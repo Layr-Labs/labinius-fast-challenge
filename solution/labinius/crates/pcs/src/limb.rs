@@ -24,10 +24,12 @@ pub fn is_quad(q: u16) -> bool {
 
 macro_rules! limb_classes {
     (items [$($m:tt)*]) => {
-        $($m)*! { [3889, 9721] [17497, 19441] [2917, 4861, 12637] }
+        // Only the two primes this prover commits with. The other five kernels are
+        // the bulk of the binary, and the score includes paging that binary in.
+        $($m)*! { [9721] [] [12637] }
     };
     ([$($m:tt)*] $($rest:tt)*) => {
-        $($m)*!([3889, 9721] [17497, 19441] [2917, 4861, 12637] $($rest)*)
+        $($m)*!([9721] [] [12637] $($rest)*)
     };
 }
 pub(crate) use limb_classes;

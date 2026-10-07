@@ -37,6 +37,7 @@ pub mod key;
 pub mod labrador;
 pub mod limb;
 pub mod params;
+pub(crate) mod pool;
 pub mod recursion;
 pub mod ring;
 pub mod rng;

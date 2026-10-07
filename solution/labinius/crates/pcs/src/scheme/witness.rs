@@ -43,12 +43,15 @@ impl Witness {
     }
 
     pub fn lifted(params: &Params, trace: &[B128]) -> Result<Witness, WitnessError> {
-        let mut w = Witness {
+        if trace.len() != params.witness_len() {
+            return Err(WitnessError::WrongLength);
+        }
+        // One write. `vec![F162::ZERO; n]` zeroed 3 MB and then `relift` overwrote it.
+        let elements = trace.iter().copied().map(F162::from_b128).collect();
+        Ok(Witness {
             params: params.clone(),
-            elements: vec![F162::ZERO; params.witness_len()],
-        };
-        w.relift(trace)?;
-        Ok(w)
+            elements,
+        })
     }
 
     pub fn from_elements(params: &Params, elements: Vec<F162>) -> Result<Witness, WitnessError> {

@@ -278,6 +278,16 @@ fn uninit_batches(n: usize) -> Vec<Batch32> {
             (*p.add(i)).representation = Representation::Ntt;
         }
         v.set_len(n);
+        // 42 MB of first-touch faults. Ask for transparent huge pages so that is tens of
+        // faults rather than ten thousand. A kernel without THP ignores the hint.
+        #[cfg(target_os = "linux")]
+        {
+            extern "C" {
+                fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+            }
+            let bytes = n * core::mem::size_of::<Batch32>();
+            let _ = madvise(p as *mut core::ffi::c_void, bytes, 14);
+        }
     }
     v
 }

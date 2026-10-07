@@ -538,8 +538,10 @@ impl<const PF: bool> BlockSink for MacKeep<PF> {
             self.acc.add(16 * ACC_PER_BLK * blk),
         );
         let dst = self.out.add(32 * 27 * blk);
+        // Cached stores. The fold reads this transform a few milliseconds later, and a
+        // non-temporal stream would force that read back out to DRAM.
         for i in 0..27 {
-            _mm512_stream_si512(
+            _mm512_store_si512(
                 dst.add(32 * i) as *mut __m512i,
                 _mm512_load_si512(w.add(32 * i) as *const __m512i),
             );

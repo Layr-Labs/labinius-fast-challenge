@@ -502,33 +502,46 @@ const G: usize = 4;
 fn accumulate<const Q: u16>(w: &AuxData, ch: &ChallengeNtt, bpc: usize) -> Vec<Batch32> {
     let pairs = ch.pair.len();
     let g = G.min(bpc);
-    let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
-    let base = acc.as_mut_ptr() as *mut i32;
-    let row = |j: usize, b: usize| w.batch(j * bpc + b).v.as_ptr() as *const i16;
+    let starts: Vec<usize> = (0..bpc).step_by(g).collect();
     let mut out: Vec<Batch32> = (0..bpc)
         .map(|_| Batch32::zero(Representation::Ntt))
         .collect();
-    unsafe {
-        for b0 in (0..bpc).step_by(g) {
-            acc.fill(AccVec([0i32; 16]));
-            for i in 0..pairs {
-                for b in 0..g {
-                    accumulate_pair(
-                        row(2 * i, b0 + b),
-                        row(2 * i + 1, b0 + b),
-                        ch.pair[i].as_ptr(),
-                        base.add(32 * N * b),
-                    );
+    // Each `b0` group streams a disjoint set of batch positions and writes a disjoint slice of
+    // `out`. The address is a usize so the worker is `Send`.
+    let out_addr = out.as_mut_ptr() as usize;
+    let stride = std::mem::size_of::<Batch32>();
+    std::thread::scope(|scope| {
+        for b0 in starts {
+            let w = w;
+            let ch = ch;
+            scope.spawn(move || {
+                let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
+                let base = acc.as_mut_ptr() as *mut i32;
+                unsafe {
+                    for i in 0..pairs {
+                        for b in 0..g {
+                            let row = |j: usize| {
+                                w.batch(j * bpc + b0 + b).v.as_ptr() as *const i16
+                            };
+                            accumulate_pair(
+                                row(2 * i),
+                                row(2 * i + 1),
+                                ch.pair[i].as_ptr(),
+                                base.add(32 * N * b),
+                            );
+                        }
+                        if (2 * (i + 1)) % fold_period(Q) == 0 {
+                            fold_back::<Q>(base, g * N * 2);
+                        }
+                    }
+                    for b in 0..g {
+                        let dst = &mut *((out_addr + (b0 + b) * stride) as *mut Batch32);
+                        drain::<Q>(base.add(32 * N * b), dst);
+                    }
                 }
-                if (2 * (i + 1)) % fold_period(Q) == 0 {
-                    fold_back::<Q>(base, g * N * 2);
-                }
-            }
-            for b in 0..g {
-                drain::<Q>(base.add(32 * N * b), &mut out[b0 + b]);
-            }
+            });
         }
-    }
+    });
     out
 }
 
@@ -616,6 +629,36 @@ unsafe fn inverse_split<const Q: u16>(b: &mut Batch32) {
     }
 }
 
+/// Run `f` on each batch from several threads. Batches are disjoint; the pointer is a `usize`
+/// because `*mut Batch32` is not `Send`.
+fn parallel_batches(vb: &mut [Batch32], f: impl Fn(&mut Batch32) + Sync) {
+    let n = vb.len();
+    if n == 0 {
+        return;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(n);
+    let addr = vb.as_mut_ptr() as usize;
+    let stride = std::mem::size_of::<Batch32>();
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let f = &f;
+            scope.spawn(move || {
+                let mut i = t;
+                while i < n {
+                    unsafe {
+                        f(&mut *((addr + i * stride) as *mut Batch32));
+                    }
+                    i += threads;
+                }
+            });
+        }
+    });
+}
+
 /// The fold over a splitting base limb: transform the challenges, accumulate, invert.
 fn fold_split<const Q: u16>(
     aux: &AuxData,
@@ -624,11 +667,7 @@ fn fold_split<const Q: u16>(
 ) -> Vec<Batch32> {
     let ch = challenge_ntt::<Q>(challenges);
     let mut vb = accumulate::<Q>(aux, &ch, bpc);
-    unsafe {
-        for b in vb.iter_mut() {
-            inverse_split::<Q>(b);
-        }
-    }
+    parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
     vb
 }
 
@@ -640,11 +679,7 @@ fn fold_quad<const Q: u16>(
 ) -> Vec<Batch32> {
     let ch = challenge_ntt_quad_base::<Q>(challenges);
     let mut vb = accumulate::<Q>(aux, &ch, bpc);
-    unsafe {
-        for b in vb.iter_mut() {
-            intt_quad_gen_batch32::<Q>(b);
-        }
-    }
+    parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
     vb
 }
 

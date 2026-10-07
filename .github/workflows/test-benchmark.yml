@@ -1,0 +1,9 @@
+name: Test PCS benchmark
+on:
+  pull_request:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  benchmark:
+    uses: ./.github/workflows/benchmark.yml

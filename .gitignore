@@ -1,0 +1,9 @@
+
+**/target/
+**/__pycache__/
+**/libobj/
+**/*.o
+**/*.a
+**/*.sage.py
+.yukon/*-score.json
+.yukon/*-score.tmp

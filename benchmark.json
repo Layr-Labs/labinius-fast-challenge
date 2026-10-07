@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "name": "labinius-fast",
+  "description": "Packed binary PCS including the GHASH field switch, over 2^24 Boolean evaluations. Score: prover process time in milliseconds. Also records serialized proof bytes and the verified commitment modulus.",
+  "category": "rust",
+  "direction": "-",
+  "editablePaths": [
+    "solution"
+  ],
+  "setupCommand": [
+    "bash",
+    ".yukon/setup.sh"
+  ],
+  "benchmarkCommand": [
+    "bash",
+    ".yukon/benchmark.sh"
+  ],
+  "scorePath": ".yukon/labinius-fast-score.json",
+  "maxSubmissionBytes": 16777216,
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml",
+    "maxConcurrentWorkflows": 1
+  }
+}

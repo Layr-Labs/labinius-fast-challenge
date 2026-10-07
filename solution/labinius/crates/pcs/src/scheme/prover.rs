@@ -52,14 +52,37 @@ impl Prover {
         prover
     }
 
+    /// A prover with no warm-up commitment.
+    ///
+    /// [`Prover::new`] commits and folds a zero witness so a later commitment finds the auxiliary
+    /// buffer already resident. This benchmark commits once, inside the timed process, so that
+    /// warm-up is a second full commitment. The real commitment pays the first touch instead.
+    pub fn cold(pp: &PublicParameters) -> Prover {
+        Prover {
+            params: pp.params.clone(),
+            key: pp.key.clone(),
+            setup: pp.recursion.clone(),
+            workspace: None,
+        }
+    }
+
     pub fn commit(&mut self, witness: &Witness) -> (Commitment, CommitmentOpening) {
         assert_eq!(
             witness.params, self.params,
             "the witness was built for other parameters"
         );
-        let mut aux = self.workspace.take().unwrap_or_else(|| {
-            AuxData::new(self.key.len_ring(), self.params.columns(), self.key.limbs())
-        });
+        let mut aux = match self.workspace.take() {
+            Some(aux) => aux,
+            None => {
+                let mut aux =
+                    AuxData::new(self.key.len_ring(), self.params.columns(), self.key.limbs());
+                // The kernel's non-temporal stores fault these pages one at a time. Touching one
+                // byte per page from several threads pays the kernel zero-fill up front, in
+                // parallel, so the commitment itself writes resident memory.
+                prefault_pages(&mut aux.batches);
+                aux
+            }
+        };
         let matrix = self
             .key
             .commit_into_aux(&witness.elements, self.params.columns(), &mut aux);
@@ -231,4 +254,46 @@ impl Prover {
             phi_bytes,
         })
     }
+}
+
+/// Fault the slot bytes of every batch before the non-temporal commit kernel writes them.
+///
+/// One volatile byte per page is enough for the kernel to zero-fill that page. Threads take
+/// disjoint batches. Only `Batch32::v` is touched, so the representation tag set by
+/// [`crate::key`] stays intact.
+fn prefault_pages(batches: &mut [crate::ring::Batch32]) {
+    if batches.is_empty() {
+        return;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
+        .min(batches.len());
+    let n = batches.len();
+    // A raw pointer is not `Send`. The threads own disjoint batches, so the address is carried
+    // as a `usize` and turned back into a reference inside each thread.
+    let addr = batches.as_mut_ptr() as usize;
+    let stride = std::mem::size_of::<crate::ring::Batch32>();
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let addr = addr;
+            scope.spawn(move || {
+                let mut i = t;
+                while i < n {
+                    unsafe {
+                        let batch = &mut *((addr + i * stride) as *mut crate::ring::Batch32);
+                        let base = batch.v.as_mut_ptr() as *mut u8;
+                        let len = std::mem::size_of_val(&batch.v);
+                        let mut off = 0;
+                        while off < len {
+                            std::ptr::write_volatile(base.add(off), 0);
+                            off += 4096;
+                        }
+                    }
+                    i += threads;
+                }
+            });
+        }
+    });
 }

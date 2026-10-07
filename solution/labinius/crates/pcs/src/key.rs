@@ -207,22 +207,45 @@ impl CommitmentKey {
         let limbs = self.limb_list();
         let nl = limbs.len();
         let g = cm::GROUP.min(r);
-        let mut st = cm::Scratch::with_group(&limbs, g);
-        let mut raw = vec![[0u32; N]; g * nl];
-        let mut data = Vec::with_capacity(4 * r);
-        let mut chunks: [&[F162]; cm::GROUP] = [&[]; cm::GROUP];
-        for c0 in (0..r).step_by(g) {
-            for (i, chunk) in chunks[..g].iter_mut().enumerate() {
-                let c = c0 + i;
-                *chunk = &witness[c * self.len_f162..(c + 1) * self.len_f162];
+        let len_f162 = self.len_f162;
+        let starts: Vec<usize> = (0..r).step_by(g).collect();
+        // Each group writes a disjoint slice of `aux.batches` and returns its raw commitments.
+        // The address is a usize so the closure is `Send`; the slices do not overlap.
+        let batch_addr = aux.batches.as_mut_ptr() as usize;
+        let stride = std::mem::size_of::<Batch32>();
+        let mut groups: Vec<(usize, Vec<[u32; N]>)> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(starts.len());
+            for c0 in starts {
+                let limbs = &limbs;
+                handles.push(scope.spawn(move || {
+                    let mut st = cm::Scratch::with_group(limbs, g);
+                    let mut raw = vec![[0u32; N]; g * nl];
+                    let mut chunks: [&[F162]; cm::GROUP] = [&[]; cm::GROUP];
+                    for i in 0..g {
+                        let c = c0 + i;
+                        chunks[i] = &witness[c * len_f162..(c + 1) * len_f162];
+                    }
+                    let batches = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (batch_addr + (c0 * bpc) * stride) as *mut Batch32,
+                            g * bpc,
+                        )
+                    };
+                    cm::commit_limbs_group(
+                        &chunks[..g],
+                        limbs,
+                        Some(batches),
+                        &mut st,
+                        &mut raw,
+                    );
+                    (c0, raw)
+                }));
             }
-            cm::commit_limbs_group(
-                &chunks[..g],
-                &limbs,
-                Some(&mut aux.batches[c0 * bpc..(c0 + g) * bpc]),
-                &mut st,
-                &mut raw,
-            );
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        groups.sort_by_key(|(c0, _)| *c0);
+        let mut data = Vec::with_capacity(4 * r);
+        for (_, raw) in groups {
             for y in raw.chunks_exact(nl) {
                 data.extend(self.components(y));
                 for (k, v) in y.iter().enumerate() {

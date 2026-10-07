@@ -22,3 +22,6 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+# The score is the whole sandboxed process, including paging the binary in.
+# Fat LTO keeps the NTT kernels; the symbol table does not need to come with them.
+strip = "symbols"

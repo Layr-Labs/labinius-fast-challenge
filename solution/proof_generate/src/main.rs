@@ -55,11 +55,16 @@ fn seed() -> [u8; 32] {
 fn trace(seed: &[u8; 32]) -> Vec<B128> {
     let mut h = blake3::Hasher::new_keyed(seed);
     h.update(b"labinius-fast/binary-table/v1");
-    let mut b = vec![0; (1 << LOG_VARS) / 8];
-    h.finalize_xof().fill(&mut b);
-    b.chunks_exact(16)
-        .map(|v| B128(u128::from_le_bytes(v.try_into().unwrap())))
-        .collect()
+    // 2^24 bits, 128 bits per word. Fill the `B128` buffer in place so the XOF
+    // output is not copied out of a temporary byte vector.
+    let n = (1usize << LOG_VARS) / 128;
+    let mut values: Vec<B128> = Vec::with_capacity(n);
+    unsafe {
+        values.set_len(n);
+        let bytes = std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, n * 16);
+        h.finalize_xof().fill(bytes);
+    }
+    values
 }
 fn transcript(seed: &[u8; 32], primes: &[u16], commitment: &[u8]) -> Transcript {
     let mut t = Transcript::new(b"labinius-fast/v1");

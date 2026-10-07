@@ -176,9 +176,31 @@ pub(crate) fn row_evaluate(witness: &[F162], p0: &[F162]) -> Vec<F162> {
         "the witness is not a whole number of columns of {wdim}"
     );
     let eq = Poly::from_scalars(&eq_table(p0));
-    (0..witness.len() / wdim)
-        .map(|j| unsafe { dot(&eq, witness.as_ptr().add(j * wdim), wdim) })
-        .collect()
+    let cols = witness.len() / wdim;
+    if cols < 8 {
+        return (0..cols)
+            .map(|j| unsafe { dot(&eq, witness.as_ptr().add(j * wdim), wdim) })
+            .collect();
+    }
+    crate::pool::install();
+    let threads = crate::pool::THREADS.min(cols);
+    let mut out = vec![F162::ZERO; cols];
+    let dst = out.as_mut_ptr() as usize;
+    let src = witness.as_ptr() as usize;
+    rayon::scope(|scope| {
+        for t in 0..threads {
+            let eq = &eq;
+            scope.spawn(move |_| {
+                let mut j = t;
+                while j < cols {
+                    let v = unsafe { dot(eq, (src as *const F162).add(j * wdim), wdim) };
+                    unsafe { (dst as *mut F162).add(j).write(v) };
+                    j += threads;
+                }
+            });
+        }
+    });
+    out
 }
 
 /// `u^T eq(p1)`, the claim a row evaluation `u` implies.

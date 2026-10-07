@@ -48,13 +48,6 @@ unsafe fn load(p: &Poly, i: usize) -> [__m512i; 3] {
 }
 
 #[inline(always)]
-unsafe fn store(p: &mut Poly, i: usize, v: [__m512i; 3]) {
-    for k in 0..3 {
-        _mm512_storeu_si512(p.w[k].as_mut_ptr().add(i) as *mut __m512i, v[k]);
-    }
-}
-
-#[inline(always)]
 unsafe fn xor3(a: [__m512i; 3], b: [__m512i; 3]) -> [__m512i; 3] {
     [
         _mm512_xor_si512(a[0], b[0]),
@@ -86,26 +79,50 @@ unsafe fn horiz(acc: [__m512i; 12]) -> F162 {
     out
 }
 
+unsafe fn msg_stripe(a: &Poly, p: &Poly, half: usize, t: usize, threads: usize, blocks: usize) -> (F162, F162) {
+    let mut acc0 = [_mm512_setzero_si512(); 12];
+    let mut acci = [_mm512_setzero_si512(); 12];
+    let mut b = t;
+    while b < blocks {
+        let j = b * 8;
+        let a0 = load(a, j);
+        let a1 = load(a, j + half);
+        let p0 = load(p, j);
+        let p1 = load(p, j + half);
+        f162::mac_soa8(&mut acc0, a0, p0);
+        f162::mac_soa8(&mut acci, xor3(a0, a1), xor3(p0, p1));
+        b += threads;
+    }
+    (horiz(acc0), horiz(acci))
+}
+
 pub(super) fn msg(a: &Poly, p: &Poly, half: usize) -> [F162; 2] {
     let mut e0 = F162::ZERO;
     let mut einf = F162::ZERO;
     let blocks = half / 8;
-    unsafe {
-        let mut acc0 = [_mm512_setzero_si512(); 12];
-        let mut acci = [_mm512_setzero_si512(); 12];
-        for b in 0..blocks {
-            let j = b * 8;
-            let a0 = load(a, j);
-            let a1 = load(a, j + half);
-            let p0 = load(p, j);
-            let p1 = load(p, j + half);
-            f162::mac_soa8(&mut acc0, a0, p0);
-            f162::mac_soa8(&mut acci, xor3(a0, a1), xor3(p0, p1));
+    if blocks >= 512 {
+        crate::pool::install();
+        let threads = crate::pool::THREADS.min(blocks);
+        let mut parts = vec![(F162::ZERO, F162::ZERO); threads];
+        let slot = parts.as_mut_ptr() as usize;
+        rayon::scope(|scope| {
+            for t in 0..threads {
+                scope.spawn(move |_| {
+                    let part = unsafe { msg_stripe(a, p, half, t, threads, blocks) };
+                    unsafe {
+                        *((slot as *mut (F162, F162)).add(t)) = part;
+                    }
+                });
+            }
+        });
+        for (u, v) in parts {
+            e0 += u;
+            einf += v;
         }
-        if blocks > 0 {
-            e0 = horiz(acc0);
-            einf = horiz(acci);
-        }
+    } else if blocks > 0 {
+        let (u, v) = unsafe { msg_stripe(a, p, half, 0, 1, blocks) };
+        e0 = u;
+        einf = v;
     }
     for j in blocks * 8..half {
         let (a0, a1) = (a.get(j), a.get(j + half));
@@ -116,19 +133,53 @@ pub(super) fn msg(a: &Poly, p: &Poly, half: usize) -> [F162; 2] {
     [e0, einf]
 }
 
+unsafe fn fold_stripe(aw: [usize; 3], pw: [usize; 3], half: usize, rb: [__m512i; 3], t: usize, threads: usize, blocks: usize) {
+    let mut b = t;
+    while b < blocks {
+        let j = b * 8;
+        let a0 = load_at(aw, j);
+        let a1 = load_at(aw, j + half);
+        let p0 = load_at(pw, j);
+        let p1 = load_at(pw, j + half);
+        store_at(aw, j, xor3(a0, f162::mul_soa8(rb, xor3(a0, a1))));
+        store_at(pw, j, xor3(p0, f162::mul_soa8(rb, xor3(p0, p1))));
+        b += threads;
+    }
+}
+
+#[inline(always)]
+unsafe fn load_at(w: [usize; 3], i: usize) -> [__m512i; 3] {
+    [
+        _mm512_loadu_si512((w[0] as *const u64).add(i) as *const __m512i),
+        _mm512_loadu_si512((w[1] as *const u64).add(i) as *const __m512i),
+        _mm512_loadu_si512((w[2] as *const u64).add(i) as *const __m512i),
+    ]
+}
+
+#[inline(always)]
+unsafe fn store_at(w: [usize; 3], i: usize, v: [__m512i; 3]) {
+    _mm512_storeu_si512((w[0] as *mut u64).add(i) as *mut __m512i, v[0]);
+    _mm512_storeu_si512((w[1] as *mut u64).add(i) as *mut __m512i, v[1]);
+    _mm512_storeu_si512((w[2] as *mut u64).add(i) as *mut __m512i, v[2]);
+}
+
 pub(super) fn fold(a: &mut Poly, p: &mut Poly, half: usize, r: F162) {
     let blocks = half / 8;
-    unsafe {
-        let rb = bcast(r);
-        for b in 0..blocks {
-            let j = b * 8;
-            let a0 = load(a, j);
-            let a1 = load(a, j + half);
-            let p0 = load(p, j);
-            let p1 = load(p, j + half);
-            store(a, j, xor3(a0, f162::mul_soa8(rb, xor3(a0, a1))));
-            store(p, j, xor3(p0, f162::mul_soa8(rb, xor3(p0, p1))));
-        }
+    let rb = unsafe { bcast(r) };
+    if blocks >= 512 {
+        crate::pool::install();
+        let threads = crate::pool::THREADS.min(blocks);
+        let aw = [a.w[0].as_mut_ptr() as usize, a.w[1].as_mut_ptr() as usize, a.w[2].as_mut_ptr() as usize];
+        let pw = [p.w[0].as_mut_ptr() as usize, p.w[1].as_mut_ptr() as usize, p.w[2].as_mut_ptr() as usize];
+        rayon::scope(|scope| {
+            for t in 0..threads {
+                scope.spawn(move |_| unsafe { fold_stripe(aw, pw, half, rb, t, threads, blocks) });
+            }
+        });
+    } else if blocks > 0 {
+        let aw = [a.w[0].as_mut_ptr() as usize, a.w[1].as_mut_ptr() as usize, a.w[2].as_mut_ptr() as usize];
+        let pw = [p.w[0].as_mut_ptr() as usize, p.w[1].as_mut_ptr() as usize, p.w[2].as_mut_ptr() as usize];
+        unsafe { fold_stripe(aw, pw, half, rb, 0, 1, blocks) };
     }
     for j in blocks * 8..half {
         let (a0, a1) = (a.get(j), a.get(j + half));

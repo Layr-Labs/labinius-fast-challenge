@@ -6,6 +6,7 @@ description = "AVX-512 Ajtai commitment, fold and verifier over Z_q[X]/(X^648 - 
 
 [dependencies]
 blake3.workspace = true
+rayon = "1.10"
 
 [features]
 labrador = []

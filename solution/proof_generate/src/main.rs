@@ -95,7 +95,7 @@ fn prove(seed: &[u8; 32], primes: &[u16]) -> Proof {
     let p = params(primes);
     let pp = PublicParameters::from_seed(p.clone(), [0x5a; 32]);
     let setup_time = clock.elapsed();
-    let mut prover = Prover::new(&pp);
+    let mut prover = Prover::cold(&pp);
     let verifier = Verifier::new(&pp);
     let values = trace(seed);
     let w = Witness::lifted(&p, &values).unwrap();

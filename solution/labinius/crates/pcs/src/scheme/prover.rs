@@ -52,6 +52,20 @@ impl Prover {
         prover
     }
 
+    /// A prover with no warm-up commitment.
+    ///
+    /// [`Prover::new`] commits and folds a zero witness so a later commitment finds the auxiliary
+    /// buffer already resident. This benchmark commits once, inside the timed process, so that
+    /// warm-up is a second full commitment. The real commitment pays the first touch instead.
+    pub fn cold(pp: &PublicParameters) -> Prover {
+        Prover {
+            params: pp.params.clone(),
+            key: pp.key.clone(),
+            setup: pp.recursion.clone(),
+            workspace: None,
+        }
+    }
+
     pub fn commit(&mut self, witness: &Witness) -> (Commitment, CommitmentOpening) {
         assert_eq!(
             witness.params, self.params,

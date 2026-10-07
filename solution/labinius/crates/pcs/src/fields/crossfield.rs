@@ -260,30 +260,54 @@ fn poly_from_eq(eqs: &[&[B128]], batches: &[Vec<F162>], out: &mut super::sumchec
     let w = &mut out.w;
     let tiles = n / TILE;
     let ms: Vec<[[u64; 16]; 24]> = batches.iter().map(|b| eq_matrices(b)).collect();
-    unsafe {
-        let mut xe = [_mm512_setzero_si512(); 16];
-        for t in 0..tiles {
-            let mut acc = [_mm512_setzero_si512(); 24];
-            for (eq, m) in eqs.iter().zip(&ms) {
-                transpose_tile(eq.as_ptr().add(TILE * t) as *const u8, &mut xe);
-                for (a, row) in acc.iter_mut().zip(m) {
-                    for k in (0..16).step_by(2) {
-                        *a = xor3(
-                            *a,
-                            affine(xe[k], _mm512_set1_epi64(row[k] as i64)),
-                            affine(xe[k + 1], _mm512_set1_epi64(row[k + 1] as i64)),
-                        );
+    let threads = if tiles >= 32 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(tiles)
+    } else {
+        1
+    };
+    let waddr = [
+        w[0].as_mut_ptr() as usize,
+        w[1].as_mut_ptr() as usize,
+        w[2].as_mut_ptr() as usize,
+    ];
+    std::thread::scope(|scope| {
+        for t0 in 0..threads {
+            let ms = &ms;
+            let eqs = eqs;
+            let waddr = waddr;
+            scope.spawn(move || unsafe {
+                let mut xe = [_mm512_setzero_si512(); 16];
+                let mut t = t0;
+                while t < tiles {
+                    let mut acc = [_mm512_setzero_si512(); 24];
+                    for (eq, m) in eqs.iter().zip(ms.iter()) {
+                        transpose_tile(eq.as_ptr().add(TILE * t) as *const u8, &mut xe);
+                        for (a, row) in acc.iter_mut().zip(m) {
+                            for k in (0..16).step_by(2) {
+                                *a = xor3(
+                                    *a,
+                                    affine(xe[k], _mm512_set1_epi64(row[k] as i64)),
+                                    affine(xe[k + 1], _mm512_set1_epi64(row[k + 1] as i64)),
+                                );
+                            }
+                        }
                     }
+                    for l in 0..3 {
+                        let out = untranspose_planes(core::array::from_fn(|c| acc[8 * l + c]));
+                        let dst = waddr[l] as *mut u64;
+                        for (g, o) in out.iter().enumerate() {
+                            _mm512_storeu_si512(dst.add(TILE * t + 8 * g) as *mut __m512i, *o);
+                        }
+                    }
+                    t += threads;
                 }
-            }
-            for (l, wl) in w.iter_mut().enumerate() {
-                let out = untranspose_planes(core::array::from_fn(|c| acc[8 * l + c]));
-                for (g, o) in out.iter().enumerate() {
-                    _mm512_storeu_si512(wl.as_mut_ptr().add(TILE * t + 8 * g) as *mut __m512i, *o);
-                }
-            }
+            });
         }
-    }
+    });
     if TILE * tiles < n {
         let tabs: Vec<_> = batches.iter().map(|b| psi_table(b)).collect();
         for j in TILE * tiles..n {

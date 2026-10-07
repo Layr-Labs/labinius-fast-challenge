@@ -90,21 +90,61 @@ pub(super) fn msg(a: &Poly, p: &Poly, half: usize) -> [F162; 2] {
     let mut e0 = F162::ZERO;
     let mut einf = F162::ZERO;
     let blocks = half / 8;
-    unsafe {
-        let mut acc0 = [_mm512_setzero_si512(); 12];
-        let mut acci = [_mm512_setzero_si512(); 12];
-        for b in 0..blocks {
-            let j = b * 8;
-            let a0 = load(a, j);
-            let a1 = load(a, j + half);
-            let p0 = load(p, j);
-            let p1 = load(p, j + half);
-            f162::mac_soa8(&mut acc0, a0, p0);
-            f162::mac_soa8(&mut acci, xor3(a0, a1), xor3(p0, p1));
+    // Large rounds dominate. Each block of 8 is an independent MAC; partial horizontal
+    // sums add in characteristic 2, so the stripes commute.
+    let threads = if blocks >= 512 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(blocks)
+    } else {
+        1
+    };
+    if threads == 1 {
+        unsafe {
+            let mut acc0 = [_mm512_setzero_si512(); 12];
+            let mut acci = [_mm512_setzero_si512(); 12];
+            for b in 0..blocks {
+                let j = b * 8;
+                let a0 = load(a, j);
+                let a1 = load(a, j + half);
+                let p0 = load(p, j);
+                let p1 = load(p, j + half);
+                f162::mac_soa8(&mut acc0, a0, p0);
+                f162::mac_soa8(&mut acci, xor3(a0, a1), xor3(p0, p1));
+            }
+            if blocks > 0 {
+                e0 = horiz(acc0);
+                einf = horiz(acci);
+            }
         }
-        if blocks > 0 {
-            e0 = horiz(acc0);
-            einf = horiz(acci);
+    } else {
+        let parts: Vec<(F162, F162)> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for t in 0..threads {
+                handles.push(scope.spawn(move || unsafe {
+                    let mut acc0 = [_mm512_setzero_si512(); 12];
+                    let mut acci = [_mm512_setzero_si512(); 12];
+                    let mut b = t;
+                    while b < blocks {
+                        let j = b * 8;
+                        let a0 = load(a, j);
+                        let a1 = load(a, j + half);
+                        let p0 = load(p, j);
+                        let p1 = load(p, j + half);
+                        f162::mac_soa8(&mut acc0, a0, p0);
+                        f162::mac_soa8(&mut acci, xor3(a0, a1), xor3(p0, p1));
+                        b += threads;
+                    }
+                    (horiz(acc0), horiz(acci))
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (x, y) in parts {
+            e0 += x;
+            einf += y;
         }
     }
     for j in blocks * 8..half {
@@ -118,17 +158,52 @@ pub(super) fn msg(a: &Poly, p: &Poly, half: usize) -> [F162; 2] {
 
 pub(super) fn fold(a: &mut Poly, p: &mut Poly, half: usize, r: F162) {
     let blocks = half / 8;
-    unsafe {
-        let rb = bcast(r);
-        for b in 0..blocks {
-            let j = b * 8;
-            let a0 = load(a, j);
-            let a1 = load(a, j + half);
-            let p0 = load(p, j);
-            let p1 = load(p, j + half);
-            store(a, j, xor3(a0, f162::mul_soa8(rb, xor3(a0, a1))));
-            store(p, j, xor3(p0, f162::mul_soa8(rb, xor3(p0, p1))));
+    let threads = if blocks >= 512 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(blocks)
+    } else {
+        1
+    };
+    if threads == 1 {
+        unsafe {
+            let rb = bcast(r);
+            for b in 0..blocks {
+                let j = b * 8;
+                let a0 = load(a, j);
+                let a1 = load(a, j + half);
+                let p0 = load(p, j);
+                let p1 = load(p, j + half);
+                store(a, j, xor3(a0, f162::mul_soa8(rb, xor3(a0, a1))));
+                store(p, j, xor3(p0, f162::mul_soa8(rb, xor3(p0, p1))));
+            }
         }
+    } else {
+        // Low-half stores at `8b` do not overlap across distinct blocks. The high half is only read.
+        let a_addr = [a.w[0].as_mut_ptr() as usize, a.w[1].as_mut_ptr() as usize, a.w[2].as_mut_ptr() as usize];
+        let p_addr = [p.w[0].as_mut_ptr() as usize, p.w[1].as_mut_ptr() as usize, p.w[2].as_mut_ptr() as usize];
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let a_addr = a_addr;
+                let p_addr = p_addr;
+                scope.spawn(move || unsafe {
+                    let rb = bcast(r);
+                    let mut b = t;
+                    while b < blocks {
+                        let j = b * 8;
+                        let a0 = load_at(&a_addr, j);
+                        let a1 = load_at(&a_addr, j + half);
+                        let p0 = load_at(&p_addr, j);
+                        let p1 = load_at(&p_addr, j + half);
+                        store_at(&a_addr, j, xor3(a0, f162::mul_soa8(rb, xor3(a0, a1))));
+                        store_at(&p_addr, j, xor3(p0, f162::mul_soa8(rb, xor3(p0, p1))));
+                        b += threads;
+                    }
+                });
+            }
+        });
     }
     for j in blocks * 8..half {
         let (a0, a1) = (a.get(j), a.get(j + half));
@@ -136,6 +211,20 @@ pub(super) fn fold(a: &mut Poly, p: &mut Poly, half: usize, r: F162) {
         a.set(j, a0 + r * (a0 + a1));
         p.set(j, p0 + r * (p0 + p1));
     }
+}
+
+unsafe fn load_at(w: &[usize; 3], i: usize) -> [__m512i; 3] {
+    [
+        _mm512_loadu_si512((w[0] as *const u64).add(i) as *const __m512i),
+        _mm512_loadu_si512((w[1] as *const u64).add(i) as *const __m512i),
+        _mm512_loadu_si512((w[2] as *const u64).add(i) as *const __m512i),
+    ]
+}
+
+unsafe fn store_at(w: &[usize; 3], i: usize, v: [__m512i; 3]) {
+    _mm512_storeu_si512((w[0] as *mut u64).add(i) as *mut __m512i, v[0]);
+    _mm512_storeu_si512((w[1] as *mut u64).add(i) as *mut __m512i, v[1]);
+    _mm512_storeu_si512((w[2] as *mut u64).add(i) as *mut __m512i, v[2]);
 }
 
 pub(super) fn round(a: &mut Poly, p: &mut Poly, half: usize, r: F162) -> [F162; 2] {

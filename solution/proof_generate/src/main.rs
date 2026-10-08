@@ -4,7 +4,8 @@ use labinius::fields::{
     crossfield as cf,
     scalar::{B128, F162},
 };
-use labinius::ring::Modulus;
+use labinius::params::N;
+use labinius::ring::{Modulus, Representation};
 use labinius::scheme::*;
 use labinius::{wire, Transcript};
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,41 @@ fn claim(partials: &[B128], lo: &[B128]) -> B128 {
         .zip(cf::eq_expand_b128(lo))
         .fold(B128::ZERO, |a, (&v, e)| a + v * e)
 }
+/// The checker's folded-witness encoding, which this must reproduce byte for byte.
+const FOLDED_BYTES: usize = 4;
+fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
+    let elements = folded.elements();
+    assert!(
+        elements
+            .iter()
+            .all(|e| e.representation == Representation::Coefficients),
+        "a fold is in coefficient form"
+    );
+    let mut out = Vec::with_capacity(FOLDED_BYTES * N * elements.len());
+    for e in elements {
+        for &c in &e.v {
+            out.extend_from_slice(&(c as i32).to_le_bytes());
+        }
+    }
+    out
+}
+#[cfg(test)]
+fn unpack_folded(bytes: &[u8], elements: usize) -> Result<FoldedWitness, String> {
+    if bytes.len() != FOLDED_BYTES * N * elements {
+        return Err("folded witness has the wrong length".into());
+    }
+    let mut words = bytes.chunks_exact(FOLDED_BYTES);
+    let mut fold = Vec::with_capacity(elements);
+    for _ in 0..elements {
+        let mut e = labinius::RingElement648::zero(Representation::Coefficients);
+        for slot in e.v.iter_mut() {
+            let word = i32::from_le_bytes(words.next().unwrap().try_into().unwrap());
+            *slot = i16::try_from(word).map_err(|_| "coefficient out of range".to_string())?;
+        }
+        fold.push(e);
+    }
+    Ok(FoldedWitness::of(fold))
+}
 #[cfg(test)]
 fn checked_f162(x: [u64; 3]) -> F162 {
     assert_eq!(x[2] >> 34, 0, "noncanonical F162 element");
@@ -139,7 +175,7 @@ fn prove(seed: &[u8; 32], primes: &[u16]) -> Proof {
         rounds,
         opened: opened.0,
         row: wire::pack_row_evaluation(&row),
-        folded: wire::encode(&folded, p.base.prime()),
+        folded: pack_folded(&folded),
     };
     let encode_time = clock.elapsed();
     eprintln!("labinius-profile setup_us={} witness_us={} commit_us={} partials_us={} switch_us={} fold_us={} encode_us={} total_us={}",
@@ -191,7 +227,7 @@ fn verify(seed: &[u8; 32], proof: &Proof) {
     t.absorb_f162(&[opened]);
     let point = EvaluationPoint::msb_first(&p, &coords);
     let row = wire::unpack_row_evaluation(&proof.row, p.columns()).unwrap();
-    let folded = wire::decode(&proof.folded).unwrap();
+    let folded = unpack_folded(&proof.folded, p.witness_len() / (4 * p.columns())).unwrap();
     let challenges = verifier.derive_folding_challenges(&mut t, &row);
     verifier.verify_evaluation(&point, &opened, &row).unwrap();
     let folded_commitment = verifier.fold_commitment(&commitment, &challenges);

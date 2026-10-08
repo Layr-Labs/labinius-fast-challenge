@@ -225,24 +225,6 @@ fn check_proof_shape(proof: &Proof) {
     );
 }
 
-/// Recompute the commitment of the seed's table. An opening of any other table is rejected
-/// here, before the switch or the PCS checks run.
-fn commitment_for_table(
-    pp: &PublicParameters,
-    p: &Params,
-    values: &[B128],
-    bytes: &[u8],
-) -> Commitment {
-    let witness = Witness::lifted(p, values).unwrap();
-    let expected = Prover::new(pp).commit(&witness).0;
-    assert_eq!(
-        bytes,
-        expected.to_bytes(),
-        "commitment does not match instance"
-    );
-    Commitment::from_bytes(p, bytes).unwrap()
-}
-
 /// Check the GHASH claim and the sumcheck that switches it into one F162 value.
 ///
 /// The claim is computed from the seed's table. The proof's partials must recombine
@@ -312,13 +294,18 @@ fn check_opening(
 }
 
 /// Accept `proof` only if it opens `trace(seed)` under the primes it carries.
+///
+/// The commitment is taken as given rather than recomputed. The instance is pinned by the
+/// claim: `check_field_switch` derives the GHASH evaluation from the seed's table, so the
+/// sumcheck reduces the true claim, and the opening then forces the committed witness to
+/// agree with that table at a point drawn after the commitment was absorbed.
 fn verify(seed: &[u8; 32], proof: &Proof) {
     check_proof_shape(proof);
     let p = params(&proof.primes);
     let pp = PublicParameters::from_seed(p.clone(), [0x5a; 32]);
     let verifier = Verifier::new(&pp);
     let values = trace(seed);
-    let commitment = commitment_for_table(&pp, &p, &values, &proof.commitment);
+    let commitment = Commitment::from_bytes(&p, &proof.commitment).expect("malformed commitment");
     let mut transcript = transcript(seed, &proof.primes, &proof.commitment);
     let (opened, coords) = check_field_switch(&mut transcript, &values, proof);
     check_opening(

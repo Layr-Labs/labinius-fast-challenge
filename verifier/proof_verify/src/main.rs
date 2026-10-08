@@ -3,21 +3,29 @@
 //! The table is 2^31 bits, packed into 2^24 GHASH words. The prover commits to
 //! that table, evaluates it at a GHASH point, and switches the claim into a
 //! single F162 opening. This binary rebuilds the table from `LABINIUS_SEED`,
-//! recomputes the commitment, and checks the switch and the clear opening.
-//! Verifier time is not scored.
+//! and checks the switch and the clear opening. Verifier time is not scored.
 //!
-//! `--prove` is a reference prover used by the round-trip tests. The scored
-//! prover is `solution/proof_generate`, which must emit this same proof layout.
+//! The commitment modulus is whatever `u128` the proof names, subject to size alone. The
+//! opening check is therefore recomputed in [`rq`] — schoolbook arithmetic in
+//! `R_Q = Z_Q[X]/(X^648 - X^324 + 1)` — rather than through the library's limb kernels, which
+//! instantiate their arithmetic per prime at compile time. Only the F162 side of the proof
+//! still runs on the library.
+//!
+//! `--prove` is a reference prover, generic in the modulus and slow; see [`reference`].
 use bincode::Options;
+use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
+use labinius::eval::eq_table;
 use labinius::fields::{
     crossfield as cf,
     scalar::{B128, F162},
 };
 use labinius::params::N;
-use labinius::ring::{Modulus, Representation};
-use labinius::scheme::*;
-use labinius::{wire, RingElement648, Transcript};
+use labinius::ring::Representation;
+use labinius::{wire, FoldedWitness, RingElement648, Transcript};
 use serde::{Deserialize, Serialize};
+
+mod reference;
+mod rq;
 
 /// Boolean table length. A solution cannot change this.
 const LOG_VARS: usize = 31;
@@ -25,6 +33,15 @@ const LOG_VARS: usize = 31;
 const LOG_PACKED: usize = LOG_VARS - labinius::fields::crossfield::LOG_PACK;
 /// Column variables of the PCS witness. The row length is `LOG_PACKED - COLUMN_LOG`.
 const COLUMN_LOG: u32 = 10;
+/// Columns of the witness, which is also the number of folding challenges and of commitment
+/// columns.
+const COLUMNS: usize = 1 << COLUMN_LOG;
+/// Row variables: the index inside one column.
+const ROW_LOG: usize = LOG_PACKED - COLUMN_LOG as usize;
+/// One column in `F162` elements.
+const COLUMN_LEN: usize = 1 << ROW_LOG;
+/// Ring elements of one column, and so of the fold: four `F162` make one element of `R_648`.
+const RING_ELEMENTS: usize = COLUMN_LEN / 4;
 /// Reject proofs larger than this before deserialization. Matches the scorer.
 const LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -36,48 +53,54 @@ const MIN_MODULUS: u128 = 34_816_965_049;
 /// The threshold above is a function of the shape, so it only holds for this one.
 const _: () = assert!(LOG_VARS == 31 && COLUMN_LOG == 10);
 
-/// Product of the ordered factors carried by the proof.
-fn commitment_modulus(primes: &[u16]) -> Result<u128, String> {
-    if primes.is_empty() {
-        return Err("proof carries no commitment modulus".into());
-    }
-    let mut product = 1u128;
-    for (i, q) in primes.iter().enumerate() {
-        if primes[..i].contains(q) {
-            return Err("duplicate commitment prime".into());
-        }
-        product = product
-            .checked_mul(u128::from(*q))
-            .ok_or_else(|| "modulus overflow".to_string())?;
-    }
-    Ok(product)
+/// The cap on `‖v‖^2` the opening check applies, the library's `Params::fold_cap()` at this
+/// shape: `FOLD_CAP` per coefficient over the `witness_len / 4 * N` coefficients of the fold.
+/// The fold has `witness_len / (4 * columns)` ring elements and each coefficient is a sum of
+/// `28 * columns` signed terms, so the product does not depend on `COLUMN_LOG`.
+fn fold_cap() -> u64 {
+    (labinius::recursion::FOLD_CAP * ((1usize << LOG_PACKED) / 4 * rq::N) as f64).ceil() as u64
 }
 
-/// The proof's modulus passes when it is at least `MIN_MODULUS`.
-fn accept_modulus(primes: &[u16]) -> Result<u128, String> {
-    let product = commitment_modulus(primes)?;
-    if product < MIN_MODULUS {
+/// The largest coefficient the `‖v‖^2` cap leaves room for, `floor(sqrt(fold_cap))`.
+fn fold_cap_bound() -> u128 {
+    fold_cap().isqrt() as u128
+}
+
+/// The proof's modulus passes on size alone: no primality, no factorisation, no smoothness, and
+/// a power of two is as welcome as anything else.
+///
+/// Two conditions. `MIN_MODULUS` is the module-BKZ threshold above. The second is the no-wrap
+/// condition that makes the mod-`Q` identity `A v = sum_j c_j C_j` an identity over the
+/// integers: the norm check accepts an integer fold with `‖v‖^2 <= fold_cap()`, so every
+/// coefficient is at most `fold_cap_bound()` in absolute value and two admissible folds differ
+/// coefficientwise by at most twice that. Once `Q` exceeds `2 * fold_cap_bound()` a centered
+/// residue class holds at most one admissible integer vector, and the extracted `v` is the one
+/// the prover folded. At this shape `2 * fold_cap_bound()` is 1083574, four orders of magnitude
+/// below `MIN_MODULUS`, so the condition states the intent rather than filtering anything.
+///
+/// [`rq::MAX_MODULUS`] is the third, and is an artifact of the checker's `i128` lanes rather
+/// than of the scheme; it sits above the product of all seven of the library's primes.
+fn accept_modulus(modulus: u128) -> Result<u128, String> {
+    if modulus < MIN_MODULUS {
         return Err("commitment modulus is below the security bound".into());
     }
-    Ok(product)
-}
-
-fn parse_primes(value: &str) -> Result<Vec<u16>, String> {
-    let primes: Vec<u16> = value
-        .split(',')
-        .map(|s| s.trim().parse().map_err(|_| "invalid prime list".to_string()))
-        .collect::<Result<_, _>>()?;
-    accept_modulus(&primes)?;
-    Ok(primes)
+    if modulus <= 2 * fold_cap_bound() {
+        return Err("commitment modulus does not clear the no-wrap bound".into());
+    }
+    if modulus >= rq::MAX_MODULUS {
+        return Err("commitment modulus is above what the checker's arithmetic covers".into());
+    }
+    Ok(modulus)
 }
 
 /// The bytes the solution prover must write. Field order is the bincode layout.
 #[derive(Serialize, Deserialize)]
 struct Proof {
     version: u32,
-    /// Ordered commitment-prime factors. The first is the base limb.
-    primes: Vec<u16>,
-    /// Commitment of the seed's table, not a prover-chosen table.
+    /// The commitment modulus. Any `u128` the size conditions of [`accept_modulus`] admit.
+    modulus: u128,
+    /// Commitment of the seed's table, not a prover-chosen table: the `COLUMNS` columns as
+    /// coefficients modulo the modulus, in [`rq::pack_ring_elements`].
     commitment: Vec<u8>,
     /// One GHASH partial per bit of a packed word (128).
     partials: Vec<u128>,
@@ -97,27 +120,6 @@ fn codec() -> impl Options {
         .with_limit(LIMIT)
         .reject_trailing_bytes()
 }
-/// Public parameters for `primes`. Shape and clear opening stay fixed; only the modulus varies.
-fn params(primes: &[u16]) -> Params {
-    accept_modulus(primes).expect("invalid commitment modulus");
-    let ms: Vec<_> = primes
-        .iter()
-        .map(|q| {
-            Modulus::ALL
-                .into_iter()
-                .find(|m| m.prime() == *q)
-                .expect("commitment modulus has no opening arithmetic")
-        })
-        .collect();
-    Params::with_base(
-        LOG_PACKED as u32,
-        COLUMN_LOG,
-        ms[0],
-        ms[1..].to_vec(),
-        Opening::Clear,
-    )
-    .unwrap()
-}
 fn seed() -> [u8; 32] {
     let s = std::env::var("LABINIUS_SEED").expect("LABINIUS_SEED is required");
     assert_eq!(s.len(), 64);
@@ -134,17 +136,14 @@ fn trace(seed: &[u8; 32]) -> Vec<B128> {
         .map(|v| B128(u128::from_le_bytes(v.try_into().unwrap())))
         .collect()
 }
-/// Fiat–Shamir state. Absorbing the seed, the shape, the ordered primes, and the
-/// commitment binds every later challenge to this instance.
-fn transcript(seed: &[u8; 32], primes: &[u16], commitment: &[u8]) -> Transcript {
+/// Fiat–Shamir state. Absorbing the seed, the shape, the modulus, and the commitment binds
+/// every later challenge to this instance.
+fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
     let mut t = Transcript::new(b"labinius-fast/v1");
     t.absorb_bytes(seed);
     t.absorb_u64(LOG_VARS as u64);
     t.absorb_u64(COLUMN_LOG as u64);
-    t.absorb_u64(primes.len() as u64);
-    for q in primes {
-        t.absorb_u64(*q as u64);
-    }
+    t.absorb_bytes(&modulus.to_le_bytes());
     t.absorb_bytes(commitment);
     t
 }
@@ -176,9 +175,6 @@ fn checked_f162(x: [u64; 3]) -> F162 {
 /// against a binary witness, so it lies in `[-28 * 1024, 28 * 1024]` and even an `i16` would
 /// hold it. Four bytes is margin on a proof whose size the scorer records rather than scores.
 const FOLDED_BYTES: usize = 4;
-fn fold_elements(p: &Params) -> usize {
-    p.witness_len() / (4 * p.columns())
-}
 fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
     let elements = folded.elements();
     assert!(
@@ -221,52 +217,53 @@ fn unpack_folded(bytes: &[u8], elements: usize) -> Result<FoldedWitness, String>
     }
     Ok(FoldedWitness::of(fold))
 }
-/// Reference proof of `trace(seed)` under `primes`. The transcript messages here
-/// are what `verify` expects, in the same order.
-fn prove(seed: &[u8; 32], primes: &[u16]) -> Proof {
-    let p = params(primes);
-    let pp = PublicParameters::from_seed(p.clone(), [0x5a; 32]);
-    let mut prover = Prover::new(&pp);
-    let verifier = Verifier::new(&pp);
-    let values = trace(seed);
-    let w = Witness::lifted(&p, &values).unwrap();
-    let (commitment, opening) = prover.commit(&w);
-    let commitment = commitment.to_bytes();
-    let mut t = transcript(seed, primes, &commitment);
-    let (lo, hi) = point(&mut t);
-    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-    let partials = ws.partial_evals(0, &values, &hi);
-    let value = claim(&partials, &lo);
-    t.absorb_b128(&[value]);
-    t.absorb_b128(&partials);
-    let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let mut sw = cf::SwitchProver::from_workspace(ws, &values, &[F162::ONE], &batch);
-    let mut rounds = Vec::new();
-    let mut coords = Vec::new();
-    for _ in 0..LOG_PACKED {
-        let msg = sw.msg();
-        t.absorb_f162(&msg);
-        let r = t.sample_f162(b"switch-round", 1)[0];
-        rounds.push(msg.map(|v| v.0));
-        coords.push(r);
-        sw.fold(r);
+/// An inner product over `F162`. The library's own kernel for this is crate-private, and the
+/// longest one here is 2^14 terms.
+fn dot_f162(a: &[F162], b: &[F162]) -> F162 {
+    assert_eq!(a.len(), b.len(), "the two operands have different lengths");
+    a.iter()
+        .zip(b)
+        .fold(F162::ZERO, |acc, (&x, &y)| acc + x * y)
+}
+/// The evaluation point split the way the witness is: `p0` over the row variables, `p1` over the
+/// column variables. The sumcheck hands its coordinates back most significant first, and the
+/// flat witness index carries the row below the column, so the leading `COLUMN_LOG` coordinates
+/// are `p1` reversed and the trailing `ROW_LOG` are `p0` reversed.
+fn split_point(coords: &[F162]) -> (Vec<F162>, Vec<F162>) {
+    assert_eq!(coords.len(), LOG_PACKED, "one coordinate per packed variable");
+    let (high, low) = coords.split_at(COLUMN_LOG as usize);
+    (
+        low.iter().rev().copied().collect(),
+        high.iter().rev().copied().collect(),
+    )
+}
+/// The `4 * v.len()` field elements of `v mod 2`, in the witness's own index order: element
+/// `4 m + k` is component `k` of packed ring element `m`, and its bit `p` is the parity of
+/// coefficient `4 p + k` of that element.
+fn components_mod_2(v: &[RingElement648]) -> Vec<F162> {
+    let mut out = vec![F162::ZERO; 4 * v.len()];
+    for (m, e) in v.iter().enumerate() {
+        for p in 0..rq::N / 4 {
+            for k in 0..4 {
+                if e.v[4 * p + k] & 1 != 0 {
+                    out[4 * m + k].0[p >> 6] |= 1u64 << (p & 63);
+                }
+            }
+        }
     }
-    let opened = sw.final_eval();
-    t.absorb_f162(&[opened]);
-    let point = EvaluationPoint::msb_first(&p, &coords);
-    let row = w.row_evaluate(&point);
-    let challenges = verifier.derive_folding_challenges(&mut t, &row);
-    let folded = prover.fold(opening, &challenges);
-    Proof {
-        version: 1,
-        primes: primes.to_vec(),
-        commitment,
-        partials: partials.iter().map(|v| v.0).collect(),
-        rounds,
-        opened: opened.0,
-        row: wire::pack_row_evaluation(&row),
-        folded: pack_folded(&folded),
-    }
+    out
+}
+/// The `COLUMNS` folding challenges: the row evaluation absorbed, then one weight-28 signed
+/// subring element per column, sampled exactly as the library's `FoldingChallenges::derive`
+/// does.
+fn folding_challenges(
+    transcript: &mut Transcript,
+    row: &labinius::RowEvaluation,
+) -> Vec<ShortChallenge> {
+    row.absorb(transcript);
+    (0..COLUMNS)
+        .map(|_| sample_short_challenge(transcript, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
+        .collect()
 }
 fn check_proof_shape(proof: &Proof) {
     assert_eq!(proof.version, 1);
@@ -311,42 +308,67 @@ fn check_field_switch(
     (opened, coords)
 }
 
-/// Clear opening of `opened` at the sumcheck point.
+/// Clear opening of `opened` at the sumcheck point, recomputed in `R_Q`.
 ///
-/// The row dotted with `eq` on the column point must equal `opened`. Folding
-/// challenges then come from the transcript and that row. The folded witness must
-/// match the folded commitment on every prime and match the folded row as bits.
+/// The row dotted with `eq` on the column point must equal `opened`. Folding challenges then
+/// come from the transcript and that row. The fold must be short — `‖v‖^2` within the cap and
+/// every coefficient within `(Q-1)/2`, both over the integers — it must satisfy
+/// `A v = sum_j c_j C_j` in `R_Q`, and it must match the folded row as bits over `F162`.
 fn check_opening(
-    verifier: &Verifier,
-    p: &Params,
+    modulus: u128,
     transcript: &mut Transcript,
-    commitment: &Commitment,
     opened: F162,
     coords: &[F162],
     proof: &Proof,
 ) {
-    let point = EvaluationPoint::msb_first(p, coords);
-    let row = wire::unpack_row_evaluation(&proof.row, p.columns()).unwrap();
-    let folded = unpack_folded(&proof.folded, fold_elements(p)).unwrap();
-    let challenges = verifier.derive_folding_challenges(transcript, &row);
-    verifier.verify_evaluation(&point, &opened, &row).unwrap();
-    let folded_commitment = verifier.fold_commitment(commitment, &challenges);
-    let folded_row_value = verifier.fold_row_evaluation(&row, &challenges);
-    verifier
-        .verify_opening(
-            commitment,
-            &challenges,
-            &point,
-            OpeningMessage::Clear {
-                folded_commitment: &folded_commitment,
-                folded_witness: &folded,
-                folded_row_value: &folded_row_value,
-            },
-        )
-        .unwrap();
+    let (p0, p1) = split_point(coords);
+    let row = wire::unpack_row_evaluation(&proof.row, COLUMNS).expect("malformed row evaluation");
+    let folded = unpack_folded(&proof.folded, RING_ELEMENTS).expect("malformed folded witness");
+    let challenges = folding_challenges(transcript, &row);
+    assert_eq!(
+        dot_f162(&eq_table(&p1), row.values()),
+        opened,
+        "the row evaluation does not reduce to the opened value"
+    );
+
+    let v = folded.elements();
+    assert_eq!(v.len(), RING_ELEMENTS, "the fold is one column of R_648");
+    let mut normsq = 0u64;
+    let mut worst = 0u128;
+    for e in v {
+        assert_eq!(
+            e.representation,
+            labinius::ring::Representation::Coefficients,
+            "the fold is not in coefficient form"
+        );
+        for &c in &e.v {
+            let magnitude = (c as i32).unsigned_abs();
+            normsq += u64::from(magnitude) * u64::from(magnitude);
+            worst = worst.max(u128::from(magnitude));
+        }
+    }
+    assert!(normsq <= fold_cap(), "the fold is longer than the cap");
+    assert!(worst <= (modulus - 1) / 2, "the fold is not centered");
+
+    let columns = rq::unpack_ring_elements(&proof.commitment, COLUMNS * rq::N, modulus)
+        .expect("malformed commitment");
+    let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
+    let coefficients: Vec<i16> = v.iter().flat_map(|e| e.v).collect();
+    assert_eq!(
+        rq::a_times_v(&matrix, &coefficients, modulus),
+        rq::challenge_combination(&columns, &challenges, modulus),
+        "the fold does not open the folded commitment"
+    );
+
+    let parities: Vec<F162> = challenges.iter().map(|c| c.to_f162()).collect();
+    assert_eq!(
+        dot_f162(&eq_table(&p0), &components_mod_2(v)),
+        dot_f162(&parities, row.values()),
+        "the fold does not match the folded row evaluation"
+    );
 }
 
-/// Accept `proof` only if it opens `trace(seed)` under the primes it carries.
+/// Accept `proof` only if it opens `trace(seed)` under the modulus it carries.
 ///
 /// The commitment is taken as given rather than recomputed. The instance is pinned by the
 /// claim: `check_field_switch` derives the GHASH evaluation from the seed's table, so the
@@ -354,37 +376,27 @@ fn check_opening(
 /// agree with that table at a point drawn after the commitment was absorbed.
 fn verify(seed: &[u8; 32], proof: &Proof) {
     check_proof_shape(proof);
-    let p = params(&proof.primes);
-    let pp = PublicParameters::from_seed(p.clone(), [0x5a; 32]);
-    let verifier = Verifier::new(&pp);
+    let modulus = accept_modulus(proof.modulus).expect("invalid commitment modulus");
     let values = trace(seed);
-    let commitment = Commitment::from_bytes(&p, &proof.commitment).expect("malformed commitment");
-    let mut transcript = transcript(seed, &proof.primes, &proof.commitment);
+    let mut transcript = transcript(seed, modulus, &proof.commitment);
     let (opened, coords) = check_field_switch(&mut transcript, &values, proof);
-    check_opening(
-        &verifier,
-        &p,
-        &mut transcript,
-        &commitment,
-        opened,
-        &coords,
-        proof,
-    );
+    check_opening(modulus, &mut transcript, opened, &coords, proof);
 }
 
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 3 || args.len() == 5,
-        "usage: labinius-fast-verify --prove FILE --primes q1,q2,... | --verify FILE"
+        "usage: labinius-fast-verify --prove FILE --modulus Q | --verify FILE"
     );
     let seed = seed();
     match args[1].as_str() {
         "--prove" => {
-            assert_eq!(args.len(), 5, "the reference prover takes --primes");
-            assert_eq!(args[3], "--primes", "unknown prover option");
-            let primes = parse_primes(&args[4]).expect("invalid commitment modulus");
-            let proof = prove(&seed, &primes);
+            assert_eq!(args.len(), 5, "the reference prover takes --modulus");
+            assert_eq!(args[3], "--modulus", "unknown prover option");
+            let modulus: u128 = args[4].trim().parse().expect("invalid modulus");
+            accept_modulus(modulus).expect("invalid commitment modulus");
+            let proof = reference::prove(&seed, modulus);
             std::fs::write(&args[2], codec().serialize(&proof).unwrap()).unwrap();
         }
         "--verify" => {
@@ -401,17 +413,52 @@ fn main() {
                 .deserialize(&std::fs::read(&args[2]).unwrap())
                 .unwrap();
             // The modulus is the one this proof was built with. Check it against the
-            // threshold, then check the opening under that schema.
-            let modulus = accept_modulus(&proof.primes).expect("invalid commitment modulus");
+            // size conditions, then check the opening under that schema.
+            let modulus = accept_modulus(proof.modulus).expect("invalid commitment modulus");
             verify(&seed, &proof);
             println!(
-                "{{\"modulus\":\"{modulus}\",\"modulusPrimes\":{:?},\"polynomialSize\":{},\"packedElements\":{},\"field\":\"GHASH\"}}",
-                proof.primes,
+                "{{\"modulus\":\"{modulus}\",\"modulusBits\":{},\"polynomialSize\":{},\"packedElements\":{},\"field\":\"GHASH\"}}",
+                rq::modulus_bits(modulus),
                 // `1 << LOG_VARS` would default to i32 and overflow at 31 bits.
                 1usize << LOG_VARS,
                 1usize << LOG_PACKED
             );
         }
         _ => panic!("unknown command"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use labinius::ring::Modulus;
+    use labinius::scheme::{Opening, Params};
+
+    /// The cap the checker applies is the library's, at this shape.
+    #[test]
+    fn fold_cap_matches_the_library() {
+        let params = Params::with_base(
+            LOG_PACKED as u32,
+            COLUMN_LOG,
+            Modulus::BASE,
+            vec![],
+            Opening::Clear,
+        )
+        .unwrap();
+        assert_eq!(fold_cap(), params.fold_cap());
+        assert_eq!(fold_cap(), 293_534_171_136);
+        assert_eq!(fold_cap_bound(), 541_787);
+    }
+
+    /// The gate takes the security threshold and nothing structural: a power of two above it
+    /// passes, the integer below it does not, and the no-wrap bound is slack.
+    #[test]
+    fn the_gate_is_two_size_conditions() {
+        assert!(accept_modulus(1u128 << 36).is_ok());
+        assert!(accept_modulus(MIN_MODULUS).is_ok());
+        assert!(accept_modulus(MIN_MODULUS - 1).is_err());
+        assert!(accept_modulus(55_144_219_393).is_ok());
+        assert!(accept_modulus(rq::MAX_MODULUS).is_err());
+        assert!(2 * fold_cap_bound() < MIN_MODULUS);
     }
 }

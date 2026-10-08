@@ -1,5 +1,5 @@
 //! Supported integer commitment factors.
-//! The checker, not this parser, rejects a product whose compiled module-BKZ estimate is under 100 bits.
+//! The checker, not this parser, applies the minimum-modulus threshold and rejects a smaller product.
 pub const SUPPORTED_PRIMES: [u16; 7] = [2917, 3889, 4861, 9721, 12637, 17497, 19441];
 
 pub fn validate(primes: &[u16]) -> Result<u128, &'static str> {

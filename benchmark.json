@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "labinius-fast",
-  "description": "Packed binary PCS including the GHASH field switch, over 2^24 Boolean evaluations. Score: prover process time in milliseconds. Also records serialized proof bytes and the verified commitment modulus.",
+  "description": "Packed binary PCS including the GHASH field switch, over 2^31 Boolean evaluations. Score: prover process time in milliseconds. Also records serialized proof bytes and the verified commitment modulus.",
   "category": "rust",
   "direction": "-",
   "editablePaths": [

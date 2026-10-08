@@ -21,6 +21,7 @@ use labinius::fields::{
 };
 use labinius::params::N;
 use labinius::ring::Representation;
+use labinius::scheme::FoldingSource;
 use labinius::{wire, FoldedWitness, RingElement648, Transcript};
 use serde::{Deserialize, Serialize};
 

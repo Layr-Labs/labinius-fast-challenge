@@ -13,9 +13,10 @@ use labinius::fields::{
     crossfield as cf,
     scalar::{B128, F162},
 };
-use labinius::ring::Modulus;
+use labinius::params::N;
+use labinius::ring::{Modulus, Representation};
 use labinius::scheme::*;
-use labinius::{wire, Transcript};
+use labinius::{wire, RingElement648, Transcript};
 use serde::{Deserialize, Serialize};
 
 /// Boolean table length. A solution cannot change this.
@@ -86,7 +87,7 @@ struct Proof {
     opened: [u64; 3],
     /// Row evaluation at the column point, in the shared wire codec.
     row: Vec<u8>,
-    /// Folded witness, entropy-coded by the shared wire codec.
+    /// Folded witness, one fixed-width little-endian integer per coefficient.
     folded: Vec<u8>,
 }
 /// Bincode layout shared with the solution prover: fixed-width integers, no trailing bytes.
@@ -168,6 +169,58 @@ fn checked_f162(x: [u64; 3]) -> F162 {
     assert_eq!(x[2] >> 34, 0, "noncanonical F162 element");
     F162(x)
 }
+/// Bytes one coefficient of the folded witness takes on the wire: a little-endian signed
+/// integer per coefficient, element by element and then coefficient by coefficient.
+///
+/// A fold coefficient is a sum over the `columns` columns of a weight-28 signed challenge
+/// against a binary witness, so it lies in `[-28 * 1024, 28 * 1024]` and even an `i16` would
+/// hold it. Four bytes is margin on a proof whose size the scorer records rather than scores.
+const FOLDED_BYTES: usize = 4;
+fn fold_elements(p: &Params) -> usize {
+    p.witness_len() / (4 * p.columns())
+}
+fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
+    let elements = folded.elements();
+    assert!(
+        elements
+            .iter()
+            .all(|e| e.representation == Representation::Coefficients),
+        "a fold is in coefficient form"
+    );
+    let mut out = Vec::with_capacity(FOLDED_BYTES * N * elements.len());
+    for e in elements {
+        for &c in &e.v {
+            out.extend_from_slice(&(c as i32).to_le_bytes());
+        }
+    }
+    out
+}
+/// The inverse of [`pack_folded`] for a fold of `elements` ring elements, strict: one fold has
+/// exactly one encoding, and an accepted byte string is the encoding of the fold it yields.
+///
+/// Strictness is what keeps the transcript honest. The transcript absorbs the commitment bytes
+/// rather than the commitment object, so an encoding with slack would let a prover re-encode one
+/// proof many ways and keep whichever encoding drew the challenges it liked. The length here is
+/// exact, every word must be a coefficient the ring can hold, and `reject_trailing_bytes` on the
+/// codec refuses bytes after the last field — bytes hidden inside this field are refused by the
+/// length instead. A fixed width and those checks make the encoding a bijection, so comparing a
+/// re-serialization against the proof would be a check that can never fire.
+fn unpack_folded(bytes: &[u8], elements: usize) -> Result<FoldedWitness, String> {
+    if bytes.len() != FOLDED_BYTES * N * elements {
+        return Err("folded witness has the wrong length".into());
+    }
+    let mut words = bytes.chunks_exact(FOLDED_BYTES);
+    let mut fold = Vec::with_capacity(elements);
+    for _ in 0..elements {
+        let mut e = RingElement648::zero(Representation::Coefficients);
+        for slot in e.v.iter_mut() {
+            let word = i32::from_le_bytes(words.next().unwrap().try_into().unwrap());
+            *slot = i16::try_from(word).map_err(|_| "coefficient out of range".to_string())?;
+        }
+        fold.push(e);
+    }
+    Ok(FoldedWitness::of(fold))
+}
 /// Reference proof of `trace(seed)` under `primes`. The transcript messages here
 /// are what `verify` expects, in the same order.
 fn prove(seed: &[u8; 32], primes: &[u16]) -> Proof {
@@ -212,7 +265,7 @@ fn prove(seed: &[u8; 32], primes: &[u16]) -> Proof {
         rounds,
         opened: opened.0,
         row: wire::pack_row_evaluation(&row),
-        folded: wire::encode(&folded, p.base.prime()),
+        folded: pack_folded(&folded),
     }
 }
 fn check_proof_shape(proof: &Proof) {
@@ -274,7 +327,7 @@ fn check_opening(
 ) {
     let point = EvaluationPoint::msb_first(p, coords);
     let row = wire::unpack_row_evaluation(&proof.row, p.columns()).unwrap();
-    let folded = wire::decode(&proof.folded).unwrap();
+    let folded = unpack_folded(&proof.folded, fold_elements(p)).unwrap();
     let challenges = verifier.derive_folding_challenges(transcript, &row);
     verifier.verify_evaluation(&point, &opened, &row).unwrap();
     let folded_commitment = verifier.fold_commitment(commitment, &challenges);

@@ -1,6 +1,6 @@
 //! Fixed checker for one packed-binary PCS instance.
 //!
-//! The table is 2^24 bits, packed into 2^17 GHASH words. The prover commits to
+//! The table is 2^31 bits, packed into 2^24 GHASH words. The prover commits to
 //! that table, evaluates it at a GHASH point, and switches the claim into a
 //! single F162 opening. This binary rebuilds the table from `LABINIUS_SEED`,
 //! recomputes the commitment, and checks the switch and the clear opening.
@@ -19,52 +19,21 @@ use labinius::{wire, Transcript};
 use serde::{Deserialize, Serialize};
 
 /// Boolean table length. A solution cannot change this.
-const LOG_VARS: usize = 24;
+const LOG_VARS: usize = 31;
 /// Packed GHASH words. Each word holds `2^LOG_PACK` bits, and `LOG_PACK` is 7.
 const LOG_PACKED: usize = LOG_VARS - labinius::fields::crossfield::LOG_PACK;
 /// Column variables of the PCS witness. The row length is `LOG_PACKED - COLUMN_LOG`.
-const COLUMN_LOG: u32 = 6;
+const COLUMN_LOG: u32 = 10;
 /// Reject proofs larger than this before deserialization. Matches the scorer.
 const LIMIT: u64 = 64 * 1024 * 1024;
 
-/// Millionths of a module-BKZ bit. 100 bits is the acceptance threshold.
-const MIN_MICROBITS: i64 = 100_000_000;
-/// `product microbits` for each modulus whose module-BKZ cost was computed offline.
-/// `modulus_security.sage --table` regenerates it; a negative cost means the SIS instance
-/// is trivially easy. Compiled into this binary so verification does not run Sage.
-const MODULUS_ESTIMATES: &str = include_str!("../modulus_estimates.txt");
-
-fn estimate_microbits(product: u128) -> Result<i64, String> {
-    for line in MODULUS_ESTIMATES.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let (Some(q), Some(bits), None) = (parts.next(), parts.next(), parts.next()) else {
-            return Err("modulus estimate table is malformed".into());
-        };
-        let q: u128 = q
-            .parse()
-            .map_err(|_| "modulus estimate table is malformed".to_string())?;
-        if q != product {
-            continue;
-        }
-        return bits
-            .parse()
-            .map_err(|_| "modulus estimate table is malformed".to_string());
-    }
-    Err("no precomputed modulus estimate for this product".into())
-}
-
-/// Accepts `product` when the compiled module-BKZ cost is at least 100 bits.
-fn estimator_accepts(product: u128) -> Result<(), String> {
-    if estimate_microbits(product)? >= MIN_MICROBITS {
-        Ok(())
-    } else {
-        Err("commitment modulus is below the security bound".into())
-    }
-}
+/// Smallest modulus reaching 100 bits of module-BKZ security at this instance's shape:
+/// ring degree 648, clear opening, length bound 8*12*sqrt(3)*sqrt(2^22 * 648 * 28 * 3.85) = 9.00e7.
+/// 34816965048 gives 99.6691 bits and 34816965049 gives 100.2194; no modulus takes a value
+/// between the two, so the threshold is one integer wide.
+const MIN_MODULUS: u128 = 34_816_965_049;
+/// The threshold above is a function of the shape, so it only holds for this one.
+const _: () = assert!(LOG_VARS == 31 && COLUMN_LOG == 10);
 
 /// Product of the ordered factors carried by the proof.
 fn commitment_modulus(primes: &[u16]) -> Result<u128, String> {
@@ -83,10 +52,12 @@ fn commitment_modulus(primes: &[u16]) -> Result<u128, String> {
     Ok(product)
 }
 
-/// The proof's modulus passes when its compiled module-BKZ cost is at least 100 bits.
+/// The proof's modulus passes when it is at least `MIN_MODULUS`.
 fn accept_modulus(primes: &[u16]) -> Result<u128, String> {
     let product = commitment_modulus(primes)?;
-    estimator_accepts(product)?;
+    if product < MIN_MODULUS {
+        return Err("commitment modulus is below the security bound".into());
+    }
     Ok(product)
 }
 
@@ -109,7 +80,7 @@ struct Proof {
     commitment: Vec<u8>,
     /// One GHASH partial per bit of a packed word (128).
     partials: Vec<u128>,
-    /// One sumcheck message per packed coordinate (17). Each message is two F162 elements.
+    /// One sumcheck message per packed coordinate (24). Each message is two F162 elements.
     rounds: Vec<[[u64; 3]; 2]>,
     /// The F162 value the switch reduces the GHASH claim to.
     opened: [u64; 3],
@@ -389,15 +360,16 @@ fn main() {
             let proof: Proof = codec()
                 .deserialize(&std::fs::read(&args[2]).unwrap())
                 .unwrap();
-            // The modulus is the one this proof was built with. Estimate it, then
-            // check the opening under that schema.
+            // The modulus is the one this proof was built with. Check it against the
+            // threshold, then check the opening under that schema.
             let modulus = accept_modulus(&proof.primes).expect("invalid commitment modulus");
             verify(&seed, &proof);
             println!(
                 "{{\"modulus\":\"{modulus}\",\"modulusPrimes\":{:?},\"polynomialSize\":{},\"packedElements\":{},\"field\":\"GHASH\"}}",
                 proof.primes,
-                1 << LOG_VARS,
-                1 << LOG_PACKED
+                // `1 << LOG_VARS` would default to i32 and overflow at 31 bits.
+                1usize << LOG_VARS,
+                1usize << LOG_PACKED
             );
         }
         _ => panic!("unknown command"),

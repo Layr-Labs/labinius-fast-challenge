@@ -85,6 +85,7 @@ if grep -qw avx512f /proc/cpuinfo; then
 else
   avx512f=false
 fi
+mem_total_kb=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
 
 verify_out=$(python3 - "$verifier" "$proof" <<'PY'
 import subprocess, sys
@@ -105,7 +106,7 @@ PY
 python3 -c '
 import json, sys
 metrics = json.loads(sys.argv[1])
-if metrics.get("field") != "GHASH" or metrics.get("polynomialSize") != 2**24:
+if metrics.get("field") != "GHASH" or metrics.get("polynomialSize") != 2**31:
     raise SystemExit("checker reported unexpected parameters")
 prove_ms = float(sys.argv[2])
 metrics["provingTimeMs"] = prove_ms
@@ -113,11 +114,12 @@ metrics["proofBytes"] = int(sys.argv[3])
 metrics["cpuModel"] = sys.argv[5]
 metrics["nproc"] = int(sys.argv[6])
 metrics["avx512f"] = sys.argv[7] == "true"
+metrics["memTotalKb"] = int(sys.argv[8])
 result = {"score": prove_ms, "metrics": metrics}
 text = json.dumps(result) + "\n"
 with open(sys.argv[4], "w", encoding="utf-8") as staged:
     staged.write(text)
 sys.stdout.write(text)
-' "$verify_out" "$prove_ms" "$proof_bytes" "$staged" "$cpu_model" "$nproc_count" "$avx512f"
+' "$verify_out" "$prove_ms" "$proof_bytes" "$staged" "$cpu_model" "$nproc_count" "$avx512f" "$mem_total_kb"
 
 mv "$staged" "$score"

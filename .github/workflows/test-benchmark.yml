@@ -1,9 +1,17 @@
 name: Test PCS benchmark
+
 on:
   pull_request:
+
 permissions:
   contents: read
   actions: read
+
 jobs:
   benchmark:
-    uses: ./.github/workflows/benchmark.yml
+    # The runner group admits this protected reusable workflow reference, not a
+    # relative workflow or arbitrary job definition supplied by the PR.
+    uses: Layr-Labs/labinius-fast-challenge/.github/workflows/benchmark.yml@master
+    with:
+      solution_repository: ${{ github.event.pull_request.head.repo.full_name }}
+      solution_ref: ${{ github.event.pull_request.head.sha }}

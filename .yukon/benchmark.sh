@@ -1,63 +1,68 @@
 #!/usr/bin/env bash
 
-# Trusted benchmark orchestration. Only an accepted nonempty proof with 
-# valid moduli produces a score.
+# Trusted benchmark orchestration. Only an accepted nonempty proof with valid
+# moduli produces a score.
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+umask 077
 
-score=.yukon/labinius-fast-score.json
-staged=.yukon/labinius-fast-score.tmp
+script_dir=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=.yukon/lib/sandbox.sh
+source "$script_dir/lib/sandbox.sh"
+
+: "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+trusted="${TRUSTED_DIR:-$RUNNER_TEMP/labinius-trusted}"
+contestant="${CONTESTANT_DIR:-$RUNNER_TEMP/labinius-contestant}"
+require_runner_temp_path "$trusted"
+require_runner_temp_path "$contestant"
+
+score="$script_dir/labinius-fast-score.json"
+staged="$script_dir/labinius-fast-score.tmp"
 rm -f "$score" "$staged"
 
-command -v bwrap >/dev/null || { echo "bubblewrap (bwrap) is required to run the untrusted prover" >&2; exit 1; }
-
-root=$(pwd)
-trusted="${TRUSTED_DIR:-${RUNNER_TEMP:-/tmp}/labinius-trusted}"
-prover=$root/solution/proof_generate/target/release/labinius-fast
-verifier=$trusted/labinius-fast-verify
-max_bytes=$((64 * 1024 * 1024))
-
-sha256_file() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
-  else
-    shasum -a 256 "$1" | awk '{print $1}'
-  fi
+command -v bwrap >/dev/null || {
+  echo "bubblewrap (bwrap) is required to run the untrusted prover" >&2
+  exit 1
 }
 
-# sample os randomness to seed the transcript. This is to prevent prevent a
-# malicious prover from being able to cheat via attacks such as caching prior 
-# proofs. This randomness is used to setup the problem instance the prover will 
-# see (ie, exact polynomials)
-export LABINIUS_SEED
+prover="$contestant/solution/proof_generate/target/release/labinius-fast"
+verifier="$trusted/labinius-fast-verify"
+max_bytes=$((64 * 1024 * 1024))
+
+if [[ ! -f "$prover" || -L "$prover" ]]; then
+  echo "missing regular contestant prover binary" >&2
+  exit 1
+fi
+if [[ ! -f "$verifier" || -L "$verifier" ]]; then
+  echo "missing regular trusted verifier binary" >&2
+  exit 1
+fi
+
+# Randomize the problem instance so a prover cannot rely on a cached proof.
 LABINIUS_SEED=$(openssl rand -hex 32)
+export LABINIUS_SEED
 
-# Keep the proof directory off /tmp: the prover sandbox mounts a fresh tmpfs there.
-workparent="${TMPDIR:-/var/tmp}"
-case "$workparent" in
-  /tmp|/tmp/*) workparent=/var/tmp ;;
-esac
-mkdir -p "$workparent"
-workdir=$(mktemp -d "$workparent/labinius-fast.XXXXXX")
-cleanup() { rm -rf "$workdir"; rm -f "$staged"; }
+workdir=$(mktemp -d "$RUNNER_TEMP/labinius-fast-proof.XXXXXX")
+cleanup() {
+  rm -rf "$workdir"
+  rm -f "$staged"
+}
 trap cleanup EXIT
-proof=$workdir/proof.bin
+proof="$workdir/proof.bin"
 
-prove_ms=$(python3 - "$prover" "$proof" "$LABINIUS_SEED" "$workdir" <<'PY'
-import subprocess, sys, time
-prover, proof, seed, workdir = sys.argv[1:5]
+prove_ms=$(python3 - "$script_dir" "$prover" "$LABINIUS_SEED" "$workdir" <<'PY'
+import subprocess
+import sys
+import time
+
+script_dir, prover, seed, workdir = sys.argv[1:5]
 cmd = [
-    "bwrap",
-    "--ro-bind", "/", "/",
-    "--dev", "/dev",
-    "--proc", "/proc",
-    "--tmpfs", "/tmp",
-    "--bind", workdir, workdir,
-    "--unshare-pid", "--unshare-net", "--die-with-parent",
-    "--setenv", "LABINIUS_SEED", seed,
-    "--chdir", workdir,
-    "--", prover, "--prove", proof,
+    "/usr/bin/bash",
+    f"{script_dir}/run-prover.sh",
+    prover,
+    workdir,
+    seed,
+    "/work/proof.bin",
 ]
 start = time.perf_counter()
 subprocess.run(cmd, timeout=900, check=True)
@@ -87,8 +92,10 @@ else
 fi
 mem_total_kb=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
 
-verify_out=$(python3 - "$verifier" "$proof" <<'PY'
-import subprocess, sys
+verify_out=$(env -i PATH=/usr/bin:/bin python3 - "$verifier" "$proof" <<'PY'
+import subprocess
+import sys
+
 checked = subprocess.run(
     [sys.argv[1], "--verify", sys.argv[2]],
     timeout=900,

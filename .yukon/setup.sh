@@ -78,21 +78,29 @@ run_contestant_build \
   "$contestant/solution/proof_generate/target" \
   "$contestant_cargo" \
   fetch \
-  /opt/cargo/bin/cargo fetch \
-    --locked \
-    --manifest-path /workspace/solution/proof_generate/Cargo.toml
+  /usr/bin/bash -eu -c '
+    manifest=/workspace/solution/proof_generate/Cargo.toml
+    if [[ ! -r "$manifest" ]]; then
+      echo "staged contestant manifest is not readable inside the sandbox" >&2
+      exit 1
+    fi
+    exec /opt/cargo/bin/cargo fetch --locked --manifest-path "$manifest"
+  '
 
 run_contestant_build \
   "$contestant/solution" \
   "$contestant/solution/proof_generate/target" \
   "$contestant_cargo" \
   offline \
-  /opt/cargo/bin/cargo build \
-    --locked \
-    --offline \
-    --release \
-    --bin labinius-fast \
-    --manifest-path /workspace/solution/proof_generate/Cargo.toml
+  /usr/bin/bash -eu -c '
+    manifest=/workspace/solution/proof_generate/Cargo.toml
+    if [[ ! -r "$manifest" ]]; then
+      echo "staged contestant manifest is not readable inside the sandbox" >&2
+      exit 1
+    fi
+    exec /opt/cargo/bin/cargo build \
+      --locked --offline --release --bin labinius-fast --manifest-path "$manifest"
+  '
 
 prover="$contestant/solution/proof_generate/target/release/labinius-fast"
 if [[ ! -f "$prover" || -L "$prover" ]]; then

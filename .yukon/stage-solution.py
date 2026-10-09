@@ -64,7 +64,12 @@ def stage(source_arg: str, destination_arg: str) -> None:
     file_count = 0
     byte_count = 0
 
-    for current, directories, files in os.walk(source, topdown=True, followlinks=False):
+    def unreadable(_error: OSError) -> NoReturn:
+        fail("solution tree is not fully readable")
+
+    for current, directories, files in os.walk(
+        source, topdown=True, onerror=unreadable, followlinks=False
+    ):
         current_path = Path(current)
         current_relative = checked_relative(current_path, source)
         destination_current = destination / current_relative

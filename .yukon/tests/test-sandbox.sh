@@ -103,6 +103,7 @@ run_contestant_build \
     test -x /workspace
     test -x /workspace/solution
     test -r ./Cargo.toml
+    printf "native build output\n" > ./native-build-output
     test ! -e "$1"
     if touch /opt/cargo/bin/.labinius-host-write-test 2>/dev/null; then
       rm -f /opt/cargo/bin/.labinius-host-write-test
@@ -112,6 +113,14 @@ run_contestant_build \
     /opt/cargo/bin/cargo build --locked --offline
   ' bash "$outside"
 
+if [[ ! -f "$staged_solution/proof_generate/native-build-output" ]]; then
+  echo "private staged solution was not writable for native build output" >&2
+  exit 1
+fi
+if [[ -e "$source_solution/proof_generate/native-build-output" ]]; then
+  echo "sandbox wrote into the original solution input" >&2
+  exit 1
+fi
 if [[ -e /opt/cargo/bin/.labinius-host-write-test ]]; then
   rm -f /opt/cargo/bin/.labinius-host-write-test
   echo "sandbox planted a file in the host tool directory" >&2

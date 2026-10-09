@@ -97,6 +97,23 @@ run_contestant_build() {
   local network_mode=$4
   shift 4
 
+  require_runner_temp_path "$solution_root"
+  require_runner_temp_path "$target_dir"
+  require_runner_temp_path "$cargo_home"
+  for path in "$solution_root" "$target_dir" "$cargo_home"; do
+    if [[ ! -d "$path" || -L "$path" ]]; then
+      echo "contestant build state must use real directories" >&2
+      return 1
+    fi
+  done
+  case "$(realpath "$target_dir")" in
+    "$(realpath "$solution_root")"/*) ;;
+    *)
+      echo "contestant target must remain inside the staged solution" >&2
+      return 1
+      ;;
+  esac
+
   local -a args=(
     --die-with-parent
     --new-session
@@ -110,8 +127,7 @@ run_contestant_build() {
     --tmpfs /tmp
     --dir /workspace
     --dir /workspace/solution
-    --ro-bind "$solution_root" /workspace/solution
-    --bind "$target_dir" /workspace/solution/proof_generate/target
+    --bind "$solution_root" /workspace/solution
     --dir /cargo-home
     --bind "$cargo_home" /cargo-home
     --dir /opt

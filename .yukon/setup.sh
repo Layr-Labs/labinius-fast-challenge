@@ -65,7 +65,8 @@ chmod 444 "$trusted/verify.sha256"
 chmod 555 "$trusted"
 
 # Copy data only: reject symlinks, special files, git control data, and paths
-# that cannot remain beneath solution/.
+# that cannot remain beneath solution/. This private RUNNER_TEMP copy is the
+# contestant's only writable source tree for native build-system outputs.
 python3 "$script_dir/stage-solution.py" \
   "$UNTRUSTED_CHECKOUT/solution" \
   "$contestant/solution"

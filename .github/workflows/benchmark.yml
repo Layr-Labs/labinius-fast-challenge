@@ -1,92 +1,65 @@
-name: Benchmark
+name: Trusted runner registration smoke test
 
 on:
   workflow_dispatch:
-  workflow_call:
 
-permissions:
-  contents: read
-  actions: read
+permissions: {}
 
-concurrency:
-  group: benchmark-${{ github.ref }}
-  cancel-in-progress: true
-
-# blacksmith-16vcpu-ubuntu-2404 does not guarantee AVX-512. Each attempt is a
-# new machine. A machine without avx512f does not compile or upload a score.
 jobs:
-  benchmark:
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 45
+  smoke:
+    if: github.repository == 'Layr-Labs/labinius-fast-challenge' && github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        host:
+          - labinius-avx512-01
+          - labinius-avx512-02
+          - labinius-avx512-03
+    timeout-minutes: 5
+    runs-on:
+      group: labinius-avx512-c7i
+      labels:
+        - self-hosted
+        - labinius-avx512-c7i
+        - ${{ matrix.host }}
     env:
-      AVX_REQUIRED: soft
-    outputs:
-      avx: ${{ steps.avx.outputs.avx }}
-    steps: &steps
-      - name: Require AVX-512
-        id: avx
+      RUSTUP_HOME: /opt/rustup
+      CARGO_HOME: /opt/cargo
+      CC: /usr/bin/gcc-13
+    steps:
+      - name: Verify trusted runner
+        shell: bash
         run: |
-          if grep -qw avx512f /proc/cpuinfo; then
-            echo "avx=ok" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "avx=missing" >> "$GITHUB_OUTPUT"
-          echo "runner has no AVX-512" >&2
-          grep -m1 '^flags' /proc/cpuinfo >&2 || true
-          if [ "$AVX_REQUIRED" = "hard" ]; then
-            exit 1
-          fi
+          set -euo pipefail
 
-      - name: Checkout
-        if: steps.avx.outputs.avx == 'ok'
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          ref: ${{ github.sha }}
+          test "$(id -u)" = "1100"
+          ! command -v sudo >/dev/null 2>&1
+          ! id -nG | tr ' ' '\n' | grep -Fxq docker
 
-      - name: Install bubblewrap
-        if: steps.avx.outputs.avx == 'ok'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap
-          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          echo "TRUSTED_DIR=$RUNNER_TEMP/labinius-trusted" >> "$GITHUB_ENV"
+          test "$RUSTUP_HOME" = "/opt/rustup"
+          test "$CARGO_HOME" = "/opt/cargo"
+          test "$CC" = "/usr/bin/gcc-13"
+          test -x "$CC"
 
-      - name: Setup
-        if: steps.avx.outputs.avx == 'ok'
-        run: bash .yukon/setup.sh
+          rustc_version="$(rustc --version)"
+          cargo_version="$(cargo --version)"
+          [[ "$rustc_version" =~ ^rustc\ 1\.99\. ]]
+          [[ "$cargo_version" =~ ^cargo\ 1\.99\. ]]
 
-      - name: Benchmark
-        if: steps.avx.outputs.avx == 'ok'
-        run: bash .yukon/benchmark.sh
+          test -x /usr/local/bin/validate-cpu
+          test ! -w /usr/local/bin/validate-cpu
+          /usr/local/bin/validate-cpu
 
-      - name: Upload score
-        if: always() && steps.avx.outputs.avx == 'ok'
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: benchmark-score
-          path: .yukon/labinius-fast-score.json
-          if-no-files-found: error
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = "1"
+          bwrap_path="$(command -v bwrap)"
+          test ! -u "$bwrap_path"
+          "$bwrap_path" --unshare-all --new-session --die-with-parent --ro-bind / / /usr/bin/true
 
-  benchmark-retry:
-    needs: benchmark
-    if: needs.benchmark.outputs.avx == 'missing'
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 45
-    env:
-      AVX_REQUIRED: soft
-    outputs:
-      avx: ${{ steps.avx.outputs.avx }}
-    steps: *steps
+          imds_exit=0
+          imds_http="$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 2 --max-time 3 http://169.254.169.254/latest/meta-data/)" || imds_exit=$?
+          test "$imds_exit" -ne 0
+          test "$imds_http" = "000"
 
-  benchmark-retry-2:
-    needs: [benchmark, benchmark-retry]
-    if: needs.benchmark.outputs.avx == 'missing' && needs.benchmark-retry.outputs.avx == 'missing'
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 45
-    env:
-      AVX_REQUIRED: hard
-    outputs:
-      avx: ${{ steps.avx.outputs.avx }}
-    steps: *steps
+          lscpu | grep -E '^(Architecture|CPU\(s\)|Model name|Flags):'
+          printf '%s\n' "$rustc_version" "$cargo_version"
+          echo "TRUSTED_RUNNER_SMOKE_PASS"

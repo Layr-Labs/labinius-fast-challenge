@@ -35,7 +35,7 @@ jobs:
     # The organization runner group is a separate admission boundary and must
     # allow only this reusable workflow at its protected reference.
     runs-on:
-      group: labinius-avx512-c7i
+      group: labinius-intel-8488c-avx512-c7i
       labels: labinius-avx512-c7i
     timeout-minutes: 45
     steps:

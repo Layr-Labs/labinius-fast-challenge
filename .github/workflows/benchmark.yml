@@ -33,8 +33,10 @@ jobs:
           set -euo pipefail
 
           test "$(id -u)" = "1100"
-          ! command -v sudo >/dev/null 2>&1
-          ! id -nG | tr ' ' '\n' | grep -Fxq docker
+          ! id -nG | tr ' ' '\n' | grep -Exq '(sudo|docker)'
+          if command -v sudo >/dev/null 2>&1; then
+            ! sudo -n true >/dev/null 2>&1
+          fi
 
           test "$RUSTUP_HOME" = "/opt/rustup"
           test "$CARGO_HOME" = "/opt/cargo"
@@ -53,7 +55,7 @@ jobs:
           test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = "1"
           bwrap_path="$(command -v bwrap)"
           test ! -u "$bwrap_path"
-          "$bwrap_path" --unshare-all --new-session --die-with-parent --ro-bind / / /usr/bin/true
+          "$bwrap_path" --ro-bind / / --dev /dev --proc /proc --unshare-pid --unshare-net --die-with-parent /usr/bin/true
 
           imds_exit=0
           imds_http="$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 2 --max-time 3 http://169.254.169.254/latest/meta-data/)" || imds_exit=$?

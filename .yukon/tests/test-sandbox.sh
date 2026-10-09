@@ -99,6 +99,7 @@ run_contestant_build \
   /usr/bin/bash -c '
     set -euo pipefail
     test -z "${LABINIUS_TEST_SECRET+x}"
+    test "$RUSTFLAGS" = "-C target-cpu=native"
     test ! -e "$1"
     if touch /opt/cargo/bin/.labinius-host-write-test 2>/dev/null; then
       rm -f /opt/cargo/bin/.labinius-host-write-test

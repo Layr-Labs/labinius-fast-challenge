@@ -131,6 +131,7 @@ run_contestant_build() {
     --setenv CARGO_TARGET_DIR /workspace/solution/proof_generate/target
     --setenv CC /usr/bin/gcc-13
     --setenv CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER /usr/bin/gcc-13
+    --setenv RUSTFLAGS "-C target-cpu=native"
     --setenv SSL_CERT_FILE /etc/ssl/certs/ca-certificates.crt
     --setenv CARGO_TERM_COLOR always
     --chdir /workspace/solution/proof_generate

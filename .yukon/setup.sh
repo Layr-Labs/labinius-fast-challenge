@@ -51,6 +51,7 @@ env -i \
   CARGO_TARGET_DIR="$trusted_target" \
   CC=/usr/bin/gcc-13 \
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/gcc-13 \
+  RUSTFLAGS="-C target-cpu=native" \
   /opt/cargo/bin/cargo build \
     --locked \
     --release \

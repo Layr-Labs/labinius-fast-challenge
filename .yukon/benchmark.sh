@@ -92,7 +92,7 @@ else
 fi
 mem_total_kb=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
 
-verify_out=$(env -i PATH=/usr/bin:/bin python3 - "$verifier" "$proof" <<'PY'
+verify_out=$(env -i PATH=/usr/bin:/bin LABINIUS_SEED="$LABINIUS_SEED" python3 - "$verifier" "$proof" <<'PY'
 import subprocess
 import sys
 

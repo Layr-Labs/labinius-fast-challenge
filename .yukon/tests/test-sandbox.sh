@@ -11,6 +11,14 @@ require_host_command /opt/cargo/bin/cargo
 require_host_command /opt/cargo/bin/rustc
 command -v bwrap >/dev/null
 
+expected_seed=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+received_seed=$(env -i PATH=/usr/bin:/bin LABINIUS_SEED="$expected_seed" \
+  python3 -c 'import os; print(os.environ["LABINIUS_SEED"])')
+if [[ "$received_seed" != "$expected_seed" ]]; then
+  echo "trusted verifier seed was not forwarded exactly" >&2
+  exit 1
+fi
+
 test_root=$(mktemp -d "$RUNNER_TEMP/labinius-sandbox-test.XXXXXX")
 cleanup() {
   rm -rf "$test_root"

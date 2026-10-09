@@ -109,6 +109,7 @@ run_contestant_build() {
     --dir /opt/cargo
     --ro-bind /opt/cargo/bin /opt/cargo/bin
     --ro-bind /opt/rustup /opt/rustup
+    --ro-bind /bin /bin
     --dir /usr
     --ro-bind /usr/bin /usr/bin
     --ro-bind /usr/include /usr/include

@@ -79,8 +79,8 @@ run_contestant_build \
   "$contestant_cargo" \
   fetch \
   /usr/bin/bash -eu -c '
-    manifest=/workspace/solution/proof_generate/Cargo.toml
-    if [[ ! -r "$manifest" ]]; then
+    manifest=./Cargo.toml
+    if [[ ! -x /workspace || ! -x /workspace/solution || ! -r "$manifest" ]]; then
       echo "staged contestant manifest is not readable inside the sandbox" >&2
       exit 1
     fi
@@ -93,8 +93,8 @@ run_contestant_build \
   "$contestant_cargo" \
   offline \
   /usr/bin/bash -eu -c '
-    manifest=/workspace/solution/proof_generate/Cargo.toml
-    if [[ ! -r "$manifest" ]]; then
+    manifest=./Cargo.toml
+    if [[ ! -x /workspace || ! -x /workspace/solution || ! -r "$manifest" ]]; then
       echo "staged contestant manifest is not readable inside the sandbox" >&2
       exit 1
     fi

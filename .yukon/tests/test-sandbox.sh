@@ -100,6 +100,9 @@ run_contestant_build \
     set -euo pipefail
     test -z "${LABINIUS_TEST_SECRET+x}"
     test "$RUSTFLAGS" = "-C target-cpu=native"
+    test -x /workspace
+    test -x /workspace/solution
+    test -r ./Cargo.toml
     test ! -e "$1"
     if touch /opt/cargo/bin/.labinius-host-write-test 2>/dev/null; then
       rm -f /opt/cargo/bin/.labinius-host-write-test

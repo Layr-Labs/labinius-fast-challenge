@@ -17,7 +17,7 @@ jobs:
           - labinius-avx512-03
     timeout-minutes: 5
     runs-on:
-      group: labinius-avx512-c7i
+      group: labinius-intel-8488c-avx512-c7i
       labels:
         - self-hosted
         - labinius-avx512-c7i

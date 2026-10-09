@@ -24,6 +24,24 @@ cleanup() {
   rm -rf "$test_root"
 }
 trap cleanup EXIT
+
+proof_test="$test_root/proof-file"
+printf 'proof' > "$proof_test"
+if [[ "$(regular_file_size "$proof_test")" != 5 ]]; then
+  echo "regular proof file size was not reported exactly" >&2
+  exit 1
+fi
+mkfifo "$test_root/proof-fifo"
+if regular_file_size "$test_root/proof-fifo"; then
+  echo "proof validation accepted a FIFO" >&2
+  exit 1
+fi
+ln -s "$proof_test" "$test_root/proof-symlink"
+if regular_file_size "$test_root/proof-symlink"; then
+  echo "proof validation accepted a symlink" >&2
+  exit 1
+fi
+
 ln -s / "$test_root/state-link"
 if require_runner_temp_path "$test_root/state-link"; then
   echo "runner state accepted a symlink escape" >&2

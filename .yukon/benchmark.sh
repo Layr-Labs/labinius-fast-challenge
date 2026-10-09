@@ -70,7 +70,7 @@ print((time.perf_counter() - start) * 1000)
 PY
 )
 
-proof_bytes=$(wc -c < "$proof" | tr -d ' ')
+proof_bytes=$(regular_file_size "$proof")
 if (( proof_bytes <= 0 || proof_bytes > max_bytes )); then
   echo "empty or oversized proof" >&2
   exit 1

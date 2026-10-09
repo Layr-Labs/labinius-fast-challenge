@@ -51,6 +51,15 @@ sha256_file() {
   fi
 }
 
+regular_file_size() {
+  local path=$1
+  if [[ ! -f "$path" || -L "$path" ]]; then
+    echo "proof must be a regular non-symlink file" >&2
+    return 1
+  fi
+  stat -c %s -- "$path"
+}
+
 system_library_binds() {
   local -n bind_args=$1
   local path

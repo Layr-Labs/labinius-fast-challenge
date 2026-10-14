@@ -87,7 +87,21 @@ The upcoming harness defines how the prover receives the input file and where it
 | `verifier/proof_verify/` | Trusted verifier and independent commitment-ring arithmetic. |
 | `verifier/labinius/` | Pinned verifier dependency. |
 | `.yukon/` | Trusted setup, input staging, sandboxing, execution, and scoring. |
-| `.github/workflows/benchmark.yml` | Remote benchmark workflow. |
+| `.github/workflows/benchmark.yml` | Stable dispatch/call wrapper retained for Yukon run correlation. |
+| `.github/workflows/benchmark-runner.yml` | Protected reusable workflow containing the trusted runner job. |
+
+Runner-policy rollout must update both the host-side workflow allowlist and the
+GitHub runner-group admission from `benchmark.yml@refs/heads/master` to
+`benchmark-runner.yml@refs/heads/master` before relying on the adapter. The
+wrapper deliberately remains the manifest workflow and calls that protected
+executor at `master`; baseline, submission, and pull-request runs therefore
+keep their original workflow filename, caller ref, exact solution repository/SHA,
+and score association while executing only the reviewed runner job. The wrapper
+concurrency key includes the caller workflow and ref so PR calls cannot cancel bot
+dispatches, while duplicate runs for the same branch and solution still cancel.
+Previously created baseline snapshots may still need a
+bounded temporary allowlist for the exact previously validated baseline ref
+during rollout; remove that exception after recovery completes.
 
 ## Optimization workflow
 

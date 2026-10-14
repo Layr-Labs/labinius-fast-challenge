@@ -8,9 +8,24 @@ permissions:
   actions: read
 
 jobs:
+  workflow-structure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workflow definitions
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install YAML parser
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+      - name: Validate protected workflow adapter
+        run: python3 .github/tests/test_benchmark_workflows.py
+
   benchmark:
     # The runner group admits this protected reusable workflow reference, not a
-    # relative workflow or arbitrary job definition supplied by the PR.
+    # relative workflow or arbitrary job definition supplied by the PR. The
+    # wrapper forwards this immutable solution identity to the executor.
     uses: Layr-Labs/labinius-fast-challenge/.github/workflows/benchmark.yml@master
     with:
       solution_repository: ${{ github.event.pull_request.head.repo.full_name }}

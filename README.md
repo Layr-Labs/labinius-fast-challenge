@@ -2,8 +2,6 @@
 
 Make a packed-binary Labinius polynomial commitment opening faster.
 
-> Draft for the upcoming five-run, pre-generated-input benchmark. Publish this document with the matching harness revision. Older harness versions time a single run and include table generation; their scores are not directly comparable.
-
 ## The task
 
 Each trial starts with a fresh 32-byte seed. It determines a table of **2³¹ Boolean evaluations**, packed into **2²⁴ GHASH words**. The trusted harness generates this table before timing begins and supplies it to the prover as a read-only file.

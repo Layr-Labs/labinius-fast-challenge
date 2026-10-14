@@ -130,4 +130,5 @@ if [[ ! -x "$target/debug/sandbox-smoke" ]]; then
   echo "legitimate sandbox build did not produce its binary" >&2
   exit 1
 fi
+bash "$script_dir/tests/test-witness-mount.sh"
 echo "sandbox regression tests passed"

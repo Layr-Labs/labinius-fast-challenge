@@ -173,6 +173,12 @@ run_contestant_prover() {
   local workdir=$2
   local seed=$3
   local proof=$4
+  local table=$5
+
+  if [[ ! -f "$table" || -L "$table" || "$(basename "$table")" != "witness-table.bin" ]]; then
+    echo "witness table must be a regular witness-table.bin file" >&2
+    return 1
+  fi
 
   local -a args=(
     --die-with-parent
@@ -190,6 +196,7 @@ run_contestant_prover() {
     --ro-bind "$prover" /app/labinius-fast
     --dir /usr
     --ro-bind /usr/lib /usr/lib
+    --ro-bind "$(dirname "$table")" /input
     --dir /work
     --bind "$workdir" /work
     --setenv HOME /tmp
@@ -198,5 +205,5 @@ run_contestant_prover() {
     --chdir /work
   )
   system_library_binds args
-  bwrap "${args[@]}" -- /app/labinius-fast --prove "$proof"
+  bwrap "${args[@]}" -- /app/labinius-fast --prove "$proof" --table /input/witness-table.bin
 }

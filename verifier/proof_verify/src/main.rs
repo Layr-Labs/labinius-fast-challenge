@@ -2,8 +2,9 @@
 //!
 //! The table is 2^31 bits, packed into 2^24 GHASH words. The prover commits to
 //! that table, evaluates it at a GHASH point, and switches the claim into a
-//! single F162 opening. This binary rebuilds the table from `LABINIUS_SEED`,
-//! and checks the switch and the clear opening. Verifier time is not scored.
+//! single F162 opening. This binary rebuilds the table from `LABINIUS_SEED`
+//! when it verifies a proof or writes the witness file. It does not read a
+//! table supplied by the contestant. Verifier time is not scored.
 //!
 //! The commitment modulus is whatever `u128` the proof names, subject to size alone. The
 //! opening check is therefore recomputed in [`rq`] — schoolbook arithmetic in
@@ -126,16 +127,39 @@ fn seed() -> [u8; 32] {
     assert_eq!(s.len(), 64);
     core::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("invalid seed"))
 }
-/// The instance table: a BLAKE3 XOF keyed by the seed. Both sides derive it, so the
-/// prover does not get to choose the polynomial.
-fn trace(seed: &[u8; 32]) -> Vec<B128> {
-    let mut h = blake3::Hasher::new_keyed(seed);
-    h.update(b"labinius-fast/binary-table/v1");
-    let mut b = vec![0; (1 << LOG_VARS) / 8];
-    h.finalize_xof().fill(&mut b);
-    b.chunks_exact(16)
-        .map(|v| B128(u128::from_le_bytes(v.try_into().unwrap())))
+const TABLE_CONTEXT: &[u8] = b"labinius-fast/binary-table/v1";
+
+/// Raw witness table: BLAKE3 XOF keyed by `seed`, updated with [`TABLE_CONTEXT`],
+/// filled to `(1 << LOG_VARS) / 8` bytes. Those bytes are the little-endian
+/// encoding of [`trace`].
+fn trace_bytes(seed: &[u8; 32]) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new_keyed(seed);
+    hasher.update(TABLE_CONTEXT);
+    let mut bytes = vec![0; (1 << LOG_VARS) / 8];
+    hasher.finalize_xof().fill(&mut bytes);
+    bytes
+}
+
+fn decode_table(bytes: &[u8]) -> Vec<B128> {
+    assert_eq!(
+        bytes.len(),
+        (1 << LOG_VARS) / 8,
+        "witness table has the wrong length"
+    );
+    bytes
+        .chunks_exact(16)
+        .map(|chunk| B128(u128::from_le_bytes(chunk.try_into().unwrap())))
         .collect()
+}
+
+/// The instance table: a BLAKE3 XOF keyed by the seed. Verification always
+/// derives it from the seed, so a contestant-supplied table is never trusted.
+fn trace(seed: &[u8; 32]) -> Vec<B128> {
+    decode_table(&trace_bytes(seed))
+}
+
+fn write_trace_file(path: &str, seed: &[u8; 32]) {
+    std::fs::write(path, trace_bytes(seed)).expect("write witness table");
 }
 /// Fiat–Shamir state. Absorbing the seed, the shape, the modulus, and the commitment binds
 /// every later challenge to this instance.
@@ -388,10 +412,14 @@ fn main() {
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 3 || args.len() == 5,
-        "usage: labinius-fast-verify --prove FILE --modulus Q | --verify FILE"
+        "usage: labinius-fast-verify --write-table FILE | --verify FILE | --prove FILE --modulus Q"
     );
     let seed = seed();
     match args[1].as_str() {
+        "--write-table" => {
+            assert_eq!(args.len(), 3, "write-table takes the output path");
+            write_trace_file(&args[2], &seed);
+        }
         "--prove" => {
             assert_eq!(args.len(), 5, "the reference prover takes --modulus");
             assert_eq!(args[3], "--modulus", "unknown prover option");
@@ -461,5 +489,34 @@ mod tests {
         assert!(accept_modulus(55_144_219_393).is_ok());
         assert!(accept_modulus(rq::MAX_MODULUS).is_err());
         assert!(2 * fold_cap_bound() < MIN_MODULUS);
+    }
+
+    /// Historical `trace` encoding, copied here so the writer is checked against
+    /// the previous implementation rather than against itself.
+    fn historical_trace_bytes(seed: &[u8; 32]) -> Vec<u8> {
+        let mut h = blake3::Hasher::new_keyed(seed);
+        h.update(b"labinius-fast/binary-table/v1");
+        let mut b = vec![0; (1 << LOG_VARS) / 8];
+        h.finalize_xof().fill(&mut b);
+        b
+    }
+
+    #[test]
+    fn written_table_matches_existing_trace() {
+        let seed = [9u8; 32];
+        let path = std::env::temp_dir().join(format!(
+            "labinius-fast-trusted-table-{}.bin",
+            std::process::id()
+        ));
+        write_trace_file(path.to_str().unwrap(), &seed);
+        let written = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let expected = historical_trace_bytes(&seed);
+        assert_eq!(written, expected);
+        assert_eq!(decode_table(&written), trace(&seed));
+        assert_ne!(
+            &written[..32],
+            &historical_trace_bytes(&[8u8; 32])[..32]
+        );
     }
 }

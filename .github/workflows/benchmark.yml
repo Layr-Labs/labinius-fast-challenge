@@ -37,7 +37,8 @@ jobs:
     runs-on:
       group: labinius-intel-8488c-avx512-c7i
       labels: labinius-avx512-c7i
-    timeout-minutes: 45
+    # Five sequential runs share the previous per-run 15 minute prover cap.
+    timeout-minutes: 120
     steps:
       - name: Require dedicated AVX-512 host
         shell: bash

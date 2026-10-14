@@ -25,8 +25,27 @@ original solution checkout, trusted checkout, and host toolchain remain outside
 that writable tree. A restricted `cargo fetch --locked` phase has networking;
 the subsequent offline compilation and prover execution have no network. The
 prover sandbox sees only its binary,
-runtime libraries, `/proc`, `/dev`, a fresh `/tmp`, and its proof output
-directory.
+runtime libraries, `/proc`, `/dev`, a fresh `/tmp`, its proof output
+directory, and a read-only mount of the witness table at
+`/input/witness-table.bin`.
+
+## Score and witness input
+
+The leaderboard score is the median prover-process time, in milliseconds, across five sequential runs. Each run draws a fresh 32-byte seed. Before the timer starts, the trusted verifier writes that seed's witness table with `--write-table`. The timed interval then covers prover startup, loading of that file, and the rest of the prover process. Table generation and trusted verification stay outside the timer.
+
+A score file is written only when every run exits successfully, the proof is a regular file of at most 64 MiB, and the trusted verifier accepts the proof for that run's seed. Verification rebuilds the table from the seed with `trace` and does not read the file given to the prover. A failed run leaves `.yukon/labinius-fast-score.json` unpublished.
+
+`score` and `metrics.provingTimeMs` are that median. `metrics.proofBytes` is the proof size of the selected run. Runs are ordered by proving time and then by earlier execution index, and the middle position of that order is the selected run. `runs` lists the five executions in order, each with `run`, `provingTimeMs`, and `proofBytes`. The other `metrics` fields keep their previous meaning and come from the selected run's verifier output plus the host description.
+
+The scored prover is invoked inside the sandbox as:
+
+```text
+labinius-fast --prove /work/proof.bin --table /input/witness-table.bin
+```
+
+`LABINIUS_SEED` is the hex seed for that run. `/input` is a read-only directory containing only `witness-table.bin`. The file is the BLAKE3 XOF keyed by the seed, updated with the context `labinius-fast/binary-table/v1`, and filled to `(1 << 31) / 8` bytes. Those bytes are the little-endian packed GHASH words produced by `trace(seed)`. The baseline prover loads this file and does not compute the XOF during the timed run. Optional `--modulus Q` may follow `--table`.
+
+The single-run numbers in the disposable-clone section below predate median-of-five scoring.
 
 Bubblewrap reduces what the contestant process can see and write on the host;
 it is not a VM reset or a claim of complete isolation. The runner image,

@@ -13,7 +13,6 @@ use crate::ring::{
     components_of, Batch32, Modulus, PowerOfThreeRingElementWithLimbs, Representation,
     VerticallyAlignedMatrix,
 };
-use crate::limb::dispatch_limb;
 use crate::rng::Rng;
 use crate::simd::commit as cm;
 
@@ -78,66 +77,6 @@ impl CommitmentKey {
                         b
                     })
                     .collect()
-            })
-            .collect();
-        CommitmentKey {
-            a,
-            base,
-            additional: additional.to_vec(),
-            len_f162,
-        }
-    }
-
-    /// A key whose matrix is given by its coefficients modulo `modulus`, rather than drawn per
-    /// limb directly in that limb's NTT domain.
-    ///
-    /// `coefficients` is the `len_f162 / 4` ring elements of `A` flattened, element `i`'s
-    /// coefficient `t` at index `N i + t` and every entry in `[0, modulus)`. Every limb takes the
-    /// centered reduction of the same coefficients and its own forward transform, so the key is
-    /// the reduction of one object of `R_modulus` and anyone who knows `modulus` and the
-    /// coefficients can rebuild it. [`CommitmentKey::random`] cannot be rebuilt that way: its
-    /// limbs are drawn independently in their own NTT domains and are not the reduction of any
-    /// single mod-`Q` matrix.
-    ///
-    /// Costs one pass of reductions over the coefficients plus one forward transform per limb.
-    pub fn from_coefficients(
-        len_f162: usize,
-        coefficients: &[u128],
-        modulus: u128,
-        base: Modulus,
-        additional: &[Modulus],
-    ) -> Self {
-        assert!(
-            len_f162 > 0 && len_f162 % F162_PER_BATCH == 0,
-            "len_f162 must be a multiple of 128"
-        );
-        assert_eq!(
-            coefficients.len(),
-            len_f162 / 4 * N,
-            "the matrix is len_f162 / 4 ring elements"
-        );
-        let mut seen = vec![base];
-        for l in additional {
-            assert!(!seen.contains(l), "the limb {l:?} is listed twice");
-            seen.push(*l);
-        }
-        let nb = len_f162 / F162_PER_BATCH;
-        let primes: Vec<u16> = core::iter::once(base.prime())
-            .chain(additional.iter().map(|l| l.prime()))
-            .collect();
-        let a = primes
-            .iter()
-            .map(|&q| {
-                let mut batches: Vec<Batch32> = (0..nb)
-                    .map(|_| Batch32::zero(Representation::Coefficients))
-                    .collect();
-                dispatch_limb!(q, |Q| reduce_coefficients::<Q>(
-                    coefficients,
-                    modulus,
-                    &mut batches
-                ));
-                crate::fold::forward_limb(q, &mut batches);
-                batches
             })
             .collect();
         CommitmentKey {
@@ -329,27 +268,6 @@ impl CommitmentKey {
     }
 }
 
-/// The centered residues of `coefficients` modulo `Q`, in the vertical layout the forward
-/// transform takes: `batches[i / 32].v[t][i % 32]` is coefficient `t` of element `i`.
-///
-/// `Q` is a const parameter so that the two reductions below are multiply-shifts rather than
-/// divisions; a coefficient is split into its two 64-bit halves because a `u128` division by a
-/// runtime modulus is a library call and this runs once per coefficient and limb.
-fn reduce_coefficients<const Q: u16>(coefficients: &[u128], modulus: u128, out: &mut [Batch32]) {
-    let q = Q as u64;
-    let half = ((Q - 1) / 2) as i16;
-    let shifted = ((1u128 << 64) % Q as u128) as u64;
-    for (i, element) in coefficients.chunks_exact(N).enumerate() {
-        let (b, p) = (i / 32, i % 32);
-        for (t, &x) in element.iter().enumerate() {
-            debug_assert!(x < modulus, "a matrix coefficient is not reduced");
-            let value = (((x >> 64) as u64 % q) * shifted + x as u64 % q) % q;
-            let value = value as i16;
-            out[b].v[t][p] = if value > half { value - Q as i16 } else { value };
-        }
-    }
-}
-
 /// `n` `Batch32`s whose 41472 bytes each are never read before the kernel writes them (zeroing
 /// 85 MB would cost 4 ms of the very DRAM traffic the non-temporal stores are there to avoid).
 fn uninit_batches(n: usize) -> Vec<Batch32> {
@@ -360,6 +278,16 @@ fn uninit_batches(n: usize) -> Vec<Batch32> {
             (*p.add(i)).representation = Representation::Ntt;
         }
         v.set_len(n);
+        // 42 MB of first-touch faults. Ask for transparent huge pages so that is tens of
+        // faults rather than ten thousand. A kernel without THP ignores the hint.
+        #[cfg(target_os = "linux")]
+        {
+            extern "C" {
+                fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+            }
+            let bytes = n * core::mem::size_of::<Batch32>();
+            let _ = madvise(p as *mut core::ffi::c_void, bytes, 14);
+        }
     }
     v
 }

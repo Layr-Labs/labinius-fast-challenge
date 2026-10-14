@@ -144,37 +144,77 @@ const TILE: usize = 64;
 /// `v[k] = sum_j bit_k(pi0[j]) eq_hi[j]`, a `128 x n` by `n x 128` bit product: per tile the
 /// bit-transposed bytes of `pi0` are the matrices, those of `eq_hi` the vectors, and
 /// `acc[h][kb].qword[i].byte[t].bit[k']` sums `V[8kb + 7 - k'][8(8h + i) + t]`.
+unsafe fn partial_tiles(
+    pi0: &[B128],
+    eq_hi: &[B128],
+    start: usize,
+    step: usize,
+    tiles: usize,
+    acc: &mut [[__m512i; 16]; 2],
+) {
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    let mut xe = [_mm512_setzero_si512(); 16];
+    let mut xp = [_mm512_setzero_si512(); 16];
+    let mut ap = [[0u64; 8]; 16];
+    let mut t = start;
+    while t < tiles {
+        transpose_tile(eq_hi.as_ptr().add(TILE * t) as *const u8, &mut xe);
+        transpose_tile(pi0.as_ptr().add(TILE * t) as *const u8, &mut xp);
+        for k in 0..16 {
+            _mm512_storeu_si512(ap[k].as_mut_ptr() as *mut __m512i, affine(ident, xp[k]));
+        }
+        let te: [__m512i; 16] = core::array::from_fn(|b| affine(ident, xe[b]));
+        for (h, acc) in acc.iter_mut().enumerate() {
+            let tep = transpose8x8_q(core::array::from_fn(|i| te[8 * h + i]));
+            for (k, a) in acc.iter_mut().enumerate() {
+                for j in (0..8).step_by(2) {
+                    *a = xor3(
+                        *a,
+                        affine(tep[j], _mm512_set1_epi64(ap[k][j] as i64)),
+                        affine(tep[j + 1], _mm512_set1_epi64(ap[k][j + 1] as i64)),
+                    );
+                }
+            }
+        }
+        t += step;
+    }
+}
+
 fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
     assert_eq!(pi0.len(), eq_hi.len());
     let n = pi0.len();
     let tiles = n / TILE;
     let mut v = vec![B128::ZERO; PACK];
     unsafe {
-        let ident = _mm512_set1_epi64(GF_IDENT);
-        let mut acc = [[_mm512_setzero_si512(); 16]; 2];
-        let mut xe = [_mm512_setzero_si512(); 16];
-        let mut xp = [_mm512_setzero_si512(); 16];
-        let mut ap = [[0u64; 8]; 16];
-        for t in 0..tiles {
-            transpose_tile(eq_hi.as_ptr().add(TILE * t) as *const u8, &mut xe);
-            transpose_tile(pi0.as_ptr().add(TILE * t) as *const u8, &mut xp);
-            for k in 0..16 {
-                _mm512_storeu_si512(ap[k].as_mut_ptr() as *mut __m512i, affine(ident, xp[k]));
-            }
-            let te: [__m512i; 16] = core::array::from_fn(|b| affine(ident, xe[b]));
-            for (h, acc) in acc.iter_mut().enumerate() {
-                let tep = transpose8x8_q(core::array::from_fn(|i| te[8 * h + i]));
-                for (k, a) in acc.iter_mut().enumerate() {
-                    for j in (0..8).step_by(2) {
-                        *a = xor3(
-                            *a,
-                            affine(tep[j], _mm512_set1_epi64(ap[k][j] as i64)),
-                            affine(tep[j + 1], _mm512_set1_epi64(ap[k][j + 1] as i64)),
-                        );
+        let acc = if tiles >= 32 {
+            crate::pool::install();
+            let threads = crate::pool::THREADS.min(tiles);
+            let mut parts: Vec<[[__m512i; 16]; 2]> =
+                (0..threads).map(|_| [[_mm512_setzero_si512(); 16]; 2]).collect();
+            let slot = parts.as_mut_ptr() as usize;
+            rayon::scope(|scope| {
+                for t in 0..threads {
+                    scope.spawn(move |_| unsafe {
+                        let mut local = [[_mm512_setzero_si512(); 16]; 2];
+                        partial_tiles(pi0, eq_hi, t, threads, tiles, &mut local);
+                        *((slot as *mut [[__m512i; 16]; 2]).add(t)) = local;
+                    });
+                }
+            });
+            let mut acc = parts[0];
+            for extra in parts.iter().skip(1) {
+                for h in 0..2 {
+                    for k in 0..16 {
+                        acc[h][k] = _mm512_xor_si512(acc[h][k], extra[h][k]);
                     }
                 }
             }
-        }
+            acc
+        } else {
+            let mut acc = [[_mm512_setzero_si512(); 16]; 2];
+            partial_tiles(pi0, eq_hi, 0, 1, tiles, &mut acc);
+            acc
+        };
         for (h, acc) in acc.iter().enumerate() {
             for (k, a) in acc.iter().enumerate() {
                 let q: [u64; 8] = core::mem::transmute(*a);

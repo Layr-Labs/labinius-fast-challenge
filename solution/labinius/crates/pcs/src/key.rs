@@ -13,7 +13,6 @@ use crate::ring::{
     components_of, Batch32, Modulus, PowerOfThreeRingElementWithLimbs, Representation,
     VerticallyAlignedMatrix,
 };
-use crate::limb::dispatch_limb;
 use crate::rng::Rng;
 use crate::simd::commit as cm;
 
@@ -78,66 +77,6 @@ impl CommitmentKey {
                         b
                     })
                     .collect()
-            })
-            .collect();
-        CommitmentKey {
-            a,
-            base,
-            additional: additional.to_vec(),
-            len_f162,
-        }
-    }
-
-    /// A key whose matrix is given by its coefficients modulo `modulus`, rather than drawn per
-    /// limb directly in that limb's NTT domain.
-    ///
-    /// `coefficients` is the `len_f162 / 4` ring elements of `A` flattened, element `i`'s
-    /// coefficient `t` at index `N i + t` and every entry in `[0, modulus)`. Every limb takes the
-    /// centered reduction of the same coefficients and its own forward transform, so the key is
-    /// the reduction of one object of `R_modulus` and anyone who knows `modulus` and the
-    /// coefficients can rebuild it. [`CommitmentKey::random`] cannot be rebuilt that way: its
-    /// limbs are drawn independently in their own NTT domains and are not the reduction of any
-    /// single mod-`Q` matrix.
-    ///
-    /// Costs one pass of reductions over the coefficients plus one forward transform per limb.
-    pub fn from_coefficients(
-        len_f162: usize,
-        coefficients: &[u128],
-        modulus: u128,
-        base: Modulus,
-        additional: &[Modulus],
-    ) -> Self {
-        assert!(
-            len_f162 > 0 && len_f162 % F162_PER_BATCH == 0,
-            "len_f162 must be a multiple of 128"
-        );
-        assert_eq!(
-            coefficients.len(),
-            len_f162 / 4 * N,
-            "the matrix is len_f162 / 4 ring elements"
-        );
-        let mut seen = vec![base];
-        for l in additional {
-            assert!(!seen.contains(l), "the limb {l:?} is listed twice");
-            seen.push(*l);
-        }
-        let nb = len_f162 / F162_PER_BATCH;
-        let primes: Vec<u16> = core::iter::once(base.prime())
-            .chain(additional.iter().map(|l| l.prime()))
-            .collect();
-        let a = primes
-            .iter()
-            .map(|&q| {
-                let mut batches: Vec<Batch32> = (0..nb)
-                    .map(|_| Batch32::zero(Representation::Coefficients))
-                    .collect();
-                dispatch_limb!(q, |Q| reduce_coefficients::<Q>(
-                    coefficients,
-                    modulus,
-                    &mut batches
-                ));
-                crate::fold::forward_limb(q, &mut batches);
-                batches
             })
             .collect();
         CommitmentKey {
@@ -268,45 +207,22 @@ impl CommitmentKey {
         let limbs = self.limb_list();
         let nl = limbs.len();
         let g = cm::GROUP.min(r);
-        let len_f162 = self.len_f162;
-        let starts: Vec<usize> = (0..r).step_by(g).collect();
-        // Each group writes a disjoint slice of `aux.batches` and returns its raw commitments.
-        // The address is a usize so the closure is `Send`; the slices do not overlap.
-        let batch_addr = aux.batches.as_mut_ptr() as usize;
-        let stride = std::mem::size_of::<Batch32>();
-        let mut groups: Vec<(usize, Vec<[u32; N]>)> = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(starts.len());
-            for c0 in starts {
-                let limbs = &limbs;
-                handles.push(scope.spawn(move || {
-                    let mut st = cm::Scratch::with_group(limbs, g);
-                    let mut raw = vec![[0u32; N]; g * nl];
-                    let mut chunks: [&[F162]; cm::GROUP] = [&[]; cm::GROUP];
-                    for i in 0..g {
-                        let c = c0 + i;
-                        chunks[i] = &witness[c * len_f162..(c + 1) * len_f162];
-                    }
-                    let batches = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (batch_addr + (c0 * bpc) * stride) as *mut Batch32,
-                            g * bpc,
-                        )
-                    };
-                    cm::commit_limbs_group(
-                        &chunks[..g],
-                        limbs,
-                        Some(batches),
-                        &mut st,
-                        &mut raw,
-                    );
-                    (c0, raw)
-                }));
-            }
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        groups.sort_by_key(|(c0, _)| *c0);
+        let mut st = cm::Scratch::with_group(&limbs, g);
+        let mut raw = vec![[0u32; N]; g * nl];
         let mut data = Vec::with_capacity(4 * r);
-        for (_, raw) in groups {
+        let mut chunks: [&[F162]; cm::GROUP] = [&[]; cm::GROUP];
+        for c0 in (0..r).step_by(g) {
+            for (i, chunk) in chunks[..g].iter_mut().enumerate() {
+                let c = c0 + i;
+                *chunk = &witness[c * self.len_f162..(c + 1) * self.len_f162];
+            }
+            cm::commit_limbs_group(
+                &chunks[..g],
+                &limbs,
+                Some(&mut aux.batches[c0 * bpc..(c0 + g) * bpc]),
+                &mut st,
+                &mut raw,
+            );
             for y in raw.chunks_exact(nl) {
                 data.extend(self.components(y));
                 for (k, v) in y.iter().enumerate() {
@@ -326,27 +242,6 @@ impl CommitmentKey {
             r,
             self.len_f162
         );
-    }
-}
-
-/// The centered residues of `coefficients` modulo `Q`, in the vertical layout the forward
-/// transform takes: `batches[i / 32].v[t][i % 32]` is coefficient `t` of element `i`.
-///
-/// `Q` is a const parameter so that the two reductions below are multiply-shifts rather than
-/// divisions; a coefficient is split into its two 64-bit halves because a `u128` division by a
-/// runtime modulus is a library call and this runs once per coefficient and limb.
-fn reduce_coefficients<const Q: u16>(coefficients: &[u128], modulus: u128, out: &mut [Batch32]) {
-    let q = Q as u64;
-    let half = ((Q - 1) / 2) as i16;
-    let shifted = ((1u128 << 64) % Q as u128) as u64;
-    for (i, element) in coefficients.chunks_exact(N).enumerate() {
-        let (b, p) = (i / 32, i % 32);
-        for (t, &x) in element.iter().enumerate() {
-            debug_assert!(x < modulus, "a matrix coefficient is not reduced");
-            let value = (((x >> 64) as u64 % q) * shifted + x as u64 % q) % q;
-            let value = value as i16;
-            out[b].v[t][p] = if value > half { value - Q as i16 } else { value };
-        }
     }
 }
 

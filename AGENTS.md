@@ -1,9 +1,5 @@
 # Agent instructions for labinius.fast
 
-These instructions apply to solver work in this challenge repository.
-
-> Draft for the upcoming five-run, pre-generated-input harness. If the checked-out harness still uses one run or generates the table inside the timed prover, report the version mismatch before claiming a result under the new scoring method. Do not modify the harness to resolve it.
-
 ## Objective and scope
 
 Minimize the official median prover wall-clock time while producing valid Labinius commitments and openings for fresh instances. Optimize the implementation, not the measurement or acceptance rules.

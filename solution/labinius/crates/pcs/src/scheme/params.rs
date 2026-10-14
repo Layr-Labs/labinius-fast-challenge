@@ -338,26 +338,6 @@ impl PublicParameters {
         pp
     }
 
-    /// Public parameters over a key the caller built, for a prover whose `A` is defined by its
-    /// coefficients in `R_Q` ([`CommitmentKey::from_coefficients`]) rather than per limb. The
-    /// recursion needs key-time setup derived from the seed, so it is refused here.
-    pub fn with_key(
-        params: Params,
-        matrix_seed: [u8; 32],
-        key: CommitmentKey,
-    ) -> PublicParameters {
-        assert!(
-            !params.recursion(),
-            "recursion needs the key-time setup of from_seed"
-        );
-        PublicParameters {
-            params,
-            matrix_seed,
-            key: Arc::new(key),
-            recursion: None,
-        }
-    }
-
     pub fn params(&self) -> &Params {
         &self.params
     }

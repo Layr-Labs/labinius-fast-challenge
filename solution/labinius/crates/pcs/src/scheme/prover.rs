@@ -71,9 +71,6 @@ impl Prover {
             witness.params, self.params,
             "the witness was built for other parameters"
         );
-        // No separate prefault. The column groups already run on several threads and write
-        // disjoint batches, so the kernel zero-fill happens inside that parallel write instead
-        // of as an extra 42 MB pass before it.
         let mut aux = self.workspace.take().unwrap_or_else(|| {
             AuxData::new(self.key.len_ring(), self.params.columns(), self.key.limbs())
         });
@@ -249,4 +246,3 @@ impl Prover {
         })
     }
 }
-

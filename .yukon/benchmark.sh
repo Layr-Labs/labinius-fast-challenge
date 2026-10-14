@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Trusted benchmark orchestration. Only an accepted nonempty proof with valid
-# moduli produces a score.
+# Trusted benchmark orchestration. The score is the median of five sequential
+# runs, published only when every run passes verification and the proof-size limit.
 
 set -euo pipefail
 umask 077
@@ -18,7 +18,8 @@ require_runner_temp_path "$contestant"
 
 score="$script_dir/labinius-fast-score.json"
 staged="$script_dir/labinius-fast-score.tmp"
-rm -f "$score" "$staged"
+runs_json="$script_dir/labinius-fast-runs.tmp"
+rm -f "$score" "$staged" "$runs_json"
 
 command -v bwrap >/dev/null || {
   echo "bubblewrap (bwrap) is required to run the untrusted prover" >&2
@@ -38,44 +39,6 @@ if [[ ! -f "$verifier" || -L "$verifier" ]]; then
   exit 1
 fi
 
-# Randomize the problem instance so a prover cannot rely on a cached proof.
-LABINIUS_SEED=$(openssl rand -hex 32)
-export LABINIUS_SEED
-
-workdir=$(mktemp -d "$RUNNER_TEMP/labinius-fast-proof.XXXXXX")
-cleanup() {
-  rm -rf "$workdir"
-  rm -f "$staged"
-}
-trap cleanup EXIT
-proof="$workdir/proof.bin"
-
-prove_ms=$(python3 - "$script_dir" "$prover" "$LABINIUS_SEED" "$workdir" <<'PY'
-import subprocess
-import sys
-import time
-
-script_dir, prover, seed, workdir = sys.argv[1:5]
-cmd = [
-    "/usr/bin/bash",
-    f"{script_dir}/run-prover.sh",
-    prover,
-    workdir,
-    seed,
-    "/work/proof.bin",
-]
-start = time.perf_counter()
-subprocess.run(cmd, timeout=900, check=True)
-print((time.perf_counter() - start) * 1000)
-PY
-)
-
-proof_bytes=$(regular_file_size "$proof")
-if (( proof_bytes <= 0 || proof_bytes > max_bytes )); then
-  echo "empty or oversized proof" >&2
-  exit 1
-fi
-
 got=$(sha256_file "$verifier")
 want=$(awk '{print $1}' "$trusted/verify.sha256")
 if [[ "$got" != "$want" ]]; then
@@ -92,7 +55,54 @@ else
 fi
 mem_total_kb=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
 
-verify_out=$(env -i PATH=/usr/bin:/bin LABINIUS_SEED="$LABINIUS_SEED" python3 - "$verifier" "$proof" <<'PY'
+workdir=$(mktemp -d "$RUNNER_TEMP/labinius-fast-proof.XXXXXX")
+table_dir=$(mktemp -d "$RUNNER_TEMP/labinius-fast-table.XXXXXX")
+cleanup() {
+  rm -rf "$workdir" "$table_dir"
+  rm -f "$staged" "$runs_json"
+}
+trap cleanup EXIT
+proof="$workdir/proof.bin"
+table="$table_dir/witness-table.bin"
+printf '[]\n' > "$runs_json"
+
+for trial in 1 2 3 4 5; do
+  # A fresh seed keeps a prover from reusing a cached proof. The witness table
+  # is written before the timer; verification runs after it.
+  LABINIUS_SEED=$(openssl rand -hex 32)
+  rm -f "$table" "$proof"
+  env -i PATH=/usr/bin:/bin LABINIUS_SEED="$LABINIUS_SEED" \
+    "$verifier" --write-table "$table"
+  chmod 444 "$table"
+
+  prove_ms=$(python3 - "$script_dir" "$prover" "$LABINIUS_SEED" "$workdir" "$table" <<'PY'
+import subprocess
+import sys
+import time
+
+script_dir, prover, seed, workdir, table = sys.argv[1:6]
+cmd = [
+    "/usr/bin/bash",
+    f"{script_dir}/run-prover.sh",
+    prover,
+    workdir,
+    seed,
+    "/work/proof.bin",
+    table,
+]
+start = time.perf_counter()
+subprocess.run(cmd, timeout=900, check=True)
+print((time.perf_counter() - start) * 1000)
+PY
+)
+
+  proof_bytes=$(regular_file_size "$proof")
+  if (( proof_bytes <= 0 || proof_bytes > max_bytes )); then
+    echo "empty or oversized proof on run ${trial}" >&2
+    exit 1
+  fi
+
+  verify_out=$(env -i PATH=/usr/bin:/bin LABINIUS_SEED="$LABINIUS_SEED" python3 - "$verifier" "$proof" <<'PY'
 import subprocess
 import sys
 
@@ -110,23 +120,27 @@ sys.stdout.write(checked.stdout)
 PY
 )
 
-python3 -c '
+  python3 -c '
 import json, sys
-metrics = json.loads(sys.argv[1])
-if metrics.get("field") != "GHASH" or metrics.get("polynomialSize") != 2**31:
-    raise SystemExit("checker reported unexpected parameters")
-prove_ms = float(sys.argv[2])
-metrics["provingTimeMs"] = prove_ms
-metrics["proofBytes"] = int(sys.argv[3])
-metrics["cpuModel"] = sys.argv[5]
-metrics["nproc"] = int(sys.argv[6])
-metrics["avx512f"] = sys.argv[7] == "true"
-metrics["memTotalKb"] = int(sys.argv[8])
-result = {"score": prove_ms, "metrics": metrics}
-text = json.dumps(result) + "\n"
-with open(sys.argv[4], "w", encoding="utf-8") as staged:
-    staged.write(text)
-sys.stdout.write(text)
-' "$verify_out" "$prove_ms" "$proof_bytes" "$staged" "$cpu_model" "$nproc_count" "$avx512f" "$mem_total_kb"
+path, prove_ms, proof_bytes, verifier = sys.argv[1:5]
+with open(path, encoding="utf-8") as handle:
+    runs = json.load(handle)
+runs.append({
+    "provingTimeMs": float(prove_ms),
+    "proofBytes": int(proof_bytes),
+    "verifier": json.loads(verifier),
+})
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(runs, handle)
+' "$runs_json" "$prove_ms" "$proof_bytes" "$verify_out"
+done
+
+python3 "$script_dir/lib/score.py" \
+  --runs "$runs_json" \
+  --cpu-model "$cpu_model" \
+  --nproc "$nproc_count" \
+  --avx512f "$avx512f" \
+  --mem-total-kb "$mem_total_kb" \
+  --out "$staged"
 
 mv "$staged" "$score"

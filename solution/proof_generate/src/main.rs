@@ -66,6 +66,22 @@ fn seed() -> [u8; 32] {
     assert_eq!(s.len(), 64);
     core::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("invalid seed"))
 }
+/// The harness witness table: `(1 << LOG_VARS) / 8` BLAKE3 XOF bytes, each 16
+/// little-endian bytes one GHASH word. The timed prover does not recompute it.
+fn load_table(path: &str) -> Vec<B128> {
+    let table_bytes = (1 << LOG_VARS) / 8;
+    let mut file = std::fs::File::open(path).expect("open witness table");
+    let mut bytes = vec![0u8; table_bytes];
+    std::io::Read::read_exact(&mut file, &mut bytes).expect("witness table has the wrong length");
+    let mut extra = [0u8; 1];
+    let extra_n = std::io::Read::read(&mut file, &mut extra).expect("read witness table");
+    assert_eq!(extra_n, 0, "witness table has the wrong length");
+    bytes
+        .chunks_exact(16)
+        .map(|chunk| B128(u128::from_le_bytes(chunk.try_into().unwrap())))
+        .collect()
+}
+#[cfg(test)]
 fn trace(seed: &[u8; 32]) -> Vec<B128> {
     let mut h = blake3::Hasher::new_keyed(seed);
     h.update(b"labinius-fast/binary-table/v1");
@@ -179,7 +195,8 @@ fn commitment_coefficients(commitment: &Commitment, primes: &[u16], modulus: u12
     }
     out
 }
-fn prove(seed: &[u8; 32], modulus: u128) -> Proof {
+fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
+    let values = load_table(table_path);
     let clock = std::time::Instant::now();
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
@@ -195,7 +212,6 @@ fn prove(seed: &[u8; 32], modulus: u128) -> Proof {
     let pp = PublicParameters::with_key(p.clone(), rq::MATRIX_SEED, key);
     let setup_time = clock.elapsed();
     let mut prover = Prover::cold(&pp);
-    let values = trace(seed);
     let w = Witness::lifted(&p, &values).unwrap();
     let witness_time = clock.elapsed();
     let (commitment, opening) = prover.commit(&w);
@@ -255,23 +271,20 @@ fn prove(seed: &[u8; 32], modulus: u128) -> Proof {
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     assert!(
-        args.len() == 3 || args.len() == 5,
-        "usage: labinius-fast --prove FILE [--modulus Q]"
+        args.len() == 5 || args.len() == 7,
+        "usage: labinius-fast --prove FILE --table FILE [--modulus Q]"
     );
+    assert_eq!(args[1], "--prove", "unknown command");
+    assert_eq!(args[3], "--table", "witness table path is required");
     let seed = seed();
-    match args[1].as_str() {
-        "--prove" => {
-            let modulus = if args.len() == 5 {
-                assert_eq!(args[3], "--modulus", "unknown prover option");
-                modulus_choice::parse(&args[4]).expect("invalid commitment modulus")
-            } else {
-                MODULUS
-            };
-            let proof = prove(&seed, modulus);
-            std::fs::write(&args[2], codec().serialize(&proof).unwrap()).unwrap();
-        }
-        _ => panic!("unknown command"),
-    }
+    let modulus = if args.len() == 7 {
+        assert_eq!(args[5], "--modulus", "unknown prover option");
+        modulus_choice::parse(&args[6]).expect("invalid commitment modulus")
+    } else {
+        MODULUS
+    };
+    let proof = prove(&seed, modulus, &args[4]);
+    std::fs::write(&args[2], codec().serialize(&proof).unwrap()).unwrap();
 }
 
 #[cfg(test)]
@@ -371,10 +384,58 @@ mod tests {
         );
     }
 
+    struct TableFile(std::path::PathBuf);
+    impl Drop for TableFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    impl TableFile {
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+    fn table_file(seed: &[u8; 32]) -> TableFile {
+        let path = std::env::temp_dir().join(format!(
+            "labinius-fast-table-{}-{}.bin",
+            std::process::id(),
+            seed.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        ));
+        let mut bytes = Vec::new();
+        for value in trace(seed) {
+            bytes.extend_from_slice(&value.0.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        TableFile(path)
+    }
+
+    #[test]
+    fn loaded_table_matches_trace() {
+        let seed = [11u8; 32];
+        let table = table_file(&seed);
+        let loaded = load_table(table.path());
+        assert_eq!(loaded, trace(&seed));
+    }
+
+    #[test]
+    fn baseline_prove_reads_witness_file() {
+        let path = std::env::temp_dir().join(format!(
+            "labinius-fast-short-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, [1u8; 32]).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            prove(&[1; 32], MODULUS, path.to_str().unwrap());
+        });
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "the prover accepted a truncated witness table");
+    }
+
     #[test]
     fn round_trip_and_reject_wrong_instance() {
         let seed = [42; 32];
-        let proof = prove(&seed, MODULUS);
+        let table = table_file(&seed);
+        let proof = prove(&seed, MODULUS, table.path());
         let bytes = codec().serialize(&proof).unwrap();
         let decoded: Proof = codec().deserialize(&bytes).unwrap();
         verify(&seed, &decoded);
@@ -385,7 +446,9 @@ mod tests {
     fn solution_selected_modulus_round_trip() {
         let modulus = 9721u128 * 2917 * 4861;
         assert_ne!(modulus, MODULUS);
-        let proof = prove(&[44; 32], modulus);
+        let seed = [44; 32];
+        let table = table_file(&seed);
+        let proof = prove(&seed, modulus, table.path());
         let bytes = codec().serialize(&proof).unwrap();
         let decoded: Proof = codec().deserialize(&bytes).unwrap();
         assert_eq!(decoded.modulus, modulus);

@@ -6,7 +6,8 @@ Minimize the official median prover wall-clock time while producing valid Labini
 
 - Edit only `solution/`, including the vendored Labinius crates.
 - Treat `benchmark.json`, `verifier/`, `.yukon/`, and `.github/` as read-only during solver work.
-- Preserve the trusted verifier's parameters, transcript, proof format, and acceptance checks. A change to the bundled prover is valid only if the trusted verifier accepts its output.
+- You are explicitly allowed to change the commitment modulus `Q`. Its bundled default is not a fixed challenge parameter. You may modify modulus selection, arithmetic, and serialization code under `solution/` to support any `Q` accepted by the trusted verifier.
+- Preserve the fixed instance shape, transcript rules, required proof format, and verifier acceptance checks. Changing `Q` within the allowed bounds does not violate this requirement. The proof must carry the chosen `Q` and pass the unchanged trusted verifier.
 - Do not cache instance-specific commitments or proofs across seeds, skip required work, tamper with the input file, change scoring output, or bypass sandboxing.
 - Keep unrelated user changes intact. Do not reset, force-sync, or discard work without explicit authorization.
 
@@ -27,7 +28,7 @@ If setup cannot run because the required CPU, toolchain, trusted checkout, or sa
 - The trusted harness generates the table outside the timer and supplies it read-only.
 - The prover produces a commitment and one opening, including the GHASH → F162 field switch.
 - The commitment ring is `(Z/QZ)[X] / (X^648 - X^324 + 1)`, with `34,816,965,049 ≤ Q < 2^96` and the verifier's no-wrap requirement.
-- The verifier accepts modulus choices by its bounds, not by a fixed prime list. The bundled prover's supported-prime products are an implementation choice. Do not confuse the integer commitment modulus with the GHASH field polynomial.
+- Choose and optimize `Q` within those bounds; you do not have to retain the bundled default or its prime factors. `Q` need not be prime or have any particular factorization: powers of two are allowed if they satisfy the verifier's bounds. You may replace the bundled prover's supported-prime implementation to handle your choice. Do not confuse the integer commitment modulus with the GHASH field polynomial.
 - Each proof must be nonempty and at most 64 MiB. Each prover invocation has a 900-second timeout.
 - All five sequential runs must succeed and pass verification before a score is published.
 
@@ -43,7 +44,7 @@ Official measurements require an Intel Xeon Platinum 8488C with eight available 
 
 Work in small, reviewable steps: identify a bottleneck, state the expected effect, change the implementation, and measure.
 
-Useful areas to investigate include allocation and buffer reuse, memory layout, input loading, commitment arithmetic, NTT kernels, folding, field-switch operations, serialization, and parallel work within the available CPUs. Measure their contribution instead of assuming they dominate.
+Useful areas to investigate include choosing a different admissible `Q` and adapting its arithmetic, allocation and buffer reuse, memory layout, input loading, commitment arithmetic, NTT kernels, folding, field-switch operations, serialization, and parallel work within the available CPUs. Measure their contribution instead of assuming they dominate.
 
 After a change:
 

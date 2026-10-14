@@ -35,7 +35,9 @@ R_Q = (Z/QZ)[X] / (X^648 - X^324 + 1)
 
 The lower bound comes from the challenge's module-BKZ security estimate. The verifier also enforces the arithmetic no-wrap requirement. At this fixed instance shape, that requirement is weaker than the minimum modulus bound.
 
-The verifier does not require `Q` to be prime or have a particular factorization. The bundled prover implements arithmetic using products of supported primes; this is a restriction of that implementation, not of the challenge. Supporting other admissible moduli may require changing the prover's arithmetic and serialization while preserving the verifier's contract.
+**You are explicitly allowed to change the commitment modulus `Q` as part of your optimization.** The bundled prover's default `Q` is not fixed by the challenge. You may choose any integer `Q` within the bounds above that satisfies the trusted verifier's acceptance checks, including a power of two. The verifier does not require `Q` to be prime or have a particular factorization.
+
+You may modify the modulus selection, arithmetic, and serialization implementation under `solution/` to support your chosen `Q`. The bundled prover's use of products of supported primes is an implementation choice you may replace, not a challenge restriction. The resulting proof must retain the verifier's required format, carry the chosen `Q`, and pass the unchanged trusted verifier.
 
 The commitment modulus `Q` is separate from the GHASH field polynomial. Changing `Q` does not change the input field, table size, or opening being checked.
 

@@ -27,94 +27,14 @@ permissions:
   actions: read
 
 concurrency:
-  group: benchmark-${{ github.repository }}-${{ inputs.solution_ref || github.sha }}
+  group: benchmark-${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}-${{ inputs.solution_ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
   benchmark:
-    # The organization runner group is a separate admission boundary and must
-    # allow only this reusable workflow at its protected reference.
-    runs-on:
-      group: labinius-intel-8488c-avx512-c7i
-      labels: labinius-avx512-c7i
-    # Five sequential runs share the previous per-run 15 minute prover cap.
-    timeout-minutes: 120
-    steps:
-      - name: Require dedicated AVX-512 host
-        shell: bash
-        run: |
-          set -euo pipefail
-          model=$(awk -F: '/^model name/ { sub(/^[[:space:]]+/, "", $2); print $2; exit }' /proc/cpuinfo)
-          cpus=$(nproc)
-          if ! grep -qw avx512f /proc/cpuinfo; then
-            echo "runner CPU does not expose avx512f" >&2
-            exit 1
-          fi
-          if [[ "$model" != *"8488C"* ]]; then
-            echo "unexpected runner CPU model: $model" >&2
-            exit 1
-          fi
-          if [[ "$cpus" -ne 8 ]]; then
-            echo "unexpected runner CPU count: $cpus (expected 8)" >&2
-            exit 1
-          fi
-
-      - name: Resolve isolated paths
-        shell: bash
-        env:
-          SOLUTION_REPOSITORY: ${{ inputs.solution_repository || github.repository }}
-          SOLUTION_REF: ${{ inputs.solution_ref || github.sha }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$SOLUTION_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            echo "solution_repository must be an owner/repository name" >&2
-            exit 1
-          fi
-          if [[ ! "$SOLUTION_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "solution_ref must be an immutable 40-hex commit SHA" >&2
-            exit 1
-          fi
-          {
-            echo "TRUSTED_CHECKOUT=$GITHUB_WORKSPACE/.trusted-src"
-            echo "UNTRUSTED_CHECKOUT=$GITHUB_WORKSPACE/.untrusted-src"
-            echo "TRUSTED_DIR=$RUNNER_TEMP/labinius-trusted"
-            echo "TRUSTED_CARGO_HOME=$RUNNER_TEMP/labinius-trusted-cargo"
-            echo "TRUSTED_TARGET_DIR=$RUNNER_TEMP/labinius-trusted-target"
-            echo "CONTESTANT_DIR=$RUNNER_TEMP/labinius-contestant"
-            echo "CONTESTANT_CARGO_HOME=$RUNNER_TEMP/labinius-contestant-cargo"
-          } >> "$GITHUB_ENV"
-
-      - name: Checkout trusted harness
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          repository: Layr-Labs/labinius-fast-challenge
-          ref: ${{ job.workflow_sha }}
-          path: .trusted-src
-          submodules: recursive
-          persist-credentials: false
-
-      - name: Checkout untrusted solution input
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          repository: ${{ inputs.solution_repository || github.repository }}
-          ref: ${{ inputs.solution_ref || github.sha }}
-          path: .untrusted-src
-          fetch-depth: 1
-          submodules: false
-          persist-credentials: false
-
-      - name: Setup
-        shell: bash
-        run: bash "$TRUSTED_CHECKOUT/.yukon/setup.sh"
-
-      - name: Benchmark
-        shell: bash
-        run: bash "$TRUSTED_CHECKOUT/.yukon/benchmark.sh"
-
-      - name: Upload score
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: benchmark-score
-          path: ${{ github.workspace }}/.trusted-src/.yukon/labinius-fast-score.json
-          if-no-files-found: error
+    # Keep this dispatch/call workflow's filename and run head for Yukon
+    # correlation, while runner admission is bound to the protected executor.
+    uses: Layr-Labs/labinius-fast-challenge/.github/workflows/benchmark-runner.yml@master
+    with:
+      solution_repository: ${{ inputs.solution_repository || github.repository }}
+      solution_ref: ${{ inputs.solution_ref || github.sha }}

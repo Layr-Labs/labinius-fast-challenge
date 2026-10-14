@@ -1,39 +1,24 @@
 //! One packed-binary PCS instance, including the GHASH -> F162 switch.
-//!
-//! The commitment modulus the checker accepts is any `u128` of the right size. This prover
-//! reaches the subset that factors into the library's primes: it commits modulo each limb with
-//! the AVX-512 kernels and then recombines the residues into the coefficients modulo their
-//! product that the proof carries. `A` is defined by its coefficients in `R_Q`
-//! ([`rq::ajtai_matrix`]), so the limb form of the key is derived rather than drawn, which costs
-//! one reduction pass and one forward transform per limb.
 use bincode::Options;
-use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
 use labinius::fields::{
     crossfield as cf,
     scalar::{B128, F162},
 };
-use labinius::key::CommitmentKey;
-use labinius::params::N;
-use labinius::ring::{Modulus, Representation};
+use labinius::ring::Modulus;
 use labinius::scheme::*;
 use labinius::{wire, Transcript};
 use serde::{Deserialize, Serialize};
 
 mod modulus_choice;
 mod parameters;
-/// Byte-for-byte the checker's `rq.rs`, so that the two sides of the format can be diffed. A
-/// release build of the prover only uses the matrix expansion and the packer; the rest is what
-/// the tests check the proof against.
-#[allow(dead_code)]
-mod rq;
-use parameters::{COLUMNS, COLUMN_LEN, COLUMN_LOG, LOG_PACKED, LOG_VARS, MODULUS, RING_ELEMENTS};
+use parameters::{COLUMN_LOG, LOG_PACKED, LOG_VARS, PRIMES};
 
 const LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct Proof {
     version: u32,
-    modulus: u128,
+    primes: Vec<u16>,
     commitment: Vec<u8>,
     partials: Vec<u128>,
     rounds: Vec<[[u64; 3]; 2]>,
@@ -48,6 +33,7 @@ fn codec() -> impl Options {
         .reject_trailing_bytes()
 }
 fn params(primes: &[u16]) -> Params {
+    modulus_choice::validate(primes).expect("invalid commitment modulus");
     let ms: Vec<_> = primes
         .iter()
         .map(|q| Modulus::ALL.into_iter().find(|m| m.prime() == *q).unwrap())
@@ -66,37 +52,29 @@ fn seed() -> [u8; 32] {
     assert_eq!(s.len(), 64);
     core::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("invalid seed"))
 }
-/// The harness witness table: `(1 << LOG_VARS) / 8` BLAKE3 XOF bytes, each 16
-/// little-endian bytes one GHASH word. The timed prover does not recompute it.
-fn load_table(path: &str) -> Vec<B128> {
-    let table_bytes = (1 << LOG_VARS) / 8;
-    let mut file = std::fs::File::open(path).expect("open witness table");
-    let mut bytes = vec![0u8; table_bytes];
-    std::io::Read::read_exact(&mut file, &mut bytes).expect("witness table has the wrong length");
-    let mut extra = [0u8; 1];
-    let extra_n = std::io::Read::read(&mut file, &mut extra).expect("read witness table");
-    assert_eq!(extra_n, 0, "witness table has the wrong length");
-    bytes
-        .chunks_exact(16)
-        .map(|chunk| B128(u128::from_le_bytes(chunk.try_into().unwrap())))
-        .collect()
-}
-#[cfg(test)]
 fn trace(seed: &[u8; 32]) -> Vec<B128> {
     let mut h = blake3::Hasher::new_keyed(seed);
     h.update(b"labinius-fast/binary-table/v1");
-    let mut b = vec![0; (1 << LOG_VARS) / 8];
-    h.finalize_xof().fill(&mut b);
-    b.chunks_exact(16)
-        .map(|v| B128(u128::from_le_bytes(v.try_into().unwrap())))
-        .collect()
+    // 2^24 bits, 128 bits per word. Fill the `B128` buffer in place so the XOF
+    // output is not copied out of a temporary byte vector.
+    let n = (1usize << LOG_VARS) / 128;
+    let mut values: Vec<B128> = Vec::with_capacity(n);
+    unsafe {
+        values.set_len(n);
+        let bytes = std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, n * 16);
+        h.finalize_xof().fill(bytes);
+    }
+    values
 }
-fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
+fn transcript(seed: &[u8; 32], primes: &[u16], commitment: &[u8]) -> Transcript {
     let mut t = Transcript::new(b"labinius-fast/v1");
     t.absorb_bytes(seed);
     t.absorb_u64(LOG_VARS as u64);
     t.absorb_u64(COLUMN_LOG as u64);
-    t.absorb_bytes(&modulus.to_le_bytes());
+    t.absorb_u64(primes.len() as u64);
+    for q in primes {
+        t.absorb_u64(*q as u64);
+    }
     t.absorb_bytes(commitment);
     t
 }
@@ -112,116 +90,25 @@ fn claim(partials: &[B128], lo: &[B128]) -> B128 {
         .zip(cf::eq_expand_b128(lo))
         .fold(B128::ZERO, |a, (&v, e)| a + v * e)
 }
-/// The checker's folded-witness encoding, which this must reproduce byte for byte.
-const FOLDED_BYTES: usize = 4;
-fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
-    let elements = folded.elements();
-    assert!(
-        elements
-            .iter()
-            .all(|e| e.representation == Representation::Coefficients),
-        "a fold is in coefficient form"
-    );
-    let mut out = Vec::with_capacity(FOLDED_BYTES * N * elements.len());
-    for e in elements {
-        for &c in &e.v {
-            out.extend_from_slice(&(c as i32).to_le_bytes());
-        }
-    }
-    out
-}
 #[cfg(test)]
-fn unpack_folded(bytes: &[u8], elements: usize) -> Result<FoldedWitness, String> {
-    if bytes.len() != FOLDED_BYTES * N * elements {
-        return Err("folded witness has the wrong length".into());
-    }
-    let mut words = bytes.chunks_exact(FOLDED_BYTES);
-    let mut fold = Vec::with_capacity(elements);
-    for _ in 0..elements {
-        let mut e = labinius::RingElement648::zero(Representation::Coefficients);
-        for slot in e.v.iter_mut() {
-            let word = i32::from_le_bytes(words.next().unwrap().try_into().unwrap());
-            *slot = i16::try_from(word).map_err(|_| "coefficient out of range".to_string())?;
-        }
-        fold.push(e);
-    }
-    Ok(FoldedWitness::of(fold))
+fn checked_f162(x: [u64; 3]) -> F162 {
+    assert_eq!(x[2] >> 34, 0, "noncanonical F162 element");
+    F162(x)
 }
-/// The `COLUMNS` folding challenges, derived the way the checker derives them: the row
-/// evaluation absorbed, then one weight-28 signed subring element per column.
-fn folding_challenges(t: &mut Transcript, row: &RowEvaluation) -> Vec<ShortChallenge> {
-    row.absorb(t);
-    (0..COLUMNS)
-        .map(|_| sample_short_challenge(t, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
-        .collect()
-}
-/// The commitment's columns as coefficients modulo `modulus`, which is what the proof carries.
-///
-/// The library's commitment is the four `R_162` components of each column in each limb's own NTT
-/// domain. `bd::column_coefficients` inverts that per limb — the recombination of the four
-/// components, then the limb's inverse transform — and Garner's algorithm lifts the residues to
-/// the single integer modulo their product. The lift is exact because `modulus` is that product,
-/// which is also why only such a modulus is reachable from here.
-fn commitment_coefficients(commitment: &Commitment, primes: &[u16], modulus: u128) -> Vec<u128> {
-    let residues = labinius::bd::column_coefficients(commitment.matrix(), primes);
-    let limbs = primes.len();
-    let inverses: Vec<Vec<u64>> = (0..limbs)
-        .map(|k| {
-            (0..k)
-                .map(|m| {
-                    let (q, p) = (primes[k] as u64, primes[m] as u64);
-                    (1..q).find(|x| x * p % q == 1).expect("the primes are distinct")
-                })
-                .collect()
-        })
-        .collect();
-    let mut mixed = vec![0u64; limbs];
-    let mut out = Vec::with_capacity(residues[0].len());
-    for i in 0..residues[0].len() {
-        for k in 0..limbs {
-            let q = primes[k] as u64;
-            let mut x = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
-            for m in 0..k {
-                x = (x + q - mixed[m] % q) % q * inverses[k][m] % q;
-            }
-            mixed[k] = x;
-        }
-        let mut value = 0u128;
-        for k in (0..limbs).rev() {
-            value = value * primes[k] as u128 + mixed[k] as u128;
-        }
-        debug_assert!(value < modulus);
-        out.push(value);
-    }
-    out
-}
-fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
-    let values = load_table(table_path);
+fn prove(seed: &[u8; 32], primes: &[u16]) -> Proof {
     let clock = std::time::Instant::now();
-    let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
-    let p = params(&primes);
-    let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
-    let matrix_time = clock.elapsed();
-    let key = CommitmentKey::from_coefficients(
-        COLUMN_LEN,
-        &matrix,
-        modulus,
-        p.base,
-        &p.extra_moduli,
-    );
-    let pp = PublicParameters::with_key(p.clone(), rq::MATRIX_SEED, key);
+    let p = params(primes);
+    let pp = PublicParameters::from_seed(p.clone(), [0x5a; 32]);
     let setup_time = clock.elapsed();
     let mut prover = Prover::cold(&pp);
+    let verifier = Verifier::new(&pp);
+    let values = trace(seed);
     let w = Witness::lifted(&p, &values).unwrap();
     let witness_time = clock.elapsed();
     let (commitment, opening) = prover.commit(&w);
+    let commitment = commitment.to_bytes();
     let commit_time = clock.elapsed();
-    let commitment = rq::pack_ring_elements(
-        &commitment_coefficients(&commitment, &primes, modulus),
-        modulus,
-    );
-    let recombine_time = clock.elapsed();
-    let mut t = transcript(seed, modulus, &commitment);
+    let mut t = transcript(seed, primes, &commitment);
     let (lo, hi) = point(&mut t);
     let mut ws = cf::Workspace::new(LOG_PACKED, 1);
     let partials = ws.partial_evals(0, &values, &hi);
@@ -246,196 +133,117 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let switch_time = clock.elapsed();
     let point = EvaluationPoint::msb_first(&p, &coords);
     let row = w.row_evaluate(&point);
-    let challenges = folding_challenges(&mut t, &row);
-    let folded = prover.fold(opening, &FoldingChallenges::of(challenges));
+    let challenges = verifier.derive_folding_challenges(&mut t, &row);
+    let folded = prover.fold(opening, &challenges);
     let fold_time = clock.elapsed();
     let proof = Proof {
         version: 1,
-        modulus,
+        primes: primes.to_vec(),
         commitment,
         partials: partials.iter().map(|v| v.0).collect(),
         rounds,
         opened: opened.0,
         row: wire::pack_row_evaluation(&row),
-        folded: pack_folded(&folded),
+        folded: wire::encode(&folded, p.base.prime()),
     };
     let encode_time = clock.elapsed();
-    eprintln!("labinius-profile matrix_us={} setup_us={} witness_us={} commit_us={} recombine_us={} partials_us={} switch_us={} fold_us={} encode_us={} total_us={}",
-        matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
-        (witness_time-setup_time).as_micros(), (commit_time-witness_time).as_micros(),
-        (recombine_time-commit_time).as_micros(), (partials_time-recombine_time).as_micros(),
+    eprintln!("labinius-profile setup_us={} witness_us={} commit_us={} partials_us={} switch_us={} fold_us={} encode_us={} total_us={}",
+        setup_time.as_micros(), (witness_time-setup_time).as_micros(),
+        (commit_time-witness_time).as_micros(), (partials_time-commit_time).as_micros(),
         (switch_time-partials_time).as_micros(), (fold_time-switch_time).as_micros(),
         (encode_time-fold_time).as_micros(), encode_time.as_micros());
     proof
 }
+#[cfg(test)]
+fn verify(seed: &[u8; 32], proof: &Proof) {
+    assert_eq!(proof.version, 1);
+    assert_eq!(proof.partials.len(), 128);
+    assert_eq!(proof.rounds.len(), LOG_PACKED);
+    let p = params(&proof.primes);
+    let pp = PublicParameters::from_seed(p.clone(), [0x5a; 32]);
+    let verifier = Verifier::new(&pp);
+    // The challenge supplies a fresh table. Bind the commitment to that table,
+    // rather than accepting an opening of an arbitrary prover-selected table.
+    let values = trace(seed);
+    let w = Witness::lifted(&p, &values).unwrap();
+    let expected = Prover::new(&pp).commit(&w).0;
+    assert_eq!(
+        proof.commitment,
+        expected.to_bytes(),
+        "commitment does not match instance"
+    );
+    let commitment = Commitment::from_bytes(&p, &proof.commitment).unwrap();
+    let mut t = transcript(seed, &proof.primes, &proof.commitment);
+    let (lo, hi) = point(&mut t);
+    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
+    let trusted_partials = ws.partial_evals(0, &values, &hi);
+    let value = claim(&trusted_partials, &lo);
+    let partials: Vec<_> = proof.partials.iter().copied().map(B128).collect();
+    t.absorb_b128(&[value]);
+    t.absorb_b128(&partials);
+    let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
+    let mut sw = cf::SwitchVerifier::start(&partials, value, &lo, &batch).unwrap();
+    let mut coords = Vec::new();
+    for raw in &proof.rounds {
+        let msg = raw.map(checked_f162);
+        t.absorb_f162(&msg);
+        let r = t.sample_f162(b"switch-round", 1)[0];
+        sw.round(msg, r);
+        coords.push(r);
+    }
+    let opened = checked_f162(proof.opened);
+    sw.finish(&hi, &coords, &batch, opened).unwrap();
+    t.absorb_f162(&[opened]);
+    let point = EvaluationPoint::msb_first(&p, &coords);
+    let row = wire::unpack_row_evaluation(&proof.row, p.columns()).unwrap();
+    let folded = wire::decode(&proof.folded).unwrap();
+    let challenges = verifier.derive_folding_challenges(&mut t, &row);
+    verifier.verify_evaluation(&point, &opened, &row).unwrap();
+    let folded_commitment = verifier.fold_commitment(&commitment, &challenges);
+    let folded_row_value = verifier.fold_row_evaluation(&row, &challenges);
+    verifier
+        .verify_opening(
+            &commitment,
+            &challenges,
+            &point,
+            OpeningMessage::Clear {
+                folded_commitment: &folded_commitment,
+                folded_witness: &folded,
+                folded_row_value: &folded_row_value,
+            },
+        )
+        .unwrap();
+}
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     assert!(
-        args.len() == 5 || args.len() == 7,
-        "usage: labinius-fast --prove FILE --table FILE [--modulus Q]"
+        args.len() == 3 || args.len() == 5,
+        "usage: labinius-fast --prove FILE [--primes q1,q2,...]"
     );
-    assert_eq!(args[1], "--prove", "unknown command");
-    assert_eq!(args[3], "--table", "witness table path is required");
     let seed = seed();
-    let modulus = if args.len() == 7 {
-        assert_eq!(args[5], "--modulus", "unknown prover option");
-        modulus_choice::parse(&args[6]).expect("invalid commitment modulus")
-    } else {
-        MODULUS
-    };
-    let proof = prove(&seed, modulus, &args[4]);
-    std::fs::write(&args[2], codec().serialize(&proof).unwrap()).unwrap();
+    match args[1].as_str() {
+        "--prove" => {
+            let primes = if args.len() == 5 {
+                assert_eq!(args[3], "--primes", "unknown prover option");
+                modulus_choice::parse(&args[4]).expect("invalid commitment modulus")
+            } else {
+                PRIMES.to_vec()
+            };
+            let proof = prove(&seed, &primes);
+            std::fs::write(&args[2], codec().serialize(&proof).unwrap()).unwrap();
+        }
+        _ => panic!("unknown command"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use labinius::eval::eq_table;
-    use labinius::ring::Representation;
-
-    fn checked_f162(x: [u64; 3]) -> F162 {
-        assert_eq!(x[2] >> 34, 0, "noncanonical F162 element");
-        F162(x)
-    }
-    fn dot_f162(a: &[F162], b: &[F162]) -> F162 {
-        assert_eq!(a.len(), b.len());
-        a.iter()
-            .zip(b)
-            .fold(F162::ZERO, |acc, (&x, &y)| acc + x * y)
-    }
-    /// `v mod 2` as field elements, in the witness's index order.
-    fn components_mod_2(v: &[labinius::RingElement648]) -> Vec<F162> {
-        let mut out = vec![F162::ZERO; 4 * v.len()];
-        for (m, e) in v.iter().enumerate() {
-            for p in 0..rq::N / 4 {
-                for k in 0..4 {
-                    if e.v[4 * p + k] & 1 != 0 {
-                        out[4 * m + k].0[p >> 6] |= 1u64 << (p & 63);
-                    }
-                }
-            }
-        }
-        out
-    }
-    /// The checker's acceptance condition, reimplemented here so that the round trip tests the
-    /// proof this prover writes rather than the objects it holds. The ring arithmetic is the
-    /// same [`rq`] the checker runs.
-    fn verify(seed: &[u8; 32], proof: &Proof) {
-        assert_eq!(proof.version, 1);
-        assert_eq!(proof.partials.len(), 128);
-        assert_eq!(proof.rounds.len(), LOG_PACKED);
-        let modulus = proof.modulus;
-        let values = trace(seed);
-        let mut t = transcript(seed, modulus, &proof.commitment);
-        let (lo, hi) = point(&mut t);
-        let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-        let trusted = ws.partial_evals(0, &values, &hi);
-        let value = claim(&trusted, &lo);
-        let partials: Vec<_> = proof.partials.iter().copied().map(B128).collect();
-        t.absorb_b128(&[value]);
-        t.absorb_b128(&partials);
-        let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-        let mut sw = cf::SwitchVerifier::start(&partials, value, &lo, &batch).unwrap();
-        let mut coords = Vec::new();
-        for raw in &proof.rounds {
-            let msg = raw.map(checked_f162);
-            t.absorb_f162(&msg);
-            let r = t.sample_f162(b"switch-round", 1)[0];
-            sw.round(msg, r);
-            coords.push(r);
-        }
-        let opened = checked_f162(proof.opened);
-        sw.finish(&hi, &coords, &batch, opened).unwrap();
-        t.absorb_f162(&[opened]);
-        let (high, low) = coords.split_at(COLUMN_LOG as usize);
-        let p0: Vec<F162> = low.iter().rev().copied().collect();
-        let p1: Vec<F162> = high.iter().rev().copied().collect();
-        let row = wire::unpack_row_evaluation(&proof.row, COLUMNS).unwrap();
-        let folded = unpack_folded(&proof.folded, RING_ELEMENTS).unwrap();
-        let challenges = folding_challenges(&mut t, &row);
-        assert_eq!(dot_f162(&eq_table(&p1), row.values()), opened);
-        let v = folded.elements();
-        assert_eq!(v.len(), RING_ELEMENTS);
-        let mut normsq = 0u64;
-        let mut worst = 0u128;
-        for e in v {
-            assert_eq!(e.representation, Representation::Coefficients);
-            for &c in &e.v {
-                let magnitude = u64::from((c as i32).unsigned_abs());
-                normsq += magnitude * magnitude;
-                worst = worst.max(magnitude as u128);
-            }
-        }
-        assert!(normsq <= 293_534_171_136);
-        assert!(worst <= (modulus - 1) / 2);
-        let columns =
-            rq::unpack_ring_elements(&proof.commitment, COLUMNS * rq::N, modulus).unwrap();
-        let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
-        let coefficients: Vec<i16> = v.iter().flat_map(|e| e.v).collect();
-        assert_eq!(
-            rq::a_times_v(&matrix, &coefficients, modulus),
-            rq::challenge_combination(&columns, &challenges, modulus),
-            "the fold does not open the folded commitment"
-        );
-        let parities: Vec<F162> = challenges.iter().map(|c| c.to_f162()).collect();
-        assert_eq!(
-            dot_f162(&eq_table(&p0), &components_mod_2(v)),
-            dot_f162(&parities, row.values())
-        );
-    }
-
-    struct TableFile(std::path::PathBuf);
-    impl Drop for TableFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    impl TableFile {
-        fn path(&self) -> &str {
-            self.0.to_str().unwrap()
-        }
-    }
-    fn table_file(seed: &[u8; 32]) -> TableFile {
-        let path = std::env::temp_dir().join(format!(
-            "labinius-fast-table-{}-{}.bin",
-            std::process::id(),
-            seed.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
-        ));
-        let mut bytes = Vec::new();
-        for value in trace(seed) {
-            bytes.extend_from_slice(&value.0.to_le_bytes());
-        }
-        std::fs::write(&path, bytes).unwrap();
-        TableFile(path)
-    }
-
-    #[test]
-    fn loaded_table_matches_trace() {
-        let seed = [11u8; 32];
-        let table = table_file(&seed);
-        let loaded = load_table(table.path());
-        assert_eq!(loaded, trace(&seed));
-    }
-
-    #[test]
-    fn baseline_prove_reads_witness_file() {
-        let path = std::env::temp_dir().join(format!(
-            "labinius-fast-short-{}.bin",
-            std::process::id()
-        ));
-        std::fs::write(&path, [1u8; 32]).unwrap();
-        let result = std::panic::catch_unwind(|| {
-            prove(&[1; 32], MODULUS, path.to_str().unwrap());
-        });
-        let _ = std::fs::remove_file(&path);
-        assert!(result.is_err(), "the prover accepted a truncated witness table");
-    }
 
     #[test]
     fn round_trip_and_reject_wrong_instance() {
         let seed = [42; 32];
-        let table = table_file(&seed);
-        let proof = prove(&seed, MODULUS, table.path());
+        let proof = prove(&seed, PRIMES);
         let bytes = codec().serialize(&proof).unwrap();
         let decoded: Proof = codec().deserialize(&bytes).unwrap();
         verify(&seed, &decoded);
@@ -444,59 +252,24 @@ mod tests {
 
     #[test]
     fn solution_selected_modulus_round_trip() {
-        let modulus = 9721u128 * 2917 * 4861;
-        assert_ne!(modulus, MODULUS);
         let seed = [44; 32];
-        let table = table_file(&seed);
-        let proof = prove(&seed, modulus, table.path());
+        let primes = [9721, 2917, 4861];
+        assert_ne!(primes.as_slice(), PRIMES);
+        let proof = prove(&seed, &primes);
         let bytes = codec().serialize(&proof).unwrap();
         let decoded: Proof = codec().deserialize(&bytes).unwrap();
-        assert_eq!(decoded.modulus, modulus);
-        verify(&[44; 32], &decoded);
+        assert_eq!(decoded.primes, primes);
+        verify(&seed, &decoded);
     }
 
     #[test]
     fn modulus_changes_transcript() {
-        let mut a = transcript(&[0; 32], MODULUS, &[]);
-        let mut b = transcript(&[0; 32], 9721u128 * 2917 * 4861, &[]);
+        let mut a = transcript(&[0; 32], PRIMES, &[]);
+        let mut b = transcript(&[0; 32], &[9721, 2917, 4861], &[]);
         let mut x = [0; 32];
         let mut y = [0; 32];
         a.fill(b"test", &mut x);
         b.fill(b"test", &mut y);
         assert_ne!(x, y);
-    }
-
-    /// The limb path's commitment, recombined, is the schoolbook `A W_j` in `R_Q`.
-    ///
-    /// This is the one place where the derived limb form of `A` and the inverse of the
-    /// commitment's per-limb NTT decomposition are checked against the definition in `R_Q`
-    /// directly, with no transform anywhere in the reference. Two columns are enough: each is a
-    /// 4096-term inner product of ring elements.
-    #[test]
-    fn commitment_is_the_schoolbook_product() {
-        let modulus = MODULUS;
-        let primes = modulus_choice::limbs(modulus).unwrap();
-        let p = params(&primes);
-        let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
-        let key = CommitmentKey::from_coefficients(
-            COLUMN_LEN,
-            &matrix,
-            modulus,
-            p.base,
-            &p.extra_moduli,
-        );
-        let pp = PublicParameters::with_key(p.clone(), rq::MATRIX_SEED, key);
-        let values = trace(&[7; 32]);
-        let w = Witness::lifted(&p, &values).unwrap();
-        let (commitment, _) = Prover::cold(&pp).commit(&w);
-        let coefficients = commitment_coefficients(&commitment, &primes, modulus);
-        for j in [0usize, COLUMNS - 1] {
-            let column = &w.elements()[j * COLUMN_LEN..(j + 1) * COLUMN_LEN];
-            assert_eq!(
-                coefficients[j * rq::N..(j + 1) * rq::N],
-                rq::commit_binary_column(&matrix, column, modulus)[..],
-                "column {j} does not match the schoolbook product"
-            );
-        }
     }
 }

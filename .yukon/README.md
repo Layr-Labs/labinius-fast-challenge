@@ -43,7 +43,7 @@ The scored prover is invoked inside the sandbox as:
 labinius-fast --prove /work/proof.bin --table /input/witness-table.bin
 ```
 
-`LABINIUS_SEED` is the hex seed for that run. `/input` is a read-only directory containing only `witness-table.bin`. The file is the BLAKE3 XOF keyed by the seed, updated with the context `labinius-fast/binary-table/v1`, and filled to `(1 << 31) / 8` bytes. Those bytes are the little-endian packed GHASH words produced by `trace(seed)`. The baseline prover loads this file and does not compute the XOF during the timed run. Optional `--modulus Q` may follow `--table`.
+`LABINIUS_SEED` is the hex seed for that run. `/input` is a read-only directory containing only `witness-table.bin`. The file is the BLAKE3 XOF keyed by the seed, updated with the context `labinius-fast/binary-table/v1`, and filled to `(1 << 31) / 8` bytes. Those bytes are the little-endian encoding of the 2^24 GHASH-field elements produced by `trace(seed)`. The baseline prover loads this file and does not compute the XOF during the timed run. Optional `--modulus Q` may follow `--table`.
 
 The single-run numbers in the disposable-clone section below predate median-of-five scoring.
 

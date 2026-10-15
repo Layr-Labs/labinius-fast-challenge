@@ -6,7 +6,7 @@ Minimize the official median prover wall-clock time while producing valid Labini
 
 - Edit only `solution/`, including the vendored Labinius crates.
 - Treat `benchmark.json`, `verifier/`, `.yukon/`, and `.github/` as read-only during solver work.
-- You are explicitly allowed to change the commitment modulus `Q`. Its bundled default is not a fixed challenge parameter. You may modify modulus selection, arithmetic, and serialization code under `solution/` to support any `Q` accepted by the trusted verifier.
+- You are explicitly allowed to change the commitment modulus `Q`. The baseline prover's default is not a fixed challenge parameter. You may modify modulus selection, arithmetic, and serialization code under `solution/` to support any `Q` accepted by the trusted verifier.
 - Preserve the fixed instance shape, transcript rules, required proof format, and verifier acceptance checks. Changing `Q` within the allowed bounds does not violate this requirement. The proof must carry the chosen `Q` and pass the unchanged trusted verifier.
 - Do not cache instance-specific commitments or proofs across seeds, skip required work, tamper with the input file, change scoring output, or bypass sandboxing.
 - Keep unrelated user changes intact. Do not reset, force-sync, or discard work without explicit authorization.
@@ -24,11 +24,11 @@ If setup cannot run because the required CPU, toolchain, trusted checkout, or sa
 
 ## Fixed contract
 
-- Each trial has a fresh 32-byte seed and a table of 2³¹ Boolean evaluations packed into 2²⁴ GHASH words.
+- Each trial has a fresh 32-byte seed and a table of 2³¹ Boolean evaluations packed into 2²⁴ elements of the GHASH field GF(2¹²⁸), 128 evaluations per element.
 - The trusted harness generates the table outside the timer and supplies it read-only.
-- The prover produces a commitment and one opening, including the GHASH → F162 field switch.
-- The commitment ring is `(Z/QZ)[X] / (X^648 - X^324 + 1)`, with `34,816,965,049 ≤ Q < 2^96` and the verifier's no-wrap requirement.
-- Choose and optimize `Q` within those bounds; you do not have to retain the bundled default or its prime factors. `Q` need not be prime or have any particular factorization: powers of two are allowed if they satisfy the verifier's bounds. You may replace the bundled prover's supported-prime implementation to handle your choice. Do not confuse the integer commitment modulus with the GHASH field polynomial.
+- The prover commits to the table, runs the GHASH → F162 field switch, and then opens the commitment at the resulting F162 point.
+- The commitment ring is `(Z/QZ)[X] / (X^648 - X^324 + 1)`, with `34,816,965,049 ≤ Q < 2^96`. The lower bound already implies the verifier's `Q > 1,083,574`, twice the largest admissible folded-witness coefficient.
+- Choose and optimize `Q` within those bounds; you do not have to retain the baseline prover's default or its prime factors. `Q` need not be prime or have any particular factorization: powers of two are allowed if they satisfy the verifier's bounds. You may replace the baseline prover's supported-prime implementation to handle your choice. Do not confuse the integer commitment modulus with the GHASH field polynomial.
 - Each proof must be nonempty and at most 64 MiB. Each prover invocation has a 900-second timeout.
 - All five sequential runs must succeed and pass verification before a score is published.
 

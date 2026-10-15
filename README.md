@@ -4,9 +4,9 @@ Make a packed-binary Labinius polynomial commitment opening faster.
 
 ## The task
 
-Each trial starts with a fresh 32-byte seed. It determines a table of **2³¹ Boolean evaluations**, packed into **2²⁴ GHASH words**. The trusted harness generates this table before timing begins and supplies it to the prover as a read-only file.
+Each trial starts with a fresh 32-byte seed. It determines a table of **2³¹ Boolean evaluations**, packed into **2²⁴ elements of the GHASH field** GF(2¹²⁸), 128 evaluations per element. The trusted harness generates this table before timing begins and supplies it to the prover as a read-only file.
 
-Your prover must produce a Labinius commitment and one opening of that table, including the **GHASH → F162 field switch**. The trusted verifier independently reconstructs the table from the seed and checks the proof. You optimize the prover implementation; the instance shape and verifier contract stay fixed.
+Your prover must commit to that table, reduce the GHASH evaluation claim to a single F162 claim (the **GHASH → F162 field switch**), and then open the Labinius commitment at the resulting F162 point. The trusted verifier independently reconstructs the table from the seed and checks the proof. You optimize the prover implementation, starting from the baseline prover in `solution/`; the instance shape and verifier contract stay fixed.
 
 ## Scoring
 
@@ -33,17 +33,17 @@ R_Q = (Z/QZ)[X] / (X^648 - X^324 + 1)
 34,816,965,049 ≤ Q < 2^96
 ```
 
-The lower bound comes from the challenge's module-BKZ security estimate. The verifier also enforces the arithmetic no-wrap requirement. At this fixed instance shape, that requirement is weaker than the minimum modulus bound.
+The lower bound comes from the challenge's module-BKZ security estimate. The verifier also requires `Q > 1,083,574`, twice the largest coefficient an accepted folded witness can have, so two different folded witnesses are never congruent modulo `Q`; the lower bound already implies this. The upper bound is a limit of the verifier's 128-bit arithmetic, not of the scheme.
 
-**You are explicitly allowed to change the commitment modulus `Q` as part of your optimization.** The bundled prover's default `Q` is not fixed by the challenge. You may choose any integer `Q` within the bounds above that satisfies the trusted verifier's acceptance checks, including a power of two. The verifier does not require `Q` to be prime or have a particular factorization.
+**You are explicitly allowed to change the commitment modulus `Q` as part of your optimization.** The baseline prover's default `Q` is not fixed by the challenge. You may choose any integer `Q` within the bounds above that satisfies the trusted verifier's acceptance checks, including a power of two. The verifier does not require `Q` to be prime or have a particular factorization.
 
-You may modify the modulus selection, arithmetic, and serialization implementation under `solution/` to support your chosen `Q`. The bundled prover's use of products of supported primes is an implementation choice you may replace, not a challenge restriction. The resulting proof must retain the verifier's required format, carry the chosen `Q`, and pass the unchanged trusted verifier.
+You may modify the modulus selection, arithmetic, and serialization implementation under `solution/` to support your chosen `Q`. The baseline prover's use of products of supported primes is an implementation choice you may replace, not a challenge restriction. The resulting proof must retain the verifier's required format, carry the chosen `Q`, and pass the unchanged trusted verifier.
 
 The commitment modulus `Q` is separate from the GHASH field polynomial. Changing `Q` does not change the input field, table size, or opening being checked.
 
 ## What you may change
 
-Only **`solution/`** is editable, including its vendored Labinius crates. You may improve algorithms, arithmetic, memory layout, allocation, vectorization, threading, and serialization, provided every output remains compatible with the trusted verifier.
+Only `solution/` is editable, including its vendored Labinius crates. You may improve algorithms, arithmetic, memory layout, allocation, vectorization, threading, and serialization, provided every output remains compatible with the trusted verifier.
 
 The trusted harness and verifier are checked out separately from the submission. Changes to `verifier/`, `.yukon/`, `.github/`, or `benchmark.json` are not solver changes and must not be used to make a candidate pass. Do not change the instance shape, weaken verification, alter the score calculation, or rely on proofs cached from earlier instances.
 
@@ -81,8 +81,8 @@ The upcoming harness defines how the prover receives the input file and where it
 | --- | --- |
 | `benchmark.json` | Benchmark identity, editable paths, commands, and score output path. |
 | `solution/proof_generate/` | Prover crate producing the `labinius-fast` executable. |
-| `solution/proof_generate/src/parameters.rs` | Bundled prover's instance constants and default modulus. |
-| `solution/proof_generate/src/modulus_choice.rs` | Moduli supported by the bundled implementation. |
+| `solution/proof_generate/src/parameters.rs` | Baseline prover's instance constants and default modulus. |
+| `solution/proof_generate/src/modulus_choice.rs` | Moduli supported by the baseline prover. |
 | `solution/labinius/` | Editable vendored implementation. |
 | `verifier/proof_verify/` | Trusted verifier and independent commitment-ring arithmetic. |
 | `verifier/labinius/` | Pinned verifier dependency. |

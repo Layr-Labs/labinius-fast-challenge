@@ -10,6 +10,29 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=.yukon/lib/sandbox.sh
 source "$script_dir/lib/sandbox.sh"
 
+# Recover the successful local build when no CI workspace was supplied.
+if [[ -z "${RUNNER_TEMP:-}" && -z "${GITHUB_ACTIONS:-}" ]]; then
+  rm -f "$script_dir/labinius-fast-score.json"
+  state="$script_dir/local-workspace"
+  if [[ ! -f "$state" || -L "$state" ]]; then
+    echo 'Run yukon setup first.' >&2
+    exit 1
+  fi
+  IFS= read -r RUNNER_TEMP < "$state"
+  export RUNNER_TEMP
+  if [[ "$RUNNER_TEMP" != /var/tmp/labinius-local.* || ! -d "$RUNNER_TEMP" || -L "$RUNNER_TEMP" || ! -O "$RUNNER_TEMP" ]]; then
+    echo 'Local workspace is unavailable. Rerun yukon setup.' >&2
+    exit 1
+  fi
+  root=$(git -C "$script_dir" rev-parse --show-toplevel)
+  if [[ $(cat "$RUNNER_TEMP/source-checkout") != "$root" ||
+        $(git -C "$RUNNER_TEMP/trusted-checkout" rev-parse HEAD) != $(git -C "$root" rev-parse HEAD) ]]; then
+    echo 'Checkout changed. Rerun yukon setup.' >&2
+    exit 1
+  fi
+  unset TRUSTED_DIR CONTESTANT_DIR
+fi
+
 : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
 trusted="${TRUSTED_DIR:-$RUNNER_TEMP/labinius-trusted}"
 contestant="${CONTESTANT_DIR:-$RUNNER_TEMP/labinius-contestant}"

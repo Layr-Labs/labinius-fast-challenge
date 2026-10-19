@@ -7,3 +7,4 @@
 **/*.sage.py
 .yukon/*-score.json
 .yukon/*-score.tmp
+.yukon/local-workspace*

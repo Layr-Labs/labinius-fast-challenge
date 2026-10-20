@@ -58,11 +58,15 @@
 //! coefficients is that tree's ([`intt_gen_batch32`], `ntt::gen_large`'s, or
 //! `ntt::gen_quad`'s).
 use crate::challenge::ShortChallenge;
-use crate::key::AuxData;
+use crate::fields::scalar::F162;
+use crate::key::{AuxData, CommitmentKey};
 use crate::limb::{dispatch_limb, is_quad};
 use crate::params::{quadratic_slots, N, QS, QS_LARGE, QS_QUAD, QUAD_CLASS_SLOT, QUAD_SLOTS};
 use crate::ring::{Batch32, Representation, RingElement, BASE_PRIME, N162, PRIMES, SLOT_648};
 use crate::simd::commit as cm;
+use crate::simd::ntt::bin_asm as vb;
+use crate::simd::ntt::bin_quad as vqb;
+use crate::simd::transpose_f162::{slice_f162_into, BinaryIndex32};
 use crate::simd::slots as sl;
 use crate::simd::ntt::bin_large as vl;
 use crate::simd::ntt::gen_small::{self as vg, intt_gen_batch32, ntt_gen_batch32};
@@ -711,6 +715,176 @@ pub(crate) fn fold_witness(
     (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
 }
 
+// =============================================================================================
+// the streaming fold
+// =============================================================================================
+
+/// One binary batch, already sliced into the kernel's index rows, written out in the transform
+/// layout with ordinary (cacheable) stores.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,gfni")]
+unsafe fn transform_batch_split<const Q: u16>(elems: &[F162; 128], out: *mut i16) {
+    let mut idx = BinaryIndex32::zero();
+    slice_f162_into(elems, &mut idx);
+    if Gen::<Q>::LARGE {
+        vl::ntt_bin_batch32_sink::<Q, _>(&idx, &mut vb::OutSink(out));
+    } else {
+        vb::ntt_bin_batch32_sink::<Q, _>(&idx, &mut vb::OutSink(out));
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,gfni")]
+unsafe fn transform_batch_quad<const Q: u16>(elems: &[F162; 128], out: *mut i16) {
+    let mut idx = BinaryIndex32::zero();
+    slice_f162_into(elems, &mut idx);
+    vqb::ntt_quad_bin_batch32_sink::<Q, _>(&idx, &mut vqb::OutSink(out));
+}
+
+type BatchTransform = unsafe fn(&[F162; 128], *mut i16);
+
+/// One worker's chunk pairs: regenerate both chunks' base-limb transform one batch at a time into
+/// two L1-resident batches, accumulate them against the pair's challenge, and fold this worker's
+/// accumulators back at the same global chunk indices the materialised path uses.
+fn stream_pairs<const Q: u16>(
+    witness: &[F162],
+    len_f162: usize,
+    ch: &ChallengeNtt,
+    transform: BatchTransform,
+    first: usize,
+    last: usize,
+    bpc: usize,
+    acc: *mut i32,
+) {
+    let mut w0 = Batch32::zero(Representation::Ntt);
+    let mut w1 = Batch32::zero(Representation::Ntt);
+    unsafe {
+        core::ptr::write_bytes(acc, 0, bpc * N * 2 * 16);
+        for i in first..last {
+            let (c0, c1) = (2 * i, 2 * i + 1);
+            let s0 = &witness[c0 * len_f162..(c0 + 1) * len_f162];
+            let s1 = &witness[c1 * len_f162..(c1 + 1) * len_f162];
+            for b in 0..bpc {
+                let e0 = &*(s0.as_ptr().add(128 * b) as *const [F162; 128]);
+                let e1 = &*(s1.as_ptr().add(128 * b) as *const [F162; 128]);
+                transform(e0, w0.v.as_mut_ptr() as *mut i16);
+                transform(e1, w1.v.as_mut_ptr() as *mut i16);
+                accumulate_pair(
+                    w0.v.as_ptr() as *const i16,
+                    w1.v.as_ptr() as *const i16,
+                    ch.pair[i].as_ptr(),
+                    acc.add(32 * N * b),
+                );
+            }
+            if (2 * (i + 1)) % fold_period(Q) == 0 {
+                fold_back::<Q>(acc, bpc * N * 2);
+            }
+        }
+        fold_back::<Q>(acc, bpc * N * 2);
+    }
+}
+
+/// The whole fold over the witness: `pairs / 4` chunk pairs per worker on four workers, each with
+/// its own batch-position accumulators, combined once at the end. Every lane of the combined
+/// accumulator is a sum of at most four reduced lanes, which stays inside `i32`.
+fn stream_drive<const Q: u16>(
+    witness: &[F162],
+    key: &CommitmentKey,
+    ch: &ChallengeNtt,
+    transform: BatchTransform,
+) -> Vec<Batch32> {
+    let bpc = key.len_ring() / 32;
+    let len_f162 = key.len_f162();
+    let pairs = ch.pair.len();
+    assert_eq!(
+        witness.len(),
+        2 * pairs * len_f162,
+        "the witness does not cover the fold's chunks"
+    );
+    let workers = 4.min(pairs);
+    let per = pairs.div_ceil(workers);
+    let mut accs: Vec<Vec<AccVec>> = (0..workers)
+        .map(|_| vec![AccVec([0i32; 16]); bpc * N * 2])
+        .collect();
+    let addrs: Vec<usize> = accs.iter_mut().map(|a| a.as_mut_ptr() as usize).collect();
+    std::thread::scope(|scope| {
+        for (w, &addr) in addrs.iter().enumerate() {
+            let first = w * per;
+            let last = ((w + 1) * per).min(pairs);
+            if first >= last {
+                continue;
+            }
+            scope.spawn(move || {
+                stream_pairs::<Q>(
+                    witness,
+                    len_f162,
+                    ch,
+                    transform,
+                    first,
+                    last,
+                    bpc,
+                    addr as *mut i32,
+                )
+            });
+        }
+    });
+    let mut acc = accs.pop().unwrap();
+    for other in accs {
+        for (a, b) in acc.iter_mut().zip(other) {
+            for k in 0..16 {
+                a.0[k] += b.0[k];
+            }
+        }
+    }
+    let base_ptr = acc.as_mut_ptr() as *mut i32;
+    let mut out: Vec<Batch32> = (0..bpc)
+        .map(|_| Batch32::zero(Representation::Ntt))
+        .collect();
+    unsafe {
+        for b in 0..bpc {
+            drain::<Q>(base_ptr.add(32 * N * b), &mut out[b]);
+        }
+    }
+    out
+}
+
+fn fold_streaming_split<const Q: u16>(
+    witness: &[F162],
+    key: &CommitmentKey,
+    challenges: &[ShortChallenge],
+) -> Vec<RingElement> {
+    let ch = challenge_ntt::<Q>(challenges);
+    let mut vb = stream_drive::<Q>(witness, key, &ch, transform_batch_split::<Q>);
+    parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
+    let bpc = vb.len();
+    (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
+}
+
+fn fold_streaming_quad<const Q: u16>(
+    witness: &[F162],
+    key: &CommitmentKey,
+    challenges: &[ShortChallenge],
+) -> Vec<RingElement> {
+    let ch = challenge_ntt_quad_base::<Q>(challenges);
+    let mut vb = stream_drive::<Q>(witness, key, &ch, transform_batch_quad::<Q>);
+    parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
+    let bpc = vb.len();
+    (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
+}
+
+/// `v = sum_j c_j W_j` modulo the base prime, regenerating the witness transform from `witness`
+/// instead of reading it back from a materialised [`AuxData`].
+pub(crate) fn fold_witness_streaming(
+    witness: &[F162],
+    key: &CommitmentKey,
+    challenges: &[ShortChallenge],
+    q: u16,
+) -> Vec<RingElement> {
+    dispatch_limb!(
+        q,
+        split |Q| fold_streaming_split::<Q>(witness, key, challenges),
+        quad |Q| fold_streaming_quad::<Q>(witness, key, challenges),
+    )
+}
+
 const QUAD_COMPONENT_SLOT: [[u16; N162]; 4] = {
     let mut m = [[0u16; N162]; 4];
     let mut s = 0;
@@ -905,194 +1079,4 @@ pub(crate) fn fold_columns_slots(
     out: &mut [[i16; N162]; 4],
 ) {
     dispatch_limb!(q, |Q| fold_columns_limb::<Q>(challenges, columns, out))
-}
-
-// =============================================================================================
-// the streaming fold: the transform regenerated from the words instead of kept
-// =============================================================================================
-//
-// At the challenge's shape the kept base-limb transform is `columns * bpc` batches of 41472
-// bytes — 5.4 GB for 2^24 words — written once with non-temporal stores, faulted in, read once
-// here and freed at exit. One binary transform of a batch is a few hundred cycles per ring
-// element, so regenerating it from the words costs less than streaming it, and the prover's
-// footprint drops to the words themselves.
-//
-// The accumulation is [`accumulate`]'s exactly: the same `accumulate_pair` over the same
-// lazily reduced kernel output (`ntt_bin_batch32` writes the values `MacKeep` streamed out), the
-// same fold-back cadence, the same `drain` and inverse transform, so the fold is bit for bit the
-// one the kept transform gives. Each worker owns a run of batch positions and regenerates the
-// `(column, position)` transforms it needs, so every transform is computed exactly once.
-
-use crate::fields::scalar::B128;
-use crate::simd::ntt::bin_asm as vb;
-use crate::simd::ntt::bin_quad as vq;
-use crate::simd::transpose_f162::{slice_b128_into, BinaryIndex32};
-
-/// The binary transform of a base limb's tree, as a type so that a splitting prime only ever
-/// instantiates the splitting kernels and a quadratic-slot prime only the quadratic one (the
-/// kernels' tables are built at compile time for their own class of prime).
-trait WordTransform {
-    /// `NTT_q(w)` of the 32 binary ring elements `idx` indexes, lazily reduced, in `out`.
-    ///
-    /// # Safety
-    /// AVX-512 F/BW/VL/VBMI/VBMI2/VNNI and GFNI.
-    unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32);
-}
-
-struct SplitTransform<const Q: u16>;
-struct QuadTransform<const Q: u16>;
-
-impl<const Q: u16> WordTransform for SplitTransform<Q> {
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-    unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32) {
-        if Gen::<Q>::LARGE {
-            vl::ntt_bin_batch32::<Q>(idx, out);
-        } else {
-            vb::ntt_bin_batch32::<Q>(idx, out);
-        }
-    }
-}
-
-impl<const Q: u16> WordTransform for QuadTransform<Q> {
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-    unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32) {
-        vq::ntt_quad_bin_batch32::<Q>(idx, out);
-    }
-}
-
-/// `NTT_q(w)` of the 32 binary ring elements formed by `words`, lazily reduced, in `out`.
-///
-/// # Safety
-/// AVX-512 F/BW/VL/VBMI/VBMI2/VNNI and GFNI.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn transform_words<T: WordTransform>(
-    words: &[B128; 128],
-    idx: &mut BinaryIndex32,
-    out: &mut Batch32,
-) {
-    slice_b128_into(words, idx);
-    T::transform(idx, out);
-}
-
-/// [`accumulate`] with the witness transform regenerated from `words`: `v_ntt` modulo `Q`,
-/// centered, one `Batch32` per batch position. `words` is `columns` columns of `128 * bpc`
-/// words each.
-fn accumulate_streaming<const Q: u16, T: WordTransform>(
-    words: &[B128],
-    columns: usize,
-    ch: &ChallengeNtt,
-    bpc: usize,
-    workers: usize,
-) -> Vec<Batch32> {
-    let pairs = ch.pair.len();
-    assert_eq!(2 * pairs, columns, "one challenge per column, paired");
-    let column_words = 128 * bpc;
-    assert_eq!(words.len(), columns * column_words, "the words are not whole columns");
-    let g = G.min(bpc);
-    let groups: Vec<usize> = (0..bpc).step_by(g).collect();
-    let workers = workers.clamp(1, groups.len());
-    let mut out: Vec<Batch32> = (0..bpc)
-        .map(|_| Batch32::zero(Representation::Ntt))
-        .collect();
-    let out_addr = out.as_mut_ptr() as usize;
-    let stride = std::mem::size_of::<Batch32>();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let groups = &groups;
-            let next = &next;
-            scope.spawn(move || {
-                let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
-                let base = acc.as_mut_ptr() as *mut i32;
-                let mut idx = BinaryIndex32::zero();
-                let mut w0 = Box::new(Batch32::zero(Representation::Ntt));
-                let mut w1 = Box::new(Batch32::zero(Representation::Ntt));
-                loop {
-                    let gi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if gi >= groups.len() {
-                        break;
-                    }
-                    let b0 = groups[gi];
-                    let gb = g.min(bpc - b0);
-                    for v in acc.iter_mut() {
-                        *v = AccVec([0i32; 16]);
-                    }
-                    unsafe {
-                        for i in 0..pairs {
-                            for b in 0..gb {
-                                let at = |j: usize| {
-                                    let start = j * column_words + 128 * (b0 + b);
-                                    &*(words.as_ptr().add(start) as *const [B128; 128])
-                                };
-                                transform_words::<T>(at(2 * i), &mut idx, &mut w0);
-                                transform_words::<T>(at(2 * i + 1), &mut idx, &mut w1);
-                                accumulate_pair(
-                                    w0.v.as_ptr() as *const i16,
-                                    w1.v.as_ptr() as *const i16,
-                                    ch.pair[i].as_ptr(),
-                                    base.add(32 * N * b),
-                                );
-                            }
-                            if (2 * (i + 1)) % fold_period(Q) == 0 {
-                                fold_back::<Q>(base, gb * N * 2);
-                            }
-                        }
-                        for b in 0..gb {
-                            let dst = &mut *((out_addr + (b0 + b) * stride) as *mut Batch32);
-                            drain::<Q>(base.add(32 * N * b), dst);
-                        }
-                    }
-                }
-            });
-        }
-    });
-    out
-}
-
-fn fold_split_streaming<const Q: u16>(
-    words: &[B128],
-    columns: usize,
-    challenges: &[ShortChallenge],
-    bpc: usize,
-    workers: usize,
-) -> Vec<Batch32> {
-    let ch = challenge_ntt::<Q>(challenges);
-    let mut vb = accumulate_streaming::<Q, SplitTransform<Q>>(words, columns, &ch, bpc, workers);
-    parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
-    vb
-}
-
-fn fold_quad_streaming<const Q: u16>(
-    words: &[B128],
-    columns: usize,
-    challenges: &[ShortChallenge],
-    bpc: usize,
-    workers: usize,
-) -> Vec<Batch32> {
-    let ch = challenge_ntt_quad_base::<Q>(challenges);
-    let mut vb = accumulate_streaming::<Q, QuadTransform<Q>>(words, columns, &ch, bpc, workers);
-    parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
-    vb
-}
-
-/// [`fold_witness`] from the `B128` words the witness was lifted from, with the base-limb
-/// transform regenerated on the fly rather than read from an [`AuxData`]: the same `v`, in
-/// coefficient form modulo the base prime `q`, centered. `words` is `columns` columns of
-/// `128 * bpc` words; `workers` bounds the threads.
-pub fn fold_witness_streaming(
-    words: &[B128],
-    columns: usize,
-    challenges: &[ShortChallenge],
-    bpc: usize,
-    q: u16,
-    workers: usize,
-) -> Vec<RingElement> {
-    assert_eq!(challenges.len(), columns, "one challenge per column");
-    assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
-    let vb = dispatch_limb!(
-        q,
-        split |Q| fold_split_streaming::<Q>(words, columns, challenges, bpc, workers),
-        quad |Q| fold_quad_streaming::<Q>(words, columns, challenges, bpc, workers),
-    );
-    (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
 }

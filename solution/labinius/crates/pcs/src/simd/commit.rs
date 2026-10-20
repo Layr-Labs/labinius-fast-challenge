@@ -106,10 +106,10 @@
 //! 7.2 (12637), 9.4 (17497) and 10.4 (19441) per further limb. Per ring element and limb:
 //! 247-533 cycles of transform, 58 (splitting) or 74 (quadratic) of base multiplication, 7, 9 or
 //! 16 of [`finish`], and the front end's 32 once for all of them.
-use crate::fields::scalar::{B128, F162};
+use crate::fields::scalar::F162;
 use crate::limb::dispatch_limb;
 use crate::params::*;
-use crate::simd::transpose_f162::{slice_b128_into, slice_f162_into};
+use crate::simd::transpose_f162::slice_f162_into;
 use crate::simd::transpose_f162::BinaryIndex32;
 use crate::simd::ntt::bin_asm::{self as vb, BlockSink};
 use crate::simd::ntt::bin_large as vl;
@@ -556,45 +556,10 @@ unsafe fn chunk128(elems: &[F162], b: usize) -> &[F162; 128] {
     &*(elems.as_ptr().add(128 * b) as *const [F162; 128])
 }
 
-/// One column of witness the batch loop slices: 128 elements per `A` batch, each element one
-/// `F162` of the witness or the `B128` word it was lifted from (a word is its own lift with a
-/// zero top limb, so the kernel's index rows are the same either way).
-pub trait BatchSource: Copy + Send + Sync {
-    /// Elements, in `F162` units: 128 per batch.
-    fn elems(&self) -> usize;
-    /// The index rows of batch `b` (elements `128 b .. 128 b + 128`).
-    ///
-    /// # Safety
-    /// AVX-512 F/BW/VL/VBMI and GFNI; `b` is below `elems() / 128`.
-    unsafe fn slice_batch(&self, b: usize, out: &mut BinaryIndex32);
-}
-
-impl BatchSource for &[F162] {
-    #[inline(always)]
-    fn elems(&self) -> usize {
-        self.len()
-    }
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-    unsafe fn slice_batch(&self, b: usize, out: &mut BinaryIndex32) {
-        slice_f162_into(chunk128(self, b), out)
-    }
-}
-
-impl BatchSource for &[B128] {
-    #[inline(always)]
-    fn elems(&self) -> usize {
-        self.len()
-    }
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-    unsafe fn slice_batch(&self, b: usize, out: &mut BinaryIndex32) {
-        slice_b128_into(&*(self.as_ptr().add(128 * b) as *const [B128; 128]), out)
-    }
-}
-
-fn check<E: BatchSource>(elems: E, a: &[Batch32]) {
+fn check(elems: &[F162], a: &[Batch32]) {
     assert_eq!(core::mem::size_of::<F162>(), 24, "F162 is not 24 bytes");
     assert_eq!(
-        elems.elems(),
+        elems.len(),
         128 * a.len(),
         "128 F162 (= 32 ring elements) per A batch"
     );
@@ -1144,8 +1109,8 @@ unsafe fn split_batch<const Q: u16, const KEEP: bool, const PF: bool>(
 /// [`crate::fold`] consumes — 648 rows whichever tree that limb runs, `nb` batches per column in
 /// column order. `out` receives one 648-row commitment per limb per column, in `[0, q)`, at
 /// `out[c * limbs.len() + k]`.
-pub fn commit_limbs_group<E: BatchSource>(
-    chunks: &[E],
+pub fn commit_limbs_group(
+    chunks: &[&[F162]],
     limbs: &[Limb],
     w: Option<&mut [Batch32]>,
     st: &mut Scratch,
@@ -1155,7 +1120,7 @@ pub fn commit_limbs_group<E: BatchSource>(
     let g = chunks.len();
     let nb = limbs[0].a.len();
     for c in chunks {
-        check(*c, limbs[0].a);
+        check(c, limbs[0].a);
     }
     for l in limbs {
         assert_eq!(
@@ -1192,7 +1157,7 @@ pub fn commit_limbs_into(
     st: &mut Scratch,
     out: &mut [[u32; N]],
 ) {
-    commit_limbs_group::<&[F162]>(&[elems], limbs, w, st, out);
+    commit_limbs_group(&[elems], limbs, w, st, out);
 }
 
 /// The base limb and the six [`crate::Modulus`]s: the widest limb list there is.
@@ -1214,8 +1179,8 @@ struct Run {
 /// One column of the group, resolved: where each limb accumulates it and where its base limb's
 /// transform is kept.
 #[derive(Clone, Copy)]
-struct Col<E: BatchSource> {
-    elems: E,
+struct Col<'a> {
+    elems: &'a [F162],
     acc: [*mut i32; MAX_LIMBS],
     acc2: [*mut i32; MAX_LIMBS],
     keep: *mut Batch32,
@@ -1228,8 +1193,8 @@ struct Col<E: BatchSource> {
 /// The arguments are [`commit_limbs_group`]'s, already checked; `keep` is `g * nb` writable
 /// batches.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn commit_limbs_core<E: BatchSource>(
-    chunks: &[E],
+unsafe fn commit_limbs_core(
+    chunks: &[&[F162]],
     limbs: &[Limb],
     keep: Option<*mut Batch32>,
     st: &mut Scratch,
@@ -1255,7 +1220,7 @@ unsafe fn commit_limbs_core<E: BatchSource>(
     let runs = &plan[..nl];
 
     let mut group = [Col {
-        elems: chunks[0],
+        elems: &[],
         acc: [core::ptr::null_mut(); MAX_LIMBS],
         acc2: [core::ptr::null_mut(); MAX_LIMBS],
         keep: core::ptr::null_mut(),
@@ -1278,9 +1243,9 @@ unsafe fn commit_limbs_core<E: BatchSource>(
     let cols = &group[..g];
 
     if nb * nl * BATCH_BYTES > A_PREFETCH_BYTES {
-        batch_loop::<E, true>(cols, runs, nb);
+        batch_loop::<true>(cols, runs, nb);
     } else {
-        batch_loop::<E, false>(cols, runs, nb);
+        batch_loop::<false>(cols, runs, nb);
     }
     if let Some(k) = keep {
         _mm_sfence();
@@ -1317,17 +1282,17 @@ pub const A_PREFETCH_BYTES: usize = 4 << 20;
 /// `runs` describes limbs whose `A` covers `nb` batches, `cols` accumulators and `keep` buffers
 /// matching them, and every column's `elems` is `128 * nb` `F162`.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn batch_loop<E: BatchSource, const PF: bool>(cols: &[Col<E>], runs: &[Run], nb: usize) {
+unsafe fn batch_loop<const PF: bool>(cols: &[Col], runs: &[Run], nb: usize) {
     let mut idx = BinaryIndex32::zero();
     let mut buf: core::mem::MaybeUninit<Blk27> = core::mem::MaybeUninit::uninit();
     let bp = buf.as_mut_ptr() as *mut i16;
     for b in 0..nb {
         for (c, col) in cols.iter().enumerate() {
-            col.elems.slice_batch(b, &mut idx);
+            slice_f162_into(chunk128(col.elems, b), &mut idx);
             if PF && c + 1 == cols.len() {
-                column_batch::<E, true>(&idx, col, runs, bp, b);
+                column_batch::<true>(&idx, col, runs, bp, b);
             } else {
-                column_batch::<E, false>(&idx, col, runs, bp, b);
+                column_batch::<false>(&idx, col, runs, bp, b);
             }
         }
     }
@@ -1339,9 +1304,9 @@ unsafe fn batch_loop<E: BatchSource, const PF: bool>(cols: &[Col<E>], runs: &[Ru
 /// # Safety
 /// As [`batch_loop`]; `b < nb`.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn column_batch<E: BatchSource, const PF: bool>(
+unsafe fn column_batch<const PF: bool>(
     idx: &BinaryIndex32,
-    col: &Col<E>,
+    col: &Col,
     runs: &[Run],
     bp: *mut i16,
     b: usize,

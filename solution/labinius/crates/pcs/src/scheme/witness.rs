@@ -43,12 +43,37 @@ impl Witness {
     }
 
     pub fn lifted(params: &Params, trace: &[B128]) -> Result<Witness, WitnessError> {
-        let mut w = Witness {
+        if trace.len() != params.witness_len() {
+            return Err(WitnessError::WrongLength);
+        }
+        // Fill spare capacity before publishing its length: the lift writes
+        // every field element, so a preceding 384 MiB zero pass is unnecessary.
+        let mut elements = Vec::<F162>::with_capacity(trace.len());
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(trace.len().max(1));
+        let per = trace.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            for (out, input) in elements.spare_capacity_mut()[..trace.len()]
+                .chunks_mut(per)
+                .zip(trace.chunks(per))
+            {
+                scope.spawn(move || {
+                    for (slot, &x) in out.iter_mut().zip(input) {
+                        slot.write(F162::from_b128(x));
+                    }
+                });
+            }
+        });
+        // Every slot was initialized by a joined worker; unwinding before here
+        // leaves a zero-length vector and drops no uninitialized values.
+        unsafe { elements.set_len(trace.len()) };
+        Ok(Witness {
             params: params.clone(),
-            elements: vec![F162::ZERO; params.witness_len()],
-        };
-        w.relift(trace)?;
-        Ok(w)
+            elements,
+        })
     }
 
     pub fn from_elements(params: &Params, elements: Vec<F162>) -> Result<Witness, WitnessError> {

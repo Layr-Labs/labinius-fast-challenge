@@ -176,9 +176,34 @@ pub(crate) fn row_evaluate(witness: &[F162], p0: &[F162]) -> Vec<F162> {
         "the witness is not a whole number of columns of {wdim}"
     );
     let eq = Poly::from_scalars(&eq_table(p0));
-    (0..witness.len() / wdim)
-        .map(|j| unsafe { dot(&eq, witness.as_ptr().add(j * wdim), wdim) })
-        .collect()
+    let columns = witness.len() / wdim;
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(columns.max(1));
+    let per = columns.div_ceil(threads);
+    let mut out = vec![F162::ZERO; columns];
+    if threads > 1 && per > 0 {
+        let base = witness.as_ptr() as usize;
+        let eq = &eq;
+        std::thread::scope(|scope| {
+            for (t, chunk) in out.chunks_mut(per).enumerate() {
+                let start = t * per;
+                scope.spawn(move || {
+                    for (i, slot) in chunk.iter_mut().enumerate() {
+                        let j = start + i;
+                        *slot = unsafe { dot(eq, (base as *const F162).add(j * wdim), wdim) };
+                    }
+                });
+            }
+        });
+    } else {
+        for (j, slot) in out.iter_mut().enumerate() {
+            *slot = unsafe { dot(&eq, witness.as_ptr().add(j * wdim), wdim) };
+        }
+    }
+    out
 }
 
 /// `u^T eq(p1)`, the claim a row evaluation `u` implies.

@@ -69,17 +69,22 @@ fn seed() -> [u8; 32] {
 /// The harness witness table: `(1 << LOG_VARS) / 8` BLAKE3 XOF bytes, each 16
 /// little-endian bytes one GHASH word. The timed prover does not recompute it.
 fn load_table(path: &str) -> Vec<B128> {
-    let table_bytes = (1 << LOG_VARS) / 8;
+    assert!(
+        cfg!(target_endian = "little"),
+        "the table is little-endian"
+    );
+    assert_eq!(core::mem::size_of::<B128>(), 16, "a GHASH word is 16 bytes");
+    let count = (1 << LOG_VARS) / 128;
     let mut file = std::fs::File::open(path).expect("open witness table");
-    let mut bytes = vec![0u8; table_bytes];
-    std::io::Read::read_exact(&mut file, &mut bytes).expect("witness table has the wrong length");
+    let mut values = vec![B128::ZERO; count];
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, 16 * count)
+    };
+    std::io::Read::read_exact(&mut file, bytes).expect("witness table has the wrong length");
     let mut extra = [0u8; 1];
     let extra_n = std::io::Read::read(&mut file, &mut extra).expect("read witness table");
     assert_eq!(extra_n, 0, "witness table has the wrong length");
-    bytes
-        .chunks_exact(16)
-        .map(|chunk| B128(u128::from_le_bytes(chunk.try_into().unwrap())))
-        .collect()
+    values
 }
 #[cfg(test)]
 fn trace(seed: &[u8; 32]) -> Vec<B128> {
@@ -211,7 +216,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     );
     let pp = PublicParameters::with_key(p.clone(), rq::MATRIX_SEED, key);
     let setup_time = clock.elapsed();
-    let mut prover = Prover::cold(&pp);
+    let mut prover = Prover::cold_without_transform(&pp);
     let w = Witness::lifted(&p, &values).unwrap();
     let witness_time = clock.elapsed();
     let (commitment, opening) = prover.commit(&w);
@@ -247,7 +252,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let point = EvaluationPoint::msb_first(&p, &coords);
     let row = w.row_evaluate(&point);
     let challenges = folding_challenges(&mut t, &row);
-    let folded = prover.fold(opening, &FoldingChallenges::of(challenges));
+    let folded = prover.fold_from_witness(opening, &FoldingChallenges::of(challenges), &w);
     let fold_time = clock.elapsed();
     let proof = Proof {
         version: 1,

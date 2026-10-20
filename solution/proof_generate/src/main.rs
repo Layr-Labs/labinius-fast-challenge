@@ -13,9 +13,8 @@
 //!   words. It is never copied and never lifted into a 24-byte `F162` buffer: the bit-slicing
 //!   front end of the kernels, the row evaluation and the switch read the words directly.
 //! - The commitment runs on a pool of `available_parallelism` workers and keeps no transform.
-//!   The fold regenerates the base limb's transform from the words with the same binary kernel,
-//!   which costs one transform pass instead of a 5.4 GB write, a 5.4 GB read, their page faults
-//!   and their release at exit.
+//!   The fold accumulates exact integer coefficients directly from bit-sliced table words,
+//!   without materializing the 5.4 GB base-limb transform.
 //! - The switch keeps `a` as a linear map applied to the `eq` table and `p` in one half-size
 //!   buffer, fusing each fold with the next message ([`cf::LeanSwitch`]); the `eq` expansion,
 //!   the partial evaluations, the row evaluation and the challenge sampling run on all cores.
@@ -641,7 +640,14 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let row_time = clock.elapsed();
     let challenges = folding_challenges(&mut t, &row);
     let challenge_time = clock.elapsed();
-    let folded = FoldedWitness::of(fold_checked(values, &challenges, primes[0], workers));
+    let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
+        values,
+        COLUMNS,
+        &challenges,
+        COLUMN_LEN / 128,
+        primes[0],
+        workers,
+    ));
     let fold_time = clock.elapsed();
     let proof = Proof {
         version: 1,

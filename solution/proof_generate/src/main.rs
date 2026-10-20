@@ -155,6 +155,18 @@ fn folding_challenges(t: &mut Transcript, row: &RowEvaluation) -> Vec<ShortChall
         .map(|_| sample_short_challenge(t, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
         .collect()
 }
+fn inverse_mod(value: u64, modulus: u64) -> u64 {
+    let (mut old_r, mut r) = (modulus as i64, value as i64);
+    let (mut old_t, mut t) = (0i64, 1i64);
+    while r != 0 {
+        let quotient = old_r / r;
+        (old_r, r) = (r, old_r - quotient * r);
+        (old_t, t) = (t, old_t - quotient * t);
+    }
+    assert_eq!(old_r, 1, "the primes are distinct");
+    old_t.rem_euclid(modulus as i64) as u64
+}
+
 /// The commitment's columns as coefficients modulo `modulus`, which is what the proof carries.
 ///
 /// The library's commitment is the four `R_162` components of each column in each limb's own NTT
@@ -170,7 +182,7 @@ fn commitment_coefficients(commitment: &Commitment, primes: &[u16], modulus: u12
             (0..k)
                 .map(|m| {
                     let (q, p) = (primes[k] as u64, primes[m] as u64);
-                    (1..q).find(|x| x * p % q == 1).expect("the primes are distinct")
+                    inverse_mod(p, q)
                 })
                 .collect()
         })

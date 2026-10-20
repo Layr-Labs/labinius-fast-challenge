@@ -756,36 +756,57 @@ impl<T> HugeBuf<T> {
     pub unsafe fn as_slice(&self) -> &[T] {
         core::slice::from_raw_parts(self.ptr, self.len)
     }
-
-    /// The buffer's address and size in bytes, for [`touch_pages`] on another thread.
-    pub fn region(&self) -> (usize, usize) {
-        (self.ptr as usize, self.len * core::mem::size_of::<T>())
-    }
-}
-
-/// Fault in every page of `[addr, addr + bytes)` by writing one zero byte per 4 KB (a huge
-/// page faults on its first touch and the rest of its touches hit), so that the first real
-/// writer finds the pages mapped. Meant for a background thread while a compute-bound phase
-/// runs.
-///
-/// # Safety
-/// The region must be writable, owned by the caller, and not read or written by anyone else
-/// until this returns.
-pub unsafe fn touch_pages(addr: usize, bytes: usize) {
-    let p = addr as *mut u8;
-    let mut off = 0;
-    while off < bytes {
-        core::ptr::write_volatile(p.add(off), 0);
-        off += 4096;
-    }
-    if bytes > 0 {
-        core::ptr::write_volatile(p.add(bytes - 1), 0);
-    }
 }
 
 impl<T> Drop for HugeBuf<T> {
     fn drop(&mut self) {
         unsafe { std::alloc::dealloc(self.ptr as *mut u8, self.layout) };
+    }
+}
+
+/// Four-wide GHASH product. Lane `k` of the result is lane `k` of `a` times lane `k` of `b`
+/// in GF(2^128) with the GHASH polynomial.
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn mul_b128x4(a: __m512i, b: __m512i) -> __m512i {
+    let lo = _mm512_clmulepi64_epi128::<0x00>(a, b);
+    let hi = _mm512_clmulepi64_epi128::<0x11>(a, b);
+    let ax = _mm512_xor_si512(a, _mm512_shuffle_epi32::<0x4E>(a));
+    let bx = _mm512_xor_si512(b, _mm512_shuffle_epi32::<0x4E>(b));
+    let mid = _mm512_xor_si512(
+        _mm512_clmulepi64_epi128::<0x00>(ax, bx),
+        _mm512_xor_si512(lo, hi),
+    );
+    let p_lo = _mm512_xor_si512(lo, _mm512_bslli_epi128::<8>(mid));
+    let p_hi = _mm512_xor_si512(hi, _mm512_bsrli_epi128::<8>(mid));
+    let poly = _mm512_set1_epi64(0x87);
+    let mut acc = p_lo;
+    let mut h = p_hi;
+    for _ in 0..2 {
+        let c_lo = _mm512_clmulepi64_epi128::<0x00>(h, poly);
+        let c_hi = _mm512_clmulepi64_epi128::<0x11>(h, poly);
+        let c = _mm512_xor_si512(c_lo, _mm512_bslli_epi128::<8>(c_hi));
+        let carry = _mm512_bsrli_epi128::<8>(c_hi);
+        acc = _mm512_xor_si512(acc, c);
+        h = carry;
+    }
+    acc
+}
+
+
+/// Write a Kronecker row using four GHASH products per vector; `out` is
+/// writable for `input.len()` words, which need not already be initialized.
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn scale_b128_row(input: &[B128], factor: B128, out: *mut B128) {
+    let lane = _mm_set_epi64x((factor.0 >> 64) as i64, factor.0 as i64);
+    let factor4 = _mm512_broadcast_i32x4(lane);
+    let blocks = input.len() / 4;
+    for block in 0..blocks {
+        let i = 4 * block;
+        let x = _mm512_loadu_si512(input.as_ptr().add(i) as *const __m512i);
+        _mm512_storeu_si512(out.add(i) as *mut __m512i, mul_b128x4(x, factor4));
+    }
+    for i in 4 * blocks..input.len() {
+        out.add(i).write(input[i] * factor);
     }
 }
 
@@ -815,6 +836,9 @@ pub unsafe fn eq_expand_b128_parallel(r: &[B128], out: *mut B128, threads: usize
     let low = eq_expand_b128(&r[n - h..]);
     let runs = crate::par::ranges(high.len(), threads, 1);
     let out = out as usize;
+    let vector = std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("vpclmulqdq");
     std::thread::scope(|scope| {
         for run in runs {
             let (high, low) = (&high, &low);
@@ -823,8 +847,12 @@ pub unsafe fn eq_expand_b128_parallel(r: &[B128], out: *mut B128, threads: usize
                 for jh in run {
                     let hv = high[jh];
                     let base = unsafe { out.add(jh << h) };
-                    for (jl, &lv) in low.iter().enumerate() {
-                        unsafe { base.add(jl).write(hv * lv) };
+                    if vector {
+                        unsafe { scale_b128_row(low, hv, base) };
+                    } else {
+                        for (jl, &lv) in low.iter().enumerate() {
+                            unsafe { base.add(jl).write(hv * lv) };
+                        }
                     }
                 }
             });
@@ -854,12 +882,11 @@ pub unsafe fn eq_expand_b128_parallel(r: &[B128], out: *mut B128, threads: usize
 // `L'_k = L_k o (x -> d_k x)` on the same tile. The identity needs `1 + r_hi[k] != 0`; a point
 // with a coordinate equal to one is refused by [`LeanSwitch::new`] and the caller falls back.
 //
-// `p` has no such structure past round 0, but rounds 0 and 1 read it straight from the words
-// (`p_1` is one fold of two words, formed on the fly and never stored), and every later
-// round's fold is fused with the next round's message: one pass per round that reads `p_k`,
-// writes `p_{k+1}` in place over the low half and accumulates the message of round `k + 1`
-// from the elements it just wrote. The words are read three times, `eq` is read once per round
-// at the round's length, and `p` lives in `2^(l-2)` elements written once each.
+// `p` has no such structure past round 0, but round 0 reads it straight from the words, and
+// every later round's fold is fused with the next round's message: one pass per round that
+// reads `p_k`, writes `p_{k+1}` in place over the low half and accumulates the message of round
+// `k + 1` from the elements it just wrote. The words are read twice, `eq` is read once per
+// round at the round's length, and `p` lives in `2^(l-1)` elements written once each.
 //
 // The messages are the values [`SwitchProver`] sends: the same products, reassociated over the
 // threads (XOR), so the transcript and the proof are unchanged.
@@ -899,32 +926,19 @@ fn compose_scale(images: &[F162], d: B128) -> Vec<F162> {
         .collect()
 }
 
-/// Where a pass reads `p_k` from: the words themselves in round 0, the words folded once by
-/// the first challenge in round 1 (`p_1[j] = p_0[j] + r_0 (p_0[j] + p_0[j + half_0])`, never
-/// stored), and the planes from round 2 on.
+/// Where a pass reads `p_k` from: the words themselves in round 0, the planes afterwards.
 #[derive(Clone, Copy)]
 enum Src {
     Words(*const B128),
-    WordsFolded {
-        words: *const B128,
-        half: usize,
-        r: F162,
-    },
     Planes([*const u64; 3]),
-}
-
-#[inline(always)]
-unsafe fn load_words(w: *const B128) -> [__m512i; 3] {
-    let (lo, hi) = split_words(w);
-    [lo, hi, _mm512_setzero_si512()]
 }
 
 #[inline(always)]
 unsafe fn load_p(src: Src, j: usize) -> [__m512i; 3] {
     match src {
-        Src::Words(w) => load_words(w.add(j)),
-        Src::WordsFolded { words, half, r } => {
-            fold8(bcast3(r), load_words(words.add(j)), load_words(words.add(j + half)))
+        Src::Words(w) => {
+            let (lo, hi) = split_words(w.add(j));
+            [lo, hi, _mm512_setzero_si512()]
         }
         Src::Planes(p) => [
             _mm512_loadu_si512(p[0].add(j) as *const __m512i),
@@ -944,10 +958,6 @@ unsafe fn store_p(dst: [*mut u64; 3], j: usize, v: [__m512i; 3]) {
 unsafe fn get_p(src: Src, j: usize) -> F162 {
     match src {
         Src::Words(w) => F162::from_b128(*w.add(j)),
-        Src::WordsFolded { words, half, r } => {
-            let (p0, p1) = (F162::from_b128(*words.add(j)), F162::from_b128(*words.add(j + half)));
-            p0 + r * (p0 + p1)
-        }
         Src::Planes(p) => F162([*p[0].add(j), *p[1].add(j), *p[2].add(j)]),
     }
 }
@@ -1091,10 +1101,8 @@ pub struct LeanSwitch<'a> {
     l: Vec<F162>,
     /// `L'_k = L_k o (x -> d_k x)`.
     lp: Vec<F162>,
-    /// `p_k` for `k >= 2`, word-sliced; [`LeanSwitch::plane_len`] elements per plane.
+    /// `p_k` for `k >= 1`, word-sliced; `2^(l-1)` elements per plane.
     p: [HugeBuf<u64>; 3],
-    /// Round 0's challenge, which defines the virtual `p_1`.
-    r0: F162,
     /// The current round's half, once `msg` has been called.
     half: usize,
     round: usize,
@@ -1103,30 +1111,19 @@ pub struct LeanSwitch<'a> {
 }
 
 impl<'a> LeanSwitch<'a> {
-    /// Elements each of the three planes must hold for `n` words: `p_2` is `n / 4` elements,
-    /// and the final value needs one.
-    pub fn plane_len(n: usize) -> usize {
-        (n / 4).max(1)
-    }
-
     /// `None` when some coordinate of `r_hi` is one, which the caller treats with
-    /// [`SwitchProver`]. `planes` are the three buffers `p` lives in, at least
-    /// [`plane_len`](Self::plane_len) elements each; they may be prefaulted ahead of time.
+    /// [`SwitchProver`].
     pub fn new(
         pi0: &'a [B128],
         eq: &'a [B128],
         r_hi: &'a [B128],
         batch: &[F162],
         threads: usize,
-        planes: [HugeBuf<u64>; 3],
     ) -> Option<Self> {
         let n = pi0.len();
         assert!(n >= 2 && n.is_power_of_two() && n == 1 << r_hi.len(), "2^l words");
         assert_eq!(eq.len(), n, "one eq entry per word");
         assert_eq!(batch.len(), PACK, "one batch weight per bit");
-        for plane in &planes {
-            assert!(plane.len() >= Self::plane_len(n), "a plane is too short");
-        }
         if r_hi.iter().any(|&r| r == B128::ONE) {
             return None;
         }
@@ -1138,8 +1135,7 @@ impl<'a> LeanSwitch<'a> {
             r_hi,
             l,
             lp,
-            p: planes,
-            r0: F162::ZERO,
+            p: [HugeBuf::new(n / 2), HugeBuf::new(n / 2), HugeBuf::new(n / 2)],
             half: n,
             round: 0,
             pending: None,
@@ -1147,27 +1143,32 @@ impl<'a> LeanSwitch<'a> {
         })
     }
 
-    /// The buffers for a fresh switch over `n` words.
-    pub fn planes(n: usize) -> [HugeBuf<u64>; 3] {
-        let len = Self::plane_len(n);
-        [HugeBuf::new(len), HugeBuf::new(len), HugeBuf::new(len)]
-    }
-
     fn src(&self) -> Src {
-        match self.round {
-            0 => Src::Words(self.pi0.as_ptr()),
-            1 => Src::WordsFolded {
-                words: self.pi0.as_ptr(),
-                half: self.pi0.len() / 2,
-                r: self.r0,
-            },
-            _ => Src::Planes([self.p[0].as_ptr(), self.p[1].as_ptr(), self.p[2].as_ptr()]),
+        if self.round == 0 {
+            Src::Words(self.pi0.as_ptr())
+        } else {
+            Src::Planes([self.p[0].as_ptr(), self.p[1].as_ptr(), self.p[2].as_ptr()])
         }
     }
 
-    /// The message over `src` at `half`: `e0 = sum_{j < half} L(eq[j]) p[j]`,
-    /// `einf = sum L'(eq[j]) (p[j] + p[j + half])`, with the maps the struct holds.
-    fn message(&self, src: Src, half: usize) -> [F162; 2] {
+    fn dst(&mut self) -> [*mut u64; 3] {
+        [
+            self.p[0].as_mut_ptr(),
+            self.p[1].as_mut_ptr(),
+            self.p[2].as_mut_ptr(),
+        ]
+    }
+
+    /// The round's two message values.
+    pub fn msg(&mut self) -> [F162; 2] {
+        self.half /= 2;
+        if let Some(m) = self.pending.take() {
+            return m;
+        }
+        debug_assert_eq!(self.round, 0);
+        let half = self.half;
+        let src = self.src();
+        let eq = self.eq.as_ptr();
         if half < TILE {
             let mut e0 = F162::ZERO;
             let mut einf = F162::ZERO;
@@ -1182,7 +1183,7 @@ impl<'a> LeanSwitch<'a> {
         let ml = eq_matrices(&self.l);
         let mlp = eq_matrices(&self.lp);
         let runs = crate::par::ranges(half, self.threads, TILE);
-        let eq = self.eq.as_ptr() as usize;
+        let (eq, src) = (eq as usize, src);
         let parts: Vec<[F162; 2]> = std::thread::scope(|scope| {
             let handles: Vec<_> = runs
                 .into_iter()
@@ -1203,27 +1204,8 @@ impl<'a> LeanSwitch<'a> {
         m
     }
 
-    fn dst(&mut self) -> [*mut u64; 3] {
-        [
-            self.p[0].as_mut_ptr(),
-            self.p[1].as_mut_ptr(),
-            self.p[2].as_mut_ptr(),
-        ]
-    }
-
-    /// The round's two message values.
-    pub fn msg(&mut self) -> [F162; 2] {
-        self.half /= 2;
-        if let Some(m) = self.pending.take() {
-            return m;
-        }
-        debug_assert_eq!(self.round, 0);
-        self.message(self.src(), self.half)
-    }
-
     /// Bind the round's challenge: fold `p`, advance the map, and — when a round follows —
-    /// compute its message in the same pass. Round 0's fold is not written: round 1 reads the
-    /// words folded by `r` on the fly.
+    /// compute its message in the same pass.
     pub fn fold(&mut self, r: F162) {
         let half = self.half;
         let hh = half / 2;
@@ -1242,13 +1224,6 @@ impl<'a> LeanSwitch<'a> {
             let (p0, p1) = unsafe { (get_p(src, 0), get_p(src, 1)) };
             unsafe { set_p(dst, 0, p0 + r * (p0 + p1)) };
             self.round += 1;
-            return;
-        }
-        if self.round == 0 {
-            self.r0 = r;
-            self.round = 1;
-            let m = self.message(self.src(), hh);
-            self.pending = Some(m);
             return;
         }
         if hh < TILE {
@@ -1307,15 +1282,10 @@ impl<'a> LeanSwitch<'a> {
         self.round += 1;
     }
 
-    /// `p` at the end of the sumcheck: the value the commitment opens to. Every last fold
-    /// writes it to the planes' first element.
+    /// `p` at the end of the sumcheck: the value the commitment opens to.
     pub fn final_eval(&self) -> F162 {
         assert_eq!(self.round, self.r_hi.len(), "the sumcheck has not finished");
-        F162([
-            unsafe { *self.p[0].as_ptr() },
-            unsafe { *self.p[1].as_ptr() },
-            unsafe { *self.p[2].as_ptr() },
-        ])
+        unsafe { get_p(self.src(), 0) }
     }
 }
 
@@ -1363,8 +1333,7 @@ mod lean_tests {
                 assert_eq!(partial_evals(&pi0, &eq), partial_evals_parallel(&pi0, &eq, threads));
 
                 let mut reference = SwitchProver::new(&pi0, &eq, &batch);
-                let mut lean =
-                    LeanSwitch::new(&pi0, &eq, &r_hi, &batch, threads, LeanSwitch::planes(n)).unwrap();
+                let mut lean = LeanSwitch::new(&pi0, &eq, &r_hi, &batch, threads).unwrap();
                 for (round, &ri) in r.iter().enumerate() {
                     let want = reference.msg();
                     let got = lean.msg();
@@ -1395,5 +1364,43 @@ mod lean_tests {
         }
         let r = B128(next(&mut x));
         assert_eq!((B128::ONE + r) * b128_inv(B128::ONE + r), B128::ONE);
+    }
+}
+
+
+#[cfg(test)]
+mod vector_row_tests {
+    use super::*;
+
+    #[test]
+    fn vector_rows_and_parallel_expansion_match_scalar() {
+        let mut state = 0x65f2_7a91_0cba_d837u128;
+        let mut word = || {
+            state ^= state << 23;
+            state ^= state >> 17;
+            state ^= state << 31;
+            B128(state)
+        };
+        let vector = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("vpclmulqdq");
+        if vector {
+            for n in 0..33 {
+                let input: Vec<_> = (0..n).map(|_| word()).collect();
+                let factor = word();
+                let mut out = vec![B128::ZERO; n];
+                unsafe { scale_b128_row(&input, factor, out.as_mut_ptr()) };
+                assert_eq!(out, input.iter().map(|&x| x * factor).collect::<Vec<_>>());
+            }
+        }
+        for log in [0, 7, 15, 16, 17, 18] {
+            let point: Vec<_> = (0..log).map(|_| word()).collect();
+            let expected = eq_expand_b128(&point);
+            for threads in [1, 3, 8] {
+                let mut out = vec![B128::ZERO; 1 << log];
+                unsafe { eq_expand_b128_parallel(&point, out.as_mut_ptr(), threads) };
+                assert_eq!(out, expected, "log={log} threads={threads}");
+            }
+        }
     }
 }

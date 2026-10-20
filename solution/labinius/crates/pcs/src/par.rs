@@ -259,9 +259,9 @@ mod pool_tests {
 }
 /// Temporary per-task affinity, restored before a pool task returns.
 #[cfg(target_os="linux")]
-pub(crate) struct CorePlacement { cpus:Vec<usize> }
+pub struct CorePlacement { cpus:Vec<usize> }
 #[cfg(target_os="linux")]
-pub(crate) struct AffinityGuard { old:[usize;16] }
+pub struct AffinityGuard { old:[usize;16] }
 #[cfg(target_os="linux")]
 unsafe extern "C" {
     fn sched_getaffinity(pid:i32,size:usize,mask:*mut usize)->i32;
@@ -269,7 +269,7 @@ unsafe extern "C" {
 }
 #[cfg(target_os="linux")]
 impl CorePlacement {
-    pub(crate) fn for_workers(workers:usize)->Option<Self> {
+    pub fn for_workers(workers:usize)->Option<Self> {
         let mut allowed=[0usize;16];
         if unsafe {sched_getaffinity(0,std::mem::size_of_val(&allowed),allowed.as_mut_ptr())} !=0 {return None;}
         let info=std::fs::read_to_string("/proc/cpuinfo").ok()?;
@@ -294,7 +294,19 @@ impl CorePlacement {
         if workers==0 || cpus.len()<workers {return None;}
         Some(Self{cpus})
     }
-    pub(crate) fn pin(&self,worker:usize)->Option<AffinityGuard> {
+    /// One task per allowed logical CPU, in CPU order: for a dispatch of exactly `tasks` equal
+    /// tasks on a pool as wide as the CPU set, so that no two of them share a CPU while another
+    /// sits idle, whatever the scheduler's placement of the workers was when they were woken
+    /// (after the commitment's per-core placement the eight runners are not spread evenly).
+    pub fn for_logical(tasks:usize)->Option<Self> {
+        let mut allowed=[0usize;16];
+        if unsafe {sched_getaffinity(0,std::mem::size_of_val(&allowed),allowed.as_mut_ptr())} !=0 {return None;}
+        let bits=usize::BITS as usize;
+        let cpus:Vec<usize>=(0..allowed.len()*bits).filter(|&c| allowed[c/bits]&(1usize<<(c%bits))!=0).collect();
+        if tasks==0 || cpus.len()<tasks {return None;}
+        Some(Self{cpus})
+    }
+    pub fn pin(&self,worker:usize)->Option<AffinityGuard> {
         let cpu=*self.cpus.get(worker)?;
         let mut old=[0usize;16];
         if unsafe {sched_getaffinity(0,std::mem::size_of_val(&old),old.as_mut_ptr())} !=0 {return None;}
@@ -309,11 +321,12 @@ impl Drop for AffinityGuard {
     fn drop(&mut self) {unsafe {sched_setaffinity(0,std::mem::size_of_val(&self.old),self.old.as_ptr());}}
 }
 #[cfg(not(target_os="linux"))]
-pub(crate) struct CorePlacement;
+pub struct CorePlacement;
 #[cfg(not(target_os="linux"))]
 impl CorePlacement {
-    pub(crate) fn for_workers(_:usize)->Option<Self>{None}
-    pub(crate) fn pin(&self,_:usize)->Option<()>{None}
+    pub fn for_workers(_:usize)->Option<Self>{None}
+    pub fn for_logical(_:usize)->Option<Self>{None}
+    pub fn pin(&self,_:usize)->Option<()>{None}
 }
 
 #[cfg(all(test,target_os="linux"))]

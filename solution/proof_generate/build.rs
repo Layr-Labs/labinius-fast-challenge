@@ -34,7 +34,24 @@ fn main() {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn host_can_run() -> bool {
+    is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vl")
+        && is_x86_feature_detected!("avx512vbmi")
+        && is_x86_feature_detected!("avx512vbmi2")
+        && is_x86_feature_detected!("avx512vnni")
+        && is_x86_feature_detected!("gfni")
+}
+
+#[cfg(target_arch = "x86_64")]
 fn key_image() -> Vec<u8> {
+    // The library's kernels need these features at run time. A build host without them (for
+    // instance a cross-build for the scored CPU) writes an empty image and the prover builds the
+    // key when it runs; the scored runner has every one of them.
+    if !host_can_run() {
+        return Vec::new();
+    }
     let key = keygen::build_key(parameters::MODULUS);
     keygen::key_image(&key)
 }
@@ -46,6 +63,8 @@ fn key_image() -> Vec<u8> {
 
 #[cfg(target_arch="x86_64")]
 fn tail_image()->Vec<u8> {
+ // Same host guard as `key_image`: an empty image makes the prover build the tail key at run time.
+ if !host_can_run() { return Vec::new(); }
  if parameters::MODULUS==modulus_choice::HYBRID_MODULUS {
   keygen::key_image(&keygen::build_tail_key(parameters::MODULUS))
  } else {Vec::new()}

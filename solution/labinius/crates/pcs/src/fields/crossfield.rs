@@ -1270,6 +1270,21 @@ unsafe fn store_p(dst: [*mut u64; 3], j: usize, v: [__m512i; 3]) {
     }
 }
 
+/// [`store_p`] with non-temporal stores: a round whose output is far larger than the cache is
+/// read back from memory in the next round whatever happens, so the read-for-ownership of its
+/// lines is pure traffic. `dst[k] + j` must be 64-byte aligned (the planes are 2 MB-aligned and
+/// `j` is a multiple of 8).
+#[inline(always)]
+unsafe fn stream_p(dst: [*mut u64; 3], j: usize, v: [__m512i; 3]) {
+    for k in 0..3 {
+        _mm512_stream_si512(dst[k].add(j) as *mut __m512i, v[k]);
+    }
+}
+
+/// Fold outputs of at least this many elements (per plane) are written non-temporally: at
+/// 24 bytes per element this is 50 MB, past what stays in the cache between two rounds.
+const STREAM_FROM: usize = 1 << 21;
+
 unsafe fn get_p(src: Src, j: usize) -> F162 {
     match src {
         Src::Words(w) => F162::from_b128(*w.add(j)),
@@ -1402,18 +1417,27 @@ unsafe fn fold_message_range(
     let mut acci = [_mm512_setzero_si512(); 12];
     let mut av = [[_mm512_setzero_si512(); 8]; 3];
     let mut apv = [[_mm512_setzero_si512(); 8]; 3];
+    let stream = hh >= STREAM_FROM;
     for j0 in range.step_by(TILE) {
         map_tile(eq.add(j0), ml, &mut av);
         map_tile(eq.add(j0), mlp, &mut apv);
         for g in 0..8 {
             let j = j0 + 8 * g;
             let q0 = fold8(rb, load_p(src, j), load_p(src, j + half));
-            store_p(dst, j, q0);
             let q1 = fold8(rb, load_p(src, j + hh), load_p(src, j + hh + half));
-            store_p(dst, j + hh, q1);
+            if stream {
+                stream_p(dst, j, q0);
+                stream_p(dst, j + hh, q1);
+            } else {
+                store_p(dst, j, q0);
+                store_p(dst, j + hh, q1);
+            }
             super::f162::mac_soa8(&mut acc0, [av[0][g], av[1][g], av[2][g]], q0);
             super::f162::mac_soa8(&mut acci, [apv[0][g], apv[1][g], apv[2][g]], xor3p(q0, q1));
         }
+    }
+    if stream {
+        _mm_sfence();
     }
     [horiz8(acc0), horiz8(acci)]
 }

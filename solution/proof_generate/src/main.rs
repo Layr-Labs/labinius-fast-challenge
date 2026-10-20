@@ -411,7 +411,12 @@ fn commitment_coefficients_rows(
     let blocks = columns.div_ceil(32);
     let runs = labinius::par::ranges(blocks, workers, 1);
     let out_addr = out.as_mut_ptr() as usize;
+    // One run per logical CPU, placed explicitly for this dispatch and released at its end:
+    // this is the first dispatch after the commitment's per-core placement, and the runner
+    // spread the scheduler produced from there measured the phase at twice its cost.
+    let placement = labinius::par::CorePlacement::for_logical(runs.len());
     labinius::par::pool().run(runs.len(), |r| {
+        let _affinity = placement.as_ref().and_then(|p| p.pin(r));
         let mut residues: Vec<Vec<i16>> = (0..limbs).map(|_| vec![0i16; 32 * N]).collect();
         let mut mixed = vec![0u64; limbs];
         let mut at = vec![0u64; limbs];

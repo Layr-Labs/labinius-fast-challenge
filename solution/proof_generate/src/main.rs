@@ -211,7 +211,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     );
     let pp = PublicParameters::with_key(p.clone(), rq::MATRIX_SEED, key);
     let setup_time = clock.elapsed();
-    let mut prover = Prover::cold(&pp);
+    let mut prover = Prover::cold_without_transform(&pp);
     let w = Witness::lifted(&p, &values).unwrap();
     let witness_time = clock.elapsed();
     let (commitment, opening) = prover.commit(&w);
@@ -247,7 +247,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let point = EvaluationPoint::msb_first(&p, &coords);
     let row = w.row_evaluate(&point);
     let challenges = folding_challenges(&mut t, &row);
-    let folded = prover.fold(opening, &FoldingChallenges::of(challenges));
+    let folded = prover.fold_from_witness(opening, &FoldingChallenges::of(challenges), &w);
     let fold_time = clock.elapsed();
     let proof = Proof {
         version: 1,

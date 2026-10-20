@@ -259,9 +259,12 @@ impl CommitmentKey {
         self.check_witness(witness, r);
         let bpc = self.a[0].len();
         assert!(
-            aux.chunks == r && aux.batches.len() == r * bpc && aux.raw.len() == self.limbs(),
+            aux.chunks == r
+                && (aux.batches.is_empty() || aux.batches.len() == r * bpc)
+                && aux.raw.len() == self.limbs(),
             "the auxiliary buffer does not match this key and r"
         );
+        let keep = !aux.batches.is_empty();
         for v in aux.raw.iter_mut() {
             v.clear();
         }
@@ -272,7 +275,11 @@ impl CommitmentKey {
         let starts: Vec<usize> = (0..r).step_by(g).collect();
         // Each group writes a disjoint slice of `aux.batches` and returns its raw commitments.
         // The address is a usize so the closure is `Send`; the slices do not overlap.
-        let batch_addr = aux.batches.as_mut_ptr() as usize;
+        let batch_addr = if keep {
+            aux.batches.as_mut_ptr() as usize
+        } else {
+            0
+        };
         let stride = std::mem::size_of::<Batch32>();
         let mut groups: Vec<(usize, Vec<[u32; N]>)> = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(starts.len());
@@ -286,16 +293,20 @@ impl CommitmentKey {
                         let c = c0 + i;
                         chunks[i] = &witness[c * len_f162..(c + 1) * len_f162];
                     }
-                    let batches = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (batch_addr + (c0 * bpc) * stride) as *mut Batch32,
-                            g * bpc,
-                        )
+                    let batches = if keep {
+                        Some(unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (batch_addr + (c0 * bpc) * stride) as *mut Batch32,
+                                g * bpc,
+                            )
+                        })
+                    } else {
+                        None
                     };
                     cm::commit_limbs_group(
                         &chunks[..g],
                         limbs,
-                        Some(batches),
+                        batches,
                         &mut st,
                         &mut raw,
                     );
@@ -395,6 +406,18 @@ impl AuxData {
         assert!(r > 0 && len_ring > 0 && len_ring % 32 == 0 && limbs > 0);
         AuxData {
             batches: uninit_batches(r * len_ring / 32),
+            raw: (0..limbs).map(|_| Vec::with_capacity(r)).collect(),
+            chunks: r,
+        }
+    }
+
+    /// An empty buffer for `r` chunks over `limbs` limbs that does not keep the witness
+    /// transform: the commitment skips the non-temporal stores and the fold recomputes the
+    /// base limb's transform from the witness instead of reading it back.
+    pub fn without_transform(r: usize, limbs: usize) -> AuxData {
+        assert!(r > 0 && limbs > 0);
+        AuxData {
+            batches: Vec::new(),
             raw: (0..limbs).map(|_| Vec::with_capacity(r)).collect(),
             chunks: r,
         }

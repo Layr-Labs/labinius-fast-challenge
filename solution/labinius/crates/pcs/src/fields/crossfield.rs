@@ -83,9 +83,43 @@ pub fn eq_expand_b128(r: &[B128]) -> Vec<B128> {
     t
 }
 
+fn worker_count(n: usize) -> usize {
+    if n < 2 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(n)
+}
+
 /// The expansion in place, doubling from the back so no entry is read after it is written.
 pub fn eq_expand_b128_into(r: &[B128], t: &mut [B128]) {
     assert_eq!(t.len(), 1 << r.len());
+    if r.len() >= 16 {
+        let h = r.len() / 2;
+        let hi = eq_expand_b128(&r[..r.len() - h]);
+        let lo = eq_expand_b128(&r[r.len() - h..]);
+        let rows = lo.len();
+        let cols = hi.len();
+        let threads = worker_count(cols);
+        let per = cols.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (k, chunk) in t.chunks_mut(rows * per).enumerate() {
+                let (lo, hi) = (&lo, &hi);
+                scope.spawn(move || {
+                    for (n, row) in chunk.chunks_mut(rows).enumerate() {
+                        let h = hi[k * per + n];
+                        for (out, &l) in row.iter_mut().zip(lo.iter()) {
+                            *out = l * h;
+                        }
+                    }
+                });
+            }
+        });
+        return;
+    }
     t[0] = B128::ONE;
     for (round, &ri) in r.iter().enumerate() {
         for i in (0..1 << round).rev() {
@@ -144,18 +178,20 @@ const TILE: usize = 64;
 /// `v[k] = sum_j bit_k(pi0[j]) eq_hi[j]`, a `128 x n` by `n x 128` bit product: per tile the
 /// bit-transposed bytes of `pi0` are the matrices, those of `eq_hi` the vectors, and
 /// `acc[h][kb].qword[i].byte[t].bit[k']` sums `V[8kb + 7 - k'][8(8h + i) + t]`.
-fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
-    assert_eq!(pi0.len(), eq_hi.len());
-    let n = pi0.len();
-    let tiles = n / TILE;
-    let mut v = vec![B128::ZERO; PACK];
+fn partial_evals_tiles(
+    pi0: &[B128],
+    eq_hi: &[B128],
+    first: usize,
+    last: usize,
+    v: &mut [B128; PACK],
+) {
     unsafe {
         let ident = _mm512_set1_epi64(GF_IDENT);
         let mut acc = [[_mm512_setzero_si512(); 16]; 2];
         let mut xe = [_mm512_setzero_si512(); 16];
         let mut xp = [_mm512_setzero_si512(); 16];
         let mut ap = [[0u64; 8]; 16];
-        for t in 0..tiles {
+        for t in first..last {
             transpose_tile(eq_hi.as_ptr().add(TILE * t) as *const u8, &mut xe);
             transpose_tile(pi0.as_ptr().add(TILE * t) as *const u8, &mut xp);
             for k in 0..16 {
@@ -191,14 +227,48 @@ fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
             }
         }
     }
+}
+
+fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
+    assert_eq!(pi0.len(), eq_hi.len());
+    let n = pi0.len();
+    let tiles = n / TILE;
+    let mut v = [B128::ZERO; PACK];
+    let threads = worker_count(tiles);
+    let per = tiles.div_ceil(threads);
+    if threads > 1 && per > 0 {
+        let mut parts = Vec::with_capacity(threads);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for first in (0..tiles).step_by(per) {
+                let last = (first + per).min(tiles);
+                handles.push(scope.spawn(move || {
+                    let mut part = [B128::ZERO; PACK];
+                    partial_evals_tiles(pi0, eq_hi, first, last, &mut part);
+                    part
+                }));
+            }
+            for handle in handles {
+                parts.push(handle.join().unwrap());
+            }
+        });
+        for part in parts {
+            for (a, b) in v.iter_mut().zip(part) {
+                *a = *a + b;
+            }
+        }
+    } else {
+        partial_evals_tiles(pi0, eq_hi, 0, tiles, &mut v);
+    }
+    let mut out = v.to_vec();
     for (&p, &e) in pi0[TILE * tiles..].iter().zip(&eq_hi[TILE * tiles..]) {
-        for (k, vk) in v.iter_mut().enumerate() {
+        for (k, vk) in out.iter_mut().enumerate() {
             if p.bit(k) {
                 *vk = *vk + e;
             }
         }
     }
-    v
+    out
 }
 
 /// The eight `B128` at `x` as their low words and their high words.
@@ -214,6 +284,20 @@ unsafe fn split_words(x: *const B128) -> (__m512i, __m512i) {
     )
 }
 
+unsafe fn poly_from_b128_blocks(
+    pi0: &[B128],
+    first: usize,
+    last: usize,
+    w0: *mut u64,
+    w1: *mut u64,
+) {
+    for b in first..last {
+        let (lo, hi) = split_words(pi0.as_ptr().add(8 * b));
+        _mm512_storeu_si512(w0.add(8 * b) as *mut __m512i, lo);
+        _mm512_storeu_si512(w1.add(8 * b) as *mut __m512i, hi);
+    }
+}
+
 /// `pi0` in the sumcheck's layout: the bits of a `B128` are the low coefficients of an `F162`.
 fn poly_from_b128(pi0: &[B128], out: &mut super::sumcheck::Poly) {
     let n = pi0.len();
@@ -221,12 +305,21 @@ fn poly_from_b128(pi0: &[B128], out: &mut super::sumcheck::Poly) {
     let w = &mut out.w;
     w[2].fill(0);
     let blocks = n / 8;
-    unsafe {
-        for b in 0..blocks {
-            let (lo, hi) = split_words(pi0.as_ptr().add(8 * b));
-            _mm512_storeu_si512(w[0].as_mut_ptr().add(8 * b) as *mut __m512i, lo);
-            _mm512_storeu_si512(w[1].as_mut_ptr().add(8 * b) as *mut __m512i, hi);
-        }
+    let threads = worker_count(blocks);
+    let per = blocks.div_ceil(threads);
+    if threads > 1 && per > 0 {
+        let w0 = w[0].as_mut_ptr() as usize;
+        let w1 = w[1].as_mut_ptr() as usize;
+        std::thread::scope(|scope| {
+            for first in (0..blocks).step_by(per) {
+                let last = (first + per).min(blocks);
+                scope.spawn(move || unsafe {
+                    poly_from_b128_blocks(pi0, first, last, w0 as *mut u64, w1 as *mut u64);
+                });
+            }
+        });
+    } else {
+        unsafe { poly_from_b128_blocks(pi0, 0, blocks, w[0].as_mut_ptr(), w[1].as_mut_ptr()) };
     }
     for j in 8 * blocks..n {
         w[0][j] = pi0[j].0 as u64;
@@ -254,34 +347,80 @@ fn eq_matrices(batch: &[F162]) -> [[u64; 16]; 24] {
 
 /// `a[j] = sum_i sum_k bit_k(eq[i][j]) batch[i][k]`, straight into the sumcheck's layout: per
 /// tile the byte planes of `eq` through [`eq_matrices`], and the 24 output planes back to qwords.
+unsafe fn poly_from_eq_tiles(
+    eqs: &[&[B128]],
+    ms: &[[[u64; 16]; 24]],
+    first: usize,
+    last: usize,
+    w: [*mut u64; 3],
+) {
+    let mut xe = [_mm512_setzero_si512(); 16];
+    for t in first..last {
+        let mut acc = [_mm512_setzero_si512(); 24];
+        for (eq, m) in eqs.iter().zip(ms) {
+            transpose_tile(eq.as_ptr().add(TILE * t) as *const u8, &mut xe);
+            for (a, row) in acc.iter_mut().zip(m) {
+                for k in (0..16).step_by(2) {
+                    *a = xor3(
+                        *a,
+                        affine(xe[k], _mm512_set1_epi64(row[k] as i64)),
+                        affine(xe[k + 1], _mm512_set1_epi64(row[k + 1] as i64)),
+                    );
+                }
+            }
+        }
+        for l in 0..3 {
+            let out = untranspose_planes(core::array::from_fn(|c| acc[8 * l + c]));
+            let wl = *w.get_unchecked(l);
+            for (g, o) in out.iter().enumerate() {
+                _mm512_storeu_si512(wl.add(TILE * t + 8 * g) as *mut __m512i, *o);
+            }
+        }
+    }
+}
+
 fn poly_from_eq(eqs: &[&[B128]], batches: &[Vec<F162>], out: &mut super::sumcheck::Poly) {
     let n = eqs[0].len();
     assert_eq!(out.n, n);
     let w = &mut out.w;
     let tiles = n / TILE;
     let ms: Vec<[[u64; 16]; 24]> = batches.iter().map(|b| eq_matrices(b)).collect();
-    unsafe {
-        let mut xe = [_mm512_setzero_si512(); 16];
-        for t in 0..tiles {
-            let mut acc = [_mm512_setzero_si512(); 24];
-            for (eq, m) in eqs.iter().zip(&ms) {
-                transpose_tile(eq.as_ptr().add(TILE * t) as *const u8, &mut xe);
-                for (a, row) in acc.iter_mut().zip(m) {
-                    for k in (0..16).step_by(2) {
-                        *a = xor3(
-                            *a,
-                            affine(xe[k], _mm512_set1_epi64(row[k] as i64)),
-                            affine(xe[k + 1], _mm512_set1_epi64(row[k + 1] as i64)),
-                        );
-                    }
-                }
+    let threads = worker_count(tiles);
+    let per = tiles.div_ceil(threads);
+    if threads > 1 && per > 0 {
+        let ptrs = [
+            w[0].as_mut_ptr() as usize,
+            w[1].as_mut_ptr() as usize,
+            w[2].as_mut_ptr() as usize,
+        ];
+        std::thread::scope(|scope| {
+            for first in (0..tiles).step_by(per) {
+                let last = (first + per).min(tiles);
+                let ms = &ms;
+                scope.spawn(move || unsafe {
+                    poly_from_eq_tiles(
+                        eqs,
+                        ms,
+                        first,
+                        last,
+                        [
+                            ptrs[0] as *mut u64,
+                            ptrs[1] as *mut u64,
+                            ptrs[2] as *mut u64,
+                        ],
+                    );
+                });
             }
-            for (l, wl) in w.iter_mut().enumerate() {
-                let out = untranspose_planes(core::array::from_fn(|c| acc[8 * l + c]));
-                for (g, o) in out.iter().enumerate() {
-                    _mm512_storeu_si512(wl.as_mut_ptr().add(TILE * t + 8 * g) as *mut __m512i, *o);
-                }
-            }
+        });
+    } else {
+        unsafe {
+            poly_from_eq_tiles(
+                eqs,
+                &ms,
+                0,
+                tiles,
+                [w[0].as_mut_ptr(), w[1].as_mut_ptr(), w[2].as_mut_ptr()],
+            );
         }
     }
     if TILE * tiles < n {

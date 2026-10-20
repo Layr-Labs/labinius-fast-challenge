@@ -40,7 +40,7 @@
 //! pairs inside the loop ([`load_soa8`]).
 use crate::challenge::ShortChallenge;
 use crate::fields::f162 as bf;
-use crate::fields::scalar::F162;
+use crate::fields::scalar::{B128, F162};
 use crate::fields::sumcheck::Poly;
 use crate::params::N;
 use crate::ring::RingElement;
@@ -162,6 +162,83 @@ fn dot_slices(a: &[F162], b: &[F162]) -> F162 {
     unsafe { dot(&Poly::from_scalars(a), b.as_ptr(), b.len()) }
 }
 
+/// 8 consecutive GHASH words as the word-sliced `[low qwords, high qwords, 0]` an `F162` run
+/// takes: a word's two qwords are the element's first two limbs and the third limb is zero.
+#[inline(always)]
+unsafe fn load_soa8_words(p: *const B128) -> [__m512i; 3] {
+    let a = _mm512_loadu_si512(p as *const __m512i);
+    let b = _mm512_loadu_si512(p.add(4) as *const __m512i);
+    let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+    let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+    [
+        _mm512_permutex2var_epi64(a, lo, b),
+        _mm512_permutex2var_epi64(a, hi, b),
+        _mm512_setzero_si512(),
+    ]
+}
+
+/// [`dot`] with the second operand in the harness's word layout.
+unsafe fn dot_words(a: &Poly, b: *const B128, n: usize) -> F162 {
+    debug_assert!(a.n >= n);
+    let (mut acc, blocks) = ([_mm512_setzero_si512(); 12], n / 8);
+    for t in 0..blocks {
+        let x = [
+            _mm512_loadu_si512(a.w[0].as_ptr().add(8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
+        ];
+        bf::mac_soa8(&mut acc, x, load_soa8_words(b.add(8 * t)));
+    }
+    let mut out = if blocks > 0 {
+        horizontal(acc)
+    } else {
+        F162::ZERO
+    };
+    for k in 8 * blocks..n {
+        out += a.get(k) * F162::from_b128(*b.add(k));
+    }
+    out
+}
+
+/// `u_j = sum_i eq(p0, i) W[i + wdim j]` over the harness's words, one dot product per column.
+pub fn row_evaluate_words(witness: &[B128], p0: &[F162]) -> Vec<F162> {
+    let wdim = 1usize << p0.len();
+    assert_eq!(
+        witness.len() % wdim,
+        0,
+        "the witness is not a whole number of columns of {wdim}"
+    );
+    let eq = Poly::from_scalars(&eq_table(p0));
+    let columns = witness.len() / wdim;
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(columns.max(1));
+    let per = columns.div_ceil(threads);
+    let mut out = vec![F162::ZERO; columns];
+    if threads > 1 && per > 0 {
+        let base = witness.as_ptr() as usize;
+        let eq = &eq;
+        std::thread::scope(|scope| {
+            for (t, chunk) in out.chunks_mut(per).enumerate() {
+                let start = t * per;
+                scope.spawn(move || {
+                    for (i, slot) in chunk.iter_mut().enumerate() {
+                        let j = start + i;
+                        *slot = unsafe { dot_words(eq, (base as *const B128).add(j * wdim), wdim) };
+                    }
+                });
+            }
+        });
+    } else {
+        for (j, slot) in out.iter_mut().enumerate() {
+            *slot = unsafe { dot_words(&eq, witness.as_ptr().add(j * wdim), wdim) };
+        }
+    }
+    out
+}
+
 // =============================================================================================
 // the four steps
 // =============================================================================================
@@ -176,9 +253,34 @@ pub(crate) fn row_evaluate(witness: &[F162], p0: &[F162]) -> Vec<F162> {
         "the witness is not a whole number of columns of {wdim}"
     );
     let eq = Poly::from_scalars(&eq_table(p0));
-    (0..witness.len() / wdim)
-        .map(|j| unsafe { dot(&eq, witness.as_ptr().add(j * wdim), wdim) })
-        .collect()
+    let columns = witness.len() / wdim;
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(columns.max(1));
+    let per = columns.div_ceil(threads);
+    let mut out = vec![F162::ZERO; columns];
+    if threads > 1 && per > 0 {
+        let base = witness.as_ptr() as usize;
+        let eq = &eq;
+        std::thread::scope(|scope| {
+            for (t, chunk) in out.chunks_mut(per).enumerate() {
+                let start = t * per;
+                scope.spawn(move || {
+                    for (i, slot) in chunk.iter_mut().enumerate() {
+                        let j = start + i;
+                        *slot = unsafe { dot(eq, (base as *const F162).add(j * wdim), wdim) };
+                    }
+                });
+            }
+        });
+    } else {
+        for (j, slot) in out.iter_mut().enumerate() {
+            *slot = unsafe { dot(&eq, witness.as_ptr().add(j * wdim), wdim) };
+        }
+    }
+    out
 }
 
 /// `u^T eq(p1)`, the claim a row evaluation `u` implies.
@@ -246,82 +348,4 @@ unsafe fn element_mod_2(e: &[i16; N], out: &mut [F162]) {
 /// The binary check `B v == u^T c` over `F`: `sum_i eq(p0, i) (v_i mod 2) == u_folded`.
 pub(crate) fn binary_check(p0: &[F162], v: &[RingElement], u_folded: F162) -> bool {
     4 * v.len() == 1usize << p0.len() && dot_slices(&eq_table(p0), &components_mod_2(v)) == u_folded
-}
-
-// =============================================================================================
-// the row evaluation straight from the words
-// =============================================================================================
-
-/// The eight `B128` at `x` as the word-sliced `[limb0, limb1, 0]` of their lifts.
-///
-/// # Safety
-/// `x` addresses 8 readable `B128`.
-#[inline(always)]
-unsafe fn load_soa8_words(x: *const F162Word) -> [__m512i; 3] {
-    let a = _mm512_loadu_si512(x as *const __m512i);
-    let b = _mm512_loadu_si512(x.add(4) as *const __m512i);
-    let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
-    let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
-    [
-        _mm512_permutex2var_epi64(a, lo, b),
-        _mm512_permutex2var_epi64(a, hi, b),
-        _mm512_setzero_si512(),
-    ]
-}
-
-type F162Word = crate::fields::scalar::B128;
-
-/// [`dot`] against a run of `n` `B128` words read as their lifts.
-///
-/// # Safety
-/// `b` addresses `n` words and `a` holds at least `n` elements.
-unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
-    debug_assert!(a.n >= n);
-    let (mut acc, blocks) = ([_mm512_setzero_si512(); 12], n / 8);
-    for t in 0..blocks {
-        let x = [
-            _mm512_loadu_si512(a.w[0].as_ptr().add(8 * t) as *const __m512i),
-            _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
-            _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
-        ];
-        bf::mac_soa8(&mut acc, x, load_soa8_words(b.add(8 * t)));
-    }
-    let mut out = if blocks > 0 {
-        horizontal(acc)
-    } else {
-        F162::ZERO
-    };
-    for k in 8 * blocks..n {
-        out += a.get(k) * F162::from_b128(*b.add(k));
-    }
-    out
-}
-
-/// [`row_evaluate`] of the witness `Witness::lifted` would build from `words`, read in place
-/// and one column per task over `workers` threads: `u_j = sum_i eq(p0, i) lift(words[i + wdim j])`.
-pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Vec<F162> {
-    let wdim = 1usize << p0.len();
-    assert_eq!(
-        words.len() % wdim,
-        0,
-        "the words are not a whole number of columns of {wdim}"
-    );
-    let columns = words.len() / wdim;
-    let eq = Poly::from_scalars(&eq_table(p0));
-    let mut out = vec![F162::ZERO; columns];
-    let runs = crate::par::ranges(columns, workers, 1);
-    std::thread::scope(|scope| {
-        let mut rest: &mut [F162] = &mut out;
-        for run in runs {
-            let (mine, tail) = rest.split_at_mut(run.len());
-            rest = tail;
-            let eq = &eq;
-            scope.spawn(move || {
-                for (slot, j) in mine.iter_mut().zip(run) {
-                    *slot = unsafe { dot_words(eq, words.as_ptr().add(j * wdim), wdim) };
-                }
-            });
-        }
-    });
-    out
 }

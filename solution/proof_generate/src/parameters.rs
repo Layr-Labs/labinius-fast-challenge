@@ -10,8 +10,8 @@ pub const COLUMNS: usize = 1 << COLUMN_LOG;
 pub const COLUMN_LEN: usize = 1 << (LOG_PACKED - COLUMN_LOG as usize);
 /// Ring elements of one column: four `F162` make one element of `R_648`.
 pub const RING_ELEMENTS: usize = COLUMN_LEN / 4;
-/// Selected by a measured sweep of supported triples. The two fully splitting
-/// small limbs 3889 and 9721 use the fast binary kernels; 2917 is quadratic.
-/// Their product clears the verifier security threshold and still uses five
-/// bytes per commitment coefficient.
-pub const MODULUS: u128 = 110_277_094_573;
+/// The product of three limbs, the minimum the checker's minimum-modulus threshold accepts: no
+/// pair of the supported primes reaches 2^35. This is the cheapest passing triple, 3889 * 2917 *
+/// 4861 at about 101.9 bits. 3889 is a fully splitting base, so the fold stays on
+/// `ntt::bin_asm`; 2917 and 4861 are the quadratic extra limbs.
+pub const MODULUS: u128 = 55_144_219_393;

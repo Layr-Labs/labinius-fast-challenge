@@ -43,11 +43,37 @@ impl Witness {
     }
 
     pub fn lifted(params: &Params, trace: &[B128]) -> Result<Witness, WitnessError> {
+        if trace.len() != params.witness_len() {
+            return Err(WitnessError::WrongLength);
+        }
+        let n = params.witness_len();
+        let mut elements: Vec<F162> = Vec::with_capacity(n);
+        unsafe { elements.set_len(n) };
         let mut w = Witness {
             params: params.clone(),
-            elements: vec![F162::ZERO; params.witness_len()],
+            elements,
         };
-        w.relift(trace)?;
+        let threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1)
+            .clamp(1, 8)
+            .min(trace.len().max(1));
+        let per = trace.len().div_ceil(threads);
+        let base = w.elements.as_mut_ptr() as usize;
+        let stride = core::mem::size_of::<F162>();
+        std::thread::scope(|scope| {
+            for (t, chunk) in trace.chunks(per).enumerate() {
+                let at = base + t * per * stride;
+                scope.spawn(move || {
+                    let out = unsafe {
+                        core::slice::from_raw_parts_mut(at as *mut F162, chunk.len())
+                    };
+                    for (e, &x) in out.iter_mut().zip(chunk) {
+                        *e = F162::from_b128(x);
+                    }
+                });
+            }
+        });
         Ok(w)
     }
 

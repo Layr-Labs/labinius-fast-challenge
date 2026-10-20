@@ -565,14 +565,17 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let recombine_time = clock.elapsed();
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
-    let partials = unsafe { cf::eq_expand_and_partials(&hi, values, eq.as_mut_ptr(), workers) };
-    let eq_words: &[B128] = unsafe { eq.as_slice() };
+    let eq_len = unsafe { cf::eq_expand_prefix_parallel(&hi, eq.as_mut_ptr(), workers) };
+    let eq: &[B128] = unsafe { std::slice::from_raw_parts(eq.as_ptr(), eq_len) };
+    let (partials, prefix) = cf::partial_evals_prefix_parallel(values, eq, &hi, workers);
     let value = claim(&partials, &lo);
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let partials_time = clock.elapsed();
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let (rounds, coords, opened) = match cf::LeanSwitch::new(values, eq_words, &hi, &batch, workers, planes) {
+    let (rounds, coords, opened) = match cf::LeanSwitch::with_prefix_partials(
+        values, eq, &hi, &batch, workers, planes, prefix,
+    ) {
         Some(mut sw) => switch_rounds(&mut sw, &mut t),
         None => {
             // A coordinate of the point is one: the baseline's prover, whose workspace holds

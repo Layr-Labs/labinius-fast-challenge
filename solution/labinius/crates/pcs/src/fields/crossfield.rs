@@ -793,6 +793,46 @@ impl<T> Drop for HugeBuf<T> {
 // the expansion on several threads
 // =============================================================================================
 
+/// Two independent little-endian GHASH products per register; the multiplier is
+/// constant across a tensor row. No byte reflection: bit i is the coefficient of x^i.
+///
+/// Safety: detect AVX2/VPCLMULQDQ; out must hold lo.len() writable, disjoint
+/// B128 slots. Raw stores permit the caller's uninitialized HugeBuf storage.
+#[target_feature(enable = "avx2,vpclmulqdq")]
+unsafe fn tensor_row_b128_vpclmul(lo: &[B128], h: B128, out: *mut B128) {
+    let b = _mm256_broadcastsi128_si256(_mm_set_epi64x((h.0 >> 64) as i64, h.0 as i64));
+    let bx = _mm256_xor_si256(b, _mm256_shuffle_epi32::<0x4e>(b));
+    let modulus = _mm256_set_epi64x(0, 0x87, 0, 0x87);
+    let pairs = lo.len() / 2;
+    for i in 0..pairs {
+        // All byte shifts below are confined to each 128-bit lane.
+        let a = _mm256_loadu_si256(lo.as_ptr().add(2 * i) as *const __m256i);
+        let low = _mm256_clmulepi64_epi128::<0x00>(a, b);
+        let high = _mm256_clmulepi64_epi128::<0x11>(a, b);
+        let ax = _mm256_xor_si256(a, _mm256_shuffle_epi32::<0x4e>(a));
+        let mid = _mm256_xor_si256(
+            _mm256_clmulepi64_epi128::<0x00>(ax, bx),
+            _mm256_xor_si256(low, high),
+        );
+        let p_lo = _mm256_xor_si256(low, _mm256_slli_si256::<8>(mid));
+        let p_hi = _mm256_xor_si256(high, _mm256_srli_si256::<8>(mid));
+        // x^128 = x^7 + x^2 + x + 1. The first fold can overflow
+        // by at most seven bits; the second fold cannot overflow.
+        let fold_lo = _mm256_clmulepi64_epi128::<0x00>(p_hi, modulus);
+        let fold_hi = _mm256_clmulepi64_epi128::<0x01>(p_hi, modulus);
+        let carry = _mm256_clmulepi64_epi128::<0x00>(_mm256_srli_si256::<8>(fold_hi), modulus);
+        let reduced = _mm256_xor_si256(
+            _mm256_xor_si256(p_lo, fold_lo),
+            _mm256_xor_si256(_mm256_slli_si256::<8>(fold_hi), carry),
+        );
+        _mm256_storeu_si256(out.add(2 * i) as *mut __m256i, reduced);
+    }
+    // Tensor rows are even today, but keep the helper valid for arbitrary slices.
+    if lo.len() % 2 != 0 {
+        out.add(2 * pairs).write(lo[2 * pairs] * h);
+    }
+}
+
 /// [`eq_expand_b128_into`] on up to `threads` threads, into the `2^r.len()` words at `out`.
 ///
 /// The serial doubling appends the newest coordinate in the lowest bit of the index, so entry
@@ -814,6 +854,8 @@ pub unsafe fn eq_expand_b128_parallel(r: &[B128], out: *mut B128, threads: usize
     let high = eq_expand_b128(&r[..n - h]);
     let low = eq_expand_b128(&r[n - h..]);
     let runs = crate::par::ranges(high.len(), threads, 1);
+    let use_vpclmul = std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("vpclmulqdq");
     let out = out as usize;
     std::thread::scope(|scope| {
         for run in runs {
@@ -823,8 +865,13 @@ pub unsafe fn eq_expand_b128_parallel(r: &[B128], out: *mut B128, threads: usize
                 for jh in run {
                     let hv = high[jh];
                     let base = unsafe { out.add(jh << h) };
-                    for (jl, &lv) in low.iter().enumerate() {
-                        unsafe { base.add(jl).write(hv * lv) };
+                    if use_vpclmul {
+                        // Each task owns its row; the raw destination may be uninitialized.
+                        unsafe { tensor_row_b128_vpclmul(low, hv, base) };
+                    } else {
+                        for (jl, &lv) in low.iter().enumerate() {
+                            unsafe { base.add(jl).write(hv * lv) };
+                        }
                     }
                 }
             });
@@ -1327,6 +1374,142 @@ unsafe impl Sync for Src {}
 /// [`Poly`] is referenced for the fallback path's type; keep the import live.
 #[allow(dead_code)]
 fn _poly_type_marker(_: &Poly) {}
+
+#[cfg(test)]
+mod tensor_row_tests {
+    use super::*;
+
+    fn next(x: &mut u128) -> B128 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        B128(*x)
+    }
+
+    // Independent polynomial shift-and-add reference, not CLMUL reduction.
+    fn portable_mul(mut a: u128, mut b: u128) -> B128 {
+        let mut out = 0;
+        for _ in 0..128 {
+            if b & 1 != 0 {
+                out ^= a;
+            }
+            let carry = a >> 127;
+            a <<= 1;
+            if carry != 0 {
+                a ^= 0x87;
+            }
+            b >>= 1;
+        }
+        B128(out)
+    }
+
+    fn simd_available() -> bool {
+        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("vpclmulqdq")
+    }
+
+    fn check_row(lo: &[B128], h: B128) {
+        let expected: Vec<_> = lo.iter().map(|l| portable_mul(l.0, h.0)).collect();
+        let scalar: Vec<_> = lo.iter().map(|&l| l * h).collect();
+        assert_eq!(scalar, expected, "scalar reference mismatch for {h:?}");
+        if simd_available() {
+            // Start one B128 into the allocation, so a 32-byte-aligned base
+            // exercises the unaligned loads/stores too. Sentinels catch overwrites.
+            let guard = B128(0x1234_5678_9abc_def0_fedc_ba98_7654_3210);
+            let mut input = vec![guard; lo.len() + 2];
+            input[1..lo.len() + 1].copy_from_slice(lo);
+            let mut out = vec![guard; lo.len() + 2];
+            unsafe {
+                tensor_row_b128_vpclmul(&input[1..lo.len() + 1], h, out.as_mut_ptr().add(1));
+            }
+            assert_eq!(&out[1..lo.len() + 1], expected.as_slice(), "h={h:?}");
+            assert_eq!((out[0], out[lo.len() + 1]), (guard, guard));
+            assert_eq!(&input[1..lo.len() + 1], lo);
+        }
+    }
+
+    #[test]
+    fn tensor_row_b128_products_and_tails() {
+        if !std::is_x86_feature_detected!("pclmulqdq") {
+            eprintln!("skipped: existing B128 scalar multiplication requires PCLMULQDQ");
+            return;
+        }
+        eprintln!("tensor-row SIMD available: {}", simd_available());
+        let mut special = vec![
+            B128::ZERO,
+            B128::ONE,
+            B128(u128::MAX),
+            B128(0xaaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa_aaaa),
+            B128(0x5555_5555_5555_5555_5555_5555_5555_5555),
+            B128(u64::MAX as u128),
+            B128((u64::MAX as u128) << 64),
+        ];
+        special.extend((0..128).map(|i| B128(1u128 << i)));
+        // Different values in adjacent lanes expose lane mixing and half swaps.
+        for &h in &special {
+            check_row(&special, h);
+        }
+        let mut seed = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+        for n in [
+            0, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 256, 257,
+        ] {
+            for _ in 0..16 {
+                let h = next(&mut seed);
+                let lo: Vec<_> = (0..n).map(|_| next(&mut seed)).collect();
+                check_row(&lo, h);
+            }
+        }
+    }
+
+    fn scalar_expand(r: &[B128]) -> Vec<B128> {
+        let mut out = vec![B128::ONE];
+        for &ri in r {
+            out = out
+                .iter()
+                .flat_map(|&x| {
+                    let hi = x * ri;
+                    [x + hi, hi]
+                })
+                .collect();
+        }
+        out
+    }
+
+    #[test]
+    fn tensor_row_b128_full_expansions() {
+        if !std::is_x86_feature_detected!("pclmulqdq") {
+            eprintln!("skipped: existing B128 scalar multiplication requires PCLMULQDQ");
+            return;
+        }
+        let mut seed = 0x243f_6a88_85a3_08d3_1319_8a2e_0370_7344;
+        // Cover the scalar cutoff and even/odd tensor splits. Reference is the
+        // original ordered doubling expansion, independent of tensor indexing.
+        for n in [0, 1, 2, 7, 14, 15, 16, 17, 18, 20] {
+            for mode in 0..4 {
+                let r: Vec<_> = (0..n)
+                    .map(|i| match mode {
+                        0 => next(&mut seed),
+                        1 => B128::ZERO,
+                        2 => B128::ONE,
+                        _ => B128(if i % 2 == 0 {
+                            u128::MAX
+                        } else {
+                            1u128 << (i % 128)
+                        }),
+                    })
+                    .collect();
+                let expected = scalar_expand(&r);
+                let mut actual = vec![B128(u128::MAX); 1 << n];
+                unsafe { eq_expand_b128_parallel(&r, actual.as_mut_ptr(), 8) };
+                assert_eq!(actual, expected, "n={n}, mode={mode}");
+                // Reuse a dirty buffer; no entry may depend on its old contents.
+                actual.fill(B128(0xdead_beef));
+                unsafe { eq_expand_b128_parallel(&r, actual.as_mut_ptr(), 8) };
+                assert_eq!(actual, expected, "reuse n={n}, mode={mode}");
+                assert_eq!(actual.iter().fold(B128::ZERO, |a, &b| a + b), B128::ONE);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod lean_tests {

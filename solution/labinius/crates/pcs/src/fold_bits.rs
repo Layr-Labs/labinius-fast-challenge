@@ -363,6 +363,12 @@ impl<L: Lanes> Pending<L> {
         }
     }
 
+    /// Empty again: only the counts matter, the slots are read only up to them.
+    #[inline(always)]
+    fn reset(&mut self) {
+        self.count = [0; COUNTER_PLANES];
+    }
+
     /// Add `x` at weight `2^w`.
     #[inline(always)]
     fn push(&mut self, mut x: L, mut w: usize) {
@@ -474,6 +480,8 @@ impl<L: Lanes> Hs<L> {
 struct Terms {
     position: [u8; 32],
     negative: [u8; 32],
+    /// `negative_prefix[k]`: negative terms among the first `k`.
+    negative_prefix: [u32; 33],
 }
 
 impl Terms {
@@ -481,6 +489,7 @@ impl Terms {
         let mut t = Terms {
             position: [0; 32],
             negative: [0; 32],
+            negative_prefix: [0; 33],
         };
         for i in 0..c.weight {
             let p = c.positions[i];
@@ -490,6 +499,9 @@ impl Terms {
             }
             t.position[i] = p;
             t.negative[i] = (((c.signs >> i) & 1 == 1) ^ (p % 2 == 1)) as u8;
+        }
+        for k in 0..32 {
+            t.negative_prefix[k + 1] = t.negative_prefix[k] + t.negative[k] as u32;
         }
         t
     }
@@ -548,6 +560,7 @@ impl Reach {
             lo_hi,
         }
     }
+    #[allow(dead_code)]
     #[inline(always)]
     fn of_row(&self, j: usize, e: usize) -> (usize, usize) {
         let r = self.lo_hi[j * ROWS + e];
@@ -611,12 +624,15 @@ pub unsafe fn fold_block<L: Lanes, T: Transposer>(
     // `e` planes further on (`e - p_t` is the plane index).
     let mut planes: Vec<[L; 2 * WORD_BITS]> = (0..BATCH).map(|_| [L::zero(); 2 * WORD_BITS]).collect();
     let mut base = [[core::ptr::null::<L>(); 32]; BATCH];
-    let mut negs = [0u32; BATCH];
+    let mut reach_at = [core::ptr::null::<[u8; 2]>(); BATCH];
     let mut list = [core::ptr::null::<L>(); 2 * BATCH * 32];
-    let zero = L::zero();
     let zeros = [L::zero(); 16];
+    let mut pending = Pending::<L>::new();
     for batch_start in (0..columns).step_by(BATCH) {
         let batch = BATCH.min(columns - batch_start);
+        for (i, at) in reach_at[..batch].iter_mut().enumerate() {
+            *at = reach.lo_hi.as_ptr().add((batch_start + i) * ROWS);
+        }
         for i in 0..batch {
             let column = batch_start + i;
             let plane: &mut [L; 2 * WORD_BITS] = &mut planes[i];
@@ -635,26 +651,30 @@ pub unsafe fn fold_block<L: Lanes, T: Transposer>(
                 let offset = t.negative[k] as usize * WORD_BITS;
                 base[i][k] = first.wrapping_add(offset).wrapping_sub(t.position[k] as usize);
             }
-            negs[i] = (0..32).map(|k| t.negative[k] as u32).sum::<u32>();
-            let _ = negs;
         }
         for e in 0..ROWS {
-            // The planes reaching row `e`, listed.
+            // The planes reaching row `e`, listed: per column the run `lo .. hi` of its terms,
+            // each term's row-0 plane address plus `e` planes.
             let mut n = 0usize;
             let mut negative = 0u32;
+            let row_bytes = e * core::mem::size_of::<L>();
             for i in 0..batch {
-                let j = batch_start + i;
-                let (lo, hi) = reach.of_row(j, e);
-                let t = &terms[j];
-                let b = &base[i];
+                let r = *reach_at.get_unchecked(i).add(e);
+                let (lo, hi) = (r[0] as usize, r[1] as usize);
+                if lo >= hi {
+                    continue;
+                }
+                let t = terms.get_unchecked(batch_start + i);
+                negative += *t.negative_prefix.get_unchecked(hi) - *t.negative_prefix.get_unchecked(lo);
+                let b = base.get_unchecked(i);
                 for k in lo..hi {
-                    *list.get_unchecked_mut(n) = b.get_unchecked(k).wrapping_add(e);
-                    negative += *t.negative.get_unchecked(k) as u32;
+                    let p = (*b.get_unchecked(k) as *const u8).wrapping_add(row_bytes) as *const L;
+                    *list.get_unchecked_mut(n) = p;
                     n += 1;
                 }
             }
             let mut hs = Hs::<L>::new();
-            let mut pending = Pending::<L>::new();
+            pending.reset();
             let mut at = 0usize;
             while at + 16 <= n {
                 let x: [L; 16] = core::array::from_fn(|i| **list.get_unchecked(at + i));
@@ -668,7 +688,6 @@ pub unsafe fn fold_block<L: Lanes, T: Transposer>(
                 }
                 pending.push(hs.add16(&x), 4);
             }
-            let _ = zero;
             pending.push(hs.ones, 0);
             pending.push(hs.twos, 1);
             pending.push(hs.fours, 2);

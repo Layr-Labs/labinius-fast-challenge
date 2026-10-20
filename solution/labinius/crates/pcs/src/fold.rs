@@ -1113,18 +1113,35 @@ pub struct Gfni {
     /// `plane[q]` is produced at raw index `perm[q]`.
     perm: [u8; fb::WORD_BITS],
     /// The word lane `l` carries.
-    map: fn(usize) -> usize,
+    map: LaneMap,
+}
+
+enum LaneMap {
+    Fixed(fn(usize) -> usize),
+    Table(Box<[u16; fb::LANES]>),
 }
 
 impl Gfni {
-    /// A transposer validated against the portable one on `sample` (512 words), under each
-    /// candidate lane order: `None` when no lane order and permutation of its raw planes
-    /// reproduces the portable planes.
+    /// A transposer validated against the portable one on `sample` (512 words): first by
+    /// reading each lane's 128-bit column off the raw planes and finding the word it is (any
+    /// lane order, natural plane order), then under each candidate lane order with a
+    /// permutation of the planes. `None` when nothing reproduces the words.
     pub fn validated(sample: &[u128]) -> Option<Gfni> {
         assert!(sample.len() >= fb::LANES);
         let mut raw = [fb::V::zero(); fb::WORD_BITS];
         unsafe { gfni_raw_planes(sample.as_ptr(), &mut raw) };
         let raw_words: Vec<[u64; 8]> = raw.iter().map(|v| v.words()).collect();
+        // Lane order from the sample itself: lane `l`'s column, planes read as bits 0..128.
+        if let Some(table) = lane_table(&raw_words, &sample[..fb::LANES]) {
+            let mut perm = [0u8; fb::WORD_BITS];
+            for (q, p) in perm.iter_mut().enumerate() {
+                *p = q as u8;
+            }
+            return Some(Gfni {
+                perm,
+                map: LaneMap::Table(table),
+            });
+        }
         let candidates: [fn(usize) -> usize; 2] = [fb::lane_word_reversed8, fb::lane_word];
         'maps: for map in candidates {
             let mut want = [fb::V::zero(); fb::WORD_BITS];
@@ -1139,10 +1156,31 @@ impl Gfni {
                 used[at] = true;
                 perm[q] = at as u8;
             }
-            return Some(Gfni { perm, map });
+            return Some(Gfni {
+                perm,
+                map: LaneMap::Fixed(map),
+            });
         }
         None
     }
+}
+
+/// For each lane, the word of the block whose bits its column holds, if every lane's column
+/// is one of the words (planes in natural order) and every word is some lane's column.
+fn lane_table(raw: &[[u64; 8]], words: &[u128]) -> Option<Box<[u16; fb::LANES]>> {
+    let mut table = Box::new([0u16; fb::LANES]);
+    let mut used = vec![false; fb::LANES];
+    for l in 0..fb::LANES {
+        let (word, bit) = (l / 64, l % 64);
+        let mut column = 0u128;
+        for q in 0..fb::WORD_BITS {
+            column |= (((raw[q][word] >> bit) & 1) as u128) << q;
+        }
+        let at = (0..fb::LANES).find(|&w| !used[w] && words[w] == column)?;
+        used[at] = true;
+        table[l] = at as u16;
+    }
+    Some(table)
 }
 
 /// The raw planes of the GFNI path, before the permutation.
@@ -1181,19 +1219,24 @@ impl Transposer for Gfni {
         }
     }
     fn lane_word(&self, l: usize) -> usize {
-        (self.map)(l)
+        match &self.map {
+            LaneMap::Fixed(f) => f(l),
+            LaneMap::Table(t) => t[l] as usize,
+        }
     }
 }
 
 /// `v = sum_j c_j W_j` from the words with the bit-sliced counters, in coefficient form,
 /// centered: the same elements [`fold_witness_streaming`] returns. `words` is `columns`
 /// columns of `column_words` words (a multiple of 512). Blocks of 128 elements go out over the
-/// pool.
+/// pool; `on_block` is called by the worker with each finished block (`block`, its 128
+/// elements), for a caller that writes the fold out as it is produced.
 pub fn fold_witness_bits(
     words: &[B128],
     columns: usize,
     column_words: usize,
     challenges: &[ShortChallenge],
+    on_block: Option<&(dyn Fn(usize, &[[i16; N]]) + Sync)>,
 ) -> Vec<RingElement> {
     assert_eq!(challenges.len(), columns, "one challenge per column");
     assert!(column_words % fb::LANES == 0 && words.len() == columns * column_words);
@@ -1228,6 +1271,9 @@ pub fn fold_witness_bits(
                 None => fb::fold_block::<fb::V, fb::Portable>(raw, columns, column_words, &cs, &reach, block, &fb::Portable, chunk),
             }
         }
+        if let Some(f) = on_block {
+            f(block, chunk);
+        }
     };
     crate::par::pool().run(blocks, run_block);
     out.into_iter()
@@ -1244,7 +1290,8 @@ pub static FOLD_USED_GFNI: std::sync::atomic::AtomicBool = std::sync::atomic::At
 
 /// [`fold_witness_streaming`] restricted to the batch positions `positions` (32 ring elements
 /// each): element `32 b + i` of the fold for `b` in `positions`, in order — the transform path's
-/// answer, for checking another path against.
+/// answer, for checking another path against. Runs entirely on the calling thread, so it can
+/// run beside the pool.
 pub fn fold_witness_positions(
     words: &[B128],
     columns: usize,
@@ -1260,20 +1307,25 @@ pub fn fold_witness_positions(
         split |Q| {
             let ch = challenge_ntt::<Q>(challenges);
             let mut vb = accumulate_streaming_positions::<Q, SplitTransform<Q>>(words, columns, &ch, bpc, positions.clone());
-            parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
+            for b in vb.iter_mut() {
+                unsafe { inverse_split::<Q>(b) };
+            }
             vb
         },
         quad |Q| {
             let ch = challenge_ntt_quad_base::<Q>(challenges);
             let mut vb = accumulate_streaming_positions::<Q, QuadTransform<Q>>(words, columns, &ch, bpc, positions.clone());
-            parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
+            for b in vb.iter_mut() {
+                unsafe { intt_quad_gen_batch32::<Q>(b) };
+            }
             vb
         },
     );
     (0..32 * vb.len()).map(|i| vb[i / 32].get(i % 32)).collect()
 }
 
-/// [`accumulate_streaming`] over the batch positions `positions` only, one position per task.
+/// [`accumulate_streaming`] over the batch positions `positions` only, one position after the
+/// other on the calling thread (no pool: this runs beside the pool's own work).
 fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
     words: &[B128],
     columns: usize,
@@ -1289,7 +1341,7 @@ fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
     let out_addr = out.as_mut_ptr() as usize;
     let stride = std::mem::size_of::<Batch32>();
     let first = positions.start;
-    crate::par::pool().run(n, |i| {
+    (0..n).for_each(|i| {
         let b = first + i;
         let mut acc = vec![AccVec([0i32; 16]); N * 2];
         let base = acc.as_mut_ptr() as *mut i32;
@@ -1332,14 +1384,25 @@ pub fn fold_witness_bitsliced(
     bpc: usize,
     q: u16,
     workers: usize,
+    on_block: Option<&(dyn Fn(usize, &[RingElement]) + Sync)>,
 ) -> Vec<RingElement> {
     assert_eq!(challenges.len(), columns, "one challenge per column");
     assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
     if bpc % 4 != 0 || challenges.iter().map(|c| c.weight).sum::<usize>() > 32767 {
-        return fold_witness_streaming(words, columns, challenges, bpc, q, workers);
+        let out = fold_witness_streaming(words, columns, challenges, bpc, q, workers);
+        if let Some(f) = on_block {
+            for (block, elements) in out.chunks(bitsliced::BLOCK_ELEMENTS).enumerate() {
+                f(block, elements);
+            }
+        }
+        return out;
     }
-    bitsliced::fold_words(words, challenges, 128 * bpc, workers)
+    bitsliced::fold_words(words, challenges, 128 * bpc, workers, on_block)
 }
+
+/// Ring elements per block of the bit-sliced fold: the `on_block` callback of
+/// [`fold_witness_bitsliced`] receives whole blocks, the last one possibly shorter.
+pub const BITSLICED_BLOCK_ELEMENTS: usize = bitsliced::BLOCK_ELEMENTS;
 
 // Exact fold of the binary witness, independent of commitment-modulus arithmetic.
 mod bitsliced {
@@ -1358,6 +1421,8 @@ mod bitsliced {
     use core::arch::x86_64::*;
 
     const LANES: usize = 512;
+    /// Ring elements per block of `LANES` word positions.
+    pub(super) const BLOCK_ELEMENTS: usize = LANES / 4;
     const SLOTS: usize = 243;
     const BITS: usize = 15;
     const COL_GROUP: usize = 16;
@@ -1662,8 +1727,9 @@ mod bitsliced {
         challenges: &[ShortChallenge],
         column_words: usize,
         workers: usize,
+        on_block: Option<&(dyn Fn(usize, &[RingElement]) + Sync)>,
     ) -> Vec<RingElement> {
-        fold_config::<COL_GROUP>(words, challenges, column_words, workers)
+        fold_config::<COL_GROUP>(words, challenges, column_words, workers, on_block)
     }
 
     fn fold_config<const GROUP: usize>(
@@ -1671,6 +1737,7 @@ mod bitsliced {
         challenges: &[ShortChallenge],
         column_words: usize,
         workers: usize,
+        on_block: Option<&(dyn Fn(usize, &[RingElement]) + Sync)>,
     ) -> Vec<RingElement> {
         assert!(GROUP > 0 && GROUP * STRIDE * 8 <= u16::MAX as usize);
         #[cfg(test)]
@@ -1739,6 +1806,9 @@ mod bitsliced {
                         }
                         #[cfg(test)]
                         if let Some(start) = start { times[2] += start.elapsed(); }
+                        if let Some(f) = on_block {
+                            f(block, output);
+                        }
                     }
                     #[cfg(test)]
                     if profile {
@@ -1840,7 +1910,7 @@ mod bitsliced {
             let columns = (COL_GROUP + 2).next_multiple_of(2);
             let words = table(columns * LANES);
             let cs = challenges(columns);
-            let exact = fold_words(&words, &cs, LANES, 2);
+            let exact = fold_words(&words, &cs, LANES, 2, None);
             assert_eq!(exact, scalar(&words, &cs, LANES));
             for q in [3889, 2917, 4861, 9721, 12637, 17497, 19441] {
                 assert_eq!(exact, super::super::fold_witness_streaming(&words, columns, &cs, 4, q, 2), "q {q}");
@@ -1855,7 +1925,27 @@ mod bitsliced {
                     c
                 }).collect();
                 let words: Vec<_> = (0..cs.len() * LANES).map(|i| B128(if i % 7 == 0 { 0 } else { u128::MAX })).collect();
-                assert_eq!(fold_words(&words, &cs, LANES, 2), scalar(&words, &cs, LANES));
+                assert_eq!(fold_words(&words, &cs, LANES, 2, None), scalar(&words, &cs, LANES));
+            }
+        }
+
+        #[test]
+        fn bitfold_blocks_are_handed_out_in_order() {
+            let columns = COL_GROUP;
+            let blocks = 3;
+            let words = table(columns * blocks * LANES);
+            let cs = challenges(columns);
+            let seen = std::sync::Mutex::new(vec![None; blocks]);
+            let on_block = |block: usize, elements: &[RingElement]| {
+                assert_eq!(elements.len(), BLOCK_ELEMENTS);
+                let mut seen = seen.lock().unwrap();
+                assert!(seen[block].is_none(), "block {block} twice");
+                seen[block] = Some(elements.to_vec());
+            };
+            let out = fold_words(&words, &cs, blocks * LANES, 2, Some(&on_block));
+            let seen = seen.into_inner().unwrap();
+            for (block, chunk) in out.chunks(BLOCK_ELEMENTS).enumerate() {
+                assert_eq!(seen[block].as_deref(), Some(chunk), "block {block}");
             }
         }
 
@@ -1868,8 +1958,8 @@ mod bitsliced {
             for (group, workers) in [(16, 4), (31, 4), (31, 2), (16, 2)] {
                 let start = std::time::Instant::now();
                 let v = match group {
-                    16 => fold_config::<16>(&words, &cs, 1 << 14, workers),
-                    31 => fold_config::<31>(&words, &cs, 1 << 14, workers),
+                    16 => fold_config::<16>(&words, &cs, 1 << 14, workers, None),
+                    31 => fold_config::<31>(&words, &cs, 1 << 14, workers, None),
                     _ => unreachable!(),
                 };
                 eprintln!("bitfold group={} workers={} exact_us={}", group, workers, start.elapsed().as_micros());

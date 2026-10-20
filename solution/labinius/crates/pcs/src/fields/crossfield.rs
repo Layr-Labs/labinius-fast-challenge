@@ -1394,8 +1394,52 @@ impl<'a> LeanSwitch<'a> {
 
     /// The buffers for a fresh switch over `n` words.
     pub fn planes(n: usize) -> [HugeBuf<u64>; 3] {
-        let len = Self::plane_len(n);
+        Self::planes_of(Self::plane_len(n))
+    }
+
+    /// Three buffers of `len` elements each.
+    pub fn planes_of(len: usize) -> [HugeBuf<u64>; 3] {
+        let len = len.max(1);
         [HugeBuf::new(len), HugeBuf::new(len), HugeBuf::new(len)]
+    }
+
+    /// The prover from round `k >= 2` on, over `p_k` already word-sliced in `planes` (`eq.len()`
+    /// elements each, the words combined over the first `k` coordinates) and `eq` the table of
+    /// the remaining coordinates scaled by the folded ones ([`eq_sets`]); `l` and `lp` are the
+    /// maps `L_k` and `L'_k` ([`SetSwitch`] drives it).
+    pub fn from_materialized(
+        pi0: &'a [B128],
+        eq: &'a [B128],
+        r_hi: &'a [B128],
+        l: Vec<F162>,
+        lp: Vec<F162>,
+        planes: [HugeBuf<u64>; 3],
+        k: usize,
+        threads: usize,
+    ) -> Self {
+        let n = pi0.len();
+        assert!(k >= 2 && k < r_hi.len(), "a materialised prover starts at round 2 or later");
+        assert!(n.is_power_of_two() && n == 1 << r_hi.len(), "2^l words");
+        assert_eq!(eq.len(), n >> k, "the table of the remaining coordinates");
+        assert_eq!(l.len(), PACK);
+        assert_eq!(lp.len(), PACK);
+        for plane in &planes {
+            assert!(plane.len() >= eq.len(), "a plane is too short");
+        }
+        LeanSwitch {
+            pi0,
+            eq,
+            r_hi,
+            l,
+            lp,
+            p: planes,
+            r0: F162::ZERO,
+            quarters: None,
+            half: eq.len(),
+            round: k,
+            pending: None,
+            threads: threads.max(1),
+        }
     }
 
     fn src(&self) -> Src {
@@ -1456,7 +1500,8 @@ impl<'a> LeanSwitch<'a> {
         if self.quarters.is_some() && self.round <= 1 {
             return self.message_from_quarters();
         }
-        debug_assert_eq!(self.round, 0);
+        // Round 0, or the first round of a prover started over a materialised `p_k`.
+        debug_assert!(self.round == 0 || self.round >= 2);
         self.message(self.src(), self.half)
     }
 
@@ -1560,6 +1605,403 @@ unsafe impl Sync for Src {}
 #[allow(dead_code)]
 fn _poly_type_marker(_: &Poly) {}
 
+
+// =============================================================================================
+// the set switch: partials per set of the first coordinates, the first rounds from them
+// =============================================================================================
+//
+// Index bit `l - 1 - i` is coordinate `i`, so the `2^k` stretches of `2^(l-k)` consecutive words
+// are the values of the first `k` coordinates. With `eq_k` the expansion of coordinates `k ..`
+// scaled by `prod_{i<k} (1 + r_i)` — the first `2^(l-k)` entries of the full table — the set
+// partials `V[s][b] = sum_{j < 2^(l-k)} eq_k[j] bit_b(w[s 2^(l-k) + j])` carry every entry's
+// weight through the ratios `c_i = r_i / (1 + r_i)`: `eq[s 2^(l-k) + j] = eq_k[j] prod_{i in s}
+// c_i`. The hierarchy `f_i[t] = f_{i+1}[2t] + c_i f_{i+1}[2t + 1]` (`f_k = V`) sums the ratios
+// out of the lower bits, `f_0` being the 128 partials of the whole table, and the message of
+// round `m < k`, with `p_m[j] = sum_{t < 2^m} coeff_m[t] w[t 2^(l-m) + j]` the words folded by
+// the first `m` challenges (`coeff_m[t] = prod_i (t_i ? rho_i : 1 + rho_i)`), is
+//
+//     e0   = sum_t coeff_m[t] sum_b L_m(f_{m+1}[2t][b]) x^b,
+//     einf = sum_t coeff_m[t] sum_b L'_m(f_{m+1}[2t][b] + f_{m+1}[2t + 1][b]) x^b,
+//
+// by the linearity [`LeanSwitch::message_from_quarters`] uses (its `k = 2` case). After round
+// `k - 1`, `p_k` — `2^(l-k)` elements, the words combined with the `2^k` products of the
+// challenges — is materialised once, and [`LeanSwitch`] runs the remaining rounds over it with
+// `eq_k` as its table. The words are read twice (the partials and the combination), the
+// expansion is `2^(l-k)` words, and the `p` buffers hold `2^(l-k)` elements.
+
+/// The expansion of coordinates `k ..` scaled by `prod_{i<k} (1 + r[i])`: the first `2^(n-k)`
+/// entries of the full table.
+pub fn eq_sets(r: &[B128], k: usize) -> Vec<B128> {
+    assert!(k <= r.len());
+    let scale = r[..k].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
+    eq_expand_b128(&r[k..]).into_iter().map(|e| e * scale).collect()
+}
+
+/// The eq side of a tile of [`PartialAcc::add_tiles`], prepared once: per half `h`, the eight
+/// vectors the products take.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct EqTile([[__m512i; 8]; 2]);
+
+/// The eq side of `tiles` tiles at `eq`.
+unsafe fn eq_tiles(eq: *const B128, tiles: usize) -> Vec<EqTile> {
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    let mut xe = [_mm512_setzero_si512(); 16];
+    (0..tiles)
+        .map(|t| {
+            transpose_tile(eq.add(TILE * t) as *const u8, &mut xe);
+            let te: [__m512i; 16] = core::array::from_fn(|b| affine(ident, xe[b]));
+            EqTile(core::array::from_fn(|h| {
+                transpose8x8_q(core::array::from_fn(|i| te[8 * h + i]))
+            }))
+        })
+        .collect()
+}
+
+impl PartialAcc {
+    /// [`add_tiles`](Self::add_tiles) with the eq side already prepared by [`eq_tiles`]: the
+    /// tiles of words at `pi0`, one per prepared tile.
+    ///
+    /// # Safety
+    /// `pi0` addresses `64 * eq.len()` words.
+    unsafe fn add_tiles_prepared(&mut self, pi0: *const B128, eq: &[EqTile]) {
+        let ident = _mm512_set1_epi64(GF_IDENT);
+        let mut xp = [_mm512_setzero_si512(); 16];
+        let mut ap = [[0u64; 8]; 16];
+        for (t, tile) in eq.iter().enumerate() {
+            transpose_tile(pi0.add(TILE * t) as *const u8, &mut xp);
+            for k in 0..16 {
+                _mm512_storeu_si512(ap[k].as_mut_ptr() as *mut __m512i, affine(ident, xp[k]));
+            }
+            for (h, acc) in self.acc.iter_mut().enumerate() {
+                let tep = &tile.0[h];
+                for (k, a) in acc.iter_mut().enumerate() {
+                    for j in (0..8).step_by(2) {
+                        *a = xor3(
+                            *a,
+                            affine(tep[j], _mm512_set1_epi64(ap[k][j] as i64)),
+                            affine(tep[j + 1], _mm512_set1_epi64(ap[k][j + 1] as i64)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`finish`](Self::finish) into `v` (128 zeroed words), gathering bit `k'` of the eight
+    /// bytes of a qword with one multiplication instead of a bit loop: `((q >> k') & 0x0101..)
+    /// * 0x0102040810204080 >> 56` has bit `t` equal to bit `k'` of byte `t`.
+    fn finish_into(&self, v: &mut [B128]) {
+        assert_eq!(v.len(), PACK);
+        for (h, acc) in self.acc.iter().enumerate() {
+            for (k, a) in acc.iter().enumerate() {
+                let q: [u64; 8] = unsafe { core::mem::transmute(*a) };
+                for (i, &qi) in q.iter().enumerate() {
+                    for kp in 0..8 {
+                        let g = ((qi >> kp) & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56;
+                        v[8 * k + 7 - kp].0 ^= (g as u128) << (8 * (8 * h + i));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `V[s][b] = sum_{j < m} eq[j] bit_b(pi0[s m + j])` for the `sets` consecutive stretches of
+/// `m = eq.len()` words (a multiple of 64), flattened as `s * PACK + b`. The eq side of the
+/// products is prepared once and shared by every set; the sets are spread over `threads`.
+pub fn set_partials(pi0: &[B128], eq: &[B128], sets: usize, threads: usize) -> Vec<B128> {
+    let m = eq.len();
+    assert!(m > 0 && m % TILE == 0, "a set is whole tiles");
+    assert_eq!(pi0.len(), sets * m, "one stretch of words per set");
+    let tiles = unsafe { eq_tiles(eq.as_ptr(), m / TILE) };
+    let mut v = vec![B128::ZERO; sets * PACK];
+    let runs = crate::par::ranges(sets, threads, 1);
+    let (v_addr, pi0_addr) = (v.as_mut_ptr() as usize, pi0.as_ptr() as usize);
+    crate::par::pool().run(runs.len(), |i| {
+        let tiles = &tiles;
+        // Run `i` owns the sets `runs[i]` of `v`.
+        for s in runs[i].clone() {
+            let mut acc = PartialAcc::new();
+            unsafe { acc.add_tiles_prepared((pi0_addr as *const B128).add(s * m), tiles) };
+            let out = unsafe { core::slice::from_raw_parts_mut((v_addr as *mut B128).add(s * PACK), PACK) };
+            acc.finish_into(out);
+        }
+    });
+    v
+}
+
+/// `f[i][t * PACK + b]` for `t < 2^i` and `i <= k`: `f[k] = v` (the set partials of `2^k` sets)
+/// and `f[i][t] = f[i+1][2t] + c_i f[i+1][2t + 1]`, `c_i = r[i] / (1 + r[i])`. `f[0]` is the 128
+/// partials of the whole table.
+pub fn ratio_hierarchy(v: &[B128], r: &[B128], k: usize, threads: usize) -> Vec<Vec<B128>> {
+    assert_eq!(v.len(), PACK << k, "2^k sets of 128 partials");
+    assert!(k <= r.len());
+    let mut f: Vec<Vec<B128>> = (0..=k).map(|i| vec![B128::ZERO; PACK << i]).collect();
+    f[k].copy_from_slice(v);
+    for i in (0..k).rev() {
+        let c = half_ratio(r[i]);
+        let (lower, upper) = f.split_at_mut(i + 1);
+        let (cur, next) = (&mut lower[i], &upper[0]);
+        let runs = crate::par::ranges(1 << i, threads, 1);
+        let cur_addr = cur.as_mut_ptr() as usize;
+        crate::par::pool().run(runs.len(), |j| {
+            // Run `j` owns the vectors `runs[j]` of `cur`.
+            let cur = cur_addr as *mut B128;
+            for t in runs[j].clone() {
+                for b in 0..PACK {
+                    let x = next[2 * t * PACK + b] + c * next[(2 * t + 1) * PACK + b];
+                    unsafe { cur.add(t * PACK + b).write(x) };
+                }
+            }
+        });
+    }
+    f
+}
+
+/// `coeff[t] = prod_{i < m} (t_i ? rho[i] : 1 + rho[i])` for `t < 2^m`, `t_i` bit `i` from the
+/// top of `t`: the words folded by the challenges `rho` are `p_m[j] = sum_t coeff[t] w[t 2^(l-m)
+/// + j]`.
+pub fn fold_coeffs(rho: &[F162]) -> Vec<F162> {
+    let mut c = vec![F162::ONE];
+    for &r in rho {
+        let mut n = Vec::with_capacity(2 * c.len());
+        for &x in &c {
+            n.push(x * (F162::ONE + r));
+            n.push(x * r);
+        }
+        c = n;
+    }
+    c
+}
+
+/// The monomials `x^(8g + i)`, `g < 16`, as SoA8 planes: lane `i` of `mono[g]` is `x^(8g + i)`.
+unsafe fn monomials() -> [[__m512i; 3]; 16] {
+    core::array::from_fn(|g| {
+        let mut lanes = [[0u64; 8]; 3];
+        for i in 0..8 {
+            let p = 8 * g + i;
+            lanes[p / 64][i] = 1u64 << (p % 64);
+        }
+        core::array::from_fn(|l| _mm512_loadu_si512(lanes[l].as_ptr() as *const __m512i))
+    })
+}
+
+/// `sum_b L(x[b]) x^b` over the 128 words at `x`, `L` as [`eq_matrices`]: the map through the
+/// GFNI tiles, the monomial products accumulated unreduced.
+unsafe fn weighted_words(x: *const B128, m: &[[u64; 16]; 24], mono: &[[__m512i; 3]; 16]) -> F162 {
+    let mut acc = [_mm512_setzero_si512(); 12];
+    let mut av = [[_mm512_setzero_si512(); 8]; 3];
+    for half in 0..2 {
+        map_tile(x.add(half * TILE), m, &mut av);
+        for g in 0..8 {
+            super::f162::mac_soa8(&mut acc, [av[0][g], av[1][g], av[2][g]], mono[8 * half + g]);
+        }
+    }
+    horiz8(acc)
+}
+
+/// `p[j] = sum_t coeff[t] lift(pi0[t m + j])` for `j < m` (a multiple of 8), word-sliced into
+/// the three planes at `dst`: the words combined over their first `coeff.len().log2()`
+/// coordinates with the challenges' products ([`fold_coeffs`]). The accumulators of 32 blocks of
+/// eight elements stay in L1 while the sets stream past.
+///
+/// # Safety
+/// `pi0` addresses `coeff.len() * m` words; each plane at `dst` is writable for `m` qwords.
+pub unsafe fn combine_sets(
+    pi0: *const B128,
+    m: usize,
+    coeff: &[F162],
+    dst: [*mut u64; 3],
+    threads: usize,
+) {
+    assert!(m % 8 == 0, "whole blocks of eight");
+    const CHUNK: usize = 32;
+    let sets = coeff.len();
+    let runs = crate::par::ranges(m / 8, threads, 1);
+    let pi0 = pi0 as usize;
+    let dst = dst.map(|p| p as usize);
+    crate::par::pool().run(runs.len(), |i| {
+        let pi0 = pi0 as *const B128;
+        let dst = dst.map(|p| p as *mut u64);
+        let run = runs[i].clone();
+        let zero = _mm512_setzero_si512();
+        let mut acc = [[zero; 12]; CHUNK];
+        let mut c0 = run.start;
+        while c0 < run.end {
+            let n = (run.end - c0).min(CHUNK);
+            for a in acc.iter_mut().take(n) {
+                *a = [zero; 12];
+            }
+            for (t, &ct) in coeff.iter().enumerate() {
+                let cb = bcast3(ct);
+                let base = pi0.add(t * m + 8 * c0);
+                for (u, a) in acc.iter_mut().take(n).enumerate() {
+                    super::f162::mac_soa8(a, cb, load_words(base.add(8 * u)));
+                }
+            }
+            for (u, a) in acc.iter().take(n).enumerate() {
+                store_p(dst, 8 * (c0 + u), super::f162::reduce_soa8(*a));
+            }
+            c0 += n;
+        }
+        let _ = sets;
+    });
+}
+
+/// The switch prover whose first `k` rounds come from the set partials (see the section
+/// comment) and whose remaining rounds are a [`LeanSwitch`] over the materialised `p_k`. Drives
+/// the same transcript as [`SwitchProver`]: `msg`, `fold`, `msg`, ... `final_eval`.
+pub struct SetSwitch<'a> {
+    pi0: &'a [B128],
+    /// [`eq_sets`]`(r_hi, k)`.
+    eq: &'a [B128],
+    r_hi: &'a [B128],
+    k: usize,
+    /// [`ratio_hierarchy`].
+    f: Vec<Vec<B128>>,
+    l: Vec<F162>,
+    lp: Vec<F162>,
+    /// The challenges bound so far.
+    rho: Vec<F162>,
+    round: usize,
+    half: usize,
+    planes: Option<[HugeBuf<u64>; 3]>,
+    tail: Option<LeanSwitch<'a>>,
+    threads: usize,
+}
+
+impl<'a> SetSwitch<'a> {
+    /// `None` when some coordinate of `r_hi` is one, which the caller treats with
+    /// [`SwitchProver`]. `eq` is [`eq_sets`]`(r_hi, k)`, `f` the [`ratio_hierarchy`] of the
+    /// [`set_partials`] of the `2^k` sets against it, and `planes` three buffers of at least
+    /// `2^(l-k)` elements for `p_k`; `2 <= k < l`.
+    pub fn new(
+        pi0: &'a [B128],
+        eq: &'a [B128],
+        r_hi: &'a [B128],
+        batch: &[F162],
+        f: Vec<Vec<B128>>,
+        k: usize,
+        planes: [HugeBuf<u64>; 3],
+        threads: usize,
+    ) -> Option<Self> {
+        let n = pi0.len();
+        let l = r_hi.len();
+        assert!(k >= 2 && k < l, "2 <= k < l");
+        assert!(n.is_power_of_two() && n == 1 << l, "2^l words");
+        assert_eq!(eq.len(), n >> k, "the table of the remaining coordinates");
+        assert_eq!(f.len(), k + 1, "a hierarchy of k + 1 levels");
+        for (i, level) in f.iter().enumerate() {
+            assert_eq!(level.len(), PACK << i, "level {i} of the hierarchy");
+        }
+        assert_eq!(batch.len(), PACK, "one batch weight per bit");
+        for plane in &planes {
+            assert!(plane.len() >= eq.len(), "a plane is too short");
+        }
+        if r_hi.iter().any(|&r| r == B128::ONE) {
+            return None;
+        }
+        let l_map = batch.to_vec();
+        let lp = compose_scale(&l_map, b128_inv(B128::ONE + r_hi[0]));
+        Some(SetSwitch {
+            pi0,
+            eq,
+            r_hi,
+            k,
+            f,
+            l: l_map,
+            lp,
+            rho: Vec::with_capacity(k),
+            round: 0,
+            half: n,
+            planes: Some(planes),
+            tail: None,
+            threads: threads.max(1),
+        })
+    }
+
+    /// The 128 partials of the whole table, which the proof carries.
+    pub fn partials(&self) -> &[B128] {
+        &self.f[0]
+    }
+
+    /// The round's two message values.
+    pub fn msg(&mut self) -> [F162; 2] {
+        if let Some(tail) = &mut self.tail {
+            return tail.msg();
+        }
+        self.half /= 2;
+        let m = self.round;
+        debug_assert!(m < self.k);
+        let coeff = fold_coeffs(&self.rho);
+        let f = &self.f[m + 1];
+        let ml = eq_matrices(&self.l);
+        let mlp = eq_matrices(&self.lp);
+        let runs = crate::par::ranges(1 << m, self.threads, 1);
+        let f_addr = f.as_ptr() as usize;
+        let parts: Vec<[F162; 2]> = crate::par::pool().map(runs.len(), |i| unsafe {
+            let f = f_addr as *const B128;
+            let mono = monomials();
+            let mut e = [F162::ZERO; 2];
+            let mut sum = [B128::ZERO; PACK];
+            for t in runs[i].clone() {
+                let x0 = f.add(2 * t * PACK);
+                let x1 = f.add((2 * t + 1) * PACK);
+                for (b, s) in sum.iter_mut().enumerate() {
+                    *s = *x0.add(b) + *x1.add(b);
+                }
+                e[0] += coeff[t] * weighted_words(x0, &ml, &mono);
+                e[1] += coeff[t] * weighted_words(sum.as_ptr(), &mlp, &mono);
+            }
+            e
+        });
+        let mut msg = [F162::ZERO; 2];
+        for part in parts {
+            msg[0] += part[0];
+            msg[1] += part[1];
+        }
+        msg
+    }
+
+    /// Bind the round's challenge; after the `k`-th, materialise `p_k` and start the tail.
+    pub fn fold(&mut self, r: F162) {
+        if let Some(tail) = &mut self.tail {
+            return tail.fold(r);
+        }
+        self.rho.push(r);
+        for i in 0..PACK {
+            self.l[i] = self.l[i] + r * self.lp[i];
+        }
+        self.round += 1;
+        if self.round < self.r_hi.len() {
+            self.lp = compose_scale(&self.l, b128_inv(B128::ONE + self.r_hi[self.round]));
+        }
+        if self.round == self.k {
+            let m = self.eq.len();
+            let coeff = fold_coeffs(&self.rho);
+            let mut planes = self.planes.take().expect("the planes are held until the tail starts");
+            let dst = planes.each_mut().map(|p| p.as_mut_ptr());
+            unsafe { combine_sets(self.pi0.as_ptr(), m, &coeff, dst, self.threads) };
+            self.tail = Some(LeanSwitch::from_materialized(
+                self.pi0,
+                self.eq,
+                self.r_hi,
+                self.l.clone(),
+                self.lp.clone(),
+                planes,
+                self.k,
+                self.threads,
+            ));
+        }
+    }
+
+    /// `p` at the end of the sumcheck: the value the commitment opens to.
+    pub fn final_eval(&self) -> F162 {
+        self.tail.as_ref().expect("the sumcheck has not reached its tail").final_eval()
+    }
+}
+
 #[cfg(test)]
 mod lean_tests {
     use super::*;
@@ -1642,6 +2084,63 @@ mod lean_tests {
                 }
                 assert_eq!(reference.final_eval(), lean.final_eval(), "l {l}");
             }
+        }
+    }
+
+    #[test]
+    fn set_switch_matches_switch_prover() {
+        let mut x = 0x5151_ABCD_0001_7777u128;
+        for l in [17usize, 18] {
+            for k in [3usize, 5] {
+                for threads in [1usize, 3] {
+                    let n = 1 << l;
+                    let pi0: Vec<B128> = (0..n).map(|_| B128(next(&mut x))).collect();
+                    let r_hi: Vec<B128> = (0..l).map(|_| B128(next(&mut x))).collect();
+                    let batch: Vec<F162> = (0..PACK)
+                        .map(|_| F162([next(&mut x) as u64, next(&mut x) as u64, (next(&mut x) as u64) & ((1 << 34) - 1)]))
+                        .collect();
+                    let r: Vec<F162> = (0..l)
+                        .map(|_| F162([next(&mut x) as u64, next(&mut x) as u64, (next(&mut x) as u64) & ((1 << 34) - 1)]))
+                        .collect();
+                    let eq = eq_expand_b128(&r_hi);
+                    let eq_k = eq_sets(&r_hi, k);
+                    assert_eq!(eq_k[..], eq[..n >> k], "the table's first 2^(l-k) entries, l {l} k {k}");
+                    let v = set_partials(&pi0, &eq_k, 1 << k, threads);
+                    for s in 0..1 << k {
+                        let stretch = &pi0[s * (n >> k)..(s + 1) * (n >> k)];
+                        assert_eq!(v[s * PACK..(s + 1) * PACK], partial_evals(stretch, &eq_k)[..], "set {s}, l {l} k {k}");
+                    }
+                    let f = ratio_hierarchy(&v, &r_hi, k, threads);
+                    assert_eq!(f[0], partial_evals(&pi0, &eq), "partials, l {l} k {k}");
+                    let mut reference = SwitchProver::new(&pi0, &eq, &batch);
+                    let mut sets =
+                        SetSwitch::new(&pi0, &eq_k, &r_hi, &batch, f, k, LeanSwitch::planes_of(n >> k), threads).unwrap();
+                    assert_eq!(sets.partials(), &partial_evals(&pi0, &eq)[..]);
+                    for (round, &ri) in r.iter().enumerate() {
+                        assert_eq!(reference.msg(), sets.msg(), "l {l} k {k} round {round}");
+                        reference.fold(ri);
+                        sets.fold(ri);
+                    }
+                    assert_eq!(reference.final_eval(), sets.final_eval(), "l {l} k {k}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fold_coeffs_are_the_challenge_products() {
+        let mut x = 0x1357_9BDF_2468_ACE0u128;
+        let rho: Vec<F162> = (0..4)
+            .map(|_| F162([next(&mut x) as u64, next(&mut x) as u64, (next(&mut x) as u64) & ((1 << 34) - 1)]))
+            .collect();
+        let c = fold_coeffs(&rho);
+        assert_eq!(c.len(), 16);
+        for t in 0..16usize {
+            let mut want = F162::ONE;
+            for (i, &r) in rho.iter().enumerate() {
+                want = want * if (t >> (3 - i)) & 1 == 1 { r } else { F162::ONE + r };
+            }
+            assert_eq!(c[t], want, "t {t}");
         }
     }
 

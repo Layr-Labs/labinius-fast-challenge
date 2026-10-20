@@ -12,15 +12,20 @@
 //! - The witness table is mapped read-only from the page cache and read in place as `B128`
 //!   words. It is never copied and never lifted into a 24-byte `F162` buffer: the bit-slicing
 //!   front end of the kernels, the row evaluation and the switch read the words directly.
-//! - The commitment runs on a pool of `available_parallelism` workers and keeps no transform.
-//!   The fold accumulates exact integer coefficients directly from bit-sliced table words,
-//!   without materializing the 5.4 GB base-limb transform.
-//! - The switch keeps `a` as a linear map applied to the `eq` table and `p` in one half-size
-//!   buffer, fusing each fold with the next message ([`cf::LeanSwitch`]); the `eq` expansion,
-//!   the partial evaluations, the row evaluation and the challenge sampling run on all cores.
+//! - The commitment runs on four workers (one per physical core) and keeps no transform.
+//! - The fold is the exact integer fold from the words' bit planes (submission 1bca3f6's lift
+//!   to `Y^243 + 1`, [`labinius::fold::fold_witness_bitsliced`]): no transform pass, no modular
+//!   reconstruction, and each block's bytes go to the proof file from the worker that made it.
+//! - The switch's sets are the columns ([`cf::SetSwitch`]): the 128 partials of every column
+//!   against the expansion of the column coordinates (2^14 words, prepared once), a ratio
+//!   hierarchy over the column coordinates whose root is the proof's partials, the first ten
+//!   messages from the hierarchy through the GFNI tiles, then one pass that combines the columns
+//!   with the ten challenges' products into a single column of `F162`, over which
+//!   [`cf::LeanSwitch`] runs the remaining rounds. No 64 MB expansion, no 100 MB `p` buffer.
 //!
 //! Every message is the one the baseline sends, so the transcript, the proof format and the
 //! modulus are unchanged.
+#[cfg(test)]
 use bincode::Options;
 use labinius::challenge::{
     sample_short_challenges_parallel, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT,
@@ -45,9 +50,7 @@ mod parameters;
 /// the tests check the proof against.
 #[allow(dead_code)]
 mod rq;
-#[cfg(test)]
-use parameters::RING_ELEMENTS;
-use parameters::{COLUMNS, COLUMN_LEN, COLUMN_LOG, LOG_PACKED, LOG_VARS, MODULUS};
+use parameters::{COLUMNS, COLUMN_LEN, COLUMN_LOG, LOG_PACKED, LOG_VARS, MODULUS, RING_ELEMENTS};
 
 /// The key of the default modulus, precomputed by `build.rs` and embedded as the bytes of its
 /// batches (empty when the build host could not run the kernels). 64-byte aligned so the
@@ -58,6 +61,7 @@ const EMBEDDED_KEY_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/key.bi
 static EMBEDDED_KEY: Aligned64<[u8; EMBEDDED_KEY_LEN]> =
     Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")));
 
+#[cfg(test)]
 const LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -80,6 +84,7 @@ struct Proof {
 fn serialize_blob<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_bytes(bytes)
 }
+#[cfg(test)]
 fn codec() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
@@ -217,6 +222,9 @@ fn populate_part(words: &[B128]) {
     }
     std::hint::black_box(sink);
 }
+
+// The mapping is owned by the `Table` alone, so it may be unmapped from any thread.
+unsafe impl Send for Table {}
 
 impl Drop for Table {
     fn drop(&mut self) {
@@ -435,7 +443,10 @@ fn commitment_coefficients_rows(
             let dst = unsafe { (out_addr as *mut u128).add(c0 * N) };
             for i in 0..cols * N {
                 for k in 0..limbs {
-                    at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+                    // The inverse transforms give centered residues, |x| <= (q-1)/2.
+                    let x = residues[k][i] as i32;
+                    at[k] = if x < 0 { (x + primes[k] as i32) as u64 } else { x as u64 };
+                    debug_assert!(at[k] < primes[k] as u64);
                 }
                 let value = garner.lift(&at, &mut mixed);
                 debug_assert!(value < modulus);
@@ -485,6 +496,17 @@ impl SwitchRounds for cf::LeanSwitch<'_> {
         cf::LeanSwitch::final_eval(self)
     }
 }
+impl SwitchRounds for cf::SetSwitch<'_> {
+    fn msg(&mut self) -> [F162; 2] {
+        cf::SetSwitch::msg(self)
+    }
+    fn fold(&mut self, r: F162) {
+        cf::SetSwitch::fold(self, r)
+    }
+    fn final_eval(&self) -> F162 {
+        cf::SetSwitch::final_eval(self)
+    }
+}
 impl SwitchRounds for cf::SwitchProver {
     fn msg(&mut self) -> [F162; 2] {
         cf::SwitchProver::msg(self)
@@ -515,40 +537,90 @@ fn switch_rounds(
     (rounds, coords, opened)
 }
 
-/// Batch positions of the fold recomputed through the transform path and compared with the
-/// bit-sliced fold: 32 ring elements each, out of 4096. Every challenge and every column enters
-/// each element, so one position exercises the whole accumulation; a mismatch means a defect
-/// in the bit-sliced path on this machine, and the transform path then produces the fold.
-const FOLD_CHECK_POSITIONS: core::ops::Range<usize> = 0..1;
+/// Where the proof is written as its parts complete: the file, and the offset of the folded
+/// witness's bytes in it.
+struct Sink<'a> {
+    file: &'a std::fs::File,
+    folded_at: u64,
+}
 
-/// `v = sum_j c_j W_j`: the bit-sliced fold from the words, spot-checked against the transform
-/// path on [`FOLD_CHECK_POSITIONS`], with the transform path as the fallback.
-fn fold_checked(
+/// `v = sum_j c_j W_j`: the exact integer fold from the words' bit planes
+/// ([`labinius::fold::fold_witness_bitsliced`], submission 1bca3f6's lift to `Y^243 + 1`),
+/// which needs no modular reconstruction and so no check against the transform path. With a
+/// sink, each block's bytes go to the file from the worker that finished the block, and the
+/// elements returned need not be packed again.
+fn fold_exact(
     values: &[B128],
     challenges: &[ShortChallenge],
     base: u16,
     workers: usize,
+    sink: Option<&Sink>,
 ) -> Vec<labinius::RingElement648> {
+    use std::os::unix::fs::FileExt;
     let bpc = COLUMN_LEN / 128;
-    let bits = labinius::fold::fold_witness_bits(values, COLUMNS, COLUMN_LEN, challenges);
-    let check = labinius::fold::fold_witness_positions(
+    let block_bytes = FOLDED_BYTES * N * labinius::fold::BITSLICED_BLOCK_ELEMENTS;
+    let write_block = |block: usize, elements: &[labinius::RingElement648]| {
+        if let Some(sink) = sink {
+            let mut bytes = vec![0u8; FOLDED_BYTES * N * elements.len()];
+            for (slot, &c) in bytes
+                .chunks_exact_mut(FOLDED_BYTES)
+                .zip(elements.iter().flat_map(|e| e.v.iter()))
+            {
+                slot.copy_from_slice(&(c as i32).to_le_bytes());
+            }
+            sink.file
+                .write_all_at(&bytes, sink.folded_at + (block * block_bytes) as u64)
+                .expect("write a block of the fold");
+        }
+    };
+    labinius::fold::fold_witness_bitsliced(
         values,
         COLUMNS,
         challenges,
         bpc,
         base,
-        FOLD_CHECK_POSITIONS,
-    );
-    let first = 32 * FOLD_CHECK_POSITIONS.start;
-    let agree = check
-        .iter()
-        .zip(&bits[first..first + check.len()])
-        .all(|(a, b)| a.v == b.v);
-    if agree {
-        return bits;
+        workers,
+        Some(&write_block),
+    )
+}
+
+/// The proof's bytes before the folded witness's, ending with the folded witness's length:
+/// bincode's fixed-width little-endian layout, `u64` lengths before sequences and byte strings,
+/// written by hand so the file can take this part before the fold runs. The test
+/// `handwritten_prefix_matches_bincode` holds it to the codec.
+fn proof_prefix(
+    modulus: u128,
+    commitment: &[u8],
+    partials: &[u128],
+    rounds: &[[[u64; 3]; 2]],
+    opened: [u64; 3],
+    row: &[u8],
+    folded_len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(commitment.len() + row.len() + 4096);
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&modulus.to_le_bytes());
+    out.extend_from_slice(&(commitment.len() as u64).to_le_bytes());
+    out.extend_from_slice(commitment);
+    out.extend_from_slice(&(partials.len() as u64).to_le_bytes());
+    for x in partials {
+        out.extend_from_slice(&x.to_le_bytes());
     }
-    eprintln!("labinius-fold-check mismatch: the bit-sliced fold disagrees with the transform path; folding through the transform");
-    labinius::fold::fold_witness_streaming(values, COLUMNS, challenges, bpc, base, workers)
+    out.extend_from_slice(&(rounds.len() as u64).to_le_bytes());
+    for r in rounds {
+        for v in r {
+            for l in v {
+                out.extend_from_slice(&l.to_le_bytes());
+            }
+        }
+    }
+    for l in &opened {
+        out.extend_from_slice(&l.to_le_bytes());
+    }
+    out.extend_from_slice(&(row.len() as u64).to_le_bytes());
+    out.extend_from_slice(row);
+    out.extend_from_slice(&(folded_len as u64).to_le_bytes());
+    out
 }
 
 /// Columns per pass over `A` in the commitment, and workers: one worker per physical core of
@@ -559,7 +631,11 @@ fn fold_checked(
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 
-fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
+/// The proof of `trace(seed)` under `modulus` from the table at `table_path`. With `out`, the
+/// proof is also written to that file as its parts complete — the prefix on a thread while the
+/// challenges are sampled, the folded witness block by block from the fold's workers — and the
+/// returned proof's `folded` is left empty, the bytes being on disk.
+fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, out: Option<&std::fs::File>) -> Proof {
     let load_clock = std::time::Instant::now();
     let table = Table::load(table_path);
     let values = table.words();
@@ -568,12 +644,9 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let clock = std::time::Instant::now();
     // The pool's workers are started here, once; every parallel phase runs on them.
     let _ = labinius::par::pool();
-    // The switch's buffers: huge pages requested, faulted in by their first writers on every
-    // core. (A thread touching them during the commitment ran on a hyperthread sibling of a
-    // commitment worker and cost the commitment more than it saved the expansion.)
-    // The first quarter of the expansion is all the switch reads.
-    let mut eq = cf::HugeBuf::<B128>::new(1 << (LOG_PACKED - 2));
-    let planes = cf::LeanSwitch::planes(1 << LOG_PACKED);
+    // The switch's `p` buffers: one column's worth of elements, the words combined over the
+    // column coordinates (huge pages requested; faulted in by their first writers).
+    let planes = cf::LeanSwitch::planes_of(COLUMN_LEN);
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
     // The table's pages come in on every core; the key is the embedded one when the modulus
@@ -587,6 +660,8 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let setup_time = clock.elapsed();
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
+    // (The direct word slicer of `transpose_f162::choose_b128_slicer` measured no faster than
+    // the staged one on the scored host; the staged one stays.)
     let rows = key.commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP);
     let commit_time = clock.elapsed();
     let commitment = pack_coefficients(
@@ -600,28 +675,32 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     // A coordinate equal to one (probability 2^-128 per coordinate) has no half ratio: the
     // baseline's prover over its own full workspace takes over for the whole switch.
     let degenerate = hi.iter().any(|&r| r == B128::ONE);
-    let quarters = if degenerate {
+    // The sets are the columns: the expansion of the column coordinates (2^14 words), the
+    // 128 partials of every column against it, and the ratio hierarchy over the columns'
+    // coordinates, whose root is the proof's partials ([`cf::SetSwitch`]).
+    let eq_sets = cf::eq_sets(&hi, COLUMN_LOG as usize);
+    let hierarchy = if degenerate {
         None
     } else {
-        Some(unsafe { cf::eq_expand_and_partials_quarters(&hi, values, eq.as_mut_ptr(), workers) })
+        let sets = cf::set_partials(values, &eq_sets, COLUMNS, workers);
+        Some(cf::ratio_hierarchy(&sets, &hi, COLUMN_LOG as usize, workers))
     };
-    let partials = match &quarters {
-        Some(sets) => cf::partials_from_quarters(sets, &hi),
+    let partials = match &hierarchy {
+        Some(f) => f[0].clone(),
         None => {
             let mut ws = cf::Workspace::new(LOG_PACKED, 1);
             ws.partial_evals(0, values, &hi)
         }
     };
-    let eq_words: &[B128] = unsafe { eq.as_slice() };
     let value = claim(&partials, &lo);
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let partials_time = clock.elapsed();
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let lean = quarters.and_then(|sets| {
-        cf::LeanSwitch::with_quarters(values, eq_words, &hi, &batch, workers, planes, sets)
+    let sets = hierarchy.and_then(|f| {
+        cf::SetSwitch::new(values, &eq_sets, &hi, &batch, f, COLUMN_LOG as usize, planes, workers)
     });
-    let (rounds, coords, opened) = match lean {
+    let (rounds, coords, opened) = match sets {
         Some(mut sw) => switch_rounds(&mut sw, &mut t),
         None => {
             // The baseline's prover, whose workspace holds its own full expansion.
@@ -633,31 +712,54 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
         }
     };
     let switch_time = clock.elapsed();
-    // The expansion is done with; its pages go back while the compute-bound phases run.
-    std::thread::spawn(move || drop(eq));
     let point = EvaluationPoint::msb_first(&p, &coords);
     let row = RowEvaluation::of(labinius::eval::row_evaluate_words(values, point.p0(), workers));
     let row_time = clock.elapsed();
+    let row_bytes = wire::pack_row_evaluation(&row);
+    let partial_words: Vec<u128> = partials.iter().map(|v| v.0).collect();
+    let folded_len = FOLDED_BYTES * N * RING_ELEMENTS;
+    let prefix = proof_prefix(
+        modulus,
+        &commitment,
+        &partial_words,
+        &rounds,
+        opened.0,
+        &row_bytes,
+        folded_len,
+    );
+    let sink = out.map(|file| Sink {
+        file,
+        folded_at: prefix.len() as u64,
+    });
+    // The prefix goes to the file now, on a thread, while the challenges and the fold run.
+    let prefix_writer = sink.as_ref().map(|sink| {
+        let file = sink.file.try_clone().expect("duplicate the proof file's handle");
+        let prefix = prefix;
+        std::thread::spawn(move || {
+            use std::os::unix::fs::FileExt;
+            file.write_all_at(&prefix, 0).expect("write the proof's prefix");
+        })
+    });
     let challenges = folding_challenges(&mut t, &row);
     let challenge_time = clock.elapsed();
-    let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
-        values,
-        COLUMNS,
-        &challenges,
-        COLUMN_LEN / 128,
-        primes[0],
-        workers,
-    ));
+    let elements = fold_exact(values, &challenges, primes[0], workers, sink.as_ref());
     let fold_time = clock.elapsed();
+    if let Some(writer) = prefix_writer {
+        writer.join().expect("the prefix writer panicked");
+    }
+    let folded = FoldedWitness::of(elements);
+    // The words are done with: the mapping's 65 536 page-table entries go back on a thread
+    // while the proof is encoded and written, instead of at exit.
+    std::thread::spawn(move || drop(table));
     let proof = Proof {
         version: 1,
         modulus,
         commitment,
-        partials: partials.iter().map(|v| v.0).collect(),
+        partials: partial_words,
         rounds,
         opened: opened.0,
-        row: wire::pack_row_evaluation(&row),
-        folded: pack_folded(&folded),
+        row: row_bytes,
+        folded: if out.is_some() { Vec::new() } else { pack_folded(&folded) },
     };
     let encode_time = clock.elapsed();
     eprintln!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}",
@@ -685,14 +787,10 @@ fn main() {
     } else {
         MODULUS
     };
-    let proof = prove(&seed, modulus, &args[4]);
-    {
-        use std::io::Write;
-        let file = std::fs::File::create(&args[2]).expect("create proof file");
-        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
-        codec().serialize_into(&mut out, &proof).expect("write proof");
-        out.flush().expect("flush proof");
-    }
+    let file = std::fs::File::create(&args[2]).expect("create proof file");
+    let proof = prove(&seed, modulus, &args[4], Some(&file));
+    debug_assert!(proof.folded.is_empty(), "the fold went to the file");
+    drop(proof);
     // The proof is on disk; nothing the destructors would do is observable.
     std::process::exit(0);
 }
@@ -842,7 +940,7 @@ mod tests {
         ));
         std::fs::write(&path, [1u8; 32]).unwrap();
         let result = std::panic::catch_unwind(|| {
-            prove(&[1; 32], MODULUS, path.to_str().unwrap());
+            prove(&[1; 32], MODULUS, path.to_str().unwrap(), None);
         });
         let _ = std::fs::remove_file(&path);
         assert!(result.is_err(), "the prover accepted a truncated witness table");
@@ -852,11 +950,55 @@ mod tests {
     fn round_trip_and_reject_wrong_instance() {
         let seed = [42; 32];
         let table = table_file(&seed);
-        let proof = prove(&seed, MODULUS, table.path());
+        let proof = prove(&seed, MODULUS, table.path(), None);
         let bytes = codec().serialize(&proof).unwrap();
         let decoded: Proof = codec().deserialize(&bytes).unwrap();
         verify(&seed, &decoded);
         assert!(std::panic::catch_unwind(|| verify(&[43; 32], &decoded)).is_err());
+        // The same proof written as its parts complete is the same file.
+        let path = std::env::temp_dir().join(format!("labinius-fast-sink-{}.bin", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let streamed = prove(&seed, MODULUS, table.path(), Some(&file));
+        drop(file);
+        let written = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(streamed.folded.is_empty());
+        assert_eq!(written, bytes, "the streamed file differs from the serialised proof");
+    }
+
+    #[test]
+    fn handwritten_prefix_matches_bincode() {
+        let mut x = 0x5555_AAAA_1234u128;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for (c, r, f) in [(0usize, 0usize, 0usize), (5, 3, 7), (3318, 20736, 4 * 648 * 3)] {
+            let proof = Proof {
+                version: 1,
+                modulus: next(),
+                commitment: (0..c).map(|_| next() as u8).collect(),
+                partials: (0..128).map(|_| next()).collect(),
+                rounds: (0..24).map(|_| [[next() as u64; 3], [next() as u64; 3]]).collect(),
+                opened: [next() as u64; 3],
+                row: (0..r).map(|_| next() as u8).collect(),
+                folded: (0..f).map(|_| next() as u8).collect(),
+            };
+            let want = codec().serialize(&proof).unwrap();
+            let mut got = proof_prefix(
+                proof.modulus,
+                &proof.commitment,
+                &proof.partials,
+                &proof.rounds,
+                proof.opened,
+                &proof.row,
+                proof.folded.len(),
+            );
+            got.extend_from_slice(&proof.folded);
+            assert_eq!(got, want, "layout {c} {r} {f}");
+        }
     }
 
     #[test]
@@ -865,7 +1007,7 @@ mod tests {
         assert_ne!(modulus, MODULUS);
         let seed = [44; 32];
         let table = table_file(&seed);
-        let proof = prove(&seed, modulus, table.path());
+        let proof = prove(&seed, modulus, table.path(), None);
         let bytes = codec().serialize(&proof).unwrap();
         let decoded: Proof = codec().deserialize(&bytes).unwrap();
         assert_eq!(decoded.modulus, modulus);
@@ -1075,7 +1217,7 @@ mod tests {
             3,
         );
         assert_eq!(folded.elements(), &streamed[..]);
-        let bits = labinius::fold::fold_witness_bits(&values, COLUMNS, COLUMN_LEN, &challenges);
+        let bits = labinius::fold::fold_witness_bits(&values, COLUMNS, COLUMN_LEN, &challenges, None);
         assert_eq!(folded.elements(), &bits[..], "the bit-sliced fold differs");
         let positions = labinius::fold::fold_witness_positions(
             &values,
@@ -1086,6 +1228,17 @@ mod tests {
             3..5,
         );
         assert_eq!(&folded.elements()[96..160], &positions[..]);
-        assert_eq!(&fold_checked(&values, &challenges, primes[0], 3)[..], folded.elements());
+        let exact = fold_exact(&values, &challenges, primes[0], 3, None);
+        assert_eq!(&exact[..], folded.elements(), "the exact fold differs");
+        // Streamed to a file, block by block, the bytes are the packed fold.
+        let path = std::env::temp_dir().join(format!("labinius-fast-fold-{}.bin", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let sink = Sink { file: &file, folded_at: 0 };
+        let streamed = fold_exact(&values, &challenges, primes[0], 3, Some(&sink));
+        assert_eq!(&streamed[..], folded.elements());
+        drop(file);
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(bytes, pack_folded(&folded));
     }
 }

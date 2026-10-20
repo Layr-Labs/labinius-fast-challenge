@@ -187,17 +187,60 @@ unsafe fn columns(base: *const u8, cp: *mut __m512i) {
             r1[j] = _mm512_mask_loadu_epi64(lo, 0xf0, p.add(736) as *const i64);
             r2[j] = _mm512_loadu_si512(p.add(800) as *const __m512i);
         }
-        let c0 = transpose8x8_q(r0);
-        let c1 = transpose8x8_q(r1);
-        let c2 = transpose8x8_q(r2);
-        for k in 0..4 {
-            for w in 0..3 {
-                let c = 3 * k + w;
-                let g0 = if c < 8 { c0[c] } else { c1[c - 8] };
-                let g1 = if c < 4 { c1[c + 4] } else { c2[c - 4] };
-                _mm512_store_si512(cp.add(4 * c + 2 * blk), bitslice(perm, ident, g0));
-                _mm512_store_si512(cp.add(4 * c + 2 * blk + 1), bitslice(perm, ident, g1));
-            }
+        columns_rows(perm, ident, cp, blk, r0, r1, r2);
+    }
+}
+
+/// Phase 1 from `B128` words: the same 24-qword rows, each `F162` of the row being a word's
+/// two qwords and a zero. Ring element `j`'s four words are one 64-byte load, and two
+/// permutes with zeroing masks lay them out as the three vectors the transposes take.
+#[inline(always)]
+unsafe fn columns_words(base: *const u8, cp: *mut __m512i) {
+    let perm = _mm512_load_si512(BYTE_PERM.0.as_ptr() as *const __m512i);
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    // r0 = [e0.lo e0.hi 0 e1.lo e1.hi 0 e2.lo e2.hi]
+    let i0 = _mm512_setr_epi64(0, 1, 0, 2, 3, 0, 4, 5);
+    // r1 = [0 e3.lo e3.hi 0 | f0.lo f0.hi 0 f1.lo] (f = the element eight on)
+    let i1 = _mm512_setr_epi64(0, 6, 7, 0, 8, 9, 0, 10);
+    // r2 = [f1.hi 0 f2.lo f2.hi 0 f3.lo f3.hi 0]
+    let i2 = _mm512_setr_epi64(3, 0, 4, 5, 0, 6, 7, 0);
+    for blk in 0..2 {
+        let b = base.add(1024 * blk);
+        let mut r0 = [_mm512_setzero_si512(); 8];
+        let mut r1 = [_mm512_setzero_si512(); 8];
+        let mut r2 = [_mm512_setzero_si512(); 8];
+        for j in 0..8 {
+            let e = _mm512_loadu_si512(b.add(64 * j) as *const __m512i);
+            let f = _mm512_loadu_si512(b.add(64 * (j + 8)) as *const __m512i);
+            r0[j] = _mm512_maskz_permutexvar_epi64(0b1101_1011, i0, e);
+            r1[j] = _mm512_maskz_permutex2var_epi64(0b1011_0110, e, i1, f);
+            r2[j] = _mm512_maskz_permutexvar_epi64(0b0110_1101, i2, f);
+        }
+        columns_rows(perm, ident, cp, blk, r0, r1, r2);
+    }
+}
+
+/// The rest of phase 1 from the 24-qword rows of one 16-element block.
+#[inline(always)]
+unsafe fn columns_rows(
+    perm: __m512i,
+    ident: __m512i,
+    cp: *mut __m512i,
+    blk: usize,
+    r0: [__m512i; 8],
+    r1: [__m512i; 8],
+    r2: [__m512i; 8],
+) {
+    let c0 = transpose8x8_q(r0);
+    let c1 = transpose8x8_q(r1);
+    let c2 = transpose8x8_q(r2);
+    for k in 0..4 {
+        for w in 0..3 {
+            let c = 3 * k + w;
+            let g0 = if c < 8 { c0[c] } else { c1[c - 8] };
+            let g1 = if c < 4 { c1[c + 4] } else { c2[c - 4] };
+            _mm512_store_si512(cp.add(4 * c + 2 * blk), bitslice(perm, ident, g0));
+            _mm512_store_si512(cp.add(4 * c + 2 * blk + 1), bitslice(perm, ident, g1));
         }
     }
 }
@@ -283,6 +326,21 @@ unsafe fn slice_raw(base: *const u8, out: &mut BinaryIndex32) {
     let mut cols: MaybeUninit<Cols> = MaybeUninit::uninit();
     let cp = cols.as_mut_ptr() as *mut __m512i;
     columns(base, cp);
+    slice_rest(cp, out)
+}
+
+/// 128 `B128` words (32 ring elements, 2048 contiguous bytes at `base`) -> the index rows.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+unsafe fn slice_raw_words(base: *const u8, out: &mut BinaryIndex32) {
+    let mut cols: MaybeUninit<Cols> = MaybeUninit::uninit();
+    let cp = cols.as_mut_ptr() as *mut __m512i;
+    columns_words(base, cp);
+    slice_rest(cp, out)
+}
+
+/// Phases 2 to 4.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+unsafe fn slice_rest(cp: *mut __m512i, out: &mut BinaryIndex32) {
 
     let mut work: MaybeUninit<Work> = MaybeUninit::uninit();
     let wk = work.as_mut_ptr();
@@ -371,11 +429,46 @@ pub unsafe fn slice_f162(elems: &[F162; 128]) -> BinaryIndex32 {
 /// in an L1-resident buffer (3 KB, written once per batch, a few cycles per ring element against
 /// the transform's hundreds) and sliced exactly as [`slice_f162_into`] slices them.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-pub unsafe fn slice_b128_into(words: &[crate::fields::scalar::B128; 128], out: &mut BinaryIndex32) {
+pub unsafe fn slice_b128_staged(words: &[crate::fields::scalar::B128; 128], out: &mut BinaryIndex32) {
     let mut staged: MaybeUninit<A64<[F162; 128]>> = MaybeUninit::uninit();
     let dst = (*staged.as_mut_ptr()).0.as_mut_ptr();
     for (i, w) in words.iter().enumerate() {
         dst.add(i).write(F162::from_b128(*w));
     }
     slice_raw(dst as *const u8, out)
+}
+
+/// The same, reading the words through permutes instead of a staging copy.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+pub unsafe fn slice_b128_direct(words: &[crate::fields::scalar::B128; 128], out: &mut BinaryIndex32) {
+    slice_raw_words(words.as_ptr() as *const u8, out)
+}
+
+/// Which `B128` slicer the process uses: the direct one once it has reproduced the staged one on
+/// a sample, else the staged one.
+static DIRECT_SLICER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Decide the `B128` slicer on `sample` (128 words): the direct permute path must give the index
+/// rows of the staged path exactly.
+pub fn choose_b128_slicer(sample: &[crate::fields::scalar::B128; 128]) -> bool {
+    *DIRECT_SLICER.get_or_init(|| {
+        let mut a = BinaryIndex32::zero();
+        let mut b = BinaryIndex32::zero();
+        unsafe {
+            slice_b128_staged(sample, &mut a);
+            slice_b128_direct(sample, &mut b);
+        }
+        a.rows == b.rows
+    })
+}
+
+/// The index rows of 128 words, by whichever slicer [`choose_b128_slicer`] settled on (the
+/// staged one until it is called).
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+pub unsafe fn slice_b128_into(words: &[crate::fields::scalar::B128; 128], out: &mut BinaryIndex32) {
+    if DIRECT_SLICER.get().copied().unwrap_or(false) {
+        slice_b128_direct(words, out)
+    } else {
+        slice_b128_staged(words, out)
+    }
 }

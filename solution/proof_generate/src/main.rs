@@ -219,6 +219,9 @@ fn populate_part(words: &[B128]) {
     std::hint::black_box(sink);
 }
 
+// The mapping is owned by the `Table` alone, so it may be unmapped from any thread.
+unsafe impl Send for Table {}
+
 impl Drop for Table {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
@@ -436,7 +439,10 @@ fn commitment_coefficients_rows(
             let dst = unsafe { (out_addr as *mut u128).add(c0 * N) };
             for i in 0..cols * N {
                 for k in 0..limbs {
-                    at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+                    // The inverse transforms give centered residues, |x| <= (q-1)/2.
+                    let x = residues[k][i] as i32;
+                    at[k] = if x < 0 { (x + primes[k] as i32) as u64 } else { x as u64 };
+                    debug_assert!(at[k] < primes[k] as u64);
                 }
                 let value = garner.lift(&at, &mut mixed);
                 debug_assert!(value < modulus);
@@ -531,15 +537,22 @@ fn fold_checked(
     workers: usize,
 ) -> Vec<labinius::RingElement648> {
     let bpc = COLUMN_LEN / 128;
-    let bits = labinius::fold::fold_witness_bits(values, COLUMNS, COLUMN_LEN, challenges);
-    let check = labinius::fold::fold_witness_positions(
-        values,
-        COLUMNS,
-        challenges,
-        bpc,
-        base,
-        FOLD_CHECK_POSITIONS,
-    );
+    // The check runs on a thread of its own beside the pool's fold: a few milliseconds of one
+    // core, hidden under the fold instead of after it.
+    let (bits, check) = std::thread::scope(|scope| {
+        let check = scope.spawn(|| {
+            labinius::fold::fold_witness_positions(
+                values,
+                COLUMNS,
+                challenges,
+                bpc,
+                base,
+                FOLD_CHECK_POSITIONS,
+            )
+        });
+        let bits = labinius::fold::fold_witness_bits(values, COLUMNS, COLUMN_LEN, challenges);
+        (bits, check.join().expect("the fold check panicked"))
+    });
     let first = 32 * FOLD_CHECK_POSITIONS.start;
     let agree = check
         .iter()
@@ -588,6 +601,8 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let setup_time = clock.elapsed();
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
+    // The direct word slicer, once it has reproduced the staged one on the first batch.
+    labinius::simd::transpose_f162::choose_b128_slicer(values[..128].try_into().unwrap());
     let rows = key.commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP);
     let commit_time = clock.elapsed();
     let commitment = pack_coefficients(
@@ -643,6 +658,9 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let challenge_time = clock.elapsed();
     let folded = FoldedWitness::of(fold_checked(values, &challenges, primes[0], workers));
     let fold_time = clock.elapsed();
+    // The words are done with: the mapping's 65 536 page-table entries go back on a thread
+    // while the proof is encoded and written, instead of at exit.
+    std::thread::spawn(move || drop(table));
     let proof = Proof {
         version: 1,
         modulus,

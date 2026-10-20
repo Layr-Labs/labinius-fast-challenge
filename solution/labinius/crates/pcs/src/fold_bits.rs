@@ -474,6 +474,8 @@ impl<L: Lanes> Hs<L> {
 struct Terms {
     position: [u8; 32],
     negative: [u8; 32],
+    /// `negative_prefix[k]`: negative terms among the first `k`.
+    negative_prefix: [u32; 33],
 }
 
 impl Terms {
@@ -481,6 +483,7 @@ impl Terms {
         let mut t = Terms {
             position: [0; 32],
             negative: [0; 32],
+            negative_prefix: [0; 33],
         };
         for i in 0..c.weight {
             let p = c.positions[i];
@@ -490,6 +493,9 @@ impl Terms {
             }
             t.position[i] = p;
             t.negative[i] = (((c.signs >> i) & 1 == 1) ^ (p % 2 == 1)) as u8;
+        }
+        for k in 0..32 {
+            t.negative_prefix[k + 1] = t.negative_prefix[k] + t.negative[k] as u32;
         }
         t
     }
@@ -611,10 +617,7 @@ pub unsafe fn fold_block<L: Lanes, T: Transposer>(
     // `e` planes further on (`e - p_t` is the plane index).
     let mut planes: Vec<[L; 2 * WORD_BITS]> = (0..BATCH).map(|_| [L::zero(); 2 * WORD_BITS]).collect();
     let mut base = [[core::ptr::null::<L>(); 32]; BATCH];
-    let mut negs = [0u32; BATCH];
-    let mut list = [core::ptr::null::<L>(); 2 * BATCH * 32];
     let zero = L::zero();
-    let zeros = [L::zero(); 16];
     for batch_start in (0..columns).step_by(BATCH) {
         let batch = BATCH.min(columns - batch_start);
         for i in 0..batch {
@@ -635,40 +638,40 @@ pub unsafe fn fold_block<L: Lanes, T: Transposer>(
                 let offset = t.negative[k] as usize * WORD_BITS;
                 base[i][k] = first.wrapping_add(offset).wrapping_sub(t.position[k] as usize);
             }
-            negs[i] = (0..32).map(|k| t.negative[k] as u32).sum::<u32>();
-            let _ = negs;
         }
+        // The terms a column contributes to a row are a run `lo .. hi` of its sorted positions;
+        // the run is read sixteen at a time through the tree, the slots past `hi` pointed at a
+        // zero vector (a select, not a branch). A run longer than sixteen takes two trees.
+        let zero_slot: *const L = &zero;
         for e in 0..ROWS {
-            // The planes reaching row `e`, listed.
-            let mut n = 0usize;
+            let mut hs = Hs::<L>::new();
+            let mut pending = Pending::<L>::new();
             let mut negative = 0u32;
             for i in 0..batch {
                 let j = batch_start + i;
                 let (lo, hi) = reach.of_row(j, e);
-                let t = &terms[j];
-                let b = &base[i];
-                for k in lo..hi {
-                    *list.get_unchecked_mut(n) = b.get_unchecked(k).wrapping_add(e);
-                    negative += *t.negative.get_unchecked(k) as u32;
-                    n += 1;
+                if lo >= hi {
+                    continue;
+                }
+                let t = terms.get_unchecked(j);
+                let b = base.get_unchecked(i);
+                negative += *t.negative_prefix.get_unchecked(hi) - *t.negative_prefix.get_unchecked(lo);
+                let mut k = lo;
+                while k < hi {
+                    let end = (k + 16).min(hi);
+                    let x: [L; 16] = core::array::from_fn(|s| {
+                        let kk = k + s;
+                        let p = if kk < end {
+                            b.get_unchecked(kk).wrapping_add(e)
+                        } else {
+                            zero_slot
+                        };
+                        *p
+                    });
+                    pending.push(hs.add16(&x), 4);
+                    k = end;
                 }
             }
-            let mut hs = Hs::<L>::new();
-            let mut pending = Pending::<L>::new();
-            let mut at = 0usize;
-            while at + 16 <= n {
-                let x: [L; 16] = core::array::from_fn(|i| **list.get_unchecked(at + i));
-                pending.push(hs.add16(&x), 4);
-                at += 16;
-            }
-            if at < n {
-                let mut x = zeros;
-                for i in at..n {
-                    x[i - at] = **list.get_unchecked(i);
-                }
-                pending.push(hs.add16(&x), 4);
-            }
-            let _ = zero;
             pending.push(hs.ones, 0);
             pending.push(hs.twos, 1);
             pending.push(hs.fours, 2);

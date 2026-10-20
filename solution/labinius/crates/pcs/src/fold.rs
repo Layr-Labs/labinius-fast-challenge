@@ -1113,18 +1113,35 @@ pub struct Gfni {
     /// `plane[q]` is produced at raw index `perm[q]`.
     perm: [u8; fb::WORD_BITS],
     /// The word lane `l` carries.
-    map: fn(usize) -> usize,
+    map: LaneMap,
+}
+
+enum LaneMap {
+    Fixed(fn(usize) -> usize),
+    Table(Box<[u16; fb::LANES]>),
 }
 
 impl Gfni {
-    /// A transposer validated against the portable one on `sample` (512 words), under each
-    /// candidate lane order: `None` when no lane order and permutation of its raw planes
-    /// reproduces the portable planes.
+    /// A transposer validated against the portable one on `sample` (512 words): first by
+    /// reading each lane's 128-bit column off the raw planes and finding the word it is (any
+    /// lane order, natural plane order), then under each candidate lane order with a
+    /// permutation of the planes. `None` when nothing reproduces the words.
     pub fn validated(sample: &[u128]) -> Option<Gfni> {
         assert!(sample.len() >= fb::LANES);
         let mut raw = [fb::V::zero(); fb::WORD_BITS];
         unsafe { gfni_raw_planes(sample.as_ptr(), &mut raw) };
         let raw_words: Vec<[u64; 8]> = raw.iter().map(|v| v.words()).collect();
+        // Lane order from the sample itself: lane `l`'s column, planes read as bits 0..128.
+        if let Some(table) = lane_table(&raw_words, &sample[..fb::LANES]) {
+            let mut perm = [0u8; fb::WORD_BITS];
+            for (q, p) in perm.iter_mut().enumerate() {
+                *p = q as u8;
+            }
+            return Some(Gfni {
+                perm,
+                map: LaneMap::Table(table),
+            });
+        }
         let candidates: [fn(usize) -> usize; 2] = [fb::lane_word_reversed8, fb::lane_word];
         'maps: for map in candidates {
             let mut want = [fb::V::zero(); fb::WORD_BITS];
@@ -1139,10 +1156,31 @@ impl Gfni {
                 used[at] = true;
                 perm[q] = at as u8;
             }
-            return Some(Gfni { perm, map });
+            return Some(Gfni {
+                perm,
+                map: LaneMap::Fixed(map),
+            });
         }
         None
     }
+}
+
+/// For each lane, the word of the block whose bits its column holds, if every lane's column
+/// is one of the words (planes in natural order) and every word is some lane's column.
+fn lane_table(raw: &[[u64; 8]], words: &[u128]) -> Option<Box<[u16; fb::LANES]>> {
+    let mut table = Box::new([0u16; fb::LANES]);
+    let mut used = vec![false; fb::LANES];
+    for l in 0..fb::LANES {
+        let (word, bit) = (l / 64, l % 64);
+        let mut column = 0u128;
+        for q in 0..fb::WORD_BITS {
+            column |= (((raw[q][word] >> bit) & 1) as u128) << q;
+        }
+        let at = (0..fb::LANES).find(|&w| !used[w] && words[w] == column)?;
+        used[at] = true;
+        table[l] = at as u16;
+    }
+    Some(table)
 }
 
 /// The raw planes of the GFNI path, before the permutation.
@@ -1181,7 +1219,10 @@ impl Transposer for Gfni {
         }
     }
     fn lane_word(&self, l: usize) -> usize {
-        (self.map)(l)
+        match &self.map {
+            LaneMap::Fixed(f) => f(l),
+            LaneMap::Table(t) => t[l] as usize,
+        }
     }
 }
 
@@ -1244,7 +1285,8 @@ pub static FOLD_USED_GFNI: std::sync::atomic::AtomicBool = std::sync::atomic::At
 
 /// [`fold_witness_streaming`] restricted to the batch positions `positions` (32 ring elements
 /// each): element `32 b + i` of the fold for `b` in `positions`, in order — the transform path's
-/// answer, for checking another path against.
+/// answer, for checking another path against. Runs entirely on the calling thread, so it can
+/// run beside the pool.
 pub fn fold_witness_positions(
     words: &[B128],
     columns: usize,
@@ -1260,20 +1302,25 @@ pub fn fold_witness_positions(
         split |Q| {
             let ch = challenge_ntt::<Q>(challenges);
             let mut vb = accumulate_streaming_positions::<Q, SplitTransform<Q>>(words, columns, &ch, bpc, positions.clone());
-            parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
+            for b in vb.iter_mut() {
+                unsafe { inverse_split::<Q>(b) };
+            }
             vb
         },
         quad |Q| {
             let ch = challenge_ntt_quad_base::<Q>(challenges);
             let mut vb = accumulate_streaming_positions::<Q, QuadTransform<Q>>(words, columns, &ch, bpc, positions.clone());
-            parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
+            for b in vb.iter_mut() {
+                unsafe { intt_quad_gen_batch32::<Q>(b) };
+            }
             vb
         },
     );
     (0..32 * vb.len()).map(|i| vb[i / 32].get(i % 32)).collect()
 }
 
-/// [`accumulate_streaming`] over the batch positions `positions` only, one position per task.
+/// [`accumulate_streaming`] over the batch positions `positions` only, one position after the
+/// other on the calling thread (no pool: this runs beside the pool's own work).
 fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
     words: &[B128],
     columns: usize,
@@ -1289,7 +1336,7 @@ fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
     let out_addr = out.as_mut_ptr() as usize;
     let stride = std::mem::size_of::<Batch32>();
     let first = positions.start;
-    crate::par::pool().run(n, |i| {
+    (0..n).for_each(|i| {
         let b = first + i;
         let mut acc = vec![AccVec([0i32; 16]); N * 2];
         let base = acc.as_mut_ptr() as *mut i32;

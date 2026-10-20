@@ -1360,7 +1360,7 @@ mod bitsliced {
     const LANES: usize = 512;
     const SLOTS: usize = 243;
     const BITS: usize = 15;
-    const COL_GROUP: usize = 31;
+    const COL_GROUP: usize = 16;
     const STRIDE: usize = 256;
     // At most 31 columns keep qword offsets in u16 and two plane/counter buffers within 2 MiB.
     // The offsets use x86's scale-8 addressing directly, avoiding a shift per input.
@@ -1373,75 +1373,106 @@ mod bitsliced {
         terms: Vec<u16>,
     }
 
-    fn plan<const GROUP: usize>(challenges: &[ShortChallenge]) -> (Vec<Group>, [i32; SLOTS]) {
+    fn plan_group<const GROUP: usize>(g: usize, cs: &[ShortChallenge]) -> (Group, [i32; SLOTS + 1]) {
         let mut bias_diff = [0i32; SLOTS + 1];
-        let mut groups = Vec::new();
-        for (g, cs) in challenges.chunks(GROUP).enumerate() {
-            let mut count_diff = [0i32; SLOTS + 1];
-            let mut shifts = Vec::with_capacity(cs.len() * 32);
-            for (j, c) in cs.iter().enumerate() {
-                assert!(c.weight <= c.positions.len());
-                for t in 0..c.weight {
-                    let m = c.positions[t] as usize;
-                    assert!(m < 162);
-                    let negative = ((c.signs >> t) & 1 != 0) ^ (m % 2 != 0);
-                    shifts.push((j as u16, m as u8, negative));
-                    let end = (m + 128).min(SLOTS);
-                    count_diff[m] += 1;
-                    count_diff[end] -= 1;
-                    if negative {
-                        bias_diff[m] += 1;
-                        bias_diff[end] -= 1;
-                    }
-                    let wrap = (m + 128).saturating_sub(SLOTS);
-                    if wrap != 0 {
-                        count_diff[0] += 1;
-                        count_diff[wrap] -= 1;
-                        if !negative {
-                            bias_diff[0] += 1;
-                            bias_diff[wrap] -= 1;
-                        }
-                    }
-                }
-            }
-            let mut group = Group {
-                first: g * GROUP,
-                columns: cs.len(),
-                offsets: [0; SLOTS + 1],
-                terms: Vec::new(),
-            };
-            let mut count = 0i32;
-            for d in 0..SLOTS {
-                count += count_diff[d];
-                debug_assert!(count >= 0);
-                group.offsets[d + 1] = group.offsets[d] + (count as usize).div_ceil(64) * 64;
-            }
-            // Plane zero is the padding plane, not the complement of zero.
-            group.terms.resize(group.offsets[SLOTS], 0);
-            let mut at: [usize; SLOTS] = core::array::from_fn(|d| group.offsets[d]);
-            for (j, m, negative) in shifts {
-                let m = m as usize;
+        let mut count_diff = [0i32; SLOTS + 1];
+        let mut shifts = Vec::with_capacity(cs.len() * 32);
+        for (j, c) in cs.iter().enumerate() {
+            assert!(c.weight <= c.positions.len());
+            for t in 0..c.weight {
+                let m = c.positions[t] as usize;
+                assert!(m < 162);
+                let negative = ((c.signs >> t) & 1 != 0) ^ (m % 2 != 0);
+                shifts.push((j as u16, m as u8, negative));
                 let end = (m + 128).min(SLOTS);
-                let base = 8 * (1 + j as usize * STRIDE);
-                let mut plane = base + 1024 * negative as usize;
-                for d in m..end {
-                    // The range-difference pass reserved one entry for this exact term in d.
-                    // Its cursor cannot reach the next slot, including that slot's padding.
-                    debug_assert!(at[d] < group.offsets[d + 1]);
-                    unsafe { *group.terms.as_mut_ptr().add(at[d]) = plane as u16; }
-                    at[d] += 1;
-                    plane += 8;
+                count_diff[m] += 1;
+                count_diff[end] -= 1;
+                if negative {
+                    bias_diff[m] += 1;
+                    bias_diff[end] -= 1;
                 }
                 let wrap = (m + 128).saturating_sub(SLOTS);
-                plane = base + 1024 * !negative as usize + 8 * (end - m);
-                for d in 0..wrap {
-                    debug_assert!(at[d] < group.offsets[d + 1]);
-                    unsafe { *group.terms.as_mut_ptr().add(at[d]) = plane as u16; }
-                    at[d] += 1;
-                    plane += 8;
+                if wrap != 0 {
+                    count_diff[0] += 1;
+                    count_diff[wrap] -= 1;
+                    if !negative {
+                        bias_diff[0] += 1;
+                        bias_diff[wrap] -= 1;
+                    }
                 }
             }
+        }
+        let mut group = Group {
+            first: g * GROUP,
+            columns: cs.len(),
+            offsets: [0; SLOTS + 1],
+            terms: Vec::new(),
+        };
+        let mut count = 0i32;
+        for d in 0..SLOTS {
+            count += count_diff[d];
+            debug_assert!(count >= 0);
+            group.offsets[d + 1] = group.offsets[d] + (count as usize).div_ceil(64) * 64;
+        }
+        // Plane zero is the padding plane, not the complement of zero.
+        group.terms.resize(group.offsets[SLOTS], 0);
+        let mut at: [usize; SLOTS] = core::array::from_fn(|d| group.offsets[d]);
+        for (j, m, negative) in shifts {
+            let m = m as usize;
+            let end = (m + 128).min(SLOTS);
+            let base = 8 * (1 + j as usize * STRIDE);
+            let mut plane = base + 1024 * negative as usize;
+            for d in m..end {
+                // The range-difference pass reserved one entry for this exact term in d.
+                // Its cursor cannot reach the next slot, including that slot's padding.
+                debug_assert!(at[d] < group.offsets[d + 1]);
+                unsafe { *group.terms.as_mut_ptr().add(at[d]) = plane as u16; }
+                at[d] += 1;
+                plane += 8;
+            }
+            let wrap = (m + 128).saturating_sub(SLOTS);
+            plane = base + 1024 * !negative as usize + 8 * (end - m);
+            for d in 0..wrap {
+                debug_assert!(at[d] < group.offsets[d + 1]);
+                unsafe { *group.terms.as_mut_ptr().add(at[d]) = plane as u16; }
+                at[d] += 1;
+                plane += 8;
+            }
+        }
+        (group, bias_diff)
+    }
+
+    fn plan<const GROUP: usize>(challenges: &[ShortChallenge], workers: usize) -> (Vec<Group>, [i32; SLOTS]) {
+        let jobs = challenges.len().div_ceil(GROUP);
+        let mut built: Vec<Option<(Group, [i32; SLOTS + 1])>> =
+            (0..jobs).map(|_| None).collect();
+        if jobs < 4 || workers <= 1 {
+            for (g, cs) in challenges.chunks(GROUP).enumerate() {
+                built[g] = Some(plan_group::<GROUP>(g, cs));
+            }
+        } else {
+            // The schedule is independent for each public column group. Four workers cover
+            // the target's physical cores; the deterministic merge preserves column order.
+            let per = jobs.div_ceil(workers.min(4));
+            std::thread::scope(|scope| {
+                for (part, targets) in built.chunks_mut(per).enumerate() {
+                    scope.spawn(move || {
+                        for (i, target) in targets.iter_mut().enumerate() {
+                            let g = part * per + i;
+                            let first = g * GROUP;
+                            let last = (first + GROUP).min(challenges.len());
+                            *target = Some(plan_group::<GROUP>(g, &challenges[first..last]));
+                        }
+                    });
+                }
+            });
+        }
+        let mut groups = Vec::with_capacity(jobs);
+        let mut bias_diff = [0i32; SLOTS + 1];
+        for item in built {
+            let (group, diff) = item.unwrap();
             groups.push(group);
+            for (dst, x) in bias_diff.iter_mut().zip(diff) { *dst += x; }
         }
         let mut count = 0;
         let bias = core::array::from_fn(|d| {
@@ -1558,9 +1589,11 @@ mod bitsliced {
     /// Three equally weighted bit planes -> sum and double-weight carry.
     #[inline(always)]
     unsafe fn csa(sum: &mut __m512i, a: __m512i, b: __m512i) -> __m512i {
-        let carry = _mm512_ternarylogic_epi64::<0xe8>(*sum, a, b);
+        // If s = old_sum XOR a XOR b, majority(old_sum,a,b) is ternlog(a,s,b,0xb2).
+        // Both inputs are dead after this pair, so the carry can overwrite a directly.
+        // This avoids the vector-register copy required by two independent ternlogs.
         *sum = _mm512_ternarylogic_epi64::<0x96>(*sum, a, b);
-        carry
+        _mm512_ternarylogic_epi64::<0xb2>(a, *sum, b)
     }
 
     // Isolate the counter's register allocation from the transpose's many vector constants.
@@ -1677,7 +1710,7 @@ mod bitsliced {
         let profile = std::env::var_os("LABINIUS_BITFOLD_PROFILE").is_some();
         #[cfg(test)]
         let plan_start = std::time::Instant::now();
-        let (groups, bias) = plan::<GROUP>(challenges);
+        let (groups, bias) = plan::<GROUP>(challenges, workers);
         #[cfg(test)]
         if profile {
             eprintln!("bitfold plan_us={}", plan_start.elapsed().as_micros());
@@ -1771,9 +1804,37 @@ mod bitsliced {
         }
 
         #[test]
+        fn bitfold_parallel_schedule_matches_serial() {
+            // Five groups, including a short final group, exercise the parallel planner.
+            let cs = challenges(4 * COL_GROUP + 3);
+            let (serial, bias) = plan::<COL_GROUP>(&cs, 1);
+            for workers in [2, 3, 4, 8] {
+                let (parallel, got_bias) = plan::<COL_GROUP>(&cs, workers);
+                assert_eq!(got_bias, bias);
+                assert_eq!(parallel.len(), serial.len());
+                for (a, b) in parallel.iter().zip(&serial) {
+                    assert_eq!(a.first, b.first);
+                    assert_eq!(a.columns, b.columns);
+                    assert_eq!(a.offsets, b.offsets);
+                    assert_eq!(a.terms, b.terms);
+                }
+            }
+        }
+
+        #[test]
         fn bitfold_transpose_and_counter() {
             let words = table(LANES);
             unsafe {
+                for x in 0..8u32 {
+                    let a = _mm512_set1_epi32(-((x & 1) as i32));
+                    let b = _mm512_set1_epi32(-(((x >> 1) & 1) as i32));
+                    let mut s = _mm512_set1_epi32(-(((x >> 2) & 1) as i32));
+                    let c = csa(&mut s, a, b);
+                    let sum: [u64; 8] = core::mem::transmute(s);
+                    let carry: [u64; 8] = core::mem::transmute(c);
+                    assert_eq!(sum, [0u64.wrapping_sub((x.count_ones() & 1) as u64); 8]);
+                    assert_eq!(carry, [0u64.wrapping_sub((x.count_ones() >= 2) as u64); 8]);
+                }
                 let zero = _mm512_setzero_si512();
                 let mut planes = vec![zero; STRIDE];
                 slice(words.as_ptr(), planes.as_mut_ptr());
@@ -1864,6 +1925,21 @@ mod bitsliced {
         fn bitfold_full_instance_matches_streaming() {
             let words = table(1 << 24);
             let cs = challenges(1024);
+            // Optional isolated kernel repetitions for perf; the ordinary test still checks
+            // every configuration against the unchanged NTT reference below.
+            if let Ok(workers) = std::env::var("LABINIUS_BITFOLD_BENCH") {
+                let workers: usize = workers.parse().unwrap();
+                let mut previous = None;
+                for trial in 0..3 {
+                    let start = std::time::Instant::now();
+                    let v = fold_words(&words, &cs, 1 << 14, workers);
+                    eprintln!("bitfold bench={} workers={} exact_us={}", trial, workers, start.elapsed().as_micros());
+                    if let Some(ref previous) = previous { assert_eq!(&v, previous); }
+                    previous = Some(v);
+                }
+                std::hint::black_box(previous);
+                return;
+            }
             let mut exact = None;
             for (group, workers) in [(16, 4), (31, 4), (31, 2), (16, 2)] {
                 let start = std::time::Instant::now();

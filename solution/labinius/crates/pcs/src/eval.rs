@@ -310,17 +310,12 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     let eq = Poly::from_scalars(&eq_table(p0));
     let mut out = vec![F162::ZERO; columns];
     let runs = crate::par::ranges(columns, workers, 1);
-    std::thread::scope(|scope| {
-        let mut rest: &mut [F162] = &mut out;
-        for run in runs {
-            let (mine, tail) = rest.split_at_mut(run.len());
-            rest = tail;
-            let eq = &eq;
-            scope.spawn(move || {
-                for (slot, j) in mine.iter_mut().zip(run) {
-                    *slot = unsafe { dot_words(eq, words.as_ptr().add(j * wdim), wdim) };
-                }
-            });
+    let out_addr = out.as_mut_ptr() as usize;
+    crate::par::pool().run(runs.len(), |i| {
+        // Run `i` owns `out[runs[i]]`.
+        for j in runs[i].clone() {
+            let value = unsafe { dot_words(&eq, words.as_ptr().add(j * wdim), wdim) };
+            unsafe { (out_addr as *mut F162).add(j).write(value) };
         }
     });
     out

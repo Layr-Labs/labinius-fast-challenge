@@ -274,72 +274,6 @@ pub fn partial_evals_parallel(pi0: &[B128], eq_hi: &[B128], threads: usize) -> V
     v
 }
 
-/// Four quarter-table partials, all weighted by the first quarter of `eq_hi`. The common
-/// weights let the first two switch messages be recovered from these 512 words, without
-/// applying the switch maps to the full witness again.
-pub type PrefixPartials = [Vec<B128>; 4];
-
-/// The usual partials and the quarter-table products needed by
-/// [`LeanSwitch::use_prefix_partials`]. A coordinate equal to one, or a table shorter than
-/// four tiles, uses the ordinary path instead.
-pub fn partial_evals_prefix_parallel(
-    pi0: &[B128],
-    eq_hi: &[B128],
-    r_hi: &[B128],
-    threads: usize,
-) -> (Vec<B128>, Option<PrefixPartials>) {
-    let n = pi0.len();
-    assert_eq!(n, 1 << r_hi.len());
-    if n < 4 * TILE || r_hi.iter().any(|&r| r == B128::ONE) {
-        assert_eq!(eq_hi.len(), n);
-        return (partial_evals_parallel(pi0, eq_hi, threads), None);
-    }
-    let quarter = n / 4;
-    assert!(eq_hi.len() >= quarter);
-    let block_tiles = quarter / TILE;
-    let eq = &eq_hi[..quarter];
-    let runs = crate::par::ranges(n / TILE, threads, 1);
-    let parts: Vec<PrefixPartials> = std::thread::scope(|scope| {
-        let handles: Vec<_> = runs
-            .into_iter()
-            .map(|run| {
-                scope.spawn(move || {
-                    core::array::from_fn(|b| {
-                        let start = run.start.max(b * block_tiles);
-                        let end = run.end.min((b + 1) * block_tiles);
-                        if start >= end {
-                            vec![B128::ZERO; PACK]
-                        } else {
-                            partial_evals_tiles(
-                                &pi0[b * quarter..(b + 1) * quarter],
-                                eq,
-                                start - b * block_tiles,
-                                end - b * block_tiles,
-                            )
-                        }
-                    })
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut prefix: PrefixPartials = core::array::from_fn(|_| vec![B128::ZERO; PACK]);
-    for part in parts {
-        for (dst, src) in prefix.iter_mut().zip(part) {
-            for (d, s) in dst.iter_mut().zip(src) {
-                *d = *d + s;
-            }
-        }
-    }
-    let c0 = r_hi[0] * b128_inv(B128::ONE + r_hi[0]);
-    let c1 = r_hi[1] * b128_inv(B128::ONE + r_hi[1]);
-    let c01 = c0 * c1;
-    let v = (0..PACK)
-        .map(|k| prefix[0][k] + c1 * prefix[1][k] + c0 * prefix[2][k] + c01 * prefix[3][k])
-        .collect();
-    (v, Some(prefix))
-}
-
 /// The eight `B128` at `x` as their low words and their high words.
 #[inline(always)]
 unsafe fn split_words(x: *const B128) -> (__m512i, __m512i) {
@@ -904,50 +838,14 @@ impl<T> Drop for HugeBuf<T> {
 /// # Safety
 /// `out` must be writable for `2^r.len()` words.
 pub unsafe fn eq_expand_b128_parallel(r: &[B128], out: *mut B128, threads: usize) {
-    eq_expand_b128_scaled_parallel(r, B128::ONE, out, threads);
-}
-
-/// Expand just the first quarter needed by [`partial_evals_prefix_parallel`] and the
-/// prepared switch, including the two leading zero-coordinate factors. Returns the number
-/// of initialized words. Degenerate or small instances retain the full-table path.
-///
-/// # Safety
-/// `out` must be writable for `2^r.len()` words (the fallback may write them all).
-pub unsafe fn eq_expand_prefix_parallel(r: &[B128], out: *mut B128, threads: usize) -> usize {
-    if r.len() < 8 || r.iter().any(|&ri| ri == B128::ONE) {
-        eq_expand_b128_parallel(r, out, threads);
-        1 << r.len()
-    } else {
-        let scale = (B128::ONE + r[0]) * (B128::ONE + r[1]);
-        eq_expand_b128_scaled_parallel(&r[2..], scale, out, threads);
-        1 << (r.len() - 2)
-    }
-}
-
-unsafe fn eq_expand_b128_scaled_parallel(
-    r: &[B128],
-    scale: B128,
-    out: *mut B128,
-    threads: usize,
-) {
     let n = r.len();
     if n < 16 || threads <= 1 {
-        let mut t = eq_expand_b128(r);
-        if scale != B128::ONE {
-            for v in &mut t {
-                *v = *v * scale;
-            }
-        }
+        let t = eq_expand_b128(r);
         core::ptr::copy_nonoverlapping(t.as_ptr(), out, t.len());
         return;
     }
     let h = n / 2;
-    let mut high = eq_expand_b128(&r[..n - h]);
-    if scale != B128::ONE {
-        for hv in &mut high {
-            *hv = *hv * scale;
-        }
-    }
+    let high = eq_expand_b128(&r[..n - h]);
     let low = eq_expand_b128(&r[n - h..]);
     let runs = crate::par::ranges(high.len(), threads, 1);
     let out = out as usize;
@@ -995,28 +893,20 @@ pub unsafe fn eq_expand_and_partials(
     debug_assert_eq!(low.len() % TILE, 0, "a stretch is whole tiles");
     let runs = crate::par::ranges(high.len(), threads, 1);
     let (out, pi0_addr) = (out as usize, pi0.as_ptr() as usize);
-    let parts: Vec<Vec<B128>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = runs
-            .into_iter()
-            .map(|run| {
-                let (high, low) = (&high, &low);
-                scope.spawn(move || {
-                    let out = out as *mut B128;
-                    let pi0 = pi0_addr as *const B128;
-                    let mut acc = PartialAcc::new();
-                    for jh in run {
-                        let hv = high[jh];
-                        let base = unsafe { out.add(jh << h) };
-                        for (jl, &lv) in low.iter().enumerate() {
-                            unsafe { base.add(jl).write(hv * lv) };
-                        }
-                        unsafe { acc.add_tiles(pi0.add(jh << h), base, low.len() / TILE) };
-                    }
-                    acc.finish()
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let parts: Vec<Vec<B128>> = crate::par::pool().map(runs.len(), |i| {
+        let run = runs[i].clone();
+        let out = out as *mut B128;
+        let pi0 = pi0_addr as *const B128;
+        let mut acc = PartialAcc::new();
+        for jh in run {
+            let hv = high[jh];
+            let base = unsafe { out.add(jh << h) };
+            for (jl, &lv) in low.iter().enumerate() {
+                unsafe { base.add(jl).write(hv * lv) };
+            }
+            unsafe { acc.add_tiles(pi0.add(jh << h), base, low.len() / TILE) };
+        }
+        acc.finish()
     });
     let mut v = vec![B128::ZERO; PACK];
     for part in parts {
@@ -1085,14 +975,6 @@ fn apply_images(images: &[F162], x: B128) -> F162 {
         }
     }
     acc
-}
-
-/// `sum_j L(eq[j]) lift(words[j])` from the bitwise partials of those words. Both `L`
-/// and the lift are GF(2)-linear; multiplication in F162 distributes over their bit sums.
-fn image_dot(images: &[F162], partials: impl Iterator<Item = B128>) -> F162 {
-    partials.enumerate().fold(F162::ZERO, |acc, (k, v)| {
-        acc + apply_images(images, v) * F162::from_b128(B128(1u128 << k))
-    })
 }
 
 /// `L o (x -> d x)` as images: `L'(e_i) = L(d e_i)`.
@@ -1302,7 +1184,6 @@ pub struct LeanSwitch<'a> {
     half: usize,
     round: usize,
     pending: Option<[F162; 2]>,
-    prefix: Option<PrefixPartials>,
     threads: usize,
 }
 
@@ -1324,28 +1205,9 @@ impl<'a> LeanSwitch<'a> {
         threads: usize,
         planes: [HugeBuf<u64>; 3],
     ) -> Option<Self> {
-        Self::with_prefix_partials(pi0, eq, r_hi, batch, threads, planes, None)
-    }
-
-    /// Construct with the products from [`partial_evals_prefix_parallel`]. With those
-    /// products `eq` only needs the initialized first quarter, as returned by
-    /// [`eq_expand_prefix_parallel`]; without them it must hold the whole expansion.
-    pub fn with_prefix_partials(
-        pi0: &'a [B128],
-        eq: &'a [B128],
-        r_hi: &'a [B128],
-        batch: &[F162],
-        threads: usize,
-        planes: [HugeBuf<u64>; 3],
-        prefix: Option<PrefixPartials>,
-    ) -> Option<Self> {
         let n = pi0.len();
         assert!(n >= 2 && n.is_power_of_two() && n == 1 << r_hi.len(), "2^l words");
-        if prefix.is_some() {
-            assert!(n >= 4 * TILE && eq.len() >= n / 4, "the first quarter of eq");
-        } else {
-            assert_eq!(eq.len(), n, "one eq entry per word");
-        }
+        assert_eq!(eq.len(), n, "one eq entry per word");
         assert_eq!(batch.len(), PACK, "one batch weight per bit");
         for plane in &planes {
             assert!(plane.len() >= Self::plane_len(n), "a plane is too short");
@@ -1355,7 +1217,7 @@ impl<'a> LeanSwitch<'a> {
         }
         let l = batch.to_vec();
         let lp = compose_scale(&l, b128_inv(B128::ONE + r_hi[0]));
-        let mut sw = LeanSwitch {
+        Some(LeanSwitch {
             pi0,
             eq,
             r_hi,
@@ -1366,30 +1228,8 @@ impl<'a> LeanSwitch<'a> {
             half: n,
             round: 0,
             pending: None,
-            prefix: None,
             threads: threads.max(1),
-        };
-        sw.use_prefix_partials(prefix);
-        Some(sw)
-    }
-
-    /// Replace the first two full-table message passes with the equivalent quarter products
-    /// returned by [`partial_evals_prefix_parallel`]. Call before the first `msg`.
-    pub fn use_prefix_partials(&mut self, prefix: Option<PrefixPartials>) {
-        assert_eq!(self.round, 0);
-        assert_eq!(self.half, self.pi0.len());
-        if let Some(p) = prefix {
-            assert!(self.r_hi.len() >= 2);
-            assert!(p.iter().all(|v| v.len() == PACK));
-            let c1 = self.r_hi[1] * b128_inv(B128::ONE + self.r_hi[1]);
-            let e0 = image_dot(&self.l, (0..PACK).map(|k| p[0][k] + c1 * p[1][k]));
-            let einf = image_dot(
-                &self.lp,
-                (0..PACK).map(|k| p[0][k] + p[2][k] + c1 * (p[1][k] + p[3][k])),
-            );
-            self.pending = Some([e0, einf]);
-            self.prefix = Some(p);
-        }
+        })
     }
 
     /// The buffers for a fresh switch over `n` words.
@@ -1428,17 +1268,8 @@ impl<'a> LeanSwitch<'a> {
         let mlp = eq_matrices(&self.lp);
         let runs = crate::par::ranges(half, self.threads, TILE);
         let eq = self.eq.as_ptr() as usize;
-        let parts: Vec<[F162; 2]> = std::thread::scope(|scope| {
-            let handles: Vec<_> = runs
-                .into_iter()
-                .map(|run| {
-                    let (ml, mlp) = (&ml, &mlp);
-                    scope.spawn(move || unsafe {
-                        message_range(eq as *const B128, src, half, ml, mlp, run)
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        let parts: Vec<[F162; 2]> = crate::par::pool().map(runs.len(), |i| unsafe {
+            message_range(eq as *const B128, src, half, &ml, &mlp, runs[i].clone())
         });
         let mut m = [F162::ZERO; 2];
         for part in parts {
@@ -1492,15 +1323,7 @@ impl<'a> LeanSwitch<'a> {
         if self.round == 0 {
             self.r0 = r;
             self.round = 1;
-            let m = if let Some(p) = self.prefix.take() {
-                let e00 = image_dot(&self.l, p[0].iter().copied());
-                let e01 = image_dot(&self.l, p[2].iter().copied());
-                let ei0 = image_dot(&self.lp, (0..PACK).map(|k| p[0][k] + p[1][k]));
-                let ei1 = image_dot(&self.lp, (0..PACK).map(|k| p[2][k] + p[3][k]));
-                [e00 + r * (e00 + e01), ei0 + r * (ei0 + ei1)]
-            } else {
-                self.message(self.src(), hh)
-            };
+            let m = self.message(self.src(), hh);
             self.pending = Some(m);
             return;
         }
@@ -1529,27 +1352,18 @@ impl<'a> LeanSwitch<'a> {
         let runs = crate::par::ranges(hh, self.threads, TILE);
         let eq = self.eq.as_ptr() as usize;
         let dst = dst.map(|p| p as usize);
-        let parts: Vec<[F162; 2]> = std::thread::scope(|scope| {
-            let handles: Vec<_> = runs
-                .into_iter()
-                .map(|run| {
-                    let (ml, mlp) = (&ml, &mlp);
-                    scope.spawn(move || unsafe {
-                        fold_message_range(
-                            eq as *const B128,
-                            src,
-                            dst.map(|p| p as *mut u64),
-                            half,
-                            hh,
-                            r,
-                            ml,
-                            mlp,
-                            run,
-                        )
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        let parts: Vec<[F162; 2]> = crate::par::pool().map(runs.len(), |i| unsafe {
+            fold_message_range(
+                eq as *const B128,
+                src,
+                dst.map(|p| p as *mut u64),
+                half,
+                hh,
+                r,
+                &ml,
+                &mlp,
+                runs[i].clone(),
+            )
         });
         let mut m = [F162::ZERO; 2];
         for part in parts {
@@ -1652,71 +1466,5 @@ mod lean_tests {
         }
         let r = B128(next(&mut x));
         assert_eq!((B128::ONE + r) * b128_inv(B128::ONE + r), B128::ONE);
-    }
-
-    #[test]
-    fn prefix_partials_and_messages_match() {
-        let mut x = 0x1234_5678_9abc_def0_0123_4567_89ab_cdefu128;
-        for l in [8usize, 11] {
-            let n = 1 << l;
-            let words: Vec<_> = (0..n).map(|_| B128(next(&mut x))).collect();
-            let batch: Vec<_> = (0..PACK)
-                .map(|_| F162([next(&mut x) as u64, next(&mut x) as u64, next(&mut x) as u64 & ((1 << 34) - 1)]))
-                .collect();
-            let challenges: Vec<_> = (0..l)
-                .map(|_| F162([next(&mut x) as u64, next(&mut x) as u64, next(&mut x) as u64 & ((1 << 34) - 1)]))
-                .collect();
-            for case in 0..6 {
-                let mut hi: Vec<_> = (0..l).map(|_| B128(next(&mut x))).collect();
-                match case {
-                    1 => hi[0] = B128::ZERO,
-                    2 => hi[1] = B128::ZERO,
-                    3 => hi[0] = B128::ONE,
-                    4 => hi[1] = B128::ONE,
-                    5 => hi[l - 1] = B128::ONE,
-                    _ => {}
-                }
-                let eq = eq_expand_b128(&hi);
-                let want = partial_evals(&words, &eq);
-                for threads in [1usize, 3, 8] {
-                    let sentinel = B128(0xdead_beef_cafe_babe);
-                    let mut expanded = vec![sentinel; n];
-                    let len = unsafe { eq_expand_prefix_parallel(&hi, expanded.as_mut_ptr(), threads) };
-                    assert_eq!(&expanded[..len], &eq[..len]);
-                    assert!(expanded[len..].iter().all(|&v| v == sentinel));
-                    let prepared_eq = &expanded[..len];
-                    let (got, prefix) = partial_evals_prefix_parallel(&words, prepared_eq, &hi, threads);
-                    assert_eq!(got, want, "l {l} case {case} threads {threads}");
-                    assert_eq!(prefix.is_some(), case < 3);
-                    let Some(mut lean) = LeanSwitch::with_prefix_partials(
-                        &words, prepared_eq, &hi, &batch, threads, LeanSwitch::planes(n), prefix,
-                    ) else {
-                        continue;
-                    };
-                    let mut reference = SwitchProver::new(&words, &eq, &batch);
-                    for (round, &r) in challenges.iter().enumerate() {
-                        assert_eq!(lean.msg(), reference.msg(), "l {l} case {case} round {round}");
-                        lean.fold(r);
-                        reference.fold(r);
-                    }
-                    assert_eq!(lean.final_eval(), reference.final_eval());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn prefix_expansion_matches_full_parallel_expansion() {
-        let mut x = 0xa5a5_5a5a_f00d_beefu128;
-        for l in [1usize, 7, 8, 18] {
-            let hi: Vec<_> = (0..l).map(|_| B128(next(&mut x))).collect();
-            let eq = eq_expand_b128(&hi);
-            for threads in [1usize, 3, 8] {
-                let mut out = vec![B128::ZERO; eq.len()];
-                let len = unsafe { eq_expand_prefix_parallel(&hi, out.as_mut_ptr(), threads) };
-                assert_eq!(len, if l < 8 { eq.len() } else { eq.len() / 4 });
-                assert_eq!(&out[..len], &eq[..len], "l {l} threads {threads}");
-            }
-        }
     }
 }

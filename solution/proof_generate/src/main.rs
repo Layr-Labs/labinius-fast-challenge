@@ -107,17 +107,20 @@ mod sys {
             offset: i64,
         ) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+        pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     }
     pub const PROT_READ: i32 = 1;
     pub const MAP_PRIVATE: i32 = 2;
-    pub const MAP_POPULATE: i32 = 0x8000;
+    /// Linux 5.14+: fault the range in now, read-only, without blocking a later writer.
+    pub const MADV_POPULATE_READ: i32 = 22;
 }
 
 /// The harness witness table: `(1 << LOG_VARS) / 8` BLAKE3 XOF bytes, each 16 little-endian
 /// bytes one GHASH word. The timed prover does not recompute it, and does not copy it either: on
-/// Linux the file is mapped read-only and pre-faulted, and the mapping is read as the `B128`
-/// words it is (`B128` is `repr(transparent)` over its little-endian `u128`, and the host is
-/// little-endian). Elsewhere, or if the mapping fails, the file is read into a buffer.
+/// Linux the file is mapped read-only and the mapping is read as the `B128` words it is (`B128`
+/// is `repr(transparent)` over its little-endian `u128`, and the host is little-endian). The
+/// pages are faulted in by [`Table::populate`] on a thread of its own while the key is set up.
+/// Elsewhere, or if the mapping fails, the file is read into a buffer.
 enum Table {
     #[cfg(target_os = "linux")]
     Mapped {
@@ -145,7 +148,7 @@ impl Table {
                     core::ptr::null_mut(),
                     Self::BYTES,
                     sys::PROT_READ,
-                    sys::MAP_PRIVATE | sys::MAP_POPULATE,
+                    sys::MAP_PRIVATE,
                     file.as_raw_fd(),
                     0,
                 )
@@ -176,6 +179,30 @@ impl Table {
             Table::Owned(v) => v,
         }
     }
+
+}
+
+/// Fault the words' pages in, page-cache pages into page tables: `MADV_POPULATE_READ` where the
+/// kernel has it (older kernels refuse it, harmlessly), one read per page otherwise (the
+/// fault-around maps a run of pages per fault). A read-only touch, so it runs on another thread
+/// while the key is built.
+fn populate_words(words: &[B128]) {
+    let (addr, bytes) = (words.as_ptr() as usize, words.len() * 16);
+    #[cfg(target_os = "linux")]
+    {
+        let done =
+            unsafe { sys::madvise(addr as *mut core::ffi::c_void, bytes, sys::MADV_POPULATE_READ) };
+        if done == 0 {
+            return;
+        }
+    }
+    let mut off = 0;
+    let mut sink = 0u8;
+    while off < bytes {
+        sink ^= unsafe { core::ptr::read_volatile((addr as *const u8).add(off)) };
+        off += 4096;
+    }
+    std::hint::black_box(sink);
 }
 
 impl Drop for Table {
@@ -431,6 +458,10 @@ fn switch_rounds(
     (rounds, coords, opened)
 }
 
+/// Columns per pass over `A` in the commitment: 4 keeps two workers' accumulators inside one
+/// L2 when the workers are hyperthread siblings (see `CommitmentKey::commit_columns_rows`).
+const COMMIT_GROUP: usize = 4;
+
 fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let load_clock = std::time::Instant::now();
     let table = Table::load(table_path);
@@ -438,6 +469,25 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let load_time = load_clock.elapsed();
     let workers = threads();
     let clock = std::time::Instant::now();
+    // The table's pages come in while the key is built; the switch's buffers are faulted in
+    // while the commitment runs. Both are memory work a compute-bound phase hides.
+    let (table_addr, table_bytes) = (values.as_ptr() as usize, values.len() * 16);
+    let populate = std::thread::spawn(move || {
+        let table = unsafe {
+            std::slice::from_raw_parts(table_addr as *const B128, table_bytes / 16)
+        };
+        populate_words(table);
+    });
+    let mut eq = cf::HugeBuf::<B128>::new(1 << LOG_PACKED);
+    let planes = cf::LeanSwitch::planes(1 << LOG_PACKED);
+    let regions: Vec<(usize, usize)> = core::iter::once(eq.region())
+        .chain(planes.iter().map(|p| p.region()))
+        .collect();
+    let prefault = std::thread::spawn(move || {
+        for (addr, bytes) in regions {
+            unsafe { cf::touch_pages(addr, bytes) };
+        }
+    });
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
     let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
@@ -450,10 +500,12 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
         &p.extra_moduli,
     );
     drop(matrix);
+    populate.join().expect("the populate thread panicked");
     let setup_time = clock.elapsed();
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
-    let rows = key.commit_columns_rows(&columns, workers);
+    let rows = key.commit_columns_rows(&columns, workers, COMMIT_GROUP);
+    prefault.join().expect("the prefault thread panicked");
     let commit_time = clock.elapsed();
     let commitment = rq::pack_ring_elements(
         &commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, workers),
@@ -463,7 +515,6 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let recombine_time = clock.elapsed();
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
-    let mut eq = cf::HugeBuf::<B128>::new(1 << LOG_PACKED);
     unsafe { cf::eq_expand_b128_parallel(&hi, eq.as_mut_ptr(), workers) };
     let eq: &[B128] = unsafe { eq.as_slice() };
     let partials = cf::partial_evals_parallel(values, eq, workers);
@@ -472,7 +523,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     t.absorb_b128(&partials);
     let partials_time = clock.elapsed();
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let (rounds, coords, opened) = match cf::LeanSwitch::new(values, eq, &hi, &batch, workers) {
+    let (rounds, coords, opened) = match cf::LeanSwitch::new(values, eq, &hi, &batch, workers, planes) {
         Some(mut sw) => switch_rounds(&mut sw, &mut t),
         None => {
             // A coordinate of the point is one: the baseline's prover, whose workspace holds
@@ -535,13 +586,12 @@ fn main() {
         MODULUS
     };
     let proof = prove(&seed, modulus, &args[4]);
-    let bytes = codec().serialize(&proof).unwrap();
-    drop(proof);
     {
         use std::io::Write;
-        let mut file = std::fs::File::create(&args[2]).expect("create proof file");
-        file.write_all(&bytes).expect("write proof");
-        file.flush().expect("flush proof");
+        let file = std::fs::File::create(&args[2]).expect("create proof file");
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        codec().serialize_into(&mut out, &proof).expect("write proof");
+        out.flush().expect("flush proof");
     }
     // The proof is on disk; nothing the destructors would do is observable.
     std::process::exit(0);
@@ -760,7 +810,7 @@ mod tests {
         let (commitment, _) = Prover::cold(&pp).commit(&w);
         let coefficients = commitment_coefficients(&commitment, &primes, modulus);
         let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
-        let rows = pp.key().commit_columns_rows(&columns, 3);
+        let rows = pp.key().commit_columns_rows(&columns, 3, 4);
         let direct = commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, 3);
         assert_eq!(coefficients, direct, "the two recombinations differ");
         for j in [0usize, COLUMNS - 1] {

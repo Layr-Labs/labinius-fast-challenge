@@ -178,15 +178,17 @@ impl CommitmentKey {
     /// in `[0, q)`, exactly what [`AuxData::commitment`] would hold after
     /// [`commit_into_aux`](Self::commit_into_aux).
     ///
-    /// The columns are taken [`cm::GROUP`] at a time against one pass over `A`, as
-    /// `commit_into_aux` takes them, but the groups are handed out to a fixed number of workers
-    /// instead of one thread each, so each worker's accumulators stay in its own L2 and the
-    /// machine runs as many kernels as it has cores. Each column may be the lifted `F162`
+    /// The columns are taken `group` (at most [`cm::GROUP`]) at a time against one pass over
+    /// `A`, as `commit_into_aux` takes them, but the groups are handed out to a fixed number of
+    /// workers instead of one thread each, so each worker's accumulators stay in its own L2 and
+    /// the machine runs as many kernels as it has cores. With two workers per physical core a
+    /// group of 4 (348 KB of accumulators each) leaves both inside one L2. Each column may be the lifted `F162`
     /// witness or the `B128` words it was lifted from ([`cm::BatchSource`]).
     pub fn commit_columns_rows<E: cm::BatchSource>(
         &self,
         columns: &[E],
         workers: usize,
+        group: usize,
     ) -> Vec<[u32; N]> {
         let r = columns.len();
         assert!(r > 0, "at least one column");
@@ -195,7 +197,7 @@ impl CommitmentKey {
         }
         let limbs = self.limb_list();
         let nl = limbs.len();
-        let g = cm::GROUP.min(r);
+        let g = group.clamp(1, cm::GROUP).min(r);
         let groups = r.div_ceil(g);
         let workers = workers.clamp(1, groups);
         let mut out = vec![[0u32; N]; r * nl];

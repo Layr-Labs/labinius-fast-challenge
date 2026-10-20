@@ -756,6 +756,31 @@ impl<T> HugeBuf<T> {
     pub unsafe fn as_slice(&self) -> &[T] {
         core::slice::from_raw_parts(self.ptr, self.len)
     }
+
+    /// The buffer's address and size in bytes, for [`touch_pages`] on another thread.
+    pub fn region(&self) -> (usize, usize) {
+        (self.ptr as usize, self.len * core::mem::size_of::<T>())
+    }
+}
+
+/// Fault in every page of `[addr, addr + bytes)` by writing one zero byte per 4 KB (a huge
+/// page faults on its first touch and the rest of its touches hit), so that the first real
+/// writer finds the pages mapped. Meant for a background thread while a compute-bound phase
+/// runs.
+///
+/// # Safety
+/// The region must be writable, owned by the caller, and not read or written by anyone else
+/// until this returns.
+pub unsafe fn touch_pages(addr: usize, bytes: usize) {
+    let p = addr as *mut u8;
+    let mut off = 0;
+    while off < bytes {
+        core::ptr::write_volatile(p.add(off), 0);
+        off += 4096;
+    }
+    if bytes > 0 {
+        core::ptr::write_volatile(p.add(bytes - 1), 0);
+    }
 }
 
 impl<T> Drop for HugeBuf<T> {
@@ -829,11 +854,12 @@ pub unsafe fn eq_expand_b128_parallel(r: &[B128], out: *mut B128, threads: usize
 // `L'_k = L_k o (x -> d_k x)` on the same tile. The identity needs `1 + r_hi[k] != 0`; a point
 // with a coordinate equal to one is refused by [`LeanSwitch::new`] and the caller falls back.
 //
-// `p` has no such structure past round 0, but round 0 reads it straight from the words, and
-// every later round's fold is fused with the next round's message: one pass per round that
-// reads `p_k`, writes `p_{k+1}` in place over the low half and accumulates the message of round
-// `k + 1` from the elements it just wrote. The words are read twice, `eq` is read once per
-// round at the round's length, and `p` lives in `2^(l-1)` elements written once each.
+// `p` has no such structure past round 0, but rounds 0 and 1 read it straight from the words
+// (`p_1` is one fold of two words, formed on the fly and never stored), and every later
+// round's fold is fused with the next round's message: one pass per round that reads `p_k`,
+// writes `p_{k+1}` in place over the low half and accumulates the message of round `k + 1`
+// from the elements it just wrote. The words are read three times, `eq` is read once per round
+// at the round's length, and `p` lives in `2^(l-2)` elements written once each.
 //
 // The messages are the values [`SwitchProver`] sends: the same products, reassociated over the
 // threads (XOR), so the transcript and the proof are unchanged.
@@ -873,19 +899,32 @@ fn compose_scale(images: &[F162], d: B128) -> Vec<F162> {
         .collect()
 }
 
-/// Where a pass reads `p_k` from: the words themselves in round 0, the planes afterwards.
+/// Where a pass reads `p_k` from: the words themselves in round 0, the words folded once by
+/// the first challenge in round 1 (`p_1[j] = p_0[j] + r_0 (p_0[j] + p_0[j + half_0])`, never
+/// stored), and the planes from round 2 on.
 #[derive(Clone, Copy)]
 enum Src {
     Words(*const B128),
+    WordsFolded {
+        words: *const B128,
+        half: usize,
+        r: F162,
+    },
     Planes([*const u64; 3]),
+}
+
+#[inline(always)]
+unsafe fn load_words(w: *const B128) -> [__m512i; 3] {
+    let (lo, hi) = split_words(w);
+    [lo, hi, _mm512_setzero_si512()]
 }
 
 #[inline(always)]
 unsafe fn load_p(src: Src, j: usize) -> [__m512i; 3] {
     match src {
-        Src::Words(w) => {
-            let (lo, hi) = split_words(w.add(j));
-            [lo, hi, _mm512_setzero_si512()]
+        Src::Words(w) => load_words(w.add(j)),
+        Src::WordsFolded { words, half, r } => {
+            fold8(bcast3(r), load_words(words.add(j)), load_words(words.add(j + half)))
         }
         Src::Planes(p) => [
             _mm512_loadu_si512(p[0].add(j) as *const __m512i),
@@ -905,6 +944,10 @@ unsafe fn store_p(dst: [*mut u64; 3], j: usize, v: [__m512i; 3]) {
 unsafe fn get_p(src: Src, j: usize) -> F162 {
     match src {
         Src::Words(w) => F162::from_b128(*w.add(j)),
+        Src::WordsFolded { words, half, r } => {
+            let (p0, p1) = (F162::from_b128(*words.add(j)), F162::from_b128(*words.add(j + half)));
+            p0 + r * (p0 + p1)
+        }
         Src::Planes(p) => F162([*p[0].add(j), *p[1].add(j), *p[2].add(j)]),
     }
 }
@@ -1048,8 +1091,10 @@ pub struct LeanSwitch<'a> {
     l: Vec<F162>,
     /// `L'_k = L_k o (x -> d_k x)`.
     lp: Vec<F162>,
-    /// `p_k` for `k >= 1`, word-sliced; `2^(l-1)` elements per plane.
+    /// `p_k` for `k >= 2`, word-sliced; [`LeanSwitch::plane_len`] elements per plane.
     p: [HugeBuf<u64>; 3],
+    /// Round 0's challenge, which defines the virtual `p_1`.
+    r0: F162,
     /// The current round's half, once `msg` has been called.
     half: usize,
     round: usize,
@@ -1058,19 +1103,30 @@ pub struct LeanSwitch<'a> {
 }
 
 impl<'a> LeanSwitch<'a> {
+    /// Elements each of the three planes must hold for `n` words: `p_2` is `n / 4` elements,
+    /// and the final value needs one.
+    pub fn plane_len(n: usize) -> usize {
+        (n / 4).max(1)
+    }
+
     /// `None` when some coordinate of `r_hi` is one, which the caller treats with
-    /// [`SwitchProver`].
+    /// [`SwitchProver`]. `planes` are the three buffers `p` lives in, at least
+    /// [`plane_len`](Self::plane_len) elements each; they may be prefaulted ahead of time.
     pub fn new(
         pi0: &'a [B128],
         eq: &'a [B128],
         r_hi: &'a [B128],
         batch: &[F162],
         threads: usize,
+        planes: [HugeBuf<u64>; 3],
     ) -> Option<Self> {
         let n = pi0.len();
         assert!(n >= 2 && n.is_power_of_two() && n == 1 << r_hi.len(), "2^l words");
         assert_eq!(eq.len(), n, "one eq entry per word");
         assert_eq!(batch.len(), PACK, "one batch weight per bit");
+        for plane in &planes {
+            assert!(plane.len() >= Self::plane_len(n), "a plane is too short");
+        }
         if r_hi.iter().any(|&r| r == B128::ONE) {
             return None;
         }
@@ -1082,7 +1138,8 @@ impl<'a> LeanSwitch<'a> {
             r_hi,
             l,
             lp,
-            p: [HugeBuf::new(n / 2), HugeBuf::new(n / 2), HugeBuf::new(n / 2)],
+            p: planes,
+            r0: F162::ZERO,
             half: n,
             round: 0,
             pending: None,
@@ -1090,32 +1147,27 @@ impl<'a> LeanSwitch<'a> {
         })
     }
 
+    /// The buffers for a fresh switch over `n` words.
+    pub fn planes(n: usize) -> [HugeBuf<u64>; 3] {
+        let len = Self::plane_len(n);
+        [HugeBuf::new(len), HugeBuf::new(len), HugeBuf::new(len)]
+    }
+
     fn src(&self) -> Src {
-        if self.round == 0 {
-            Src::Words(self.pi0.as_ptr())
-        } else {
-            Src::Planes([self.p[0].as_ptr(), self.p[1].as_ptr(), self.p[2].as_ptr()])
+        match self.round {
+            0 => Src::Words(self.pi0.as_ptr()),
+            1 => Src::WordsFolded {
+                words: self.pi0.as_ptr(),
+                half: self.pi0.len() / 2,
+                r: self.r0,
+            },
+            _ => Src::Planes([self.p[0].as_ptr(), self.p[1].as_ptr(), self.p[2].as_ptr()]),
         }
     }
 
-    fn dst(&mut self) -> [*mut u64; 3] {
-        [
-            self.p[0].as_mut_ptr(),
-            self.p[1].as_mut_ptr(),
-            self.p[2].as_mut_ptr(),
-        ]
-    }
-
-    /// The round's two message values.
-    pub fn msg(&mut self) -> [F162; 2] {
-        self.half /= 2;
-        if let Some(m) = self.pending.take() {
-            return m;
-        }
-        debug_assert_eq!(self.round, 0);
-        let half = self.half;
-        let src = self.src();
-        let eq = self.eq.as_ptr();
+    /// The message over `src` at `half`: `e0 = sum_{j < half} L(eq[j]) p[j]`,
+    /// `einf = sum L'(eq[j]) (p[j] + p[j + half])`, with the maps the struct holds.
+    fn message(&self, src: Src, half: usize) -> [F162; 2] {
         if half < TILE {
             let mut e0 = F162::ZERO;
             let mut einf = F162::ZERO;
@@ -1130,7 +1182,7 @@ impl<'a> LeanSwitch<'a> {
         let ml = eq_matrices(&self.l);
         let mlp = eq_matrices(&self.lp);
         let runs = crate::par::ranges(half, self.threads, TILE);
-        let (eq, src) = (eq as usize, src);
+        let eq = self.eq.as_ptr() as usize;
         let parts: Vec<[F162; 2]> = std::thread::scope(|scope| {
             let handles: Vec<_> = runs
                 .into_iter()
@@ -1151,8 +1203,27 @@ impl<'a> LeanSwitch<'a> {
         m
     }
 
+    fn dst(&mut self) -> [*mut u64; 3] {
+        [
+            self.p[0].as_mut_ptr(),
+            self.p[1].as_mut_ptr(),
+            self.p[2].as_mut_ptr(),
+        ]
+    }
+
+    /// The round's two message values.
+    pub fn msg(&mut self) -> [F162; 2] {
+        self.half /= 2;
+        if let Some(m) = self.pending.take() {
+            return m;
+        }
+        debug_assert_eq!(self.round, 0);
+        self.message(self.src(), self.half)
+    }
+
     /// Bind the round's challenge: fold `p`, advance the map, and — when a round follows —
-    /// compute its message in the same pass.
+    /// compute its message in the same pass. Round 0's fold is not written: round 1 reads the
+    /// words folded by `r` on the fly.
     pub fn fold(&mut self, r: F162) {
         let half = self.half;
         let hh = half / 2;
@@ -1171,6 +1242,13 @@ impl<'a> LeanSwitch<'a> {
             let (p0, p1) = unsafe { (get_p(src, 0), get_p(src, 1)) };
             unsafe { set_p(dst, 0, p0 + r * (p0 + p1)) };
             self.round += 1;
+            return;
+        }
+        if self.round == 0 {
+            self.r0 = r;
+            self.round = 1;
+            let m = self.message(self.src(), hh);
+            self.pending = Some(m);
             return;
         }
         if hh < TILE {
@@ -1229,10 +1307,15 @@ impl<'a> LeanSwitch<'a> {
         self.round += 1;
     }
 
-    /// `p` at the end of the sumcheck: the value the commitment opens to.
+    /// `p` at the end of the sumcheck: the value the commitment opens to. Every last fold
+    /// writes it to the planes' first element.
     pub fn final_eval(&self) -> F162 {
         assert_eq!(self.round, self.r_hi.len(), "the sumcheck has not finished");
-        unsafe { get_p(self.src(), 0) }
+        F162([
+            unsafe { *self.p[0].as_ptr() },
+            unsafe { *self.p[1].as_ptr() },
+            unsafe { *self.p[2].as_ptr() },
+        ])
     }
 }
 
@@ -1280,7 +1363,8 @@ mod lean_tests {
                 assert_eq!(partial_evals(&pi0, &eq), partial_evals_parallel(&pi0, &eq, threads));
 
                 let mut reference = SwitchProver::new(&pi0, &eq, &batch);
-                let mut lean = LeanSwitch::new(&pi0, &eq, &r_hi, &batch, threads).unwrap();
+                let mut lean =
+                    LeanSwitch::new(&pi0, &eq, &r_hi, &batch, threads, LeanSwitch::planes(n)).unwrap();
                 for (round, &ri) in r.iter().enumerate() {
                     let want = reference.msg();
                     let got = lean.msg();

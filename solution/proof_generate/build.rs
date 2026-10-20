@@ -29,6 +29,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let image = key_image();
     std::fs::write(&out, image).expect("write the key image");
+    let tail=PathBuf::from(env::var("OUT_DIR").unwrap()).join("tail-key.bin");
+    std::fs::write(tail,tail_image()).expect("write the auxiliary key image");
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -41,3 +43,12 @@ fn key_image() -> Vec<u8> {
 fn key_image() -> Vec<u8> {
     Vec::new()
 }
+
+#[cfg(target_arch="x86_64")]
+fn tail_image()->Vec<u8> {
+ if parameters::MODULUS==modulus_choice::HYBRID_MODULUS {
+  keygen::key_image(&keygen::build_tail_key(parameters::MODULUS))
+ } else {Vec::new()}
+}
+#[cfg(not(target_arch="x86_64"))]
+fn tail_image()->Vec<u8> {Vec::new()}

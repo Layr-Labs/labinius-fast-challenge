@@ -1,16 +1,13 @@
-//! The moduli this prover can commit under.
+//! Supported commitment moduli.
 //!
-//! The checker takes any `u128` that clears its size conditions. This prover goes through the
-//! library's limb kernels, whose arithmetic is instantiated per prime at compile time, so the
-//! modulus it can reach is a product of distinct supported primes — it commits modulo each of
-//! them and recombines the residues into coefficients modulo the product. A modulus with any
-//! other factorisation, a power of two included, is one the checker would accept and this prover
-//! cannot build; that is a property of this solution, not of the scheme.
-//!
-//! The checker, not this parser, applies the minimum-modulus threshold and rejects a smaller
-//! product.
+//! The hybrid default is 3889 * 9721 * 1024. Its two returned primes identify
+//! witness transforms; the 1024 residue is computed by exact auxiliary CRT.
+//! Other supported moduli are products of distinct primes from the original
+//! library. The verifier accepts more moduli than this implementation supports.
 
 /// The primes the library has opening arithmetic for.
+pub const HYBRID_MODULUS:u128=3889u128*9721*1024;
+
 pub const SUPPORTED_PRIMES: [u16; 7] = [2917, 3889, 4861, 9721, 12637, 17497, 19441];
 
 /// The order the limbs are listed in once a modulus has been factored. The first entry present
@@ -35,8 +32,11 @@ const _: () = {
     assert!(LIMB_ORDER.len() == SUPPORTED_PRIMES.len());
 };
 
-/// The limbs of `modulus`, base first, if it is a product of distinct supported primes.
+/// Witness-transform primes, base first, for a supported modulus.
+
 pub fn limbs(modulus: u128) -> Result<Vec<u16>, &'static str> {
+    // These are the witness transform primes; the 1024 residue reuses both transforms.
+    if modulus == HYBRID_MODULUS { return Ok(vec![3889,9721]); }
     if modulus < 2 {
         return Err("a modulus is at least 2");
     }
@@ -67,6 +67,7 @@ mod tests {
     use super::*;
     #[test]
     fn supported_choices() {
+        assert_eq!(limbs(HYBRID_MODULUS),Ok(vec![3889,9721]));
         for q in SUPPORTED_PRIMES {
             assert_eq!(limbs(q as u128), Ok(vec![q]));
         }

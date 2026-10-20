@@ -1,26 +1,15 @@
-//! One packed-binary PCS instance, including the GHASH -> F162 switch.
+//! Packed-binary PCS opening, including the GHASH-to-F162 field switch.
 //!
-//! The commitment modulus the checker accepts is any `u128` of the right size. This prover
-//! reaches the subset that factors into the library's primes: it commits modulo each limb with
-//! the AVX-512 kernels and then recombines the residues into the coefficients modulo their
-//! product that the proof carries. `A` is defined by its coefficients in `R_Q`
-//! ([`rq::ajtai_matrix`]), so the limb form of the key is derived rather than drawn, which costs
-//! one reduction pass and one forward transform per limb.
+//! The default commitment modulus is 3889 * 9721 * 1024. Two witness NTTs feed
+//! ordinary residues and an exact auxiliary computation of the 1024 residue.
+//! Public matrix images and reconstruction bounds are computed at build time
+//! from the fixed matrix seed and modulus. Other supported prime products use
+//! the generic RNS implementation.
 //!
-//! What the timed process does, and what it no longer does:
-//!
-//! - The witness table is mapped read-only from the page cache and read in place as `B128`
-//!   words. It is never copied and never lifted into a 24-byte `F162` buffer: the bit-slicing
-//!   front end of the kernels, the row evaluation and the switch read the words directly.
-//! - The commitment runs on a pool of `available_parallelism` workers and keeps no transform.
-//!   The fold accumulates exact integer coefficients directly from bit-sliced table words,
-//!   without materializing the 5.4 GB base-limb transform.
-//! - The switch keeps `a` as a linear map applied to the `eq` table and `p` in one half-size
-//!   buffer, fusing each fold with the next message ([`cf::LeanSwitch`]); the `eq` expansion,
-//!   the partial evaluations, the row evaluation and the challenge sampling run on all cores.
-//!
-//! Every message is the one the baseline sends, so the transcript, the proof format and the
-//! modulus are unchanged.
+//! The timed process reads the fresh table in place, commits without retaining
+//! witness transforms, runs the eighth-table field switch, computes the exact
+//! integer fold, and writes the checker-compatible proof. Transcript challenges
+//! are derived using the chosen modulus and the resulting commitment.
 use bincode::Options;
 use labinius::challenge::{
     sample_short_challenges_parallel, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT,
@@ -414,7 +403,9 @@ fn commitment_coefficients_rows(
     workers: usize,
 ) -> Vec<u128> {
     let limbs = primes.len();
-    assert_eq!(rows.len(), columns * limbs);
+    let hybrid=modulus==modulus_choice::HYBRID_MODULUS;
+    let stride=if hybrid {3}else{limbs};
+    assert_eq!(rows.len(), columns * stride);
     let garner = Garner::of(primes);
     let mut out = vec![0u128; columns * N];
     let blocks = columns.div_ceil(32);
@@ -428,7 +419,7 @@ fn commitment_coefficients_rows(
             let c0 = blk * 32;
             let cols = (columns - c0).min(32);
             for k in 0..limbs {
-                let refs: Vec<&[u32; N]> = (0..cols).map(|c| &rows[(c0 + c) * limbs + k]).collect();
+                let refs: Vec<&[u32; N]> = (0..cols).map(|c| &rows[(c0 + c) * stride + k]).collect();
                 labinius::bd::coefficients_from_rows(primes[k], &refs, &mut residues[k][..cols * N]);
             }
             // Block `blk` owns coefficients `c0 * N .. (c0 + cols) * N` of `out`.
@@ -437,7 +428,12 @@ fn commitment_coefficients_rows(
                 for k in 0..limbs {
                     at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
                 }
-                let value = garner.lift(&at, &mut mixed);
+                let mut value = garner.lift(&at, &mut mixed);
+                if hybrid {
+                    let tail=rows[(c0+i/N)*3+2][i%N] as u64;
+                    let digit=tail.wrapping_sub(value as u64).wrapping_mul(153)&1023;
+                    value+=(3889u128*9721)*(digit as u128);
+                }
                 debug_assert!(value < modulus);
                 unsafe { dst.add(i).write(value) };
             }
@@ -553,6 +549,8 @@ fn fold_checked(
 
 /// One commitment task per physical core, temporarily placed by the key's
 /// worker entry point; eight columns share each pass over the public key.
+const EMBEDDED_TAIL_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/tail-key.bin")).len();
+static EMBEDDED_TAIL:Aligned64<[u8;EMBEDDED_TAIL_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/tail-key.bin")));
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 
@@ -588,7 +586,10 @@ fn prove_with_storage(seed: &[u8; 32], modulus: u128, table_path: &str) -> (Proo
     let setup_time = clock.elapsed();
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
-    let rows = key.commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP);
+    let rows = if modulus==modulus_choice::HYBRID_MODULUS {
+        let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
+        labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&columns,workers,8)
+    } else {key.commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
     let commit_time = clock.elapsed();
     let commitment = pack_coefficients(
         &commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, workers),
@@ -914,6 +915,7 @@ mod tests {
     #[test]
     fn garner_lift_is_the_chinese_remainder() {
         let primes = modulus_choice::limbs(MODULUS).unwrap();
+        let product:u128=primes.iter().map(|&q|q as u128).product();
         let garner = Garner::of(&primes);
         let mut x = 0x1234_5678u128;
         let mut mixed = vec![0u64; primes.len()];
@@ -921,12 +923,12 @@ mod tests {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            let value = x % MODULUS;
+            let value = x % product;
             let residues: Vec<u64> = primes.iter().map(|&q| (value % q as u128) as u64).collect();
             assert_eq!(garner.lift(&residues, &mut mixed), value);
         }
         let residues: Vec<u64> = primes.iter().map(|&q| q as u64 - 1).collect();
-        assert_eq!(garner.lift(&residues, &mut mixed), MODULUS - 1);
+        assert_eq!(garner.lift(&residues, &mut mixed), product - 1);
     }
 
     #[test]
@@ -1016,7 +1018,7 @@ mod tests {
     /// other and against the definition.
     #[test]
     fn commitment_is_the_schoolbook_product() {
-        let modulus = MODULUS;
+        let modulus = 110_277_094_573; // Retained generic RNS path.
         let primes = modulus_choice::limbs(modulus).unwrap();
         let p = params(&primes);
         let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
@@ -1096,4 +1098,22 @@ mod tests {
         assert_eq!(&folded.elements()[96..160], &positions[..]);
         assert_eq!(&fold_checked(&values, &challenges, primes[0], 3)[..], folded.elements());
     }
+    #[test]
+    fn hybrid_commitment_matches_schoolbook_under_new_modulus() {
+        let q=modulus_choice::HYBRID_MODULUS;let ring=128usize;let columns=4;
+        let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
+        let matrix=rq::ajtai_matrix(q,ring);
+        let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
+        let tail=keygen::build_tail_key_from_matrix(&matrix);
+        let mut t=Transcript::new(b"hybrid-commitment-regression");
+        let values=t.sample_b128(b"binary",ring*4*columns);
+        let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
+        let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,4);
+        let coefficients=commitment_coefficients_rows(&rows,&primes,q,columns,3);
+        for c in 0..columns {
+            let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
+            assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);
+        }
+    }
+
 }

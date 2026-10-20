@@ -107,9 +107,42 @@ mod sys {
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     }
     pub const PROT_READ: i32 = 1;
+    pub const PROT_WRITE: i32 = 2;
+    pub const MAP_SHARED: i32 = 1;
     pub const MAP_PRIVATE: i32 = 2;
     /// Linux 5.14+: fault the range in now, read-only, without blocking a later writer.
     pub const MADV_POPULATE_READ: i32 = 22;
+    pub const MADV_DONTNEED: i32 = 4;
+
+    /// The output file, created at its final size and mapped shared and writable: the bytes
+    /// stored through the mapping are the file's page-cache pages, so the proof is written
+    /// once, by every core, with no buffer and no `write(2)` copy. `None` if the file cannot
+    /// be mapped; the caller then writes it the ordinary way.
+    pub fn map_output(path: &str, bytes: usize) -> Option<*mut u8> {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .ok()?;
+        file.set_len(bytes as u64).ok()?;
+        let ptr = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                bytes,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr as isize == -1 || ptr.is_null() {
+            return None;
+        }
+        Some(ptr as *mut u8)
+    }
 }
 
 /// The harness witness table: `(1 << LOG_VARS) / 8` BLAKE3 XOF bytes, each 16 little-endian
@@ -207,6 +240,24 @@ fn populate_part(words: &[B128]) {
     std::hint::black_box(sink);
 }
 
+/// Drop the table's pages from the page tables once nothing reads them: `MADV_DONTNEED` on an
+/// eighth of the mapping per pool task. Unmapping is what the exit would do to the 65k mapped
+/// pages, serially, before the parent is told the process has ended; here the same work runs on
+/// every core. The file stays mapped (a read would fault its pages back in) and the pages stay
+/// in the page cache. Nothing for an owned table.
+fn release_words(table: &Table, threads: usize) {
+    #[cfg(target_os = "linux")]
+    if let Table::Mapped { ptr, bytes } = table {
+        let (addr, bytes) = (*ptr as usize, *bytes);
+        let runs = labinius::par::ranges(bytes, threads, 1 << 21);
+        labinius::par::pool().run(runs.len(), |i| {
+            let run = runs[i].clone();
+            unsafe { sys::madvise((addr + run.start) as *mut core::ffi::c_void, run.len(), sys::MADV_DONTNEED) };
+        });
+    }
+    let _ = (table, threads);
+}
+
 impl Drop for Table {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
@@ -252,6 +303,12 @@ fn claim(partials: &[B128], lo: &[B128]) -> B128 {
 /// parallel over elements.
 const FOLDED_BYTES: usize = 4;
 fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
+    let mut out = vec![0u8; FOLDED_BYTES * N * folded.elements().len()];
+    pack_folded_into(folded, &mut out);
+    out
+}
+/// [`pack_folded`] into a buffer of exactly the packed size (a file mapping in the prover).
+fn pack_folded_into(folded: &FoldedWitness, out: &mut [u8]) {
     let elements = folded.elements();
     assert!(
         elements
@@ -259,7 +316,7 @@ fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
             .all(|e| e.representation == Representation::Coefficients),
         "a fold is in coefficient form"
     );
-    let mut out = vec![0u8; FOLDED_BYTES * N * elements.len()];
+    assert_eq!(out.len(), FOLDED_BYTES * N * elements.len(), "a sized output");
     let runs = labinius::par::ranges(elements.len(), threads(), 1);
     let out_addr = out.as_mut_ptr() as usize;
     labinius::par::pool().run(runs.len(), |i| {
@@ -278,7 +335,38 @@ fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
             slot.copy_from_slice(&(c as i32).to_le_bytes());
         }
     });
-    out
+}
+
+/// The proof file: the proof's fixed-width encoding is its header, the folded witness's byte
+/// length and the packed folded witness, so the header is serialised and the folded witness is
+/// packed straight into a mapping of the file by every core ([`sys::map_output`]). The mapping
+/// is left to the exit: the file has its final size and its pages are the page cache's, so a
+/// reader sees the whole proof. Without a mapping the same bytes go through one buffered write.
+fn write_proof(path: &str, proof: &Proof, folded: &FoldedWitness) {
+    assert!(proof.folded.is_empty(), "the folded witness is written from its elements");
+    let mut head = codec().serialize(proof).expect("serialize proof");
+    assert!(head.ends_with(&[0u8; 8]), "an empty folded field ends the header");
+    head.truncate(head.len() - 8);
+    let folded_bytes = FOLDED_BYTES * N * folded.elements().len();
+    let total = head.len() + 8 + folded_bytes;
+    #[cfg(target_os = "linux")]
+    if let Some(ptr) = sys::map_output(path, total) {
+        // A fresh mapping of `total` bytes, every byte of which is written here.
+        let out = unsafe { std::slice::from_raw_parts_mut(ptr, total) };
+        let (h, rest) = out.split_at_mut(head.len());
+        h.copy_from_slice(&head);
+        let (len, body) = rest.split_at_mut(8);
+        len.copy_from_slice(&(folded_bytes as u64).to_le_bytes());
+        pack_folded_into(folded, body);
+        return;
+    }
+    use std::io::Write;
+    let file = std::fs::File::create(path).expect("create proof file");
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+    out.write_all(&head).expect("write proof");
+    out.write_all(&(folded_bytes as u64).to_le_bytes()).expect("write proof");
+    out.write_all(&pack_folded(folded)).expect("write proof");
+    out.flush().expect("flush proof");
 }
 
 /// `rq::pack_ring_elements`, byte for byte, into a sized buffer in parallel: `coefficient_bytes`
@@ -650,6 +738,8 @@ fn prove_with_storage(seed: &[u8; 32], modulus: u128, table_path: &str) -> (Proo
     let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
         values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
     ));
+    // The fold was the last reader of the table.
+    release_words(&table, workers);
     let fold_time = clock.elapsed();
     let proof = Proof {
         version: 1,
@@ -659,7 +749,8 @@ fn prove_with_storage(seed: &[u8; 32], modulus: u128, table_path: &str) -> (Proo
         rounds,
         opened: opened.0,
         row: wire::pack_row_evaluation(&row),
-        folded: pack_folded(&folded),
+        // Packed by `write_proof`, straight into the proof file.
+        folded: Vec::new(),
     };
     let encode_time = clock.elapsed();
     eprintln!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}",
@@ -675,7 +766,9 @@ fn prove_with_storage(seed: &[u8; 32], modulus: u128, table_path: &str) -> (Proo
 
 #[cfg(test)]
 fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
-    prove_with_storage(seed, modulus, table_path).0
+    let (mut proof, (_, _, folded)) = prove_with_storage(seed, modulus, table_path);
+    proof.folded = pack_folded(&folded);
+    proof
 }
 
 fn main() {
@@ -694,15 +787,9 @@ fn main() {
         MODULUS
     };
     let output_clock = std::time::Instant::now();
-    let (proof, _storage) = prove_with_storage(&seed, modulus, &args[4]);
+    let (proof, storage) = prove_with_storage(&seed, modulus, &args[4]);
     let prove_return = output_clock.elapsed();
-    {
-        use std::io::Write;
-        let file = std::fs::File::create(&args[2]).expect("create proof file");
-        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
-        codec().serialize_into(&mut out, &proof).expect("write proof");
-        out.flush().expect("flush proof");
-    }
+    write_proof(&args[2], &proof, &storage.2);
     eprintln!("labinius-output prove_return_us={} write_us={}",
         prove_return.as_micros(), (output_clock.elapsed()-prove_return).as_micros());
     // The proof is on disk; nothing the destructors would do is observable.
@@ -936,6 +1023,45 @@ mod tests {
         assert_eq!(garner.lift(&residues, &mut mixed), product - 1);
     }
 
+    /// `write_proof` lays the file out as the codec would serialise the whole proof.
+    #[test]
+    fn proof_file_is_the_codec_encoding() {
+        let mut next = 0x9e37_79b9_7f4a_7c15u64;
+        let elements: Vec<labinius::RingElement648> = (0..3)
+            .map(|_| {
+                let mut e = labinius::RingElement648::zero(Representation::Coefficients);
+                for slot in e.v.iter_mut() {
+                    next ^= next << 13;
+                    next ^= next >> 7;
+                    next ^= next << 17;
+                    *slot = (next % 2001) as i16 - 1000;
+                }
+                e
+            })
+            .collect();
+        let folded = FoldedWitness::of(elements);
+        let mut proof = Proof {
+            version: 1,
+            modulus: MODULUS,
+            commitment: (0..=255).collect(),
+            partials: vec![0, u128::MAX, 17],
+            rounds: vec![[[0, 1, 2], [u64::MAX, 4, 5]]],
+            opened: [7, 8, 9],
+            row: vec![1, 2, 3],
+            folded: Vec::new(),
+        };
+        let dir = std::env::temp_dir().join(format!("labinius-proof-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("proof.bin");
+        write_proof(path.to_str().unwrap(), &proof, &folded);
+        let written = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        proof.folded = pack_folded(&folded);
+        assert_eq!(written, codec().serialize(&proof).unwrap());
+        let decoded: Proof = codec().deserialize(&written).unwrap();
+        assert_eq!(decoded.folded, proof.folded);
+    }
+
     #[test]
     fn bulk_byte_fields_serialize_as_byte_sequences() {
         #[derive(Serialize)]
@@ -1108,7 +1234,7 @@ mod tests {
         let q=modulus_choice::HYBRID_MODULUS;let ring=128usize;let columns=4;
         let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
         let matrix=rq::ajtai_matrix(q,ring);
-        let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
+        let key=labinius::simd::commit::hybrid::pair_key(&CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli));
         let tail=keygen::build_tail_key_from_matrix(&matrix);
         let mut t=Transcript::new(b"hybrid-commitment-regression");
         let values=t.sample_b128(b"binary",ring*4*columns);

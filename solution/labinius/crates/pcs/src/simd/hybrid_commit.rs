@@ -11,26 +11,60 @@ const P1:u16=9721;
 const PRODUCT:i64=P0 as i64*P1 as i64;
 pub const MODULUS:u128=PRODUCT as u128*1024;
 pub const CHUNK_BATCHES:usize=7;
+/// The paired key layout the sink streams. Within each 27-slot block, slots `2p` and `2p + 1`
+/// (`p < 13`) are stored as two rows: ring elements 0..16 of both slots, then elements 16..32 of
+/// both; slot 26 keeps its row. [`TwinSink`] forms the same two halves of the transform block
+/// with two `vshufi64x2` per pair (shared by the two key streams of a prime) and feeds them to
+/// `vpdpwssd`, so accumulator lane `k` receives the products of elements `2k, 2k+1, 2k+16,
+/// 2k+17` of slot `2p` (lanes 0..8) or `2p + 1` (lanes 8..16): the same lane sums [`pack2`] of
+/// two `vpmaddwd` gave, in the same integer, without the three shuffle-and-add uops per pair and
+/// without the separate accumulator add.
+pub fn pair_batch(src:&Batch32)->Batch32 {
+ let mut out=src.clone();
+ for blk in 0..24 {
+  for p in 0..13 {
+   let (j0,j1)=(27*blk+2*p,27*blk+2*p+1);
+   out.v[j0][..16].copy_from_slice(&src.v[j0][..16]);out.v[j0][16..].copy_from_slice(&src.v[j1][..16]);
+   out.v[j1][..16].copy_from_slice(&src.v[j0][16..]);out.v[j1][16..].copy_from_slice(&src.v[j1][16..]);
+  }
+ }
+ out
+}
+/// The owned, paired copy of a key for [`commit_columns_rows`], which takes paired keys only.
+pub fn pair_key(key:&crate::key::CommitmentKey)->crate::key::CommitmentKey {key.map_rows(pair_batch)}
 struct TwinSink {buf:*mut i16,a:*const i16,t:*const i16,base:*mut i32,tail:*mut i32}
 impl BlockSink for TwinSink {
  #[inline(always)]unsafe fn dst(&mut self,_:usize)->*mut i16 {self.buf}
- #[target_feature(enable="avx512f,avx512bw")]
+ #[target_feature(enable="avx512f,avx512bw,avx512vnni")]
  unsafe fn block(&mut self,blk:usize,w:*const i16) {
-  for p in 0..14 {
-   let j0=2*p;let j1=(j0+1).min(26);
-   let w0=_mm512_load_si512(w.add(32*j0) as *const __m512i);
-   let w1=_mm512_load_si512(w.add(32*j1) as *const __m512i);
-   let a0=_mm512_load_si512(self.a.add(32*(27*blk+j0)) as *const __m512i);
-   let a1=_mm512_load_si512(self.a.add(32*(27*blk+j1)) as *const __m512i);
-   let t0=_mm512_load_si512(self.t.add(32*(27*blk+j0)) as *const __m512i);
-   let t1=_mm512_load_si512(self.t.add(32*(27*blk+j1)) as *const __m512i);
-   let ba=self.base.add(16*(ACC_PER_BLK*blk+p)) as *mut __m512i;
-   let ta=self.tail.add(16*(ACC_PER_BLK*blk+p)) as *mut __m512i;
-   let bp=pack2(_mm512_madd_epi16(w0,a0),_mm512_madd_epi16(w1,a1));
-   let tp=pack2(_mm512_madd_epi16(w0,t0),_mm512_madd_epi16(w1,t1));
-   _mm512_store_si512(ba,_mm512_add_epi32(_mm512_load_si512(ba),bp));
-   _mm512_store_si512(ta,_mm512_add_epi32(_mm512_load_si512(ta),tp));
+  let a=self.a.add(32*27*blk);let t=self.t.add(32*27*blk);
+  let base=self.base.add(16*ACC_PER_BLK*blk);let tail=self.tail.add(16*ACC_PER_BLK*blk);
+  for p in 0..13 {
+   let w0=_mm512_load_si512(w.add(64*p) as *const __m512i);
+   let w1=_mm512_load_si512(w.add(64*p+32) as *const __m512i);
+   let lo=_mm512_shuffle_i64x2::<0x44>(w0,w1);
+   let hi=_mm512_shuffle_i64x2::<0xEE>(w0,w1);
+   let a0=_mm512_load_si512(a.add(64*p) as *const __m512i);
+   let a1=_mm512_load_si512(a.add(64*p+32) as *const __m512i);
+   let t0=_mm512_load_si512(t.add(64*p) as *const __m512i);
+   let t1=_mm512_load_si512(t.add(64*p+32) as *const __m512i);
+   let ba=base.add(16*p) as *mut __m512i;let ta=tail.add(16*p) as *mut __m512i;
+   let mut sb=_mm512_load_si512(ba);let mut st=_mm512_load_si512(ta);
+   sb=_mm512_dpwssd_epi32(sb,lo,a0);sb=_mm512_dpwssd_epi32(sb,hi,a1);
+   st=_mm512_dpwssd_epi32(st,lo,t0);st=_mm512_dpwssd_epi32(st,hi,t1);
+   _mm512_store_si512(ba,sb);_mm512_store_si512(ta,st);
   }
+  // Slot 26 stands alone in vector 13, with its sum in both lane groups: the row and its
+  // 256-bit halves swapped, against the block's row 26 and its halves swapped.
+  let w26=_mm512_load_si512(w.add(32*26) as *const __m512i);
+  let w26s=_mm512_shuffle_i64x2::<0x4E>(w26,w26);
+  let a26=_mm512_load_si512(a.add(32*26) as *const __m512i);
+  let t26=_mm512_load_si512(t.add(32*26) as *const __m512i);
+  let ba=base.add(16*13) as *mut __m512i;let ta=tail.add(16*13) as *mut __m512i;
+  let mut sb=_mm512_load_si512(ba);let mut st=_mm512_load_si512(ta);
+  sb=_mm512_dpwssd_epi32(sb,w26,a26);sb=_mm512_dpwssd_epi32(sb,w26s,_mm512_shuffle_i64x2::<0x4E>(a26,a26));
+  st=_mm512_dpwssd_epi32(st,w26,t26);st=_mm512_dpwssd_epi32(st,w26s,_mm512_shuffle_i64x2::<0x4E>(t26,t26));
+  _mm512_store_si512(ba,sb);_mm512_store_si512(ta,st);
  }
 }
 #[inline(always)]
@@ -131,7 +165,8 @@ pub fn certify(raw:&[[i16;648]],chunk_batches:usize)->i64 {
 }
 
 /// Commit B128 columns under two ordinary limbs and an auxiliary 1024 residue.
-/// The tail key is the NTT of the centered coefficient lift of A mod 1024.
+/// The tail key is the NTT of the centered coefficient lift of A mod 1024. Both keys must be
+/// in the paired layout of [`pair_key`].
 /// The public-key certificate establishes exact reconstruction for CHUNK_BATCHES.
 pub fn commit_columns_rows(
  base:&crate::key::CommitmentKey, tail:&crate::key::CommitmentKey,
@@ -168,6 +203,26 @@ pub fn commit_columns_rows(
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[test]
+ fn paired_sink_matches_pack2() {
+  let mut x=0x9e3779b97f4a7c15u64;
+  let mut next=||{x^=x<<13;x^=x>>7;x^=x<<17;x};
+  let mut key=Batch32::zero(Representation::Ntt);
+  for j in 0..N {for p in 0..32 {key.v[j][p]=(next()%3889) as i16-1944;}}
+  let paired=pair_batch(&key);
+  let mut w=Blk27([0;27*32]);
+  for v in w.0.iter_mut() {*v=(next()%3889) as i16-1944;}
+  let mut acc_ref=Acc::zero();let mut acc_new=Acc::zero();let mut dummy=Acc::zero();
+  unsafe {
+   let apf=key.v.as_ptr() as *const i8;
+   super::super::mac27::<false>(w.0.as_ptr(),key.v.as_ptr() as *const i16,apf,acc_ref.v.as_mut_ptr() as *mut i32);
+   let mut sink=TwinSink{buf:w.0.as_mut_ptr(),a:paired.v.as_ptr() as *const i16,t:paired.v.as_ptr() as *const i16,
+    base:acc_new.v.as_mut_ptr() as *mut i32,tail:dummy.v.as_mut_ptr() as *mut i32};
+   sink.block(0,w.0.as_ptr());
+  }
+  assert_eq!(&acc_ref.v[..ACC_PER_BLK],&acc_new.v[..ACC_PER_BLK]);
+  assert_eq!(&acc_new.v[..ACC_PER_BLK],&dummy.v[..ACC_PER_BLK]);
+ }
  #[test]
  fn centered_crt_boundaries() {
   unsafe{

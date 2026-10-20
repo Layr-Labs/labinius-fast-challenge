@@ -37,7 +37,13 @@ pub fn build_key(modulus: u128) -> CommitmentKey {
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
     let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
-    CommitmentKey::from_coefficients(COLUMN_LEN, &matrix, modulus, p.base, &p.extra_moduli)
+    let key = CommitmentKey::from_coefficients(COLUMN_LEN, &matrix, modulus, p.base, &p.extra_moduli);
+    // The hybrid commitment streams its keys in a paired slot layout; its image is paired too.
+    if modulus == modulus_choice::HYBRID_MODULUS {
+        labinius::simd::commit::hybrid::pair_key(&key)
+    } else {
+        key
+    }
 }
 
 /// The byte image of a key: limb by limb, batch by batch, each batch as its rows, its tag
@@ -103,7 +109,7 @@ pub fn build_tail_key_from_matrix(matrix:&[u128])->CommitmentKey {
     let product=3889u128*9721;
     let lifted:Vec<u128>=raw.iter().flatten().map(|&v|(v as i64).rem_euclid(product as i64) as u128).collect();
     let p=params(&[3889,9721]);
-    CommitmentKey::from_coefficients(raw.len()*4,&lifted,product,p.base,&p.extra_moduli)
+    hybrid::pair_key(&CommitmentKey::from_coefficients(raw.len()*4,&lifted,product,p.base,&p.extra_moduli))
 }
 pub fn build_tail_key(modulus:u128)->CommitmentKey {
     assert_eq!(modulus,modulus_choice::HYBRID_MODULUS);

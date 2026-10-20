@@ -190,6 +190,20 @@ impl CommitmentKey {
         }
     }
 
+    /// An owned copy of this key with every batch of every limb passed through `f`: for a
+    /// consumer that streams the rows in a layout of its own (the hybrid commitment pairs the
+    /// slots of each block, [`crate::simd::commit::hybrid::pair_batch`]).
+    pub fn map_rows(&self, f: impl Fn(&Batch32) -> Batch32) -> Self {
+        CommitmentKey {
+            a: (0..self.limbs())
+                .map(|k| KeyRows::Owned(self.row(k).iter().map(&f).collect()))
+                .collect(),
+            base: self.base,
+            additional: self.additional.clone(),
+            len_f162: self.len_f162,
+        }
+    }
+
     /// A key whose per-limb rows already exist in storage that outlives it: `rows[k]` is limb
     /// `k`'s `len_f162 / 128` batches in the NTT domain, exactly what [`row`](Self::row) of the
     /// key [`from_coefficients`](Self::from_coefficients) builds returns. Nothing is copied or

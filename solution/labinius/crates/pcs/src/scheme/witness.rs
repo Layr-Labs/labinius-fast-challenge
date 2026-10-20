@@ -22,6 +22,31 @@ impl fmt::Display for WitnessError {
 
 impl std::error::Error for WitnessError {}
 
+fn lift_into(elements: &mut [F162], trace: &[B128]) {
+    let n = elements.len();
+    let threads = crate::huge::workers(n / 4096);
+    if threads == 1 {
+        for (e, &x) in elements.iter_mut().zip(trace) {
+            *e = F162::from_b128(x);
+        }
+        return;
+    }
+    let ptr = elements.as_mut_ptr() as usize;
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let start = t * n / threads;
+            let end = (t + 1) * n / threads;
+            let trace = &trace[start..end];
+            scope.spawn(move || unsafe {
+                let dst = (ptr as *mut F162).add(start);
+                for (i, &x) in trace.iter().enumerate() {
+                    dst.add(i).write(F162::from_b128(x));
+                }
+            });
+        }
+    });
+}
+
 /// The private input: `witness_len()` elements of `F162`, read as
 /// `witness_len() / 4` binary ring elements of `R_648` four `F162` at a time.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -36,16 +61,19 @@ impl Witness {
         if trace.len() != self.params.witness_len() {
             return Err(WitnessError::WrongLength);
         }
-        for (e, &x) in self.elements.iter_mut().zip(trace) {
-            *e = F162::from_b128(x);
-        }
+        lift_into(&mut self.elements, trace);
         Ok(())
     }
 
     pub fn lifted(params: &Params, trace: &[B128]) -> Result<Witness, WitnessError> {
+        if trace.len() != params.witness_len() {
+            return Err(WitnessError::WrongLength);
+        }
+        // `F162` is `Copy`. Skip the zero-fill: every element is overwritten below.
+        let elements = unsafe { crate::huge::uninit(trace.len()) };
         let mut w = Witness {
             params: params.clone(),
-            elements: vec![F162::ZERO; params.witness_len()],
+            elements,
         };
         w.relift(trace)?;
         Ok(w)

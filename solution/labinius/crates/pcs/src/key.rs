@@ -274,35 +274,48 @@ impl CommitmentKey {
         // The address is a usize so the closure is `Send`; the slices do not overlap.
         let batch_addr = aux.batches.as_mut_ptr() as usize;
         let stride = std::mem::size_of::<Batch32>();
+        // One worker per CPU, each owning a scratch and walking many column groups.
+        // A thread per group (128 of them on this instance) time-slices the NTT working
+        // set out of L2; the kernel is long enough that the extra threads never pay for
+        // themselves.
+        let thread_n = crate::huge::workers(starts.len());
         let mut groups: Vec<(usize, Vec<[u32; N]>)> = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(starts.len());
-            for c0 in starts {
+            let mut handles = Vec::with_capacity(thread_n);
+            for t in 0..thread_n {
                 let limbs = &limbs;
+                let starts = &starts;
                 handles.push(scope.spawn(move || {
                     let mut st = cm::Scratch::with_group(limbs, g);
-                    let mut raw = vec![[0u32; N]; g * nl];
-                    let mut chunks: [&[F162]; cm::GROUP] = [&[]; cm::GROUP];
-                    for i in 0..g {
-                        let c = c0 + i;
-                        chunks[i] = &witness[c * len_f162..(c + 1) * len_f162];
+                    let mut owned = Vec::with_capacity(starts.len().div_ceil(thread_n));
+                    for (idx, &c0) in starts.iter().enumerate() {
+                        if idx % thread_n != t {
+                            continue;
+                        }
+                        let mut raw = vec![[0u32; N]; g * nl];
+                        let mut chunks: [&[F162]; cm::GROUP] = [&[]; cm::GROUP];
+                        for i in 0..g {
+                            let c = c0 + i;
+                            chunks[i] = &witness[c * len_f162..(c + 1) * len_f162];
+                        }
+                        let batches = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (batch_addr + (c0 * bpc) * stride) as *mut Batch32,
+                                g * bpc,
+                            )
+                        };
+                        cm::commit_limbs_group(
+                            &chunks[..g],
+                            limbs,
+                            Some(batches),
+                            &mut st,
+                            &mut raw,
+                        );
+                        owned.push((c0, raw));
                     }
-                    let batches = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (batch_addr + (c0 * bpc) * stride) as *mut Batch32,
-                            g * bpc,
-                        )
-                    };
-                    cm::commit_limbs_group(
-                        &chunks[..g],
-                        limbs,
-                        Some(batches),
-                        &mut st,
-                        &mut raw,
-                    );
-                    (c0, raw)
+                    owned
                 }));
             }
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         groups.sort_by_key(|(c0, _)| *c0);
         let mut data = Vec::with_capacity(4 * r);

@@ -33,6 +33,7 @@ pub mod eval;
 pub mod f162;
 pub mod fields;
 pub mod fold;
+pub mod huge;
 pub mod key;
 pub mod labrador;
 pub mod limb;

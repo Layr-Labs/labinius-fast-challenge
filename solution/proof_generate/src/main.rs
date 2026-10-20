@@ -69,17 +69,21 @@ fn seed() -> [u8; 32] {
 /// The harness witness table: `(1 << LOG_VARS) / 8` BLAKE3 XOF bytes, each 16
 /// little-endian bytes one GHASH word. The timed prover does not recompute it.
 fn load_table(path: &str) -> Vec<B128> {
-    let table_bytes = (1 << LOG_VARS) / 8;
+    let n = (1 << LOG_VARS) / 128;
+    let table_bytes = n * 16;
     let mut file = std::fs::File::open(path).expect("open witness table");
-    let mut bytes = vec![0u8; table_bytes];
-    std::io::Read::read_exact(&mut file, &mut bytes).expect("witness table has the wrong length");
+    // The file is already the little-endian `B128` encoding. Read it straight into the
+    // output buffer instead of zeroing a byte buffer and copying it element by element.
+    let mut values: Vec<B128> = Vec::with_capacity(n);
+    unsafe { values.set_len(n) };
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, table_bytes)
+    };
+    std::io::Read::read_exact(&mut file, bytes).expect("witness table has the wrong length");
     let mut extra = [0u8; 1];
     let extra_n = std::io::Read::read(&mut file, &mut extra).expect("read witness table");
     assert_eq!(extra_n, 0, "witness table has the wrong length");
-    bytes
-        .chunks_exact(16)
-        .map(|chunk| B128(u128::from_le_bytes(chunk.try_into().unwrap())))
-        .collect()
+    values
 }
 #[cfg(test)]
 fn trace(seed: &[u8; 32]) -> Vec<B128> {

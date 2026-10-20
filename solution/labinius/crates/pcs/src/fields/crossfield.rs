@@ -78,7 +78,8 @@ pub fn eq_expand_f162(r: &[F162]) -> Vec<F162> {
 }
 
 pub fn eq_expand_b128(r: &[B128]) -> Vec<B128> {
-    let mut t = vec![B128::ZERO; 1 << r.len()];
+    let n = 1usize << r.len();
+    let mut t = unsafe { crate::huge::uninit(n) };
     eq_expand_b128_into(r, &mut t);
     t
 }
@@ -86,6 +87,16 @@ pub fn eq_expand_b128(r: &[B128]) -> Vec<B128> {
 /// The expansion in place, doubling from the back so no entry is read after it is written.
 pub fn eq_expand_b128_into(r: &[B128], t: &mut [B128]) {
     assert_eq!(t.len(), 1 << r.len());
+    if std::arch::is_x86_feature_detected!("vpclmulqdq")
+        && std::arch::is_x86_feature_detected!("avx512f")
+    {
+        unsafe { eq_expand_b128_simd(r, t) };
+    } else {
+        eq_expand_b128_scalar(r, t);
+    }
+}
+
+fn eq_expand_b128_scalar(r: &[B128], t: &mut [B128]) {
     t[0] = B128::ONE;
     for (round, &ri) in r.iter().enumerate() {
         for i in (0..1 << round).rev() {
@@ -93,6 +104,66 @@ pub fn eq_expand_b128_into(r: &[B128], t: &mut [B128]) {
             t[2 * i + 1] = hi;
             t[2 * i] = t[i] + hi;
         }
+    }
+}
+
+/// Four-wide GHASH product. Lane `k` of the result is lane `k` of `a` times lane `k` of `b`
+/// in GF(2^128) with the GHASH polynomial.
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn mul_b128x4(a: __m512i, b: __m512i) -> __m512i {
+    let lo = _mm512_clmulepi64_epi128::<0x00>(a, b);
+    let hi = _mm512_clmulepi64_epi128::<0x11>(a, b);
+    let ax = _mm512_xor_si512(a, _mm512_shuffle_epi32::<0x4E>(a));
+    let bx = _mm512_xor_si512(b, _mm512_shuffle_epi32::<0x4E>(b));
+    let mid = _mm512_xor_si512(
+        _mm512_clmulepi64_epi128::<0x00>(ax, bx),
+        _mm512_xor_si512(lo, hi),
+    );
+    let p_lo = _mm512_xor_si512(lo, _mm512_bslli_epi128::<8>(mid));
+    let p_hi = _mm512_xor_si512(hi, _mm512_bsrli_epi128::<8>(mid));
+    let poly = _mm512_set1_epi64(0x87);
+    let mut acc = p_lo;
+    let mut h = p_hi;
+    for _ in 0..2 {
+        let c_lo = _mm512_clmulepi64_epi128::<0x00>(h, poly);
+        let c_hi = _mm512_clmulepi64_epi128::<0x11>(h, poly);
+        let c = _mm512_xor_si512(c_lo, _mm512_bslli_epi128::<8>(c_hi));
+        let carry = _mm512_bsrli_epi128::<8>(c_hi);
+        acc = _mm512_xor_si512(acc, c);
+        h = carry;
+    }
+    acc
+}
+
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn eq_expand_b128_simd(r: &[B128], t: &mut [B128]) {
+    t[0] = B128::ONE;
+    let mut n = 1usize;
+    for &ri in r {
+        let lane = _mm_set_epi64x((ri.0 >> 64) as i64, ri.0 as i64);
+        let rb = _mm512_broadcast_i32x4(lane);
+        let mut i = n;
+        while i >= 4 {
+            i -= 4;
+            let a = _mm512_loadu_si512(t.as_ptr().add(i) as *const __m512i);
+            let hv = mul_b128x4(a, rb);
+            let mut hi = [0u128; 4];
+            let mut av = [0u128; 4];
+            _mm512_storeu_si512(hi.as_mut_ptr() as *mut __m512i, hv);
+            _mm512_storeu_si512(av.as_mut_ptr() as *mut __m512i, a);
+            for k in (0..4).rev() {
+                let h = B128(hi[k]);
+                t[2 * (i + k) + 1] = h;
+                t[2 * (i + k)] = B128(av[k]) + h;
+            }
+        }
+        while i > 0 {
+            i -= 1;
+            let h = t[i] * ri;
+            t[2 * i + 1] = h;
+            t[2 * i] = t[i] + h;
+        }
+        n *= 2;
     }
 }
 
@@ -146,8 +217,45 @@ const TILE: usize = 64;
 /// `acc[h][kb].qword[i].byte[t].bit[k']` sums `V[8kb + 7 - k'][8(8h + i) + t]`.
 fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
     assert_eq!(pi0.len(), eq_hi.len());
-    let n = pi0.len();
-    let tiles = n / TILE;
+    let tiles = pi0.len() / TILE;
+    let threads = if tiles >= 1024 {
+        crate::huge::workers(tiles / 256)
+    } else {
+        1
+    };
+    let mut v = if threads == 1 {
+        partial_evals_tiles(pi0, eq_hi, 0, tiles)
+    } else {
+        let mut parts = Vec::with_capacity(threads);
+        std::thread::scope(|scope| {
+            let mut jobs = Vec::with_capacity(threads);
+            for t in 0..threads {
+                let (a, b) = (t * tiles / threads, (t + 1) * tiles / threads);
+                jobs.push(scope.spawn(move || partial_evals_tiles(pi0, eq_hi, a, b)));
+            }
+            for job in jobs {
+                parts.push(job.join().unwrap());
+            }
+        });
+        let mut acc = parts.pop().unwrap();
+        for part in &parts {
+            for (dst, src) in acc.iter_mut().zip(part) {
+                *dst = *dst + *src;
+            }
+        }
+        acc
+    };
+    for (&p, &e) in pi0[TILE * tiles..].iter().zip(&eq_hi[TILE * tiles..]) {
+        for (k, vk) in v.iter_mut().enumerate() {
+            if p.bit(k) {
+                *vk = *vk + e;
+            }
+        }
+    }
+    v
+}
+
+fn partial_evals_tiles(pi0: &[B128], eq_hi: &[B128], t0: usize, t1: usize) -> Vec<B128> {
     let mut v = vec![B128::ZERO; PACK];
     unsafe {
         let ident = _mm512_set1_epi64(GF_IDENT);
@@ -155,7 +263,7 @@ fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
         let mut xe = [_mm512_setzero_si512(); 16];
         let mut xp = [_mm512_setzero_si512(); 16];
         let mut ap = [[0u64; 8]; 16];
-        for t in 0..tiles {
+        for t in t0..t1 {
             transpose_tile(eq_hi.as_ptr().add(TILE * t) as *const u8, &mut xe);
             transpose_tile(pi0.as_ptr().add(TILE * t) as *const u8, &mut xp);
             for k in 0..16 {
@@ -191,13 +299,6 @@ fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
             }
         }
     }
-    for (&p, &e) in pi0[TILE * tiles..].iter().zip(&eq_hi[TILE * tiles..]) {
-        for (k, vk) in v.iter_mut().enumerate() {
-            if p.bit(k) {
-                *vk = *vk + e;
-            }
-        }
-    }
     v
 }
 
@@ -218,19 +319,34 @@ unsafe fn split_words(x: *const B128) -> (__m512i, __m512i) {
 fn poly_from_b128(pi0: &[B128], out: &mut super::sumcheck::Poly) {
     let n = pi0.len();
     assert_eq!(out.n, n);
-    let w = &mut out.w;
-    w[2].fill(0);
+    let w0 = out.w[0].as_mut_ptr() as usize;
+    let w1 = out.w[1].as_mut_ptr() as usize;
+    out.w[2].fill(0);
     let blocks = n / 8;
-    unsafe {
-        for b in 0..blocks {
-            let (lo, hi) = split_words(pi0.as_ptr().add(8 * b));
-            _mm512_storeu_si512(w[0].as_mut_ptr().add(8 * b) as *mut __m512i, lo);
-            _mm512_storeu_si512(w[1].as_mut_ptr().add(8 * b) as *mut __m512i, hi);
+    let threads = if blocks >= 4096 {
+        crate::huge::workers(blocks / 1024)
+    } else {
+        1
+    };
+    let src = pi0.as_ptr() as usize;
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            scope.spawn(move || {
+                let b0 = t * blocks / threads;
+                let b1 = (t + 1) * blocks / threads;
+                unsafe {
+                    for b in b0..b1 {
+                        let (lo, hi) = split_words((src as *const B128).add(8 * b));
+                        _mm512_storeu_si512((w0 as *mut u64).add(8 * b) as *mut __m512i, lo);
+                        _mm512_storeu_si512((w1 as *mut u64).add(8 * b) as *mut __m512i, hi);
+                    }
+                }
+            });
         }
-    }
+    });
     for j in 8 * blocks..n {
-        w[0][j] = pi0[j].0 as u64;
-        w[1][j] = (pi0[j].0 >> 64) as u64;
+        out.w[0][j] = pi0[j].0 as u64;
+        out.w[1][j] = (pi0[j].0 >> 64) as u64;
     }
 }
 
@@ -260,30 +376,25 @@ fn poly_from_eq(eqs: &[&[B128]], batches: &[Vec<F162>], out: &mut super::sumchec
     let w = &mut out.w;
     let tiles = n / TILE;
     let ms: Vec<[[u64; 16]; 24]> = batches.iter().map(|b| eq_matrices(b)).collect();
-    unsafe {
-        let mut xe = [_mm512_setzero_si512(); 16];
-        for t in 0..tiles {
-            let mut acc = [_mm512_setzero_si512(); 24];
-            for (eq, m) in eqs.iter().zip(&ms) {
-                transpose_tile(eq.as_ptr().add(TILE * t) as *const u8, &mut xe);
-                for (a, row) in acc.iter_mut().zip(m) {
-                    for k in (0..16).step_by(2) {
-                        *a = xor3(
-                            *a,
-                            affine(xe[k], _mm512_set1_epi64(row[k] as i64)),
-                            affine(xe[k + 1], _mm512_set1_epi64(row[k + 1] as i64)),
-                        );
-                    }
-                }
-            }
-            for (l, wl) in w.iter_mut().enumerate() {
-                let out = untranspose_planes(core::array::from_fn(|c| acc[8 * l + c]));
-                for (g, o) in out.iter().enumerate() {
-                    _mm512_storeu_si512(wl.as_mut_ptr().add(TILE * t + 8 * g) as *mut __m512i, *o);
-                }
-            }
+    let threads = if tiles >= 1024 {
+        crate::huge::workers(tiles / 256)
+    } else {
+        1
+    };
+    let ptrs = [
+        w[0].as_mut_ptr() as usize,
+        w[1].as_mut_ptr() as usize,
+        w[2].as_mut_ptr() as usize,
+    ];
+    std::thread::scope(|scope| {
+        for thr in 0..threads {
+            let ms = &ms;
+            let eqs = eqs;
+            scope.spawn(move || unsafe {
+                poly_from_eq_tiles(eqs, ms, ptrs, thr * tiles / threads, (thr + 1) * tiles / threads);
+            });
         }
-    }
+    });
     if TILE * tiles < n {
         let tabs: Vec<_> = batches.iter().map(|b| psi_table(b)).collect();
         for j in TILE * tiles..n {
@@ -293,6 +404,38 @@ fn poly_from_eq(eqs: &[&[B128]], batches: &[Vec<F162>], out: &mut super::sumchec
                 .fold(F162::ZERO, |acc, (e, t)| acc + psi(t, e[j]));
             for l in 0..3 {
                 w[l][j] = x.0[l];
+            }
+        }
+    }
+}
+
+unsafe fn poly_from_eq_tiles(
+    eqs: &[&[B128]],
+    ms: &[[[u64; 16]; 24]],
+    w: [usize; 3],
+    t0: usize,
+    t1: usize,
+) {
+    let mut xe = [_mm512_setzero_si512(); 16];
+    for t in t0..t1 {
+        let mut acc = [_mm512_setzero_si512(); 24];
+        for (eq, m) in eqs.iter().zip(ms) {
+            transpose_tile(eq.as_ptr().add(TILE * t) as *const u8, &mut xe);
+            for (a, row) in acc.iter_mut().zip(m) {
+                for k in (0..16).step_by(2) {
+                    *a = xor3(
+                        *a,
+                        affine(xe[k], _mm512_set1_epi64(row[k] as i64)),
+                        affine(xe[k + 1], _mm512_set1_epi64(row[k + 1] as i64)),
+                    );
+                }
+            }
+        }
+        for l in 0..3 {
+            let out = untranspose_planes(core::array::from_fn(|c| acc[8 * l + c]));
+            let wl = w[l] as *mut u64;
+            for (g, o) in out.iter().enumerate() {
+                _mm512_storeu_si512(wl.add(TILE * t + 8 * g) as *mut __m512i, *o);
             }
         }
     }
@@ -397,7 +540,9 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(l: usize, claims: usize) -> Self {
         Self {
-            eq: (0..claims).map(|_| vec![B128::ZERO; 1 << l]).collect(),
+            eq: (0..claims)
+                .map(|_| unsafe { crate::huge::uninit(1 << l) })
+                .collect(),
             a: super::sumcheck::Poly::zero(1 << l),
             p: super::sumcheck::Poly::zero(1 << l),
         }

@@ -510,33 +510,41 @@ fn accumulate<const Q: u16>(w: &AuxData, ch: &ChallengeNtt, bpc: usize) -> Vec<B
     // `out`. The address is a usize so the worker is `Send`.
     let out_addr = out.as_mut_ptr() as usize;
     let stride = std::mem::size_of::<Batch32>();
+    let thread_n = crate::huge::workers(starts.len());
     std::thread::scope(|scope| {
-        for b0 in starts {
+        for t in 0..thread_n {
             let w = w;
             let ch = ch;
+            let starts = &starts;
             scope.spawn(move || {
                 let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
                 let base = acc.as_mut_ptr() as *mut i32;
-                unsafe {
-                    for i in 0..pairs {
-                        for b in 0..g {
-                            let row = |j: usize| {
-                                w.batch(j * bpc + b0 + b).v.as_ptr() as *const i16
-                            };
-                            accumulate_pair(
-                                row(2 * i),
-                                row(2 * i + 1),
-                                ch.pair[i].as_ptr(),
-                                base.add(32 * N * b),
-                            );
-                        }
-                        if (2 * (i + 1)) % fold_period(Q) == 0 {
-                            fold_back::<Q>(base, g * N * 2);
-                        }
+                for (idx, &b0) in starts.iter().enumerate() {
+                    if idx % thread_n != t {
+                        continue;
                     }
-                    for b in 0..g {
-                        let dst = &mut *((out_addr + (b0 + b) * stride) as *mut Batch32);
-                        drain::<Q>(base.add(32 * N * b), dst);
+                    unsafe {
+                        core::ptr::write_bytes(base, 0, g * N * 2 * 16);
+                        for i in 0..pairs {
+                            for b in 0..g {
+                                let row = |j: usize| {
+                                    w.batch(j * bpc + b0 + b).v.as_ptr() as *const i16
+                                };
+                                accumulate_pair(
+                                    row(2 * i),
+                                    row(2 * i + 1),
+                                    ch.pair[i].as_ptr(),
+                                    base.add(32 * N * b),
+                                );
+                            }
+                            if (2 * (i + 1)) % fold_period(Q) == 0 {
+                                fold_back::<Q>(base, g * N * 2);
+                            }
+                        }
+                        for b in 0..g {
+                            let dst = &mut *((out_addr + (b0 + b) * stride) as *mut Batch32);
+                            drain::<Q>(base.add(32 * N * b), dst);
+                        }
                     }
                 }
             });
@@ -636,11 +644,7 @@ fn parallel_batches(vb: &mut [Batch32], f: impl Fn(&mut Batch32) + Sync) {
     if n == 0 {
         return;
     }
-    let threads = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1)
-        .clamp(1, 8)
-        .min(n);
+    let threads = crate::huge::workers(n);
     let addr = vb.as_mut_ptr() as usize;
     let stride = std::mem::size_of::<Batch32>();
     std::thread::scope(|scope| {

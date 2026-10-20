@@ -551,15 +551,16 @@ fn fold_checked(
     labinius::fold::fold_witness_streaming(values, COLUMNS, challenges, bpc, base, workers)
 }
 
-/// Columns per pass over `A` in the commitment, and workers: one worker per physical core of
-/// the scored host (its 8 logical CPUs are 4 cores), each with the 8-column group whose 696 KB
-/// of accumulators fit its own L2. Measured on that host by submission d1c3cf12's sweep
-/// (`commit_columns_rows` alone: 312.9 ms at 4 workers against 315.4 at 8 for this modulus);
-/// the other phases keep every logical CPU.
+/// One commitment task per physical core, temporarily placed by the key's
+/// worker entry point; eight columns share each pass over the public key.
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 
-fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
+type ProverStorage = (Table, Vec<[u32; N]>, FoldedWitness);
+
+/// Keep large read-only/intermediate mappings alive through the output write.
+/// The existing process exit retires them with the address space in one operation.
+fn prove_with_storage(seed: &[u8; 32], modulus: u128, table_path: &str) -> (Proof, ProverStorage) {
     let load_clock = std::time::Instant::now();
     let table = Table::load(table_path);
     let values = table.words();
@@ -571,8 +572,8 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     // The switch's buffers: huge pages requested, faulted in by their first writers on every
     // core. (A thread touching them during the commitment ran on a hyperthread sibling of a
     // commitment worker and cost the commitment more than it saved the expansion.)
-    // The first quarter of the expansion is all the switch reads.
-    let mut eq = cf::HugeBuf::<B128>::new(1 << (LOG_PACKED - 2));
+    // The first eighth of the expansion is all the switch reads.
+    let mut eq = cf::HugeBuf::<B128>::new(1 << (LOG_PACKED - 3));
     let planes = cf::LeanSwitch::planes(1 << LOG_PACKED);
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
@@ -593,33 +594,33 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
         &commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, workers),
         modulus,
     );
-    drop(rows);
     let recombine_time = clock.elapsed();
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
     // A coordinate equal to one (probability 2^-128 per coordinate) has no half ratio: the
     // baseline's prover over its own full workspace takes over for the whole switch.
     let degenerate = hi.iter().any(|&r| r == B128::ONE);
-    let quarters = if degenerate {
+    let eighths = if degenerate {
         None
     } else {
-        Some(unsafe { cf::eq_expand_and_partials_quarters(&hi, values, eq.as_mut_ptr(), workers) })
+        Some(unsafe { cf::eq_expand_and_partials_eighths(&hi, values, eq.as_mut_ptr(), workers) })
     };
-    let partials = match &quarters {
-        Some(sets) => cf::partials_from_quarters(sets, &hi),
+    let partials = match &eighths {
+        Some(sets) => cf::partials_from_eighths(sets, &hi),
         None => {
             let mut ws = cf::Workspace::new(LOG_PACKED, 1);
             ws.partial_evals(0, values, &hi)
         }
     };
-    let eq_words: &[B128] = unsafe { eq.as_slice() };
     let value = claim(&partials, &lo);
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let partials_time = clock.elapsed();
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let lean = quarters.and_then(|sets| {
-        cf::LeanSwitch::with_quarters(values, eq_words, &hi, &batch, workers, planes, sets)
+    let lean = eighths.and_then(|sets| {
+        // Only the nondegenerate path initialized this prefix.
+        let eq_words: &[B128] = unsafe { eq.as_slice() };
+        cf::LeanSwitch::with_eighths(values, eq_words, &hi, &batch, workers, planes, sets)
     });
     let (rounds, coords, opened) = match lean {
         Some(mut sw) => switch_rounds(&mut sw, &mut t),
@@ -641,12 +642,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let challenges = folding_challenges(&mut t, &row);
     let challenge_time = clock.elapsed();
     let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
-        values,
-        COLUMNS,
-        &challenges,
-        COLUMN_LEN / 128,
-        primes[0],
-        workers,
+        values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
     ));
     let fold_time = clock.elapsed();
     let proof = Proof {
@@ -668,8 +664,14 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
         (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
         encode_time.as_micros(), workers,
         labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed));
-    proof
+    (proof, (table, rows, folded))
 }
+
+#[cfg(test)]
+fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
+    prove_with_storage(seed, modulus, table_path).0
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     assert!(
@@ -685,7 +687,9 @@ fn main() {
     } else {
         MODULUS
     };
-    let proof = prove(&seed, modulus, &args[4]);
+    let output_clock = std::time::Instant::now();
+    let (proof, _storage) = prove_with_storage(&seed, modulus, &args[4]);
+    let prove_return = output_clock.elapsed();
     {
         use std::io::Write;
         let file = std::fs::File::create(&args[2]).expect("create proof file");
@@ -693,6 +697,8 @@ fn main() {
         codec().serialize_into(&mut out, &proof).expect("write proof");
         out.flush().expect("flush proof");
     }
+    eprintln!("labinius-output prove_return_us={} write_us={}",
+        prove_return.as_micros(), (output_clock.elapsed()-prove_return).as_micros());
     // The proof is on disk; nothing the destructors would do is observable.
     std::process::exit(0);
 }
@@ -976,6 +982,8 @@ mod tests {
             return;
         }
         assert_eq!(&EMBEDDED_KEY.0[..], &image[..], "the embedded image differs");
+        assert!(keygen::key_from_image(55_144_219_393, &EMBEDDED_KEY.0).is_none(),
+            "a different three-limb modulus must rebuild its matrix");
         let read = keygen::key_from_image(MODULUS, &EMBEDDED_KEY.0).expect("a valid image");
         for k in 0..built.limbs() {
             assert_eq!(read.prime(k), built.prime(k));

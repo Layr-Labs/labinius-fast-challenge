@@ -823,6 +823,62 @@ impl<T> Drop for HugeBuf<T> {
     }
 }
 
+
+/// Scale a row by one fixed GHASH field element. Intel's precomputed-operand
+/// multiply/reduce form (2023, section 2.2.1) removes one serial folding step:
+/// K = b_hi * (x^7+x^2+x+1) + b_lo*x^64.
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn scale_b128_row(input: &[B128], factor: B128, out: *mut B128) {
+    let f = _mm_set_epi64x((factor.0 >> 64) as i64, factor.0 as i64);
+    let poly128 = _mm_set_epi64x(0, 0x87);
+    let kh = _mm_clmulepi64_si128::<0x01>(f, poly128);
+    let k = _mm_xor_si128(kh, _mm_slli_si128::<8>(f));
+    let b = _mm512_broadcast_i32x4(f);
+    let k = _mm512_broadcast_i32x4(k);
+    let poly = _mm512_set1_epi64(0x87);
+    for i in (0..input.len()/4*4).step_by(4) {
+        let a = _mm512_loadu_si512(input.as_ptr().add(i) as *const __m512i);
+        let y0 = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(a, b),
+            _mm512_clmulepi64_epi128::<0x01>(a, k),
+        );
+        let y1 = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x10>(a, b),
+            _mm512_clmulepi64_epi128::<0x11>(a, k),
+        );
+        let lo = _mm512_xor_si512(y0, _mm512_bslli_epi128::<8>(y1));
+        let hi = _mm512_bsrli_epi128::<8>(y1);
+        let res = _mm512_xor_si512(lo, _mm512_clmulepi64_epi128::<0x00>(hi, poly));
+        _mm512_storeu_si512(out.add(i) as *mut __m512i, res);
+    }
+    for i in input.len()/4*4..input.len() {
+        out.add(i).write(input[i]*factor);
+    }
+}
+
+#[cfg(test)]
+mod ghash_fixed_tests {
+    use super::*;
+    #[test]
+    fn fixed_row_matches_scalar_on_basis_and_random() {
+        if !std::arch::is_x86_feature_detected!("vpclmulqdq") { return; }
+        let mut x=0x0123456789abcdef_fedcba9876543210u128;
+        let mut next=|| { x^=x<<13; x^=x>>7; x^=x<<17; B128(x) };
+        let mut inputs:Vec<_>=(0..128).map(|i|B128(1u128<<i)).collect();
+        inputs.extend([B128::ZERO,B128::ONE,B128(u128::MAX)]);
+        inputs.extend((0..2050).map(|_| next()));
+        let factors:Vec<_>=[B128::ZERO,B128::ONE,B128(u128::MAX)]
+            .into_iter().chain((0..48).map(|_|next())).collect();
+        for f in factors {
+            let mut out=vec![B128::ZERO;inputs.len()];
+            unsafe { scale_b128_row(&inputs,f,out.as_mut_ptr()); }
+            for (i,(&a,&b)) in inputs.iter().zip(&out).enumerate() {
+                assert_eq!(b,a*f,"input {i}, factor {f:?}");
+            }
+        }
+    }
+}
+
 // =============================================================================================
 // the expansion on several threads
 // =============================================================================================
@@ -901,9 +957,7 @@ pub unsafe fn eq_expand_and_partials(
         for jh in run {
             let hv = high[jh];
             let base = unsafe { out.add(jh << h) };
-            for (jl, &lv) in low.iter().enumerate() {
-                unsafe { base.add(jl).write(hv * lv) };
-            }
+            unsafe { scale_b128_row(&low, hv, base) };
             unsafe { acc.add_tiles(pi0.add(jh << h), base, low.len() / TILE) };
         }
         acc.finish()
@@ -915,6 +969,41 @@ pub unsafe fn eq_expand_and_partials(
         }
     }
     v
+}
+
+
+/// Add all prefix blocks against a shared equality tile; transpose eq once.
+unsafe fn add_shared_partial_tiles<const P:usize>(
+    acc:&mut [PartialAcc;P], words:*const B128, stride:usize,
+    eq:*const B128, tiles:usize,
+) {
+    let ident=_mm512_set1_epi64(GF_IDENT);
+    let zero=_mm512_setzero_si512();
+    for t in 0..tiles {
+        let mut xe=[zero;16];
+        transpose_tile(eq.add(TILE*t) as *const u8,&mut xe);
+        let te:[__m512i;16]=core::array::from_fn(|b|affine(ident,xe[b]));
+        let tep:[[__m512i;8];2]=core::array::from_fn(|h|
+            transpose8x8_q(core::array::from_fn(|i|te[8*h+i])));
+        for q in 0..P {
+            let mut xp=[zero;16];
+            let mut ap=[[0u64;8];16];
+            transpose_tile(words.add(q*stride+TILE*t) as *const u8,&mut xp);
+            for k in 0..16 {
+                _mm512_storeu_si512(ap[k].as_mut_ptr() as *mut __m512i,affine(ident,xp[k]));
+            }
+            for h in 0..2 {
+                for k in 0..16 {
+                    let a=&mut acc[q].acc[h][k];
+                    for j in (0..8).step_by(2) {
+                        *a=xor3(*a,
+                            affine(tep[h][j],_mm512_set1_epi64(ap[k][j] as i64)),
+                            affine(tep[h][j+1],_mm512_set1_epi64(ap[k][j+1] as i64)));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The first quarter of the expansion and the partials of each quarter of the words against
@@ -964,9 +1053,7 @@ pub unsafe fn eq_expand_and_partials_quarters(
         for jh in run {
             let hv = high[jh];
             let base = unsafe { out.add(jh << h) };
-            for (jl, &lv) in low.iter().enumerate() {
-                unsafe { base.add(jl).write(hv * lv) };
-            }
+            unsafe { scale_b128_row(&low, hv, base) };
             for (q, a) in acc.iter_mut().enumerate() {
                 unsafe { a.add_tiles(pi0.add(q * quarter + (jh << h)), base, low.len() / TILE) };
             }
@@ -984,6 +1071,57 @@ pub unsafe fn eq_expand_and_partials_quarters(
     v
 }
 
+/// First eighth of eq and eight 128-word sufficient-statistic sets.
+/// Requires >=18 coordinates and no coordinate equal to one; out holds n/8 words.
+pub unsafe fn eq_expand_and_partials_eighths(
+    r: &[B128],
+    pi0: &[B128],
+    out: *mut B128,
+    threads: usize,
+) -> [Vec<B128>; 8] {
+    let n = r.len();
+    assert!(n >= 18, "the eighth path wants a large table");
+    assert_eq!(pi0.len(), 1 << n, "one word per eq entry");
+    let eighth = 1usize << (n - 3);
+    let rest = &r[3..];
+    let h = rest.len() / 2;
+    let scale = (B128::ONE + r[0]) * (B128::ONE + r[1]) * (B128::ONE + r[2]);
+    let high: Vec<B128> = eq_expand_b128(&rest[..rest.len() - h])
+        .into_iter()
+        .map(|x| x * scale)
+        .collect();
+    let low = eq_expand_b128(&rest[rest.len() - h..]);
+    debug_assert_eq!(low.len() % TILE, 0, "a stretch is whole tiles");
+    debug_assert_eq!(high.len() * low.len(), eighth);
+    let runs = crate::par::ranges(high.len(), threads, 1);
+    let (out, pi0_addr) = (out as usize, pi0.as_ptr() as usize);
+    let parts: Vec<[Vec<B128>; 8]> = crate::par::pool().map(runs.len(), |i| {
+        let run = runs[i].clone();
+        let out = out as *mut B128;
+        let pi0 = pi0_addr as *const B128;
+        let mut acc: [PartialAcc; 8] = core::array::from_fn(|_| PartialAcc::new());
+        for jh in run {
+            let hv = high[jh];
+            let base = unsafe { out.add(jh << h) };
+            unsafe { scale_b128_row(&low, hv, base) };
+            unsafe {
+                add_shared_partial_tiles(&mut acc, pi0.add(jh << h), eighth, base, low.len()/TILE);
+            }
+        }
+        core::array::from_fn(|q| acc[q].finish())
+    });
+    let mut v: [Vec<B128>; 8] = core::array::from_fn(|_| vec![B128::ZERO; PACK]);
+    for part in parts {
+        for q in 0..8 {
+            for (vk, &x) in v[q].iter_mut().zip(&part[q]) {
+                *vk = *vk + x;
+            }
+        }
+    }
+    v
+}
+
+
 /// `c_k = r / (1 + r)`, the ratio between the two halves of the table at coordinate `k`.
 pub fn half_ratio(r: B128) -> B128 {
     r * b128_inv(B128::ONE + r)
@@ -995,6 +1133,18 @@ pub fn partials_from_quarters(v: &[Vec<B128>; 4], r_hi: &[B128]) -> Vec<B128> {
     (0..PACK)
         .map(|b| v[0][b] + c1 * v[1][b] + c0 * v[2][b] + c0 * c1 * v[3][b])
         .collect()
+}
+
+
+/// Recombine eight sets using the ratios of the first three Boolean coordinates.
+pub fn partials_from_eighths(v: &[Vec<B128>;8], r_hi: &[B128]) -> Vec<B128> {
+    let c=[half_ratio(r_hi[0]),half_ratio(r_hi[1]),half_ratio(r_hi[2])];
+    let rho: [B128;8]=core::array::from_fn(|q| {
+        let mut x=B128::ONE;
+        for i in 0..3 {if q & (1<<(2-i)) !=0 {x=x*c[i];}}
+        x
+    });
+    (0..PACK).map(|b| (0..8).fold(B128::ZERO,|sum,q|sum+rho[q]*v[q][b])).collect()
 }
 
 // =============================================================================================
@@ -1048,11 +1198,13 @@ fn b128_inv(x: B128) -> B128 {
 
 /// `L(x) = sum_k bit_k(x) images[k]`.
 fn apply_images(images: &[F162], x: B128) -> F162 {
+    assert_eq!(images.len(), PACK);
     let mut acc = F162::ZERO;
-    for (k, &im) in images.iter().enumerate() {
-        if x.bit(k) {
-            acc += im;
-        }
+    let mut bits = x.0;
+    while bits != 0 {
+        let k = bits.trailing_zeros() as usize;
+        acc += images[k];
+        bits &= bits - 1;
     }
     acc
 }
@@ -1075,6 +1227,7 @@ enum Src {
         half: usize,
         r: F162,
     },
+    WordsFoldedTwice { words: *const B128, quarter: usize, r0: F162, r1: F162, r01: F162 },
     Planes([*const u64; 3]),
 }
 
@@ -1090,6 +1243,17 @@ unsafe fn load_p(src: Src, j: usize) -> [__m512i; 3] {
         Src::Words(w) => load_words(w.add(j)),
         Src::WordsFolded { words, half, r } => {
             fold8(bcast3(r), load_words(words.add(j)), load_words(words.add(j + half)))
+        }
+        Src::WordsFoldedTwice { words, quarter, r0, r1, r01 } => {
+            let a=load_words(words.add(j));
+            let b=load_words(words.add(j+quarter));
+            let c=load_words(words.add(j+2*quarter));
+            let d=load_words(words.add(j+3*quarter));
+            xor3p(a, xor3p(
+                super::f162::mul_soa8(bcast3(r0),xor3p(a,c)),
+                xor3p(
+                    super::f162::mul_soa8(bcast3(r1),xor3p(a,b)),
+                    super::f162::mul_soa8(bcast3(r01),xor3p(xor3p(a,b),xor3p(c,d))))))
         }
         Src::Planes(p) => [
             _mm512_loadu_si512(p[0].add(j) as *const __m512i),
@@ -1112,6 +1276,15 @@ unsafe fn get_p(src: Src, j: usize) -> F162 {
         Src::WordsFolded { words, half, r } => {
             let (p0, p1) = (F162::from_b128(*words.add(j)), F162::from_b128(*words.add(j + half)));
             p0 + r * (p0 + p1)
+        }
+        Src::WordsFoldedTwice { words, quarter, r0, r1, r01: _ } => {
+            let w0=F162::from_b128(*words.add(j));
+            let w1=F162::from_b128(*words.add(j+quarter));
+            let w2=F162::from_b128(*words.add(j+2*quarter));
+            let w3=F162::from_b128(*words.add(j+3*quarter));
+            let a=w0+r0*(w0+w2);
+            let b=w1+r0*(w1+w3);
+            a+r1*(a+b)
         }
         Src::Planes(p) => F162([*p[0].add(j), *p[1].add(j), *p[2].add(j)]),
     }
@@ -1260,6 +1433,8 @@ pub struct LeanSwitch<'a> {
     p: [HugeBuf<u64>; 3],
     /// Round 0's challenge, which defines the virtual `p_1`.
     r0: F162,
+    r1: F162,
+    eighths: Option<[Vec<B128>;8]>,
     /// The four quarter partial sets of [`eq_expand_and_partials_quarters`], when the first
     /// two messages come from them (and `eq` is the first quarter only).
     quarters: Option<[Vec<B128>; 4]>,
@@ -1288,7 +1463,7 @@ impl<'a> LeanSwitch<'a> {
         threads: usize,
         planes: [HugeBuf<u64>; 3],
     ) -> Option<Self> {
-        Self::build(pi0, eq, r_hi, batch, threads, planes, None)
+        Self::build(pi0, eq, r_hi, batch, threads, planes, None, None)
     }
 
     /// The prover over the first quarter of the expansion and the four quarter partial sets
@@ -1304,7 +1479,18 @@ impl<'a> LeanSwitch<'a> {
         quarters: [Vec<B128>; 4],
     ) -> Option<Self> {
         assert!(r_hi.len() >= 3, "the quarter path wants rounds past the second");
-        Self::build(pi0, eq_quarter, r_hi, batch, threads, planes, Some(quarters))
+        Self::build(pi0, eq_quarter, r_hi, batch, threads, planes, Some(quarters), None)
+    }
+
+    /// Three prefix coordinates: rounds 0..2 use sufficient statistics;
+    /// the first stored folded table is p_3, computed directly from input words.
+    pub fn with_eighths(
+        pi0: &'a [B128], eq_eighth: &'a [B128], r_hi: &'a [B128],
+        batch: &[F162], threads: usize, planes: [HugeBuf<u64>;3],
+        eighths: [Vec<B128>;8],
+    ) -> Option<Self> {
+        assert!(r_hi.len()>=4);
+        Self::build(pi0,eq_eighth,r_hi,batch,threads,planes,None,Some(eighths))
     }
 
     fn build(
@@ -1315,14 +1501,21 @@ impl<'a> LeanSwitch<'a> {
         threads: usize,
         planes: [HugeBuf<u64>; 3],
         quarters: Option<[Vec<B128>; 4]>,
+        eighths: Option<[Vec<B128>;8]>,
     ) -> Option<Self> {
         let n = pi0.len();
         assert!(n >= 2 && n.is_power_of_two() && n == 1 << r_hi.len(), "2^l words");
-        match &quarters {
-            None => assert_eq!(eq.len(), n, "one eq entry per word"),
-            Some(v) => {
-                assert_eq!(eq.len(), n / 4, "the first quarter of the expansion");
-                assert!(v.iter().all(|s| s.len() == PACK), "128 partials per quarter");
+        if let Some(v)=&eighths {
+            assert!(quarters.is_none());
+            assert_eq!(eq.len(),n/8,"the first eighth of the expansion");
+            assert!(v.iter().all(|s|s.len()==PACK));
+        } else {
+            match &quarters {
+                None => assert_eq!(eq.len(), n, "one eq entry per word"),
+                Some(v) => {
+                    assert_eq!(eq.len(), n / 4, "the first quarter of the expansion");
+                    assert!(v.iter().all(|s| s.len() == PACK), "128 partials per quarter");
+                }
             }
         }
         assert_eq!(batch.len(), PACK, "one batch weight per bit");
@@ -1342,6 +1535,8 @@ impl<'a> LeanSwitch<'a> {
             lp,
             p: planes,
             r0: F162::ZERO,
+            r1: F162::ZERO,
+            eighths,
             quarters,
             half: n,
             round: 0,
@@ -1392,6 +1587,36 @@ impl<'a> LeanSwitch<'a> {
         }
     }
 
+    /// Combine folded-prefix F162 weights with original GHASH-coordinate ratios.
+    /// Challenge weights stay outside the GF(2)-linear map; GHASH ratios stay inside.
+    fn message_from_eighths(&self) -> [F162;2] {
+        let v=self.eighths.as_ref().unwrap();
+        let k=self.round;
+        let tail=1usize<<(2-k);
+        let ratios:Vec<B128>=(k+1..3).map(|i|half_ratio(self.r_hi[i])).collect();
+        let rho:Vec<B128>=(0..tail).map(|z| {
+            let mut x=B128::ONE;
+            for (i,&c) in ratios.iter().enumerate() {
+                if z & (1<<(ratios.len()-1-i)) !=0 {x=x*c;}
+            }
+            x
+        }).collect();
+        let challenges=[self.r0,self.r1];
+        let mut msg=[F162::ZERO;2];
+        for a in 0..(1usize<<k) {
+            let mut weight=F162::ONE;
+            for i in 0..k {
+                weight=weight * if a & (1<<(k-1-i))==0 {F162::ONE+challenges[i]} else {challenges[i]};
+            }
+            let offset=a*(2*tail);
+            let zero=|b| (0..tail).fold(B128::ZERO,|sum,z|sum+rho[z]*v[offset+z][b]);
+            let both=|b| (0..tail).fold(B128::ZERO,|sum,z|sum+rho[z]*(v[offset+z][b]+v[offset+tail+z][b]));
+            msg[0]+=weight*Self::weighted(&self.l,zero);
+            msg[1]+=weight*Self::weighted(&self.lp,both);
+        }
+        msg
+    }
+
     /// The buffers for a fresh switch over `n` words.
     pub fn planes(n: usize) -> [HugeBuf<u64>; 3] {
         let len = Self::plane_len(n);
@@ -1405,6 +1630,9 @@ impl<'a> LeanSwitch<'a> {
                 words: self.pi0.as_ptr(),
                 half: self.pi0.len() / 2,
                 r: self.r0,
+            },
+            2 if self.eighths.is_some() => Src::WordsFoldedTwice {
+                words:self.pi0.as_ptr(),quarter:self.pi0.len()/4,r0:self.r0,r1:self.r1,r01:self.r0*self.r1,
             },
             _ => Src::Planes([self.p[0].as_ptr(), self.p[1].as_ptr(), self.p[2].as_ptr()]),
         }
@@ -1453,6 +1681,7 @@ impl<'a> LeanSwitch<'a> {
         if let Some(m) = self.pending.take() {
             return m;
         }
+        if self.eighths.is_some() && self.round <= 2 { return self.message_from_eighths(); }
         if self.quarters.is_some() && self.round <= 1 {
             return self.message_from_quarters();
         }
@@ -1486,11 +1715,14 @@ impl<'a> LeanSwitch<'a> {
         if self.round == 0 {
             self.r0 = r;
             self.round = 1;
-            if self.quarters.is_none() {
+            if self.quarters.is_none() && self.eighths.is_none() {
                 let m = self.message(self.src(), hh);
                 self.pending = Some(m);
             }
             return;
+        }
+        if self.round==1 && self.eighths.is_some() {
+            self.r1=r;self.round=2;return;
         }
         if hh < TILE {
             let mut e0 = F162::ZERO;
@@ -1641,6 +1873,47 @@ mod lean_tests {
                     lean.fold(ri);
                 }
                 assert_eq!(reference.final_eval(), lean.final_eval(), "l {l}");
+            }
+        }
+    }
+
+    #[test]
+    fn eighth_path_matches_every_reference_message() {
+        let mut x=0x66778899aabbccdd1122334455667788u128;
+        for l in [18usize,19] {
+            let n=1usize<<l;
+            let words:Vec<_>=(0..n).map(|_|B128(next(&mut x))).collect();
+            let batch:Vec<_>=(0..PACK).map(|_|F162([next(&mut x) as u64,next(&mut x) as u64,next(&mut x) as u64 & ((1<<34)-1)])).collect();
+            for case in 0..6 {
+                let mut hi:Vec<_>=(0..l).map(|_|B128(next(&mut x))).collect();
+                if (1..=3).contains(&case) {hi[case-1]=B128::ZERO;}
+                let r:Vec<_>=(0..l).map(|_|match case {
+                    4=>F162::ZERO,5=>F162::ONE,
+                    _=>F162([next(&mut x) as u64,next(&mut x) as u64,next(&mut x) as u64 & ((1<<34)-1)])
+                }).collect();
+                let full=eq_expand_b128(&hi);
+                for workers in [1usize,3,8] {
+                    let sentinel=B128(0xdeadbeefcafebabe);
+                    let mut prefix=vec![sentinel;n/4];
+                    let sets=unsafe {eq_expand_and_partials_eighths(&hi,&words,prefix.as_mut_ptr(),workers)};
+                    assert_eq!(&prefix[..n/8],&full[..n/8]);
+                    assert!(prefix[n/8..].iter().all(|&w|w==sentinel));
+                    assert_eq!(partials_from_eighths(&sets,&hi),partial_evals(&words,&full));
+                    let mut reference=SwitchProver::new(&words,&full,&batch);
+                    let mut lean=LeanSwitch::with_eighths(&words,&prefix[..n/8],&hi,&batch,workers,LeanSwitch::planes(n),sets).unwrap();
+                    for (round,&challenge) in r.iter().enumerate() {
+                        assert_eq!(reference.msg(),lean.msg(),"l {l} case {case} workers {workers} round {round}");
+                        reference.fold(challenge);lean.fold(challenge);
+                    }
+                    assert_eq!(reference.final_eval(),lean.final_eval());
+                }
+            }
+            let mut hi=vec![B128::ZERO;l];
+            let prefix=vec![B128::ZERO;n/8];
+            for i in 0..l {
+                hi[i]=B128::ONE;
+                assert!(LeanSwitch::with_eighths(&words,&prefix,&hi,&batch,3,LeanSwitch::planes(n),core::array::from_fn(|_|vec![B128::ZERO;PACK])).is_none());
+                hi[i]=B128::ZERO;
             }
         }
     }

@@ -257,3 +257,82 @@ mod pool_tests {
         assert_eq!(total.load(Ordering::Relaxed), 200 * 16 + 200 * 15);
     }
 }
+/// Temporary per-task affinity, restored before a pool task returns.
+#[cfg(target_os="linux")]
+pub(crate) struct CorePlacement { cpus:Vec<usize> }
+#[cfg(target_os="linux")]
+pub(crate) struct AffinityGuard { old:[usize;16] }
+#[cfg(target_os="linux")]
+unsafe extern "C" {
+    fn sched_getaffinity(pid:i32,size:usize,mask:*mut usize)->i32;
+    fn sched_setaffinity(pid:i32,size:usize,mask:*const usize)->i32;
+}
+#[cfg(target_os="linux")]
+impl CorePlacement {
+    pub(crate) fn for_workers(workers:usize)->Option<Self> {
+        let mut allowed=[0usize;16];
+        if unsafe {sched_getaffinity(0,std::mem::size_of_val(&allowed),allowed.as_mut_ptr())} !=0 {return None;}
+        let info=std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        let mut seen=std::collections::BTreeSet::new();
+        let mut cpus=Vec::new();
+        for record in info.split("\n\n") {
+            let mut cpu=None;let mut package=None;let mut core=None;
+            for line in record.lines() {
+                let Some((k,v))=line.split_once(':') else {continue};
+                match k.trim() {
+                    "processor"=>cpu=v.trim().parse::<usize>().ok(),
+                    "physical id"=>package=Some(v.trim().to_owned()),
+                    "core id"=>core=Some(v.trim().to_owned()),
+                    _=>{}
+                }
+            }
+            let (Some(cpu),Some(package),Some(core))=(cpu,package,core) else {continue};
+            let bits=usize::BITS as usize;
+            if cpu>=allowed.len()*bits || allowed[cpu/bits]&(1usize<<(cpu%bits))==0 {continue;}
+            if seen.insert((package,core)) {cpus.push(cpu);}
+        }
+        if workers==0 || cpus.len()<workers {return None;}
+        Some(Self{cpus})
+    }
+    pub(crate) fn pin(&self,worker:usize)->Option<AffinityGuard> {
+        let cpu=*self.cpus.get(worker)?;
+        let mut old=[0usize;16];
+        if unsafe {sched_getaffinity(0,std::mem::size_of_val(&old),old.as_mut_ptr())} !=0 {return None;}
+        let mut chosen=[0usize;16];
+        chosen[cpu/usize::BITS as usize]=1usize<<(cpu%usize::BITS as usize);
+        if unsafe {sched_setaffinity(0,std::mem::size_of_val(&chosen),chosen.as_ptr())} !=0 {return None;}
+        Some(AffinityGuard{old})
+    }
+}
+#[cfg(target_os="linux")]
+impl Drop for AffinityGuard {
+    fn drop(&mut self) {unsafe {sched_setaffinity(0,std::mem::size_of_val(&self.old),self.old.as_ptr());}}
+}
+#[cfg(not(target_os="linux"))]
+pub(crate) struct CorePlacement;
+#[cfg(not(target_os="linux"))]
+impl CorePlacement {
+    pub(crate) fn for_workers(_:usize)->Option<Self>{None}
+    pub(crate) fn pin(&self,_:usize)->Option<()>{None}
+}
+
+#[cfg(all(test,target_os="linux"))]
+mod affinity_tests {
+    use super::*;
+    #[test]
+    fn temporary_affinity_restores_the_original_mask() {
+        let mut original=[0usize;16];
+        assert_eq!(unsafe {sched_getaffinity(0,std::mem::size_of_val(&original),original.as_mut_ptr())},0);
+        let Some(p)=CorePlacement::for_workers(1) else {return};
+        {
+            let Some(_guard)=p.pin(0) else {return};
+            let mut pinned=[0usize;16];
+            assert_eq!(unsafe {sched_getaffinity(0,std::mem::size_of_val(&pinned),pinned.as_mut_ptr())},0);
+            assert_eq!(pinned.iter().map(|x|x.count_ones()).sum::<u32>(),1);
+            assert!(pinned.iter().zip(original).all(|(a,b)|*a & b==*a));
+        }
+        let mut restored=[0usize;16];
+        assert_eq!(unsafe {sched_getaffinity(0,std::mem::size_of_val(&restored),restored.as_mut_ptr())},0);
+        assert_eq!(restored,original);
+    }
+}

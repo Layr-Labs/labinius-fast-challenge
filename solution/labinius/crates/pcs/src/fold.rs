@@ -1360,7 +1360,7 @@ mod bitsliced {
     const LANES: usize = 512;
     const SLOTS: usize = 243;
     const BITS: usize = 15;
-    const COL_GROUP: usize = 16;
+    const COL_GROUP: usize = 31;
     const STRIDE: usize = 256;
     // At most 31 columns keep qword offsets in u16 and two plane/counter buffers within 2 MiB.
     // The offsets use x86's scale-8 addressing directly, avoiding a shift per input.

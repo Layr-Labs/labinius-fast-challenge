@@ -255,7 +255,9 @@ impl CommitmentKey {
         let mut out = vec![[0u32; N]; r * nl];
         let out_addr = out.as_mut_ptr() as usize;
         let next = std::sync::atomic::AtomicUsize::new(0);
-        crate::par::pool().run(workers, |_| {
+        let placement = crate::par::CorePlacement::for_workers(workers);
+        crate::par::pool().run(workers, |worker| {
+            let _affinity = placement.as_ref().and_then(|p| p.pin(worker));
             let mut st = cm::Scratch::with_group(&limbs, g);
             let mut raw = vec![[0u32; N]; g * nl];
             loop {

@@ -67,6 +67,9 @@ pub fn key_image(key: &CommitmentKey) -> Vec<u8> {
 /// The key `image` describes, if it is an image of a key for `modulus` at this shape: one
 /// `[Batch32]` per limb, read in place. `image` must be 64-byte aligned and outlive the key.
 pub fn key_from_image(modulus: u128, image: &'static [u8]) -> Option<CommitmentKey> {
+    // The build script embeds only the default-modulus matrix. Another modulus
+    // with the same number of residue limbs needs its own runtime-built matrix.
+    if modulus != crate::parameters::MODULUS { return None; }
     let primes = modulus_choice::limbs(modulus).ok()?;
     if image.len() != primes.len() * BATCHES * BATCH_BYTES || image.as_ptr() as usize % 64 != 0 {
         return None;

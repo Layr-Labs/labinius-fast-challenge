@@ -52,8 +52,8 @@ pub const LANES: usize = 512;
 pub const BLOCK_ELEMENTS: usize = LANES / 4;
 /// Planes of the counter: counts are below `2^15`.
 pub const COUNTER_PLANES: usize = 16;
-/// Columns whose planes are resident together: 16 x 128 planes x 64 bytes = 128 KB.
-pub const BATCH: usize = 16;
+/// Columns resident together: 32 x 256 direct/complement planes x 64 bytes = 512 KB.
+pub const BATCH: usize = 32;
 
 /// A challenge in the sparse form the library samples: `weight` sorted positions below 162, a
 /// sign bit per position (`1` = negative).

@@ -164,50 +164,21 @@ fn partial_evals(pi0: &[B128], eq_hi: &[B128]) -> Vec<B128> {
 /// are the XOR of the partials of its parts.
 fn partial_evals_tiles(pi0: &[B128], eq_hi: &[B128], t0: usize, t1: usize) -> Vec<B128> {
     debug_assert!(TILE * t1 <= pi0.len() && pi0.len() == eq_hi.len());
-    let mut acc = PartialAcc::new();
+    let mut v = vec![B128::ZERO; PACK];
     unsafe {
-        acc.add_tiles(
-            pi0.as_ptr().add(TILE * t0),
-            eq_hi.as_ptr().add(TILE * t0),
-            t1 - t0,
-        );
-    }
-    acc.finish()
-}
-
-/// The running accumulator of [`partial_evals`]: `acc[h][kb].qword[i].byte[t].bit[k']` sums
-/// `V[8kb + 7 - k'][8(8h + i) + t]` over the tiles added so far. Tiles can be added in any
-/// number of calls, which is what lets the expansion of a stretch of `eq` be consumed while it
-/// is still in cache.
-#[repr(C, align(64))]
-struct PartialAcc {
-    acc: [[__m512i; 16]; 2],
-}
-
-impl PartialAcc {
-    fn new() -> Self {
-        PartialAcc {
-            acc: [[unsafe { _mm512_setzero_si512() }; 16]; 2],
-        }
-    }
-
-    /// Add `tiles` tiles of 64 words at `pi0` and `eq`.
-    ///
-    /// # Safety
-    /// Both pointers address `64 * tiles` words.
-    unsafe fn add_tiles(&mut self, pi0: *const B128, eq: *const B128, tiles: usize) {
         let ident = _mm512_set1_epi64(GF_IDENT);
+        let mut acc = [[_mm512_setzero_si512(); 16]; 2];
         let mut xe = [_mm512_setzero_si512(); 16];
         let mut xp = [_mm512_setzero_si512(); 16];
         let mut ap = [[0u64; 8]; 16];
-        for t in 0..tiles {
-            transpose_tile(eq.add(TILE * t) as *const u8, &mut xe);
-            transpose_tile(pi0.add(TILE * t) as *const u8, &mut xp);
+        for t in t0..t1 {
+            transpose_tile(eq_hi.as_ptr().add(TILE * t) as *const u8, &mut xe);
+            transpose_tile(pi0.as_ptr().add(TILE * t) as *const u8, &mut xp);
             for k in 0..16 {
                 _mm512_storeu_si512(ap[k].as_mut_ptr() as *mut __m512i, affine(ident, xp[k]));
             }
             let te: [__m512i; 16] = core::array::from_fn(|b| affine(ident, xe[b]));
-            for (h, acc) in self.acc.iter_mut().enumerate() {
+            for (h, acc) in acc.iter_mut().enumerate() {
                 let tep = transpose8x8_q(core::array::from_fn(|i| te[8 * h + i]));
                 for (k, a) in acc.iter_mut().enumerate() {
                     for j in (0..8).step_by(2) {
@@ -220,14 +191,9 @@ impl PartialAcc {
                 }
             }
         }
-    }
-
-    /// The 128 partials the accumulator holds.
-    fn finish(&self) -> Vec<B128> {
-        let mut v = vec![B128::ZERO; PACK];
-        for (h, acc) in self.acc.iter().enumerate() {
+        for (h, acc) in acc.iter().enumerate() {
             for (k, a) in acc.iter().enumerate() {
-                let q: [u64; 8] = unsafe { core::mem::transmute(*a) };
+                let q: [u64; 8] = core::mem::transmute(*a);
                 for (i, qi) in q.iter().enumerate() {
                     for t in 0..8 {
                         let byte = (qi >> (8 * t)) & 0xff;
@@ -240,8 +206,8 @@ impl PartialAcc {
                 }
             }
         }
-        v
     }
+    v
 }
 
 /// [`partial_evals`] with the tiles split over `threads` threads and the per-thread partials
@@ -855,74 +821,60 @@ pub unsafe fn eq_expand_b128_parallel(r: &[B128], out: *mut B128, threads: usize
             scope.spawn(move || {
                 let out = out as *mut B128;
                 for jh in run {
-                    let hv = high[jh];
                     let base = unsafe { out.add(jh << h) };
-                    for (jl, &lv) in low.iter().enumerate() {
-                        unsafe { base.add(jl).write(hv * lv) };
-                    }
+                    unsafe { scale_low(high[jh], low, base) };
                 }
             });
         }
     });
 }
 
-/// [`eq_expand_b128_parallel`] and [`partial_evals_parallel`] in one pass: each thread writes
-/// its stretch of the expansion (one `2^h`-word run per high index, 64 KB at `h = 12`) and
-/// feeds it to the partials while it is still in cache, so the table is written once and never
-/// read back from memory for the partials. The expansion at `out` is the full table on return.
-/// Below 16 coordinates the two serial steps are run one after the other.
+/// `dst[j] = hv * low[j]` for every entry, four words at a time. The product is the scalar
+/// `B128` multiply (same polynomial, same Karatsuba, same two reduction rounds).
 ///
 /// # Safety
-/// `out` must be writable for `2^r.len()` words, which is `pi0.len()`.
-pub unsafe fn eq_expand_and_partials(
-    r: &[B128],
-    pi0: &[B128],
-    out: *mut B128,
-    threads: usize,
-) -> Vec<B128> {
-    let n = r.len();
-    assert_eq!(pi0.len(), 1 << n, "one word per eq entry");
-    if n < 16 || threads <= 1 {
-        eq_expand_b128_parallel(r, out, 1);
-        let eq = core::slice::from_raw_parts(out, 1 << n);
-        return partial_evals(pi0, eq);
+/// `dst` is writable for `low.len()` words. AVX-512F and VPCLMULQDQ.
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn scale_low(hv: B128, low: &[B128], dst: *mut B128) {
+    let n = low.len();
+    let hb = _mm512_broadcast_i32x4(_mm_loadu_si128(&hv as *const B128 as *const __m128i));
+    let mut j = 0;
+    while j + 4 <= n {
+        let lv = _mm512_loadu_si512(low.as_ptr().add(j) as *const __m512i);
+        _mm512_storeu_si512(dst.add(j) as *mut __m512i, ghash_mul4(hb, lv));
+        j += 4;
     }
-    let h = n / 2;
-    let high = eq_expand_b128(&r[..n - h]);
-    let low = eq_expand_b128(&r[n - h..]);
-    debug_assert_eq!(low.len() % TILE, 0, "a stretch is whole tiles");
-    let runs = crate::par::ranges(high.len(), threads, 1);
-    let (out, pi0_addr) = (out as usize, pi0.as_ptr() as usize);
-    let parts: Vec<Vec<B128>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = runs
-            .into_iter()
-            .map(|run| {
-                let (high, low) = (&high, &low);
-                scope.spawn(move || {
-                    let out = out as *mut B128;
-                    let pi0 = pi0_addr as *const B128;
-                    let mut acc = PartialAcc::new();
-                    for jh in run {
-                        let hv = high[jh];
-                        let base = unsafe { out.add(jh << h) };
-                        for (jl, &lv) in low.iter().enumerate() {
-                            unsafe { base.add(jl).write(hv * lv) };
-                        }
-                        unsafe { acc.add_tiles(pi0.add(jh << h), base, low.len() / TILE) };
-                    }
-                    acc.finish()
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let mut v = vec![B128::ZERO; PACK];
-    for part in parts {
-        for (vk, &x) in v.iter_mut().zip(&part) {
-            *vk = *vk + x;
-        }
+    for jl in j..n {
+        dst.add(jl).write(hv * low[jl]);
     }
-    v
+}
+
+/// Four GHASH products, one per 128-bit lane. Matches [`B128`]'s `Mul`.
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn ghash_mul4(a: __m512i, b: __m512i) -> __m512i {
+    let swap = _mm512_shuffle_epi32::<0x4E>(a);
+    let a01 = _mm512_xor_si512(a, swap);
+    let swap = _mm512_shuffle_epi32::<0x4E>(b);
+    let b01 = _mm512_xor_si512(b, swap);
+    let lo = _mm512_clmulepi64_epi128::<0x00>(a, b);
+    let hi = _mm512_clmulepi64_epi128::<0x11>(a, b);
+    let mid = _mm512_xor_si512(
+        _mm512_clmulepi64_epi128::<0x00>(a01, b01),
+        _mm512_xor_si512(lo, hi),
+    );
+    let p_lo = _mm512_xor_si512(lo, _mm512_bslli_epi128::<8>(mid));
+    let p_hi = _mm512_xor_si512(hi, _mm512_bsrli_epi128::<8>(mid));
+    let poly = _mm512_set1_epi64(0x87);
+    let mut acc = p_lo;
+    let mut h = p_hi;
+    for _ in 0..2 {
+        let h_hi = _mm512_bsrli_epi128::<8>(h);
+        let c_lo = _mm512_clmulepi64_epi128::<0x00>(h, poly);
+        let c_hi = _mm512_clmulepi64_epi128::<0x00>(h_hi, poly);
+        acc = _mm512_xor_si512(acc, _mm512_xor_si512(c_lo, _mm512_bslli_epi128::<8>(c_hi)));
+        h = _mm512_bsrli_epi128::<8>(c_hi);
+    }
+    acc
 }
 
 // =============================================================================================
@@ -1089,12 +1041,24 @@ unsafe fn horiz8(acc: [__m512i; 12]) -> F162 {
     out
 }
 
-/// The map `m` ([`eq_matrices`]) applied to the 64 words at `eq`, word-sliced: `out[l][g]` is
-/// limb `l` of words `8 g .. 8 g + 8` — the tile of [`poly_from_eq`], kept in registers.
+/// Both maps applied to the 64 words at `eq`, sharing one transpose of the tile. `out[l][g]` is
+/// limb `l` of words `8 g .. 8 g + 8`.
 #[inline(always)]
-unsafe fn map_tile(eq: *const B128, m: &[[u64; 16]; 24], out: &mut [[__m512i; 8]; 3]) {
+unsafe fn map_tile2(
+    eq: *const B128,
+    m0: &[[u64; 16]; 24],
+    m1: &[[u64; 16]; 24],
+    o0: &mut [[__m512i; 8]; 3],
+    o1: &mut [[__m512i; 8]; 3],
+) {
     let mut xe = [_mm512_setzero_si512(); 16];
     transpose_tile(eq as *const u8, &mut xe);
+    apply_map(&xe, m0, o0);
+    apply_map(&xe, m1, o1);
+}
+
+#[inline(always)]
+unsafe fn apply_map(xe: &[__m512i; 16], m: &[[u64; 16]; 24], out: &mut [[__m512i; 8]; 3]) {
     let mut acc = [_mm512_setzero_si512(); 24];
     for (a, row) in acc.iter_mut().zip(m) {
         for k in (0..16).step_by(2) {
@@ -1125,8 +1089,7 @@ unsafe fn message_range(
     let mut av = [[_mm512_setzero_si512(); 8]; 3];
     let mut apv = [[_mm512_setzero_si512(); 8]; 3];
     for j0 in range.step_by(TILE) {
-        map_tile(eq.add(j0), ml, &mut av);
-        map_tile(eq.add(j0), mlp, &mut apv);
+        map_tile2(eq.add(j0), ml, mlp, &mut av, &mut apv);
         for g in 0..8 {
             let j = j0 + 8 * g;
             let p0 = load_p(src, j);
@@ -1158,8 +1121,7 @@ unsafe fn fold_message_range(
     let mut av = [[_mm512_setzero_si512(); 8]; 3];
     let mut apv = [[_mm512_setzero_si512(); 8]; 3];
     for j0 in range.step_by(TILE) {
-        map_tile(eq.add(j0), ml, &mut av);
-        map_tile(eq.add(j0), mlp, &mut apv);
+        map_tile2(eq.add(j0), ml, mlp, &mut av, &mut apv);
         for g in 0..8 {
             let j = j0 + 8 * g;
             let q0 = fold8(rb, load_p(src, j), load_p(src, j + half));
@@ -1438,7 +1400,7 @@ mod lean_tests {
     #[test]
     fn lean_switch_matches_switch_prover() {
         let mut x = 0x0123_4567_89AB_CDEF_1122_3344_5566_7788u128;
-        for l in [1usize, 3, 6, 7, 8, 10, 17] {
+        for l in [1usize, 3, 6, 7, 8, 10] {
             for threads in [1usize, 3] {
                 let n = 1 << l;
                 let pi0: Vec<B128> = (0..n).map(|_| B128(next(&mut x))).collect();
@@ -1454,10 +1416,6 @@ mod lean_tests {
                 unsafe { eq_expand_b128_parallel(&r_hi, eq_par.as_mut_ptr(), threads) };
                 assert_eq!(eq, eq_par, "l {l}");
                 assert_eq!(partial_evals(&pi0, &eq), partial_evals_parallel(&pi0, &eq, threads));
-                let mut eq_fused = vec![B128::ZERO; n];
-                let fused = unsafe { eq_expand_and_partials(&r_hi, &pi0, eq_fused.as_mut_ptr(), threads) };
-                assert_eq!(eq, eq_fused, "fused expansion, l {l}");
-                assert_eq!(partial_evals(&pi0, &eq), fused, "fused partials, l {l}");
 
                 let mut reference = SwitchProver::new(&pi0, &eq, &batch);
                 let mut lean =

@@ -689,73 +689,89 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
     let ip: *const u8 = input.rows.as_ptr() as *const u8;
     let mut blk: core::mem::MaybeUninit<Blk> = core::mem::MaybeUninit::uninit();
     let bp = blk.as_mut_ptr() as *mut i16;
-
     for k in 0..4 {
-        let lut = t.lut.as_ptr().add(12 * k) as *const u8;
-        let l = |s2: usize, r: usize, ab: usize| -> __m512i {
-            _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
-        };
-        let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
-        let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
-        let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
-        let (l110, l111) = (l(1, 1, 0), l(1, 1, 1));
-        let (l120, l121) = (l(1, 2, 0), l(1, 2, 1));
+        ntt_group::<Q, S>(ip, k, t, &c, bar, bp, sink);
+    }
+}
 
-        // levels 0+1+2 (table lookups) fused with level 3 (omega multiply only).
-        for i in 0..27 {
-            let n0 = ldb(ip, i);
-            let n0h = ldb(ip, i + 81);
-            let n1 = ldb(ip, i + 27);
-            let n1h = ldb(ip, i + 108);
-            let n2 = ldb(ip, i + 54);
-            let n2h = ldb(ip, i + 135);
+/// One 162-row group of [`ntt_core`]: levels 0–3 into `bp`, then six 27-blocks through `sink`.
+///
+/// The four groups read the same index rows and differ only in the twiddle tables, so a caller
+/// can run one group of two batches and consume it before starting the next.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn ntt_group<const Q: u16, S: BlockSink>(
+    ip: *const u8,
+    k: usize,
+    t: &Tables,
+    c: &C,
+    bar: bool,
+    bp: *mut i16,
+    sink: &mut S,
+) {
+    let lut = t.lut.as_ptr().add(12 * k) as *const u8;
+    let l = |s2: usize, r: usize, ab: usize| -> __m512i {
+        _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
+    };
+    let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
+    let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
+    let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
+    let (l110, l111) = (l(1, 1, 0), l(1, 1, 1));
+    let (l120, l121) = (l(1, 2, 0), l(1, 2, 1));
 
-            let x = _mm512_permutexvar_epi8(n0, l000);
-            let y = _mm512_permutexvar_epi8(n0h, l001);
-            let a0 = _mm512_add_epi16(x, y);
-            let b0 = _mm512_sub_epi16(x, y);
+    // levels 0+1+2 (table lookups) fused with level 3 (omega multiply only).
+    for i in 0..27 {
+        let n0 = ldb(ip, i);
+        let n0h = ldb(ip, i + 81);
+        let n1 = ldb(ip, i + 27);
+        let n1h = ldb(ip, i + 108);
+        let n2 = ldb(ip, i + 54);
+        let n2h = ldb(ip, i + 135);
 
-            let x = _mm512_permutexvar_epi8(n1, l010);
-            let y = _mm512_permutexvar_epi8(n1h, l011);
-            let a1 = _mm512_add_epi16(x, y);
-            let x = _mm512_permutexvar_epi8(n1, l110);
-            let y = _mm512_permutexvar_epi8(n1h, l111);
-            let b1 = _mm512_sub_epi16(x, y);
+        let x = _mm512_permutexvar_epi8(n0, l000);
+        let y = _mm512_permutexvar_epi8(n0h, l001);
+        let a0 = _mm512_add_epi16(x, y);
+        let b0 = _mm512_sub_epi16(x, y);
 
-            let x = _mm512_permutexvar_epi8(n2, l020);
-            let y = _mm512_permutexvar_epi8(n2h, l021);
-            let a2 = _mm512_add_epi16(x, y);
-            let x = _mm512_permutexvar_epi8(n2, l120);
-            let y = _mm512_permutexvar_epi8(n2h, l121);
-            let b2 = _mm512_sub_epi16(x, y);
+        let x = _mm512_permutexvar_epi8(n1, l010);
+        let y = _mm512_permutexvar_epi8(n1h, l011);
+        let a1 = _mm512_add_epi16(x, y);
+        let x = _mm512_permutexvar_epi8(n1, l110);
+        let y = _mm512_permutexvar_epi8(n1h, l111);
+        let b1 = _mm512_sub_epi16(x, y);
 
-            let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
-            let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
-            st(bp, i, u0);
-            st(bp, i + 27, u1);
-            st(bp, i + 54, u2);
-            st(bp, i + 81, v0);
-            st(bp, i + 108, v1);
-            st(bp, i + 135, v2);
+        let x = _mm512_permutexvar_epi8(n2, l020);
+        let y = _mm512_permutexvar_epi8(n2h, l021);
+        let a2 = _mm512_add_epi16(x, y);
+        let x = _mm512_permutexvar_epi8(n2, l120);
+        let y = _mm512_permutexvar_epi8(n2h, l121);
+        let b2 = _mm512_sub_epi16(x, y);
+
+        let (u0, u1, u2) = r3_folded(c, a0, a1, a2);
+        let (v0, v1, v2) = r3_folded(c, b0, b1, b2);
+        st(bp, i, u0);
+        st(bp, i + 27, u1);
+        st(bp, i + 54, u2);
+        st(bp, i + 81, v0);
+        st(bp, i + 108, v1);
+        st(bp, i + 135, v2);
+    }
+
+    // levels 4, 5 and 6: one register-resident asm block per 27-block, handed to the sink.
+    let cv = t.cv.as_ptr() as *const i16;
+    for j in 0..6 {
+        let kk = 6 * k + j;
+        let (bpj, opj) = (bp.add(32 * 27 * j), sink.dst(kk));
+        let (t4, t5, t6) = (
+            t.tw4[kk].as_ptr(),
+            t.tw5[3 * kk].as_ptr(),
+            t.tw6[9 * kk].as_ptr(),
+        );
+        if bar {
+            tail27_b(bpj, opj, t4, t5, t6, cv);
+        } else {
+            tail27_p(bpj, opj, t4, t5, t6, cv);
         }
-
-        // levels 4, 5 and 6: one register-resident asm block per 27-block, handed to the sink.
-        let cv = t.cv.as_ptr() as *const i16;
-        for j in 0..6 {
-            let kk = 6 * k + j;
-            let (bpj, opj) = (bp.add(32 * 27 * j), sink.dst(kk));
-            let (t4, t5, t6) = (
-                t.tw4[kk].as_ptr(),
-                t.tw5[3 * kk].as_ptr(),
-                t.tw6[9 * kk].as_ptr(),
-            );
-            if bar {
-                tail27_b(bpj, opj, t4, t5, t6, cv);
-            } else {
-                tail27_p(bpj, opj, t4, t5, t6, cv);
-            }
-            sink.block(kk, opj);
-        }
+        sink.block(kk, opj);
     }
 }
 
@@ -779,4 +795,130 @@ pub unsafe fn ntt_bin_batch32_sink<const Q: u16, S: BlockSink>(
     sink: &mut S,
 ) {
     ntt_core::<Q, S>(input, sink);
+}
+
+/// Six finished 27-blocks: one 162-row group, 10 KB, which stays in L1 across the second batch.
+#[repr(C, align(64))]
+struct SavedGroup([i16; 6 * 27 * 32]);
+
+/// Scratch for one 27-block of the second batch. Reused; the consumer runs before the next block.
+#[repr(C, align(64))]
+struct OneBlock([i16; 27 * 32]);
+
+struct SaveSink {
+    base: *mut i16,
+    k: usize,
+}
+
+impl BlockSink for SaveSink {
+    #[inline(always)]
+    unsafe fn dst(&mut self, blk: usize) -> *mut i16 {
+        self.base.add(32 * 27 * (blk - 6 * self.k))
+    }
+    #[inline(always)]
+    unsafe fn block(&mut self, _blk: usize, _dst: *const i16) {}
+}
+
+/// `vpmaddwd` of a saved block of batch 0 with the block just produced for batch 1, into `acc`
+/// in the layout of `fold::accumulate_pair`: slot `u` occupies `acc[32 u .. 32 u + 32]`.
+struct PairMac {
+    saved: *const i16,
+    k: usize,
+    cp: *const u32,
+    acc: *mut i32,
+    scratch: *mut i16,
+}
+
+impl BlockSink for PairMac {
+    #[inline(always)]
+    unsafe fn dst(&mut self, _blk: usize) -> *mut i16 {
+        self.scratch
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn block(&mut self, blk: usize, w1: *const i16) {
+        let w0 = self.saved.add(32 * 27 * (blk - 6 * self.k));
+        let u0 = 27 * blk;
+        for i in 0..27 {
+            let u = u0 + i;
+            let a = _mm512_load_si512(w0.add(32 * i) as *const __m512i);
+            let b = _mm512_load_si512(w1.add(32 * i) as *const __m512i);
+            let c = _mm512_set1_epi32(*self.cp.add(u) as i32);
+            let lo = _mm512_madd_epi16(_mm512_unpacklo_epi16(a, b), c);
+            let hi = _mm512_madd_epi16(_mm512_unpackhi_epi16(a, b), c);
+            let d = self.acc.add(32 * u);
+            _mm512_store_si512(
+                d as *mut __m512i,
+                _mm512_add_epi32(_mm512_load_si512(d as *const __m512i), lo),
+            );
+            _mm512_store_si512(
+                d.add(16) as *mut __m512i,
+                _mm512_add_epi32(_mm512_load_si512(d.add(16) as *const __m512i), hi),
+            );
+        }
+    }
+}
+
+/// Both binary transforms, accumulated as `acc += c0·NTT(in0) + c1·NTT(in1)` without either
+/// 41 KB batch leaving L1. `cp[u]` is the packed challenge pair at slot `u` (`c0` in the low
+/// half, `c1` in the high half), and `acc` is the `fold::accumulate_pair` buffer: 32 `i32`s
+/// per slot, 64-byte aligned. The values are the lazily reduced kernel outputs, so the
+/// products match a transform written out in full and accumulated afterwards.
+///
+/// # Safety
+/// AVX-512 F/BW/VL/VBMI/VBMI2/VNNI and GFNI. `cp` has [`crate::params::N`] entries and `acc`
+/// has `32 * N` aligned `i32`s.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+pub unsafe fn ntt_bin_accumulate_pair<const Q: u16>(
+    in0: &BinaryIndex32,
+    in1: &BinaryIndex32,
+    cp: *const u32,
+    acc: *mut i32,
+) {
+    let t = tables::<Q>();
+    let c = C {
+        q: bc(&t.qd),
+        om: bc(&t.om[0]),
+        omp: bc(&t.om[1]),
+    };
+    let bar = needs_barrett(Q);
+    let ip0 = in0.rows.as_ptr() as *const u8;
+    let ip1 = in1.rows.as_ptr() as *const u8;
+    let mut mid: core::mem::MaybeUninit<Blk> = core::mem::MaybeUninit::uninit();
+    let bp = mid.as_mut_ptr() as *mut i16;
+    // Both buffers are fully written before any read: the six blocks of a group, then each
+    // 27-block of the second batch inside `block`.
+    let mut saved: core::mem::MaybeUninit<SavedGroup> = core::mem::MaybeUninit::uninit();
+    let mut scratch: core::mem::MaybeUninit<OneBlock> = core::mem::MaybeUninit::uninit();
+    let saved_ptr = saved.as_mut_ptr() as *mut i16;
+    let scratch_ptr = scratch.as_mut_ptr() as *mut i16;
+    for k in 0..4 {
+        ntt_group::<Q, _>(
+            ip0,
+            k,
+            t,
+            &c,
+            bar,
+            bp,
+            &mut SaveSink {
+                base: saved_ptr,
+                k,
+            },
+        );
+        ntt_group::<Q, _>(
+            ip1,
+            k,
+            t,
+            &c,
+            bar,
+            bp,
+            &mut PairMac {
+                saved: saved_ptr,
+                k,
+                cp,
+                acc,
+                scratch: scratch_ptr,
+            },
+        );
+    }
 }

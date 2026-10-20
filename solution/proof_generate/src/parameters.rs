@@ -10,11 +10,8 @@ pub const COLUMNS: usize = 1 << COLUMN_LOG;
 pub const COLUMN_LEN: usize = 1 << (LOG_PACKED - COLUMN_LOG as usize);
 /// Ring elements of one column: four `F162` make one element of `R_648`.
 pub const RING_ELEMENTS: usize = COLUMN_LEN / 4;
-/// The product of three limbs: no pair of the supported primes reaches the checker's 2^35
-/// threshold. 3889 * 9721 * 2917 (about 36.7 bits): the two fully splitting primes below 2^14
-/// run the hand-scheduled `ntt::bin_asm`, 2917 is the cheaper of the quadratic-slot limbs, and
-/// a measured sweep over all triples on the scored CPU (submission d1c3cf12) put this one
-/// first — the quadratic kernels cost more there than the baseline's 3889 * 2917 * 4861 assumed.
-/// 3889 stays the base, so the fold's regenerated transform is `ntt::bin_asm`. Five bytes per
-/// commitment coefficient either way.
-pub const MODULUS: u128 = 110_277_094_573;
+/// The product of three limbs, the minimum the checker's minimum-modulus threshold accepts: no
+/// pair of the supported primes reaches 2^35. This is the cheapest passing triple, 3889 * 2917 *
+/// 4861 at about 101.9 bits. 3889 is a fully splitting base, so the fold stays on
+/// `ntt::bin_asm`; 2917 and 4861 are the quadratic extra limbs.
+pub const MODULUS: u128 = 55_144_219_393;

@@ -937,6 +937,32 @@ trait WordTransform {
     /// # Safety
     /// AVX-512 F/BW/VL/VBMI/VBMI2/VNNI and GFNI.
     unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32);
+
+    /// `acc += c0·NTT(idx0) + c1·NTT(idx1)` in [`accumulate_pair`]'s layout. `w0` and `w1`
+    /// are scratch the default path materialises into; a kernel that consumes each block in
+    /// L1 may ignore them.
+    ///
+    /// # Safety
+    /// As [`transform`](Self::transform). `cp` has `N` packed challenge pairs and `acc` has
+    /// `32 * N` aligned `i32`s.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+    unsafe fn mac_pair(
+        idx0: &BinaryIndex32,
+        idx1: &BinaryIndex32,
+        cp: *const u32,
+        acc: *mut i32,
+        w0: &mut Batch32,
+        w1: &mut Batch32,
+    ) {
+        Self::transform(idx0, w0);
+        Self::transform(idx1, w1);
+        accumulate_pair(
+            w0.v.as_ptr() as *const i16,
+            w1.v.as_ptr() as *const i16,
+            cp,
+            acc,
+        );
+    }
 }
 
 struct SplitTransform<const Q: u16>;
@@ -951,6 +977,31 @@ impl<const Q: u16> WordTransform for SplitTransform<Q> {
             vb::ntt_bin_batch32::<Q>(idx, out);
         }
     }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+    unsafe fn mac_pair(
+        idx0: &BinaryIndex32,
+        idx1: &BinaryIndex32,
+        cp: *const u32,
+        acc: *mut i32,
+        w0: &mut Batch32,
+        w1: &mut Batch32,
+    ) {
+        // The small splitting tree can emit a 162-row group and accumulate it before the next
+        // group starts, so neither batch is written out. The large tree has no such hook.
+        if Gen::<Q>::LARGE {
+            Self::transform(idx0, w0);
+            Self::transform(idx1, w1);
+            accumulate_pair(
+                w0.v.as_ptr() as *const i16,
+                w1.v.as_ptr() as *const i16,
+                cp,
+                acc,
+            );
+        } else {
+            vb::ntt_bin_accumulate_pair::<Q>(idx0, idx1, cp, acc);
+        }
+    }
 }
 
 impl<const Q: u16> WordTransform for QuadTransform<Q> {
@@ -958,20 +1009,6 @@ impl<const Q: u16> WordTransform for QuadTransform<Q> {
     unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32) {
         vq::ntt_quad_bin_batch32::<Q>(idx, out);
     }
-}
-
-/// `NTT_q(w)` of the 32 binary ring elements formed by `words`, lazily reduced, in `out`.
-///
-/// # Safety
-/// AVX-512 F/BW/VL/VBMI/VBMI2/VNNI and GFNI.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn transform_words<T: WordTransform>(
-    words: &[B128; 128],
-    idx: &mut BinaryIndex32,
-    out: &mut Batch32,
-) {
-    slice_b128_into(words, idx);
-    T::transform(idx, out);
 }
 
 /// [`accumulate`] with the witness transform regenerated from `words`: `v_ntt` modulo `Q`,
@@ -1004,7 +1041,8 @@ fn accumulate_streaming<const Q: u16, T: WordTransform>(
             scope.spawn(move || {
                 let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
                 let base = acc.as_mut_ptr() as *mut i32;
-                let mut idx = BinaryIndex32::zero();
+                let mut idx0 = BinaryIndex32::zero();
+                let mut idx1 = BinaryIndex32::zero();
                 let mut w0 = Box::new(Batch32::zero(Representation::Ntt));
                 let mut w1 = Box::new(Batch32::zero(Representation::Ntt));
                 loop {
@@ -1024,13 +1062,15 @@ fn accumulate_streaming<const Q: u16, T: WordTransform>(
                                     let start = j * column_words + 128 * (b0 + b);
                                     &*(words.as_ptr().add(start) as *const [B128; 128])
                                 };
-                                transform_words::<T>(at(2 * i), &mut idx, &mut w0);
-                                transform_words::<T>(at(2 * i + 1), &mut idx, &mut w1);
-                                accumulate_pair(
-                                    w0.v.as_ptr() as *const i16,
-                                    w1.v.as_ptr() as *const i16,
+                                slice_b128_into(at(2 * i), &mut idx0);
+                                slice_b128_into(at(2 * i + 1), &mut idx1);
+                                T::mac_pair(
+                                    &idx0,
+                                    &idx1,
                                     ch.pair[i].as_ptr(),
                                     base.add(32 * N * b),
+                                    &mut w0,
+                                    &mut w1,
                                 );
                             }
                             if (2 * (i + 1)) % fold_period(Q) == 0 {

@@ -117,16 +117,12 @@ impl<T> VerticallyAlignedMatrix<T> {
 }
 
 
-/// `repr(u8)`, `Coefficients = 0` and `Ntt = 1`: a `Batch32` then has one fixed byte layout
-/// (`v`, the tag byte, 63 bytes of padding), which is what lets a key built at compile time be
-/// embedded as the bytes of its batches.
-#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Representation {
     /// Plain coefficients a_0..a_647 of a(X).
-    Coefficients = 0,
+    Coefficients,
     /// NTT domain in tree order: v[j] = a(psi^SLOT_EXP[j]) (see `params`), lazily reduced.
-    Ntt = 1,
+    Ntt,
 }
 
 /// One ring element, rokoko-style: flat inline array + representation tag. Values are signed

@@ -33,27 +33,10 @@ const F162_PER_BATCH: usize = 128;
 /// quadratic tree (the two coefficients of each of the 324 leaves); in both cases every row is
 /// uniform in `[-(q-1)/2, (q-1)/2]`.
 pub struct CommitmentKey {
-    a: Vec<KeyRows>,
+    a: Vec<Vec<Batch32>>,
     base: Modulus,
     additional: Vec<Modulus>,
     len_f162: usize,
-}
-
-/// One limb's `A`: built at run time, or borrowed from storage that outlives the key (the
-/// bytes of the batches embedded in a binary by a build script, say).
-pub enum KeyRows {
-    Owned(Vec<Batch32>),
-    Static(&'static [Batch32]),
-}
-
-impl KeyRows {
-    #[inline]
-    fn as_slice(&self) -> &[Batch32] {
-        match self {
-            KeyRows::Owned(v) => v,
-            KeyRows::Static(s) => s,
-        }
-    }
 }
 
 impl CommitmentKey {
@@ -78,7 +61,7 @@ impl CommitmentKey {
         let primes: Vec<u16> = core::iter::once(base.prime())
             .chain(additional.iter().map(|l| l.prime()))
             .collect();
-        let a: Vec<Vec<Batch32>> = primes
+        let a = primes
             .iter()
             .enumerate()
             .map(|(k, &q)| {
@@ -98,7 +81,7 @@ impl CommitmentKey {
             })
             .collect();
         CommitmentKey {
-            a: a.into_iter().map(KeyRows::Owned).collect(),
+            a,
             base,
             additional: additional.to_vec(),
             len_f162,
@@ -183,42 +166,7 @@ impl CommitmentKey {
                 .collect()
         });
         CommitmentKey {
-            a: a.into_iter().map(KeyRows::Owned).collect(),
-            base,
-            additional: additional.to_vec(),
-            len_f162,
-        }
-    }
-
-    /// A key whose per-limb rows already exist in storage that outlives it: `rows[k]` is limb
-    /// `k`'s `len_f162 / 128` batches in the NTT domain, exactly what [`row`](Self::row) of the
-    /// key [`from_coefficients`](Self::from_coefficients) builds returns. Nothing is copied or
-    /// computed, so a key built once at compile time costs the process nothing.
-    pub fn from_static_rows(
-        len_f162: usize,
-        base: Modulus,
-        additional: &[Modulus],
-        rows: &[&'static [Batch32]],
-    ) -> Self {
-        assert!(
-            len_f162 > 0 && len_f162 % F162_PER_BATCH == 0,
-            "len_f162 must be a multiple of 128"
-        );
-        assert_eq!(rows.len(), 1 + additional.len(), "one row set per limb");
-        let mut seen = vec![base];
-        for l in additional {
-            assert!(!seen.contains(l), "the limb {l:?} is listed twice");
-            seen.push(*l);
-        }
-        for r in rows {
-            assert_eq!(r.len(), len_f162 / F162_PER_BATCH, "one batch per 128 elements");
-            assert!(
-                r.iter().all(|b| b.representation == Representation::Ntt),
-                "a key is in the NTT domain"
-            );
-        }
-        CommitmentKey {
-            a: rows.iter().map(|r| KeyRows::Static(r)).collect(),
+            a,
             base,
             additional: additional.to_vec(),
             len_f162,
@@ -338,7 +286,7 @@ impl CommitmentKey {
     /// that a caller can drive the kernel directly, or check a commitment against
     /// [`crate::scalar`].
     pub fn row(&self, k: usize) -> &[Batch32] {
-        self.a[k].as_slice()
+        &self.a[k]
     }
 
     /// The limbs in the form the kernel driver takes.
@@ -347,7 +295,7 @@ impl CommitmentKey {
             .map(|k| cm::Limb {
                 q: self.prime(k),
                 quad: self.is_quadratic(k),
-                a: self.a[k].as_slice(),
+                a: &self.a[k],
             })
             .collect()
     }
@@ -397,7 +345,7 @@ impl CommitmentKey {
         aux: &mut AuxData,
     ) -> VerticallyAlignedMatrix<PowerOfThreeRingElementWithLimbs> {
         self.check_witness(witness, r);
-        let bpc = self.a[0].as_slice().len();
+        let bpc = self.a[0].len();
         assert!(
             aux.chunks == r && aux.batches.len() == r * bpc && aux.raw.len() == self.limbs(),
             "the auxiliary buffer does not match this key and r"

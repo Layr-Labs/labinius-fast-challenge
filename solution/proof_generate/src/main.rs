@@ -6,8 +6,26 @@
 //! product that the proof carries. `A` is defined by its coefficients in `R_Q`
 //! ([`rq::ajtai_matrix`]), so the limb form of the key is derived rather than drawn, which costs
 //! one reduction pass and one forward transform per limb.
+//!
+//! What the timed process does, and what it no longer does:
+//!
+//! - The witness table is mapped read-only from the page cache and read in place as `B128`
+//!   words. It is never copied and never lifted into a 24-byte `F162` buffer: the bit-slicing
+//!   front end of the kernels, the row evaluation and the switch read the words directly.
+//! - The commitment runs on a pool of `available_parallelism` workers and keeps no transform.
+//!   The fold regenerates the base limb's transform from the words with the same binary kernel,
+//!   which costs one transform pass instead of a 5.4 GB write, a 5.4 GB read, their page faults
+//!   and their release at exit.
+//! - The switch keeps `a` as a linear map applied to the `eq` table and `p` in one half-size
+//!   buffer, fusing each fold with the next message ([`cf::LeanSwitch`]); the `eq` expansion,
+//!   the partial evaluations, the row evaluation and the challenge sampling run on all cores.
+//!
+//! Every message is the one the baseline sends, so the transcript, the proof format and the
+//! modulus are unchanged.
 use bincode::Options;
-use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
+use labinius::challenge::{
+    sample_short_challenges_parallel, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT,
+};
 use labinius::fields::{
     crossfield as cf,
     scalar::{B128, F162},
@@ -66,50 +84,109 @@ fn seed() -> [u8; 32] {
     assert_eq!(s.len(), 64);
     core::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("invalid seed"))
 }
-/// The harness witness table: `(1 << LOG_VARS) / 8` little-endian BLAKE3 XOF bytes, each 16
-/// bytes one GHASH word, mapped read-only instead of copied.
-struct Table {
-    ptr: *const u8,
-    len: usize,
+
+/// Threads the parallel phases use: what the sandbox lets the process see.
+fn threads() -> usize {
+    labinius::par::threads()
 }
 
-impl Table {
-    fn words(&self) -> &[B128] {
-        unsafe { core::slice::from_raw_parts(self.ptr as *const B128, self.len / 16) }
-    }
-}
+// =============================================================================================
+// the witness table, read in place
+// =============================================================================================
 
-fn load_table(path: &str) -> Table {
-    use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "linux")]
+mod sys {
+    use core::ffi::c_void;
     extern "C" {
-        fn mmap(
-            addr: *mut core::ffi::c_void,
+        pub fn mmap(
+            addr: *mut c_void,
             len: usize,
             prot: i32,
             flags: i32,
             fd: i32,
             offset: i64,
-        ) -> *mut core::ffi::c_void;
+        ) -> *mut c_void;
+        pub fn munmap(addr: *mut c_void, len: usize) -> i32;
     }
-    assert!(
-        cfg!(target_endian = "little"),
-        "the table is little-endian"
-    );
-    assert_eq!(core::mem::size_of::<B128>(), 16, "a GHASH word is 16 bytes");
-    let file = std::fs::File::open(path).expect("open witness table");
-    let len = file.metadata().expect("stat witness table").len() as usize;
-    assert_eq!(
-        len,
-        (1 << LOG_VARS) / 8,
-        "witness table has the wrong length"
-    );
-    let ptr = unsafe { mmap(core::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
-    assert!(ptr as isize != -1, "witness table could not be mapped");
-    Table {
-        ptr: ptr as *const u8,
-        len,
+    pub const PROT_READ: i32 = 1;
+    pub const MAP_PRIVATE: i32 = 2;
+    pub const MAP_POPULATE: i32 = 0x8000;
+}
+
+/// The harness witness table: `(1 << LOG_VARS) / 8` BLAKE3 XOF bytes, each 16 little-endian
+/// bytes one GHASH word. The timed prover does not recompute it, and does not copy it either: on
+/// Linux the file is mapped read-only and pre-faulted, and the mapping is read as the `B128`
+/// words it is (`B128` is `repr(transparent)` over its little-endian `u128`, and the host is
+/// little-endian). Elsewhere, or if the mapping fails, the file is read into a buffer.
+enum Table {
+    #[cfg(target_os = "linux")]
+    Mapped {
+        ptr: *const B128,
+        bytes: usize,
+    },
+    Owned(Vec<B128>),
+}
+
+impl Table {
+    const WORDS: usize = 1 << LOG_PACKED;
+    const BYTES: usize = (1 << LOG_VARS) / 8;
+
+    fn load(path: &str) -> Table {
+        assert!(cfg!(target_endian = "little"), "the table is little-endian");
+        assert_eq!(core::mem::size_of::<B128>(), 16, "B128 is 16 bytes");
+        let file = std::fs::File::open(path).expect("open witness table");
+        let len = file.metadata().expect("stat witness table").len();
+        assert_eq!(len, Self::BYTES as u64, "witness table has the wrong length");
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let ptr = unsafe {
+                sys::mmap(
+                    core::ptr::null_mut(),
+                    Self::BYTES,
+                    sys::PROT_READ,
+                    sys::MAP_PRIVATE | sys::MAP_POPULATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if ptr as isize != -1 && !ptr.is_null() && (ptr as usize) % 16 == 0 {
+                return Table::Mapped {
+                    ptr: ptr as *const B128,
+                    bytes: Self::BYTES,
+                };
+            }
+        }
+        let mut words = vec![B128::ZERO; Self::WORDS];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, Self::BYTES)
+        };
+        let mut file = file;
+        std::io::Read::read_exact(&mut file, bytes).expect("witness table has the wrong length");
+        let mut extra = [0u8; 1];
+        let extra_n = std::io::Read::read(&mut file, &mut extra).expect("read witness table");
+        assert_eq!(extra_n, 0, "witness table has the wrong length");
+        Table::Owned(words)
+    }
+
+    fn words(&self) -> &[B128] {
+        match self {
+            #[cfg(target_os = "linux")]
+            Table::Mapped { ptr, .. } => unsafe { std::slice::from_raw_parts(*ptr, Self::WORDS) },
+            Table::Owned(v) => v,
+        }
     }
 }
+
+impl Drop for Table {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Table::Mapped { ptr, bytes } = self {
+            unsafe { sys::munmap(*ptr as *mut core::ffi::c_void, *bytes) };
+        }
+    }
+}
+
 #[cfg(test)]
 fn trace(seed: &[u8; 32]) -> Vec<B128> {
     let mut h = blake3::Hasher::new_keyed(seed);
@@ -177,61 +254,189 @@ fn unpack_folded(bytes: &[u8], elements: usize) -> Result<FoldedWitness, String>
     Ok(FoldedWitness::of(fold))
 }
 /// The `COLUMNS` folding challenges, derived the way the checker derives them: the row
-/// evaluation absorbed, then one weight-28 signed subring element per column.
+/// evaluation absorbed, then one weight-28 signed subring element per column. The samples are
+/// independent derivations of the transcript, so they are drawn on every core; the result is
+/// the sequence `sample_short_challenge` would produce.
 fn folding_challenges(t: &mut Transcript, row: &RowEvaluation) -> Vec<ShortChallenge> {
     row.absorb(t);
-    (0..COLUMNS)
-        .map(|_| sample_short_challenge(t, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
-        .collect()
+    sample_short_challenges_parallel(t, COLUMNS, DEFAULT_WEIGHT, DEFAULT_BOUND, threads())
 }
-/// The commitment's columns as coefficients modulo `modulus`, which is what the proof carries.
-///
-/// The library's commitment is the four `R_162` components of each column in each limb's own NTT
-/// domain. `bd::column_coefficients` inverts that per limb — the recombination of the four
-/// components, then the limb's inverse transform — and Garner's algorithm lifts the residues to
-/// the single integer modulo their product. The lift is exact because `modulus` is that product,
-/// which is also why only such a modulus is reachable from here.
-fn commitment_coefficients(commitment: &Commitment, primes: &[u16], modulus: u128) -> Vec<u128> {
-    let residues = labinius::bd::column_coefficients(commitment.matrix(), primes);
-    let limbs = primes.len();
-    let inverses: Vec<Vec<u64>> = (0..limbs)
-        .map(|k| {
-            (0..k)
-                .map(|m| {
-                    let (q, p) = (primes[k] as u64, primes[m] as u64);
-                    (1..q).find(|x| x * p % q == 1).expect("the primes are distinct")
+
+/// Garner's lift of one coefficient from its residues modulo `primes` (each already in
+/// `[0, q)`) to the integer modulo their product.
+struct Garner {
+    primes: Vec<u64>,
+    inverses: Vec<Vec<u64>>,
+}
+
+impl Garner {
+    fn of(primes: &[u16]) -> Garner {
+        let limbs = primes.len();
+        Garner {
+            primes: primes.iter().map(|&q| q as u64).collect(),
+            inverses: (0..limbs)
+                .map(|k| {
+                    (0..k)
+                        .map(|m| {
+                            let (q, p) = (primes[k] as u64, primes[m] as u64);
+                            (1..q).find(|x| x * p % q == 1).expect("the primes are distinct")
+                        })
+                        .collect()
                 })
-                .collect()
-        })
-        .collect();
-    let mut mixed = vec![0u64; limbs];
-    let mut out = Vec::with_capacity(residues[0].len());
-    for i in 0..residues[0].len() {
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn lift(&self, residues: &[u64], mixed: &mut [u64]) -> u128 {
+        let limbs = self.primes.len();
         for k in 0..limbs {
-            let q = primes[k] as u64;
-            let mut x = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+            let q = self.primes[k];
+            let mut x = residues[k];
             for m in 0..k {
-                x = (x + q - mixed[m] % q) % q * inverses[k][m] % q;
+                x = (x + q - mixed[m] % q) % q * self.inverses[k][m] % q;
             }
             mixed[k] = x;
         }
         let mut value = 0u128;
         for k in (0..limbs).rev() {
-            value = value * primes[k] as u128 + mixed[k] as u128;
+            value = value * self.primes[k] as u128 + mixed[k] as u128;
         }
+        value
+    }
+}
+
+/// The commitment's columns as coefficients modulo `modulus`, which is what the proof carries,
+/// from the kernel's raw rows: `rows[c * limbs + k]` is column `c`'s 648 NTT-domain rows
+/// modulo limb `k`. Each limb's rows go through that limb's inverse transform
+/// ([`labinius::bd::coefficients_from_rows`]) 32 columns at a time, and Garner's algorithm
+/// lifts the residues to the single integer modulo their product; the lift is exact because
+/// `modulus` is that product. The column blocks are independent and run on `workers` threads.
+fn commitment_coefficients_rows(
+    rows: &[[u32; N]],
+    primes: &[u16],
+    modulus: u128,
+    columns: usize,
+    workers: usize,
+) -> Vec<u128> {
+    let limbs = primes.len();
+    assert_eq!(rows.len(), columns * limbs);
+    let garner = Garner::of(primes);
+    let mut out = vec![0u128; columns * N];
+    let blocks = columns.div_ceil(32);
+    let runs = labinius::par::ranges(blocks, workers, 1);
+    let out_addr = out.as_mut_ptr() as usize;
+    std::thread::scope(|scope| {
+        for run in runs {
+            let garner = &garner;
+            scope.spawn(move || {
+                let mut residues: Vec<Vec<i16>> = (0..limbs).map(|_| vec![0i16; 32 * N]).collect();
+                let mut mixed = vec![0u64; limbs];
+                let mut at = vec![0u64; limbs];
+                for blk in run {
+                    let c0 = blk * 32;
+                    let cols = (columns - c0).min(32);
+                    for k in 0..limbs {
+                        let refs: Vec<&[u32; N]> =
+                            (0..cols).map(|c| &rows[(c0 + c) * limbs + k]).collect();
+                        labinius::bd::coefficients_from_rows(
+                            primes[k],
+                            &refs,
+                            &mut residues[k][..cols * N],
+                        );
+                    }
+                    // Block `blk` owns coefficients `c0 * N .. (c0 + cols) * N` of `out`.
+                    let dst = unsafe { (out_addr as *mut u128).add(c0 * N) };
+                    for i in 0..cols * N {
+                        for k in 0..limbs {
+                            at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+                        }
+                        let value = garner.lift(&at, &mut mixed);
+                        debug_assert!(value < modulus);
+                        unsafe { dst.add(i).write(value) };
+                    }
+                }
+            });
+        }
+    });
+    out
+}
+
+/// The baseline's recombination through the library's commitment matrix, kept as the reference
+/// the tests check [`commitment_coefficients_rows`] against.
+#[cfg(test)]
+fn commitment_coefficients(commitment: &Commitment, primes: &[u16], modulus: u128) -> Vec<u128> {
+    let residues = labinius::bd::column_coefficients(commitment.matrix(), primes);
+    let garner = Garner::of(primes);
+    let limbs = primes.len();
+    let mut mixed = vec![0u64; limbs];
+    let mut at = vec![0u64; limbs];
+    let mut out = Vec::with_capacity(residues[0].len());
+    for i in 0..residues[0].len() {
+        for k in 0..limbs {
+            at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+        }
+        let value = garner.lift(&at, &mut mixed);
         debug_assert!(value < modulus);
         out.push(value);
     }
     out
 }
+
+/// The switch's rounds: the messages, the coordinates and the opened value, driven through
+/// either prover.
+trait SwitchRounds {
+    fn msg(&mut self) -> [F162; 2];
+    fn fold(&mut self, r: F162);
+    fn final_eval(&self) -> F162;
+}
+impl SwitchRounds for cf::LeanSwitch<'_> {
+    fn msg(&mut self) -> [F162; 2] {
+        cf::LeanSwitch::msg(self)
+    }
+    fn fold(&mut self, r: F162) {
+        cf::LeanSwitch::fold(self, r)
+    }
+    fn final_eval(&self) -> F162 {
+        cf::LeanSwitch::final_eval(self)
+    }
+}
+impl SwitchRounds for cf::SwitchProver {
+    fn msg(&mut self) -> [F162; 2] {
+        cf::SwitchProver::msg(self)
+    }
+    fn fold(&mut self, r: F162) {
+        cf::SwitchProver::fold(self, r)
+    }
+    fn final_eval(&self) -> F162 {
+        cf::SwitchProver::final_eval(self)
+    }
+}
+fn switch_rounds(
+    sw: &mut impl SwitchRounds,
+    t: &mut Transcript,
+) -> (Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
+    let mut rounds = Vec::with_capacity(LOG_PACKED);
+    let mut coords = Vec::with_capacity(LOG_PACKED);
+    for _ in 0..LOG_PACKED {
+        let msg = sw.msg();
+        t.absorb_f162(&msg);
+        let r = t.sample_f162(b"switch-round", 1)[0];
+        rounds.push(msg.map(|v| v.0));
+        coords.push(r);
+        sw.fold(r);
+    }
+    let opened = sw.final_eval();
+    t.absorb_f162(&[opened]);
+    (rounds, coords, opened)
+}
+
 fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
-    let load_start = std::time::Instant::now();
-    let table = load_table(table_path);
+    let load_clock = std::time::Instant::now();
+    let table = Table::load(table_path);
     let values = table.words();
-    eprintln!(
-        "labinius-load load_us={}",
-        load_start.elapsed().as_micros()
-    );
+    let load_time = load_clock.elapsed();
+    let workers = threads();
     let clock = std::time::Instant::now();
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
@@ -244,45 +449,55 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
         p.base,
         &p.extra_moduli,
     );
-    let pp = PublicParameters::with_key(p.clone(), rq::MATRIX_SEED, key);
+    drop(matrix);
     let setup_time = clock.elapsed();
-    let mut prover = Prover::cold_without_transform(&pp);
-    let w = Witness::lifted(&p, values).unwrap();
-    let witness_time = clock.elapsed();
-    let (commitment, opening) = prover.commit(&w);
+    let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
+    assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
+    let rows = key.commit_columns_rows(&columns, workers);
     let commit_time = clock.elapsed();
     let commitment = rq::pack_ring_elements(
-        &commitment_coefficients(&commitment, &primes, modulus),
+        &commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, workers),
         modulus,
     );
+    drop(rows);
     let recombine_time = clock.elapsed();
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
-    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-    let partials = ws.partial_evals(0, values, &hi);
+    let mut eq = cf::HugeBuf::<B128>::new(1 << LOG_PACKED);
+    unsafe { cf::eq_expand_b128_parallel(&hi, eq.as_mut_ptr(), workers) };
+    let eq: &[B128] = unsafe { eq.as_slice() };
+    let partials = cf::partial_evals_parallel(values, eq, workers);
     let value = claim(&partials, &lo);
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let partials_time = clock.elapsed();
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let mut sw = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
-    let mut rounds = Vec::new();
-    let mut coords = Vec::new();
-    for _ in 0..LOG_PACKED {
-        let msg = sw.msg();
-        t.absorb_f162(&msg);
-        let r = t.sample_f162(b"switch-round", 1)[0];
-        rounds.push(msg.map(|v| v.0));
-        coords.push(r);
-        sw.fold(r);
-    }
-    let opened = sw.final_eval();
-    t.absorb_f162(&[opened]);
+    let (rounds, coords, opened) = match cf::LeanSwitch::new(values, eq, &hi, &batch, workers) {
+        Some(mut sw) => switch_rounds(&mut sw, &mut t),
+        None => {
+            // A coordinate of the point is one: the baseline's prover, whose workspace holds
+            // its own copy of the expansion.
+            let mut ws = cf::Workspace::new(LOG_PACKED, 1);
+            let again = ws.partial_evals(0, values, &hi);
+            assert_eq!(again, partials);
+            let mut sw = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
+            switch_rounds(&mut sw, &mut t)
+        }
+    };
     let switch_time = clock.elapsed();
     let point = EvaluationPoint::msb_first(&p, &coords);
-    let row = w.row_evaluate(&point);
+    let row = RowEvaluation::of(labinius::eval::row_evaluate_words(values, point.p0(), workers));
+    let row_time = clock.elapsed();
     let challenges = folding_challenges(&mut t, &row);
-    let folded = prover.fold_from_witness(opening, &FoldingChallenges::of(challenges), &w);
+    let challenge_time = clock.elapsed();
+    let folded = FoldedWitness::of(labinius::fold::fold_witness_streaming(
+        values,
+        COLUMNS,
+        &challenges,
+        COLUMN_LEN / 128,
+        primes[0],
+        workers,
+    ));
     let fold_time = clock.elapsed();
     let proof = Proof {
         version: 1,
@@ -295,12 +510,13 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
         folded: pack_folded(&folded),
     };
     let encode_time = clock.elapsed();
-    eprintln!("labinius-profile matrix_us={} setup_us={} witness_us={} commit_us={} recombine_us={} partials_us={} switch_us={} fold_us={} encode_us={} total_us={}",
-        matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
-        (witness_time-setup_time).as_micros(), (commit_time-witness_time).as_micros(),
-        (recombine_time-commit_time).as_micros(), (partials_time-recombine_time).as_micros(),
-        (switch_time-partials_time).as_micros(), (fold_time-switch_time).as_micros(),
-        (encode_time-fold_time).as_micros(), encode_time.as_micros());
+    eprintln!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={}",
+        load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
+        (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
+        (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
+        (row_time-switch_time).as_micros(), (challenge_time-row_time).as_micros(),
+        (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
+        encode_time.as_micros(), workers);
     proof
 }
 fn main() {
@@ -319,7 +535,16 @@ fn main() {
         MODULUS
     };
     let proof = prove(&seed, modulus, &args[4]);
-    std::fs::write(&args[2], codec().serialize(&proof).unwrap()).unwrap();
+    let bytes = codec().serialize(&proof).unwrap();
+    drop(proof);
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&args[2]).expect("create proof file");
+        file.write_all(&bytes).expect("write proof");
+        file.flush().expect("flush proof");
+    }
+    // The proof is on disk; nothing the destructors would do is observable.
+    std::process::exit(0);
 }
 
 #[cfg(test)]
@@ -387,7 +612,14 @@ mod tests {
         let p1: Vec<F162> = high.iter().rev().copied().collect();
         let row = wire::unpack_row_evaluation(&proof.row, COLUMNS).unwrap();
         let folded = unpack_folded(&proof.folded, RING_ELEMENTS).unwrap();
-        let challenges = folding_challenges(&mut t, &row);
+        let challenges = {
+            row.absorb(&mut t);
+            (0..COLUMNS)
+                .map(|_| {
+                    labinius::challenge::sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0
+                })
+                .collect::<Vec<_>>()
+        };
         assert_eq!(dot_f162(&eq_table(&p1), row.values()), opened);
         let v = folded.elements();
         assert_eq!(v.len(), RING_ELEMENTS);
@@ -448,8 +680,8 @@ mod tests {
     fn loaded_table_matches_trace() {
         let seed = [11u8; 32];
         let table = table_file(&seed);
-        let loaded = load_table(table.path());
-        assert_eq!(loaded.words(), trace(&seed).as_slice());
+        let loaded = Table::load(table.path());
+        assert_eq!(loaded.words(), &trace(&seed)[..]);
     }
 
     #[test]
@@ -506,7 +738,9 @@ mod tests {
     /// This is the one place where the derived limb form of `A` and the inverse of the
     /// commitment's per-limb NTT decomposition are checked against the definition in `R_Q`
     /// directly, with no transform anywhere in the reference. Two columns are enough: each is a
-    /// 4096-term inner product of ring elements.
+    /// 4096-term inner product of ring elements. Both the baseline's recombination through the
+    /// commitment matrix and the direct one from the kernel's rows are checked, against each
+    /// other and against the definition.
     #[test]
     fn commitment_is_the_schoolbook_product() {
         let modulus = MODULUS;
@@ -525,6 +759,10 @@ mod tests {
         let w = Witness::lifted(&p, &values).unwrap();
         let (commitment, _) = Prover::cold(&pp).commit(&w);
         let coefficients = commitment_coefficients(&commitment, &primes, modulus);
+        let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
+        let rows = pp.key().commit_columns_rows(&columns, 3);
+        let direct = commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, 3);
+        assert_eq!(coefficients, direct, "the two recombinations differ");
         for j in [0usize, COLUMNS - 1] {
             let column = &w.elements()[j * COLUMN_LEN..(j + 1) * COLUMN_LEN];
             assert_eq!(
@@ -533,5 +771,44 @@ mod tests {
                 "column {j} does not match the schoolbook product"
             );
         }
+    }
+
+    /// The streaming fold from the words is the fold from the kept transform, and the row
+    /// evaluation from the words is the one from the lifted witness.
+    #[test]
+    fn streaming_fold_and_row_match_the_library() {
+        let modulus = MODULUS;
+        let primes = modulus_choice::limbs(modulus).unwrap();
+        let p = params(&primes);
+        let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
+        let key = CommitmentKey::from_coefficients(
+            COLUMN_LEN,
+            &matrix,
+            modulus,
+            p.base,
+            &p.extra_moduli,
+        );
+        let pp = PublicParameters::with_key(p.clone(), rq::MATRIX_SEED, key);
+        let values = trace(&[8; 32]);
+        let w = Witness::lifted(&p, &values).unwrap();
+        let mut prover = Prover::cold(&pp);
+        let (_, opening) = prover.commit(&w);
+        let mut t = Transcript::new(b"labinius-fast/test-fold");
+        let coords = t.sample_f162(b"coords", LOG_PACKED);
+        let point = EvaluationPoint::msb_first(&p, &coords);
+        let row = w.row_evaluate(&point);
+        let direct = labinius::eval::row_evaluate_words(&values, point.p0(), 3);
+        assert_eq!(row.values(), &direct[..]);
+        let challenges = folding_challenges(&mut t, &row);
+        let folded = prover.fold(opening, &FoldingChallenges::of(challenges.clone()));
+        let streamed = labinius::fold::fold_witness_streaming(
+            &values,
+            COLUMNS,
+            &challenges,
+            COLUMN_LEN / 128,
+            primes[0],
+            3,
+        );
+        assert_eq!(folded.elements(), &streamed[..]);
     }
 }

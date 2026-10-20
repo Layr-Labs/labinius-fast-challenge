@@ -3,9 +3,14 @@ use std::ops::{Add, AddAssign, Mul};
 
 const GHASH_MOD: u128 = (1 << 7) | (1 << 2) | (1 << 1) | 1;
 
+/// `repr(transparent)`: a `B128` is exactly the 16 little-endian bytes of its word, which is what
+/// lets the witness table be read in place.
+#[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct B128(pub u128);
 
+/// `repr(C)`: three consecutive limbs, 24 bytes, which the bit-slicing kernels read raw.
+#[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct F162(pub [u64; 3]);
 

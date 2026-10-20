@@ -125,27 +125,113 @@ impl CommitmentKey {
         let primes: Vec<u16> = core::iter::once(base.prime())
             .chain(additional.iter().map(|l| l.prime()))
             .collect();
-        let a = primes
-            .iter()
-            .map(|&q| {
-                let mut batches: Vec<Batch32> = (0..nb)
-                    .map(|_| Batch32::zero(Representation::Coefficients))
-                    .collect();
-                dispatch_limb!(q, |Q| reduce_coefficients::<Q>(
-                    coefficients,
-                    modulus,
-                    &mut batches
-                ));
-                crate::fold::forward_limb(q, &mut batches);
-                batches
-            })
-            .collect();
+        // Every (limb, run of batches) is independent: the reduction reads its own elements and
+        // the forward transform is per batch, so the whole key goes out over the cores.
+        let threads = crate::par::threads();
+        let runs = crate::par::ranges(nb, threads.div_ceil(primes.len()).max(2), 1);
+        let a: Vec<Vec<Batch32>> = std::thread::scope(|scope| {
+            let handles: Vec<Vec<_>> = primes
+                .iter()
+                .map(|&q| {
+                    runs.iter()
+                        .map(|run| {
+                            let run = run.clone();
+                            scope.spawn(move || {
+                                let mut batches: Vec<Batch32> = (0..run.len())
+                                    .map(|_| Batch32::zero(Representation::Coefficients))
+                                    .collect();
+                                let first = run.start * 32 * N;
+                                let last = run.end * 32 * N;
+                                dispatch_limb!(q, |Q| reduce_coefficients::<Q>(
+                                    &coefficients[first..last],
+                                    modulus,
+                                    &mut batches
+                                ));
+                                crate::fold::forward_limb(q, &mut batches);
+                                batches
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|limb| {
+                    let mut all = Vec::with_capacity(nb);
+                    for h in limb {
+                        all.extend(h.join().unwrap());
+                    }
+                    all
+                })
+                .collect()
+        });
         CommitmentKey {
             a,
             base,
             additional: additional.to_vec(),
             len_f162,
         }
+    }
+
+    /// The raw 648-row commitments of `columns` columns, every limb, with no transform kept and
+    /// a bounded pool of `workers` threads: `out[c * limbs + k]` is column `c` modulo limb `k`,
+    /// in `[0, q)`, exactly what [`AuxData::commitment`] would hold after
+    /// [`commit_into_aux`](Self::commit_into_aux).
+    ///
+    /// The columns are taken [`cm::GROUP`] at a time against one pass over `A`, as
+    /// `commit_into_aux` takes them, but the groups are handed out to a fixed number of workers
+    /// instead of one thread each, so each worker's accumulators stay in its own L2 and the
+    /// machine runs as many kernels as it has cores. Each column may be the lifted `F162`
+    /// witness or the `B128` words it was lifted from ([`cm::BatchSource`]).
+    pub fn commit_columns_rows<E: cm::BatchSource>(
+        &self,
+        columns: &[E],
+        workers: usize,
+    ) -> Vec<[u32; N]> {
+        let r = columns.len();
+        assert!(r > 0, "at least one column");
+        for c in columns {
+            assert_eq!(c.elems(), self.len_f162, "a column is len_f162() elements");
+        }
+        let limbs = self.limb_list();
+        let nl = limbs.len();
+        let g = cm::GROUP.min(r);
+        let groups = r.div_ceil(g);
+        let workers = workers.clamp(1, groups);
+        let mut out = vec![[0u32; N]; r * nl];
+        let out_addr = out.as_mut_ptr() as usize;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let limbs = &limbs;
+                let next = &next;
+                scope.spawn(move || {
+                    let mut st = cm::Scratch::with_group(limbs, g);
+                    let mut raw = vec![[0u32; N]; g * nl];
+                    loop {
+                        let gi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if gi >= groups {
+                            break;
+                        }
+                        let c0 = gi * g;
+                        let gc = g.min(r - c0);
+                        cm::commit_limbs_group(
+                            &columns[c0..c0 + gc],
+                            limbs,
+                            None,
+                            &mut st,
+                            &mut raw[..gc * nl],
+                        );
+                        // Disjoint slices of `out`: group `gi` owns columns `c0 .. c0 + gc`.
+                        unsafe {
+                            let dst = (out_addr as *mut [u32; N]).add(c0 * nl);
+                            core::ptr::copy_nonoverlapping(raw.as_ptr(), dst, gc * nl);
+                        }
+                    }
+                });
+            }
+        });
+        out
     }
 
     /// Length of the key in `F162` elements: the size of one chunk of witness it commits to.
@@ -259,12 +345,9 @@ impl CommitmentKey {
         self.check_witness(witness, r);
         let bpc = self.a[0].len();
         assert!(
-            aux.chunks == r
-                && (aux.batches.is_empty() || aux.batches.len() == r * bpc)
-                && aux.raw.len() == self.limbs(),
+            aux.chunks == r && aux.batches.len() == r * bpc && aux.raw.len() == self.limbs(),
             "the auxiliary buffer does not match this key and r"
         );
-        let keep = !aux.batches.is_empty();
         for v in aux.raw.iter_mut() {
             v.clear();
         }
@@ -275,62 +358,37 @@ impl CommitmentKey {
         let starts: Vec<usize> = (0..r).step_by(g).collect();
         // Each group writes a disjoint slice of `aux.batches` and returns its raw commitments.
         // The address is a usize so the closure is `Send`; the slices do not overlap.
-        let batch_addr = if keep {
-            aux.batches.as_mut_ptr() as usize
-        } else {
-            0
-        };
+        let batch_addr = aux.batches.as_mut_ptr() as usize;
         let stride = std::mem::size_of::<Batch32>();
-        let thread_n = starts.len().min(
-            std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1)
-                .max(1),
-        );
         let mut groups: Vec<(usize, Vec<[u32; N]>)> = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(thread_n);
-            for t in 0..thread_n {
+            let mut handles = Vec::with_capacity(starts.len());
+            for c0 in starts {
                 let limbs = &limbs;
-                let starts = &starts;
                 handles.push(scope.spawn(move || {
                     let mut st = cm::Scratch::with_group(limbs, g);
-                    let mut owned = Vec::with_capacity(starts.len().div_ceil(thread_n));
-                    for (idx, &c0) in starts.iter().enumerate() {
-                        if idx % thread_n != t {
-                            continue;
-                        }
-                        let mut raw = vec![[0u32; N]; g * nl];
-                        let mut chunks: [&[F162]; cm::GROUP] = [&[]; cm::GROUP];
-                        for i in 0..g {
-                            let c = c0 + i;
-                            chunks[i] = &witness[c * len_f162..(c + 1) * len_f162];
-                        }
-                        let batches = if keep {
-                            Some(unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    (batch_addr + (c0 * bpc) * stride) as *mut Batch32,
-                                    g * bpc,
-                                )
-                            })
-                        } else {
-                            None
-                        };
-                        cm::commit_limbs_group(
-                            &chunks[..g],
-                            limbs,
-                            batches,
-                            &mut st,
-                            &mut raw,
-                        );
-                        owned.push((c0, raw));
+                    let mut raw = vec![[0u32; N]; g * nl];
+                    let mut chunks: [&[F162]; cm::GROUP] = [&[]; cm::GROUP];
+                    for i in 0..g {
+                        let c = c0 + i;
+                        chunks[i] = &witness[c * len_f162..(c + 1) * len_f162];
                     }
-                    owned
+                    let batches = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (batch_addr + (c0 * bpc) * stride) as *mut Batch32,
+                            g * bpc,
+                        )
+                    };
+                    cm::commit_limbs_group(
+                        &chunks[..g],
+                        limbs,
+                        Some(batches),
+                        &mut st,
+                        &mut raw,
+                    );
+                    (c0, raw)
                 }));
             }
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap())
-                .collect()
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         groups.sort_by_key(|(c0, _)| *c0);
         let mut data = Vec::with_capacity(4 * r);
@@ -423,18 +481,6 @@ impl AuxData {
         assert!(r > 0 && len_ring > 0 && len_ring % 32 == 0 && limbs > 0);
         AuxData {
             batches: uninit_batches(r * len_ring / 32),
-            raw: (0..limbs).map(|_| Vec::with_capacity(r)).collect(),
-            chunks: r,
-        }
-    }
-
-    /// An empty buffer for `r` chunks over `limbs` limbs that does not keep the witness
-    /// transform: the commitment skips the non-temporal stores and the fold recomputes the
-    /// base limb's transform from the witness instead of reading it back.
-    pub fn without_transform(r: usize, limbs: usize) -> AuxData {
-        assert!(r > 0 && limbs > 0);
-        AuxData {
-            batches: Vec::new(),
             raw: (0..limbs).map(|_| Vec::with_capacity(r)).collect(),
             chunks: r,
         }

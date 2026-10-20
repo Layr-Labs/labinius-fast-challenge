@@ -531,3 +531,95 @@ pub fn sample_short_challenge(
         }
     }
 }
+
+// =============================================================================================
+// parallel sampling
+// =============================================================================================
+
+impl Transcript {
+    /// The derivation [`reader`](Self::reader) would make `offset` samples from now, without
+    /// advancing the counter: what lets `n` consecutive samples be taken on several threads.
+    fn reader_at(&self, label: &[u8], offset: u64) -> blake3::OutputReader {
+        let mut state = self.state.clone();
+        state.update(&(self.counter + offset).to_le_bytes());
+        state.update(&(label.len() as u64).to_le_bytes());
+        state.update(label);
+        state.finalize_xof()
+    }
+
+    /// Advance the sample counter by `n`, as `n` derivations would have.
+    fn skip(&mut self, n: u64) {
+        self.counter += n;
+    }
+}
+
+/// The same challenge [`sample_short_challenge`] draws from the derivation `reader`.
+fn sample_short_challenge_from(
+    reader: blake3::OutputReader,
+    weight: usize,
+    bound: f64,
+) -> ShortChallenge {
+    let bound_sq = bound * bound + 1e-12;
+    let mut x = Xof::new(reader);
+    let mut perm = [0u8; N162];
+    loop {
+        let c = attempt(&mut x, weight, &mut perm).signed();
+        if within(&c, bound_sq) {
+            return c;
+        }
+    }
+}
+
+/// `n` consecutive [`sample_short_challenge`]s, bit for bit the same challenges in the same
+/// order, drawn on up to `threads` threads. Sample `i` is one derivation of the transcript at
+/// counter `base + i` whatever the other samples did, so the samples are independent work; the
+/// counter is advanced by `n` at the end exactly as `n` sequential calls would have left it.
+pub fn sample_short_challenges_parallel(
+    t: &mut Transcript,
+    n: usize,
+    weight: usize,
+    bound: f64,
+    threads: usize,
+) -> Vec<ShortChallenge> {
+    let threads = threads.clamp(1, n.max(1));
+    let mut out = vec![ShortChallenge::zero(); n];
+    if n > 0 {
+        let per = n.div_ceil(threads);
+        let t_ref = &*t;
+        std::thread::scope(|scope| {
+            for (w, block) in out.chunks_mut(per).enumerate() {
+                let first = w * per;
+                scope.spawn(move || {
+                    for (i, slot) in block.iter_mut().enumerate() {
+                        let reader = t_ref.reader_at(b"short-challenge", (first + i) as u64);
+                        *slot = sample_short_challenge_from(reader, weight, bound);
+                    }
+                });
+            }
+        });
+    }
+    t.skip(n as u64);
+    out
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_sampling_matches_sequential() {
+        let mut a = Transcript::new(b"labinius/parallel-sampling");
+        a.absorb_bytes(b"some prefix");
+        let mut b = a.clone();
+        let sequential: Vec<ShortChallenge> = (0..37)
+            .map(|_| sample_short_challenge(&mut a, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
+            .collect();
+        let parallel = sample_short_challenges_parallel(&mut b, 37, DEFAULT_WEIGHT, DEFAULT_BOUND, 5);
+        assert_eq!(sequential, parallel);
+        let mut x = [0u8; 16];
+        let mut y = [0u8; 16];
+        a.fill(b"after", &mut x);
+        b.fill(b"after", &mut y);
+        assert_eq!(x, y, "the counter advanced the same way");
+    }
+}

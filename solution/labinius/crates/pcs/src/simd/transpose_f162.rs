@@ -365,17 +365,3 @@ pub unsafe fn slice_f162(elems: &[F162; 128]) -> BinaryIndex32 {
     slice_f162_into(elems, &mut out);
     out
 }
-
-/// The same index rows for 128 words of `B128`, the lifted witness read in place: a lifted
-/// `F162` is the word's two limbs and a zero top limb, so the 128 words are staged as 128 `F162`
-/// in an L1-resident buffer (3 KB, written once per batch, a few cycles per ring element against
-/// the transform's hundreds) and sliced exactly as [`slice_f162_into`] slices them.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-pub unsafe fn slice_b128_into(words: &[crate::fields::scalar::B128; 128], out: &mut BinaryIndex32) {
-    let mut staged: MaybeUninit<A64<[F162; 128]>> = MaybeUninit::uninit();
-    let dst = (*staged.as_mut_ptr()).0.as_mut_ptr();
-    for (i, w) in words.iter().enumerate() {
-        dst.add(i).write(F162::from_b128(*w));
-    }
-    slice_raw(dst as *const u8, out)
-}

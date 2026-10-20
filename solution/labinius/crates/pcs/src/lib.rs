@@ -36,7 +36,6 @@ pub mod fold;
 pub mod key;
 pub mod labrador;
 pub mod limb;
-pub mod par;
 pub mod params;
 pub mod recursion;
 pub mod ring;

@@ -33,10 +33,27 @@ const F162_PER_BATCH: usize = 128;
 /// quadratic tree (the two coefficients of each of the 324 leaves); in both cases every row is
 /// uniform in `[-(q-1)/2, (q-1)/2]`.
 pub struct CommitmentKey {
-    a: Vec<Vec<Batch32>>,
+    a: Vec<KeyRows>,
     base: Modulus,
     additional: Vec<Modulus>,
     len_f162: usize,
+}
+
+/// One limb's `A`: built at run time, or borrowed from storage that outlives the key (the
+/// bytes of the batches embedded in a binary by a build script, say).
+pub enum KeyRows {
+    Owned(Vec<Batch32>),
+    Static(&'static [Batch32]),
+}
+
+impl KeyRows {
+    #[inline]
+    fn as_slice(&self) -> &[Batch32] {
+        match self {
+            KeyRows::Owned(v) => v,
+            KeyRows::Static(s) => s,
+        }
+    }
 }
 
 impl CommitmentKey {
@@ -61,7 +78,7 @@ impl CommitmentKey {
         let primes: Vec<u16> = core::iter::once(base.prime())
             .chain(additional.iter().map(|l| l.prime()))
             .collect();
-        let a = primes
+        let a: Vec<Vec<Batch32>> = primes
             .iter()
             .enumerate()
             .map(|(k, &q)| {
@@ -81,7 +98,7 @@ impl CommitmentKey {
             })
             .collect();
         CommitmentKey {
-            a,
+            a: a.into_iter().map(KeyRows::Owned).collect(),
             base,
             additional: additional.to_vec(),
             len_f162,
@@ -166,7 +183,42 @@ impl CommitmentKey {
                 .collect()
         });
         CommitmentKey {
-            a,
+            a: a.into_iter().map(KeyRows::Owned).collect(),
+            base,
+            additional: additional.to_vec(),
+            len_f162,
+        }
+    }
+
+    /// A key whose per-limb rows already exist in storage that outlives it: `rows[k]` is limb
+    /// `k`'s `len_f162 / 128` batches in the NTT domain, exactly what [`row`](Self::row) of the
+    /// key [`from_coefficients`](Self::from_coefficients) builds returns. Nothing is copied or
+    /// computed, so a key built once at compile time costs the process nothing.
+    pub fn from_static_rows(
+        len_f162: usize,
+        base: Modulus,
+        additional: &[Modulus],
+        rows: &[&'static [Batch32]],
+    ) -> Self {
+        assert!(
+            len_f162 > 0 && len_f162 % F162_PER_BATCH == 0,
+            "len_f162 must be a multiple of 128"
+        );
+        assert_eq!(rows.len(), 1 + additional.len(), "one row set per limb");
+        let mut seen = vec![base];
+        for l in additional {
+            assert!(!seen.contains(l), "the limb {l:?} is listed twice");
+            seen.push(*l);
+        }
+        for r in rows {
+            assert_eq!(r.len(), len_f162 / F162_PER_BATCH, "one batch per 128 elements");
+            assert!(
+                r.iter().all(|b| b.representation == Representation::Ntt),
+                "a key is in the NTT domain"
+            );
+        }
+        CommitmentKey {
+            a: rows.iter().map(|r| KeyRows::Static(r)).collect(),
             base,
             additional: additional.to_vec(),
             len_f162,
@@ -178,15 +230,17 @@ impl CommitmentKey {
     /// in `[0, q)`, exactly what [`AuxData::commitment`] would hold after
     /// [`commit_into_aux`](Self::commit_into_aux).
     ///
-    /// The columns are taken [`cm::GROUP`] at a time against one pass over `A`, as
-    /// `commit_into_aux` takes them, but the groups are handed out to a fixed number of workers
-    /// instead of one thread each, so each worker's accumulators stay in its own L2 and the
-    /// machine runs as many kernels as it has cores. Each column may be the lifted `F162`
+    /// The columns are taken `group` (at most [`cm::GROUP`]) at a time against one pass over
+    /// `A`, as `commit_into_aux` takes them, but the groups are handed out to a fixed number of
+    /// workers instead of one thread each, so each worker's accumulators stay in its own L2 and
+    /// the machine runs as many kernels as it has cores. With two workers per physical core a
+    /// group of 4 (348 KB of accumulators each) leaves both inside one L2. Each column may be the lifted `F162`
     /// witness or the `B128` words it was lifted from ([`cm::BatchSource`]).
     pub fn commit_columns_rows<E: cm::BatchSource>(
         &self,
         columns: &[E],
         workers: usize,
+        group: usize,
     ) -> Vec<[u32; N]> {
         let r = columns.len();
         assert!(r > 0, "at least one column");
@@ -195,7 +249,7 @@ impl CommitmentKey {
         }
         let limbs = self.limb_list();
         let nl = limbs.len();
-        let g = cm::GROUP.min(r);
+        let g = group.clamp(1, cm::GROUP).min(r);
         let groups = r.div_ceil(g);
         let workers = workers.clamp(1, groups);
         let mut out = vec![[0u32; N]; r * nl];
@@ -284,7 +338,7 @@ impl CommitmentKey {
     /// that a caller can drive the kernel directly, or check a commitment against
     /// [`crate::scalar`].
     pub fn row(&self, k: usize) -> &[Batch32] {
-        &self.a[k]
+        self.a[k].as_slice()
     }
 
     /// The limbs in the form the kernel driver takes.
@@ -293,7 +347,7 @@ impl CommitmentKey {
             .map(|k| cm::Limb {
                 q: self.prime(k),
                 quad: self.is_quadratic(k),
-                a: &self.a[k],
+                a: self.a[k].as_slice(),
             })
             .collect()
     }
@@ -343,7 +397,7 @@ impl CommitmentKey {
         aux: &mut AuxData,
     ) -> VerticallyAlignedMatrix<PowerOfThreeRingElementWithLimbs> {
         self.check_witness(witness, r);
-        let bpc = self.a[0].len();
+        let bpc = self.a[0].as_slice().len();
         assert!(
             aux.chunks == r && aux.batches.len() == r * bpc && aux.raw.len() == self.limbs(),
             "the auxiliary buffer does not match this key and r"

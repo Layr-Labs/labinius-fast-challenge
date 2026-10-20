@@ -643,13 +643,18 @@ fn parallel_batches(vb: &mut [Batch32], f: impl Fn(&mut Batch32) + Sync) {
         .min(n);
     let addr = vb.as_mut_ptr() as usize;
     let stride = std::mem::size_of::<Batch32>();
-    crate::par::pool().run(threads, |t| {
-        let mut i = t;
-        while i < n {
-            unsafe {
-                f(&mut *((addr + i * stride) as *mut Batch32));
-            }
-            i += threads;
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let f = &f;
+            scope.spawn(move || {
+                let mut i = t;
+                while i < n {
+                    unsafe {
+                        f(&mut *((addr + i * stride) as *mut Batch32));
+                    }
+                    i += threads;
+                }
+            });
         }
     });
 }
@@ -992,47 +997,53 @@ fn accumulate_streaming<const Q: u16, T: WordTransform>(
     let out_addr = out.as_mut_ptr() as usize;
     let stride = std::mem::size_of::<Batch32>();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    crate::par::pool().run(workers, |_| {
-        let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
-        let base = acc.as_mut_ptr() as *mut i32;
-        let mut idx = BinaryIndex32::zero();
-        let mut w0 = Box::new(Batch32::zero(Representation::Ntt));
-        let mut w1 = Box::new(Batch32::zero(Representation::Ntt));
-        loop {
-            let gi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if gi >= groups.len() {
-                break;
-            }
-            let b0 = groups[gi];
-            let gb = g.min(bpc - b0);
-            for v in acc.iter_mut() {
-                *v = AccVec([0i32; 16]);
-            }
-            unsafe {
-                for i in 0..pairs {
-                    for b in 0..gb {
-                        let at = |j: usize| {
-                            let start = j * column_words + 128 * (b0 + b);
-                            &*(words.as_ptr().add(start) as *const [B128; 128])
-                        };
-                        transform_words::<T>(at(2 * i), &mut idx, &mut w0);
-                        transform_words::<T>(at(2 * i + 1), &mut idx, &mut w1);
-                        accumulate_pair(
-                            w0.v.as_ptr() as *const i16,
-                            w1.v.as_ptr() as *const i16,
-                            ch.pair[i].as_ptr(),
-                            base.add(32 * N * b),
-                        );
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let groups = &groups;
+            let next = &next;
+            scope.spawn(move || {
+                let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
+                let base = acc.as_mut_ptr() as *mut i32;
+                let mut idx = BinaryIndex32::zero();
+                let mut w0 = Box::new(Batch32::zero(Representation::Ntt));
+                let mut w1 = Box::new(Batch32::zero(Representation::Ntt));
+                loop {
+                    let gi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if gi >= groups.len() {
+                        break;
                     }
-                    if (2 * (i + 1)) % fold_period(Q) == 0 {
-                        fold_back::<Q>(base, gb * N * 2);
+                    let b0 = groups[gi];
+                    let gb = g.min(bpc - b0);
+                    for v in acc.iter_mut() {
+                        *v = AccVec([0i32; 16]);
+                    }
+                    unsafe {
+                        for i in 0..pairs {
+                            for b in 0..gb {
+                                let at = |j: usize| {
+                                    let start = j * column_words + 128 * (b0 + b);
+                                    &*(words.as_ptr().add(start) as *const [B128; 128])
+                                };
+                                transform_words::<T>(at(2 * i), &mut idx, &mut w0);
+                                transform_words::<T>(at(2 * i + 1), &mut idx, &mut w1);
+                                accumulate_pair(
+                                    w0.v.as_ptr() as *const i16,
+                                    w1.v.as_ptr() as *const i16,
+                                    ch.pair[i].as_ptr(),
+                                    base.add(32 * N * b),
+                                );
+                            }
+                            if (2 * (i + 1)) % fold_period(Q) == 0 {
+                                fold_back::<Q>(base, gb * N * 2);
+                            }
+                        }
+                        for b in 0..gb {
+                            let dst = &mut *((out_addr + (b0 + b) * stride) as *mut Batch32);
+                            drain::<Q>(base.add(32 * N * b), dst);
+                        }
                     }
                 }
-                for b in 0..gb {
-                    let dst = &mut *((out_addr + (b0 + b) * stride) as *mut Batch32);
-                    drain::<Q>(base.add(32 * N * b), dst);
-                }
-            }
+            });
         }
     });
     out
@@ -1084,239 +1095,4 @@ pub fn fold_witness_streaming(
         quad |Q| fold_quad_streaming::<Q>(words, columns, challenges, bpc, workers),
     );
     (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
-}
-
-// =============================================================================================
-// the fold from the words with bit-sliced counters
-// =============================================================================================
-//
-// [`crate::fold_bits`] computes `v` without any transform: a few vector operations per
-// challenge term on 512-lane bit planes of the words. This is the driver: the GFNI transpose of
-// the library feeds the planes, the blocks go out over the pool, and two runtime checks guard
-// the result — the GFNI transposer is compared with the portable one on one block (and
-// replaced by it if they differ), and one batch position of the fold is recomputed through the
-// transform path by the caller (`fold_witness_positions`) and compared.
-
-use crate::fold_bits::{self as fb, Challenge, Lanes, Transposer};
-use crate::simd::transpose_f162::transpose8x8_q;
-use crate::fields::bitmat::{transpose_tile, GF_IDENT};
-
-/// The library's GFNI tile transpose, continued to bit planes: per 64-word tile the byte
-/// transpose, the 8x8 bit transpose of every qword (`gf2p8affine` by the identity), and an 8x8
-/// byte transpose, which leaves qword `t` of vector `k` holding bit `8 k + t` of the tile's
-/// 64 words in `word_at` order; a qword transpose across the eight tiles then assembles each
-/// plane's 512 lanes.
-///
-/// Which plane index a given (`k`, `t`) lands on depends on the affine's bit convention, so the
-/// driver derives the plane permutation at run time against the portable transposer.
-pub struct Gfni {
-    /// `plane[q]` is produced at raw index `perm[q]`.
-    perm: [u8; fb::WORD_BITS],
-    /// The word lane `l` carries.
-    map: fn(usize) -> usize,
-}
-
-impl Gfni {
-    /// A transposer validated against the portable one on `sample` (512 words), under each
-    /// candidate lane order: `None` when no lane order and permutation of its raw planes
-    /// reproduces the portable planes.
-    pub fn validated(sample: &[u128]) -> Option<Gfni> {
-        assert!(sample.len() >= fb::LANES);
-        let mut raw = [fb::V::zero(); fb::WORD_BITS];
-        unsafe { gfni_raw_planes(sample.as_ptr(), &mut raw) };
-        let raw_words: Vec<[u64; 8]> = raw.iter().map(|v| v.words()).collect();
-        let candidates: [fn(usize) -> usize; 2] = [fb::lane_word_reversed8, fb::lane_word];
-        'maps: for map in candidates {
-            let mut want = [fb::V::zero(); fb::WORD_BITS];
-            unsafe { fb::portable_planes(sample.as_ptr(), &mut want, map) };
-            let mut perm = [0u8; fb::WORD_BITS];
-            let mut used = [false; fb::WORD_BITS];
-            for (q, w) in want.iter().enumerate() {
-                let w = w.words();
-                let Some(at) = (0..fb::WORD_BITS).find(|&i| !used[i] && raw_words[i] == w) else {
-                    continue 'maps;
-                };
-                used[at] = true;
-                perm[q] = at as u8;
-            }
-            return Some(Gfni { perm, map });
-        }
-        None
-    }
-}
-
-/// The raw planes of the GFNI path, before the permutation.
-///
-/// # Safety
-/// AVX-512 F/BW/VBMI and GFNI; `words` addresses 512 readable `u128`.
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-unsafe fn gfni_raw_planes(words: *const u128, out: &mut [fb::V; fb::WORD_BITS]) {
-    // Byte (8 t + i) of the output takes byte (8 i + t) of the input: an 8x8 byte transpose.
-    let idx: [u8; 64] = core::array::from_fn(|o| (8 * (o % 8) + o / 8) as u8);
-    let t8 = _mm512_loadu_si512(idx.as_ptr() as *const __m512i);
-    let ident = _mm512_set1_epi64(GF_IDENT);
-    let mut u = [[_mm512_setzero_si512(); 16]; 8];
-    let mut xp = [_mm512_setzero_si512(); 16];
-    for tile in 0..8 {
-        transpose_tile(words.add(64 * tile) as *const u8, &mut xp);
-        for k in 0..16 {
-            let bits = _mm512_gf2p8affine_epi64_epi8::<0>(ident, xp[k]);
-            u[tile][k] = _mm512_permutexvar_epi8(t8, bits);
-        }
-    }
-    for k in 0..16 {
-        let o = transpose8x8_q(core::array::from_fn(|tile| u[tile][k]));
-        for t in 0..8 {
-            out[8 * k + t] = fb::V(o[t]);
-        }
-    }
-}
-
-impl Transposer for Gfni {
-    unsafe fn planes<L: Lanes>(&self, words: *const u128, out: &mut [L; fb::WORD_BITS]) {
-        let mut raw = [fb::V::zero(); fb::WORD_BITS];
-        gfni_raw_planes(words, &mut raw);
-        for q in 0..fb::WORD_BITS {
-            out[q] = L::from_words(raw[self.perm[q] as usize].words());
-        }
-    }
-    fn lane_word(&self, l: usize) -> usize {
-        (self.map)(l)
-    }
-}
-
-/// `v = sum_j c_j W_j` from the words with the bit-sliced counters, in coefficient form,
-/// centered: the same elements [`fold_witness_streaming`] returns. `words` is `columns`
-/// columns of `column_words` words (a multiple of 512). Blocks of 128 elements go out over the
-/// pool.
-pub fn fold_witness_bits(
-    words: &[B128],
-    columns: usize,
-    column_words: usize,
-    challenges: &[ShortChallenge],
-) -> Vec<RingElement> {
-    assert_eq!(challenges.len(), columns, "one challenge per column");
-    assert!(column_words % fb::LANES == 0 && words.len() == columns * column_words);
-    let cs: Vec<Challenge> = challenges
-        .iter()
-        .map(|c| Challenge {
-            positions: c.positions,
-            signs: c.signs,
-            weight: c.weight,
-        })
-        .collect();
-    let raw = words.as_ptr() as usize;
-    let elements = column_words / 4;
-    let blocks = elements / fb::BLOCK_ELEMENTS;
-    let reach = fb::Reach::of(&cs);
-    let mut out: Vec<[i16; N]> = vec![[0i16; N]; elements];
-    let out_addr = out.as_mut_ptr() as usize;
-    let sample = &words[..fb::LANES];
-    let gfni = Gfni::validated(unsafe { core::slice::from_raw_parts(sample.as_ptr() as *const u128, fb::LANES) });
-    FOLD_USED_GFNI.store(gfni.is_some(), std::sync::atomic::Ordering::Relaxed);
-    let run_block = |block: usize| {
-        let chunk = unsafe {
-            core::slice::from_raw_parts_mut(
-                (out_addr as *mut [i16; N]).add(block * fb::BLOCK_ELEMENTS),
-                fb::BLOCK_ELEMENTS,
-            )
-        };
-        let raw = raw as *const u128;
-        unsafe {
-            match &gfni {
-                Some(t) => fb::fold_block::<fb::V, Gfni>(raw, columns, column_words, &cs, &reach, block, t, chunk),
-                None => fb::fold_block::<fb::V, fb::Portable>(raw, columns, column_words, &cs, &reach, block, &fb::Portable, chunk),
-            }
-        }
-    };
-    crate::par::pool().run(blocks, run_block);
-    out.into_iter()
-        .map(|v| RingElement {
-            v,
-            representation: Representation::Coefficients,
-        })
-        .collect()
-}
-
-/// Whether the last [`fold_witness_bits`] ran on the GFNI transposer (else the portable one),
-/// for the profile line.
-pub static FOLD_USED_GFNI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// [`fold_witness_streaming`] restricted to the batch positions `positions` (32 ring elements
-/// each): element `32 b + i` of the fold for `b` in `positions`, in order — the transform path's
-/// answer, for checking another path against.
-pub fn fold_witness_positions(
-    words: &[B128],
-    columns: usize,
-    challenges: &[ShortChallenge],
-    bpc: usize,
-    q: u16,
-    positions: core::ops::Range<usize>,
-) -> Vec<RingElement> {
-    assert_eq!(challenges.len(), columns, "one challenge per column");
-    assert!(bpc > 0 && words.len() == columns * 128 * bpc && positions.end <= bpc);
-    let vb = dispatch_limb!(
-        q,
-        split |Q| {
-            let ch = challenge_ntt::<Q>(challenges);
-            let mut vb = accumulate_streaming_positions::<Q, SplitTransform<Q>>(words, columns, &ch, bpc, positions.clone());
-            parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
-            vb
-        },
-        quad |Q| {
-            let ch = challenge_ntt_quad_base::<Q>(challenges);
-            let mut vb = accumulate_streaming_positions::<Q, QuadTransform<Q>>(words, columns, &ch, bpc, positions.clone());
-            parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
-            vb
-        },
-    );
-    (0..32 * vb.len()).map(|i| vb[i / 32].get(i % 32)).collect()
-}
-
-/// [`accumulate_streaming`] over the batch positions `positions` only, one position per task.
-fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
-    words: &[B128],
-    columns: usize,
-    ch: &ChallengeNtt,
-    bpc: usize,
-    positions: core::ops::Range<usize>,
-) -> Vec<Batch32> {
-    let pairs = ch.pair.len();
-    assert_eq!(2 * pairs, columns, "one challenge per column, paired");
-    let column_words = 128 * bpc;
-    let n = positions.len();
-    let mut out: Vec<Batch32> = (0..n).map(|_| Batch32::zero(Representation::Ntt)).collect();
-    let out_addr = out.as_mut_ptr() as usize;
-    let stride = std::mem::size_of::<Batch32>();
-    let first = positions.start;
-    crate::par::pool().run(n, |i| {
-        let b = first + i;
-        let mut acc = vec![AccVec([0i32; 16]); N * 2];
-        let base = acc.as_mut_ptr() as *mut i32;
-        let mut idx = BinaryIndex32::zero();
-        let mut w0 = Box::new(Batch32::zero(Representation::Ntt));
-        let mut w1 = Box::new(Batch32::zero(Representation::Ntt));
-        unsafe {
-            for p in 0..pairs {
-                let at = |j: usize| {
-                    let start = j * column_words + 128 * b;
-                    &*(words.as_ptr().add(start) as *const [B128; 128])
-                };
-                transform_words::<T>(at(2 * p), &mut idx, &mut w0);
-                transform_words::<T>(at(2 * p + 1), &mut idx, &mut w1);
-                accumulate_pair(
-                    w0.v.as_ptr() as *const i16,
-                    w1.v.as_ptr() as *const i16,
-                    ch.pair[p].as_ptr(),
-                    base,
-                );
-                if (2 * (p + 1)) % fold_period(Q) == 0 {
-                    fold_back::<Q>(base, N * 2);
-                }
-            }
-            let dst = &mut *((out_addr + i * stride) as *mut Batch32);
-            drain::<Q>(base, dst);
-        }
-    });
-    out
 }

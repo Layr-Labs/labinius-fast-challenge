@@ -197,7 +197,12 @@ impl Table {
 /// while the key is built.
 fn populate_words(words: &[B128], threads: usize) {
     let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
-    labinius::par::pool().run(runs.len(), |i| populate_part(&words[runs[i].clone()]));
+    std::thread::scope(|scope| {
+        for run in runs {
+            let part = &words[run];
+            scope.spawn(move || populate_part(part));
+        }
+    });
 }
 
 fn populate_part(words: &[B128]) {
@@ -273,21 +278,20 @@ fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
     );
     let mut out = vec![0u8; FOLDED_BYTES * N * elements.len()];
     let runs = labinius::par::ranges(elements.len(), threads(), 1);
-    let out_addr = out.as_mut_ptr() as usize;
-    labinius::par::pool().run(runs.len(), |i| {
-        let run = runs[i].clone();
-        // Run `i` owns the bytes of elements `run`.
-        let mine = unsafe {
-            std::slice::from_raw_parts_mut(
-                (out_addr as *mut u8).add(FOLDED_BYTES * N * run.start),
-                FOLDED_BYTES * N * run.len(),
-            )
-        };
-        for (slot, &c) in mine
-            .chunks_exact_mut(FOLDED_BYTES)
-            .zip(elements[run].iter().flat_map(|e| e.v.iter()))
-        {
-            slot.copy_from_slice(&(c as i32).to_le_bytes());
+    std::thread::scope(|scope| {
+        let mut rest: &mut [u8] = &mut out;
+        for run in runs {
+            let (mine, tail) = rest.split_at_mut(FOLDED_BYTES * N * run.len());
+            rest = tail;
+            let elements = &elements[run];
+            scope.spawn(move || {
+                for (slot, &c) in mine
+                    .chunks_exact_mut(FOLDED_BYTES)
+                    .zip(elements.iter().flat_map(|e| e.v.iter()))
+                {
+                    slot.copy_from_slice(&(c as i32).to_le_bytes());
+                }
+            });
         }
     });
     out
@@ -299,16 +303,18 @@ fn pack_coefficients(coefficients: &[u128], modulus: u128) -> Vec<u8> {
     let width = rq::coefficient_bytes(modulus);
     let mut out = vec![0u8; width * coefficients.len()];
     let runs = labinius::par::ranges(coefficients.len(), threads(), 1);
-    let out_addr = out.as_mut_ptr() as usize;
-    labinius::par::pool().run(runs.len(), |i| {
-        let run = runs[i].clone();
-        // Run `i` owns the bytes of coefficients `run`.
-        let mine = unsafe {
-            std::slice::from_raw_parts_mut((out_addr as *mut u8).add(width * run.start), width * run.len())
-        };
-        for (slot, &x) in mine.chunks_exact_mut(width).zip(&coefficients[run]) {
-            debug_assert!(x < modulus, "a coefficient is not reduced");
-            slot.copy_from_slice(&x.to_le_bytes()[..width]);
+    std::thread::scope(|scope| {
+        let mut rest: &mut [u8] = &mut out;
+        for run in runs {
+            let (mine, tail) = rest.split_at_mut(width * run.len());
+            rest = tail;
+            let coefficients = &coefficients[run];
+            scope.spawn(move || {
+                for (slot, &x) in mine.chunks_exact_mut(width).zip(coefficients) {
+                    debug_assert!(x < modulus, "a coefficient is not reduced");
+                    slot.copy_from_slice(&x.to_le_bytes()[..width]);
+                }
+            });
         }
     });
     out
@@ -340,12 +346,9 @@ fn folding_challenges(t: &mut Transcript, row: &RowEvaluation) -> Vec<ShortChall
 }
 
 /// Garner's lift of one coefficient from its residues modulo `primes` (each already in
-/// `[0, q)`) to the integer modulo their product. The reductions are Barrett's with the
-/// library's magic `floor(2^43 / q)`: exact for operands below `2^31`, which every product of
-/// two residues of primes below `2^15` is, and no division.
+/// `[0, q)`) to the integer modulo their product.
 struct Garner {
     primes: Vec<u64>,
-    magic: Vec<u64>,
     inverses: Vec<Vec<u64>>,
 }
 
@@ -354,7 +357,6 @@ impl Garner {
         let limbs = primes.len();
         Garner {
             primes: primes.iter().map(|&q| q as u64).collect(),
-            magic: primes.iter().map(|&q| (1u64 << 43) / q as u64).collect(),
             inverses: (0..limbs)
                 .map(|k| {
                     (0..k)
@@ -368,18 +370,6 @@ impl Garner {
         }
     }
 
-    /// `x mod q_k` for `x < 2^31`.
-    #[inline(always)]
-    fn reduce(&self, k: usize, x: u64) -> u64 {
-        let q = self.primes[k];
-        let r = x - ((x * self.magic[k]) >> 43) * q;
-        if r >= q {
-            r - q
-        } else {
-            r
-        }
-    }
-
     #[inline]
     fn lift(&self, residues: &[u64], mixed: &mut [u64]) -> u128 {
         let limbs = self.primes.len();
@@ -387,9 +377,7 @@ impl Garner {
             let q = self.primes[k];
             let mut x = residues[k];
             for m in 0..k {
-                // `mixed[m] < q_m < 2^15`, so `x + q - reduce(mixed[m]) < 2^16` and the
-                // product with an inverse below `q` stays below `2^31`.
-                x = self.reduce(k, (x + q - self.reduce(k, mixed[m])) * self.inverses[k][m]);
+                x = (x + q - mixed[m] % q) % q * self.inverses[k][m] % q;
             }
             mixed[k] = x;
         }
@@ -421,27 +409,37 @@ fn commitment_coefficients_rows(
     let blocks = columns.div_ceil(32);
     let runs = labinius::par::ranges(blocks, workers, 1);
     let out_addr = out.as_mut_ptr() as usize;
-    labinius::par::pool().run(runs.len(), |r| {
-        let mut residues: Vec<Vec<i16>> = (0..limbs).map(|_| vec![0i16; 32 * N]).collect();
-        let mut mixed = vec![0u64; limbs];
-        let mut at = vec![0u64; limbs];
-        for blk in runs[r].clone() {
-            let c0 = blk * 32;
-            let cols = (columns - c0).min(32);
-            for k in 0..limbs {
-                let refs: Vec<&[u32; N]> = (0..cols).map(|c| &rows[(c0 + c) * limbs + k]).collect();
-                labinius::bd::coefficients_from_rows(primes[k], &refs, &mut residues[k][..cols * N]);
-            }
-            // Block `blk` owns coefficients `c0 * N .. (c0 + cols) * N` of `out`.
-            let dst = unsafe { (out_addr as *mut u128).add(c0 * N) };
-            for i in 0..cols * N {
-                for k in 0..limbs {
-                    at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+    std::thread::scope(|scope| {
+        for run in runs {
+            let garner = &garner;
+            scope.spawn(move || {
+                let mut residues: Vec<Vec<i16>> = (0..limbs).map(|_| vec![0i16; 32 * N]).collect();
+                let mut mixed = vec![0u64; limbs];
+                let mut at = vec![0u64; limbs];
+                for blk in run {
+                    let c0 = blk * 32;
+                    let cols = (columns - c0).min(32);
+                    for k in 0..limbs {
+                        let refs: Vec<&[u32; N]> =
+                            (0..cols).map(|c| &rows[(c0 + c) * limbs + k]).collect();
+                        labinius::bd::coefficients_from_rows(
+                            primes[k],
+                            &refs,
+                            &mut residues[k][..cols * N],
+                        );
+                    }
+                    // Block `blk` owns coefficients `c0 * N .. (c0 + cols) * N` of `out`.
+                    let dst = unsafe { (out_addr as *mut u128).add(c0 * N) };
+                    for i in 0..cols * N {
+                        for k in 0..limbs {
+                            at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+                        }
+                        let value = garner.lift(&at, &mut mixed);
+                        debug_assert!(value < modulus);
+                        unsafe { dst.add(i).write(value) };
+                    }
                 }
-                let value = garner.lift(&at, &mut mixed);
-                debug_assert!(value < modulus);
-                unsafe { dst.add(i).write(value) };
-            }
+            });
         }
     });
     out
@@ -516,42 +514,6 @@ fn switch_rounds(
     (rounds, coords, opened)
 }
 
-/// Batch positions of the fold recomputed through the transform path and compared with the
-/// bit-sliced fold: 32 ring elements each, out of 4096. Every challenge and every column enters
-/// each element, so one position exercises the whole accumulation; a mismatch means a defect
-/// in the bit-sliced path on this machine, and the transform path then produces the fold.
-const FOLD_CHECK_POSITIONS: core::ops::Range<usize> = 0..1;
-
-/// `v = sum_j c_j W_j`: the bit-sliced fold from the words, spot-checked against the transform
-/// path on [`FOLD_CHECK_POSITIONS`], with the transform path as the fallback.
-fn fold_checked(
-    values: &[B128],
-    challenges: &[ShortChallenge],
-    base: u16,
-    workers: usize,
-) -> Vec<labinius::RingElement648> {
-    let bpc = COLUMN_LEN / 128;
-    let bits = labinius::fold::fold_witness_bits(values, COLUMNS, COLUMN_LEN, challenges);
-    let check = labinius::fold::fold_witness_positions(
-        values,
-        COLUMNS,
-        challenges,
-        bpc,
-        base,
-        FOLD_CHECK_POSITIONS,
-    );
-    let first = 32 * FOLD_CHECK_POSITIONS.start;
-    let agree = check
-        .iter()
-        .zip(&bits[first..first + check.len()])
-        .all(|(a, b)| a.v == b.v);
-    if agree {
-        return bits;
-    }
-    eprintln!("labinius-fold-check mismatch: the bit-sliced fold disagrees with the transform path; folding through the transform");
-    labinius::fold::fold_witness_streaming(values, COLUMNS, challenges, bpc, base, workers)
-}
-
 /// Columns per pass over `A` in the commitment, and workers: one worker per physical core of
 /// the scored host (its 8 logical CPUs are 4 cores), each with the 8-column group whose 696 KB
 /// of accumulators fit its own L2. Measured on that host by submission d1c3cf12's sweep
@@ -567,14 +529,20 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let load_time = load_clock.elapsed();
     let workers = threads();
     let clock = std::time::Instant::now();
-    // The pool's workers are started here, once; every parallel phase runs on them.
-    let _ = labinius::par::pool();
-    // The switch's buffers: huge pages requested, faulted in by their first writers on every
-    // core. (A thread touching them during the commitment ran on a hyperthread sibling of a
-    // commitment worker and cost the commitment more than it saved the expansion.)
-    // The first quarter of the expansion is all the switch reads.
-    let mut eq = cf::HugeBuf::<B128>::new(1 << (LOG_PACKED - 2));
+    // The switch's buffers are faulted in while the commitment runs: memory work a
+    // compute-bound phase hides.
+    let mut eq_storage = cf::HugeBuf::<B128>::new(1 << LOG_PACKED);
     let planes = cf::LeanSwitch::planes(1 << LOG_PACKED);
+    // Normally only the first quarter is written; fallback expansion faults the rest on demand.
+    let (eq_addr, eq_bytes) = eq_storage.region();
+    let regions: Vec<(usize, usize)> = core::iter::once((eq_addr, eq_bytes / 4))
+        .chain(planes.iter().map(|p| p.region()))
+        .collect();
+    let prefault = std::thread::spawn(move || {
+        for (addr, bytes) in regions {
+            unsafe { cf::touch_pages(addr, bytes) };
+        }
+    });
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
     // The table's pages come in on every core; the key is the embedded one when the modulus
@@ -589,6 +557,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
     let rows = key.commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP);
+    prefault.join().expect("the prefault thread panicked");
     let commit_time = clock.elapsed();
     let commitment = pack_coefficients(
         &commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, workers),
@@ -598,34 +567,21 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let recombine_time = clock.elapsed();
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
-    // A coordinate equal to one (probability 2^-128 per coordinate) has no half ratio: the
-    // baseline's prover over its own full workspace takes over for the whole switch.
-    let degenerate = hi.iter().any(|&r| r == B128::ONE);
-    let quarters = if degenerate {
-        None
-    } else {
-        Some(unsafe { cf::eq_expand_and_partials_quarters(&hi, values, eq.as_mut_ptr(), workers) })
-    };
-    let partials = match &quarters {
-        Some(sets) => cf::partials_from_quarters(sets, &hi),
-        None => {
-            let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-            ws.partial_evals(0, values, &hi)
-        }
-    };
-    let eq_words: &[B128] = unsafe { eq.as_slice() };
+    let eq_len = unsafe { cf::eq_expand_prefix_parallel(&hi, eq_storage.as_mut_ptr(), workers) };
+    let eq: &[B128] = unsafe { std::slice::from_raw_parts(eq_storage.as_ptr(), eq_len) };
+    let (partials, prefix) = cf::partial_evals_prefix_parallel(values, eq, &hi, workers);
     let value = claim(&partials, &lo);
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let partials_time = clock.elapsed();
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let lean = quarters.and_then(|sets| {
-        cf::LeanSwitch::with_quarters(values, eq_words, &hi, &batch, workers, planes, sets)
-    });
-    let (rounds, coords, opened) = match lean {
+    let (rounds, coords, opened) = match cf::LeanSwitch::with_prefix_partials(
+        values, eq, &hi, &batch, workers, planes, prefix,
+    ) {
         Some(mut sw) => switch_rounds(&mut sw, &mut t),
         None => {
-            // The baseline's prover, whose workspace holds its own full expansion.
+            // A coordinate of the point is one: the baseline's prover, whose workspace holds
+            // its own copy of the expansion.
             let mut ws = cf::Workspace::new(LOG_PACKED, 1);
             let again = ws.partial_evals(0, values, &hi);
             assert_eq!(again, partials);
@@ -634,14 +590,19 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
         }
     };
     let switch_time = clock.elapsed();
-    // The expansion is done with; its pages go back while the compute-bound phases run.
-    std::thread::spawn(move || drop(eq));
     let point = EvaluationPoint::msb_first(&p, &coords);
     let row = RowEvaluation::of(labinius::eval::row_evaluate_words(values, point.p0(), workers));
     let row_time = clock.elapsed();
     let challenges = folding_challenges(&mut t, &row);
     let challenge_time = clock.elapsed();
-    let folded = FoldedWitness::of(fold_checked(values, &challenges, primes[0], workers));
+    let folded = FoldedWitness::of(labinius::fold::fold_witness_streaming(
+        values,
+        COLUMNS,
+        &challenges,
+        COLUMN_LEN / 128,
+        primes[0],
+        workers,
+    ));
     let fold_time = clock.elapsed();
     let proof = Proof {
         version: 1,
@@ -654,14 +615,13 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
         folded: pack_folded(&folded),
     };
     let encode_time = clock.elapsed();
-    eprintln!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}",
+    eprintln!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={}",
         load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
         (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
         (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
         (row_time-switch_time).as_micros(), (challenge_time-row_time).as_micros(),
         (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
-        encode_time.as_micros(), workers,
-        labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed));
+        encode_time.as_micros(), workers);
     proof
 }
 fn main() {
@@ -900,24 +860,6 @@ mod tests {
     }
 
     #[test]
-    fn garner_lift_is_the_chinese_remainder() {
-        let primes = modulus_choice::limbs(MODULUS).unwrap();
-        let garner = Garner::of(&primes);
-        let mut x = 0x1234_5678u128;
-        let mut mixed = vec![0u64; primes.len()];
-        for _ in 0..2000 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let value = x % MODULUS;
-            let residues: Vec<u64> = primes.iter().map(|&q| (value % q as u128) as u64).collect();
-            assert_eq!(garner.lift(&residues, &mut mixed), value);
-        }
-        let residues: Vec<u64> = primes.iter().map(|&q| q as u64 - 1).collect();
-        assert_eq!(garner.lift(&residues, &mut mixed), MODULUS - 1);
-    }
-
-    #[test]
     fn bulk_byte_fields_serialize_as_byte_sequences() {
         #[derive(Serialize)]
         struct Plain<'a> {
@@ -1069,17 +1011,5 @@ mod tests {
             3,
         );
         assert_eq!(folded.elements(), &streamed[..]);
-        let bits = labinius::fold::fold_witness_bits(&values, COLUMNS, COLUMN_LEN, &challenges);
-        assert_eq!(folded.elements(), &bits[..], "the bit-sliced fold differs");
-        let positions = labinius::fold::fold_witness_positions(
-            &values,
-            COLUMNS,
-            &challenges,
-            COLUMN_LEN / 128,
-            primes[0],
-            3..5,
-        );
-        assert_eq!(&folded.elements()[96..160], &positions[..]);
-        assert_eq!(&fold_checked(&values, &challenges, primes[0], 3)[..], folded.elements());
     }
 }

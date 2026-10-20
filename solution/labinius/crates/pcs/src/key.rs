@@ -255,28 +255,34 @@ impl CommitmentKey {
         let mut out = vec![[0u32; N]; r * nl];
         let out_addr = out.as_mut_ptr() as usize;
         let next = std::sync::atomic::AtomicUsize::new(0);
-        crate::par::pool().run(workers, |_| {
-            let mut st = cm::Scratch::with_group(&limbs, g);
-            let mut raw = vec![[0u32; N]; g * nl];
-            loop {
-                let gi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if gi >= groups {
-                    break;
-                }
-                let c0 = gi * g;
-                let gc = g.min(r - c0);
-                cm::commit_limbs_group(
-                    &columns[c0..c0 + gc],
-                    &limbs,
-                    None,
-                    &mut st,
-                    &mut raw[..gc * nl],
-                );
-                // Disjoint slices of `out`: group `gi` owns columns `c0 .. c0 + gc`.
-                unsafe {
-                    let dst = (out_addr as *mut [u32; N]).add(c0 * nl);
-                    core::ptr::copy_nonoverlapping(raw.as_ptr(), dst, gc * nl);
-                }
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let limbs = &limbs;
+                let next = &next;
+                scope.spawn(move || {
+                    let mut st = cm::Scratch::with_group(limbs, g);
+                    let mut raw = vec![[0u32; N]; g * nl];
+                    loop {
+                        let gi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if gi >= groups {
+                            break;
+                        }
+                        let c0 = gi * g;
+                        let gc = g.min(r - c0);
+                        cm::commit_limbs_group(
+                            &columns[c0..c0 + gc],
+                            limbs,
+                            None,
+                            &mut st,
+                            &mut raw[..gc * nl],
+                        );
+                        // Disjoint slices of `out`: group `gi` owns columns `c0 .. c0 + gc`.
+                        unsafe {
+                            let dst = (out_addr as *mut [u32; N]).add(c0 * nl);
+                            core::ptr::copy_nonoverlapping(raw.as_ptr(), dst, gc * nl);
+                        }
+                    }
+                });
             }
         });
         out

@@ -202,6 +202,25 @@ unsafe fn columns(base: *const u8, cp: *mut __m512i) {
     }
 }
 
+/// Binary input has only two limbs per element, so transpose its eight-qword ring rows directly.
+#[inline(always)]
+unsafe fn columns_b128(base: *const u8, cp: *mut __m512i) {
+    let perm = _mm512_load_si512(BYTE_PERM.0.as_ptr() as *const __m512i);
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    for g in 0..4 {
+        let mut rows = [_mm512_setzero_si512(); 8];
+        for j in 0..8 {
+            rows[j] = _mm512_loadu_si512(base.add(512 * g + 64 * j) as *const __m512i);
+        }
+        let cols = transpose8x8_q(rows);
+        for k in 0..4 {
+            for w in 0..2 {
+                _mm512_store_si512(cp.add((3 * k + w) * 4 + g), bitslice(perm, ident, cols[2 * k + w]));
+            }
+        }
+    }
+}
+
 /// Phase 2: writes the 64 u64 `(M_k0[m], M_k1[m])`, m = 64w..64w+64, of one (k pair, w).
 #[inline(always)]
 unsafe fn interleave8(cp: *const __m512i, k0: usize, w: usize, dst: *mut u64) {
@@ -279,18 +298,22 @@ unsafe fn gather8(p0: *const i64, p1: *const i64, p2: *const i64, p3: *const i64
 
 /// 128 `F162` (32 ring elements, 3072 contiguous bytes at `base`) -> the kernel's index rows.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-unsafe fn slice_raw(base: *const u8, out: &mut BinaryIndex32) {
+unsafe fn slice_raw<const BINARY: bool>(base: *const u8, out: &mut BinaryIndex32) {
     let mut cols: MaybeUninit<Cols> = MaybeUninit::uninit();
     let cp = cols.as_mut_ptr() as *mut __m512i;
-    columns(base, cp);
+    if BINARY { columns_b128(base, cp); } else { columns(base, cp); }
 
     let mut work: MaybeUninit<Work> = MaybeUninit::uninit();
     let wk = work.as_mut_ptr();
     let u = (*wk).u.as_mut_ptr();
     let v = (*wk).v.as_mut_ptr();
-    for w in 0..3 {
+    for w in 0..if BINARY { 2 } else { 3 } {
         interleave8(cp, 0, w, u.add(64 * w));
         interleave8(cp, 2, w, v.add(64 * w));
+    }
+    if BINARY {
+        std::ptr::write_bytes(u.add(128), 0, 64);
+        std::ptr::write_bytes(v.add(128), 0, 64);
     }
 
     let (ag, bg) = ((*wk).ag.as_mut_ptr(), (*wk).bg.as_mut_ptr());
@@ -356,7 +379,7 @@ unsafe fn slice_raw(base: *const u8, out: &mut BinaryIndex32) {
 /// coefficients 4m + k of ring element p).
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
 pub unsafe fn slice_f162_into(elems: &[F162; 128], out: &mut BinaryIndex32) {
-    slice_raw(elems.as_ptr() as *const u8, out)
+    slice_raw::<false>(elems.as_ptr() as *const u8, out)
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
@@ -366,16 +389,38 @@ pub unsafe fn slice_f162(elems: &[F162; 128]) -> BinaryIndex32 {
     out
 }
 
-/// The same index rows for 128 words of `B128`, the lifted witness read in place: a lifted
-/// `F162` is the word's two limbs and a zero top limb, so the 128 words are staged as 128 `F162`
-/// in an L1-resident buffer (3 KB, written once per batch, a few cycles per ring element against
-/// the transform's hundreds) and sliced exactly as [`slice_f162_into`] slices them.
+/// The same index rows for 128 packed words, with the lifted element's top limb zero.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
 pub unsafe fn slice_b128_into(words: &[crate::fields::scalar::B128; 128], out: &mut BinaryIndex32) {
-    let mut staged: MaybeUninit<A64<[F162; 128]>> = MaybeUninit::uninit();
-    let dst = (*staged.as_mut_ptr()).0.as_mut_ptr();
-    for (i, w) in words.iter().enumerate() {
-        dst.add(i).write(F162::from_b128(*w));
+    slice_raw::<true>(words.as_ptr() as *const u8, out)
+}
+
+#[cfg(test)]
+mod binary_tests {
+    use super::*;
+    use crate::fields::scalar::B128;
+
+    #[test]
+    fn direct_words_match_lifted_indices() {
+        let mut seed = 0x123456789abcdef123456789abcdefu128;
+        for case in 0..138 {
+            let words = std::array::from_fn(|i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                B128(match case {
+                    0..=127 => (1u128 << case).rotate_left(i as u32),
+                    128 => 0,
+                    129 => u128::MAX,
+                    _ => seed,
+                })
+            });
+            let lifted = words.map(F162::from_b128);
+            let mut actual = BinaryIndex32::zero();
+            unsafe {
+                slice_b128_into(&words, &mut actual);
+                assert_eq!(actual.rows, slice_f162(&lifted).rows, "case {case}");
+            }
+        }
     }
-    slice_raw(dst as *const u8, out)
 }

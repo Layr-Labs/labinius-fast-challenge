@@ -551,13 +551,9 @@ fn fold_checked(
     labinius::fold::fold_witness_streaming(values, COLUMNS, challenges, bpc, base, workers)
 }
 
-/// Columns per pass over `A` in the commitment, and workers: one worker per physical core of
-/// the scored host (its 8 logical CPUs are 4 cores), each with the 8-column group whose 696 KB
-/// of accumulators fit its own L2. Measured on that host by submission d1c3cf12's sweep
-/// (`commit_columns_rows` alone: 312.9 ms at 4 workers against 315.4 at 8 for this modulus);
-/// the other phases keep every logical CPU.
-const COMMIT_GROUP: usize = 8;
-const COMMIT_WORKERS: usize = 4;
+/// Four-column groups keep each worker's accumulators small while using all available workers.
+const COMMIT_GROUP: usize = 4;
+const COMMIT_WORKERS: usize = 8;
 
 fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let load_clock = std::time::Instant::now();
@@ -1025,9 +1021,11 @@ mod tests {
         let (commitment, _) = Prover::cold(&pp).commit(&w);
         let coefficients = commitment_coefficients(&commitment, &primes, modulus);
         let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
-        let rows = pp.key().commit_columns_rows(&columns, 3, 4);
-        let direct = commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, 3);
-        assert_eq!(coefficients, direct, "the two recombinations differ");
+        for group in [1, 4, 8] {
+            let rows = pp.key().commit_columns_rows(&columns, 3, group);
+            let direct = commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, 3);
+            assert_eq!(coefficients, direct, "column group {group} differs");
+        }
         for j in [0usize, COLUMNS - 1] {
             let column = &w.elements()[j * COLUMN_LEN..(j + 1) * COLUMN_LEN];
             assert_eq!(

@@ -259,9 +259,12 @@ impl CommitmentKey {
         self.check_witness(witness, r);
         let bpc = self.a[0].len();
         assert!(
-            aux.chunks == r && aux.batches.len() == r * bpc && aux.raw.len() == self.limbs(),
+            aux.chunks == r
+                && (aux.batches.is_empty() || aux.batches.len() == r * bpc)
+                && aux.raw.len() == self.limbs(),
             "the auxiliary buffer does not match this key and r"
         );
+        let keep = !aux.batches.is_empty();
         for v in aux.raw.iter_mut() {
             v.clear();
         }
@@ -272,13 +275,18 @@ impl CommitmentKey {
         let starts: Vec<usize> = (0..r).step_by(g).collect();
         // Each group writes a disjoint slice of `aux.batches` and returns its raw commitments.
         // The address is a usize so the closure is `Send`; the slices do not overlap.
-        let batch_addr = aux.batches.as_mut_ptr() as usize;
+        let batch_addr = if keep {
+            aux.batches.as_mut_ptr() as usize
+        } else {
+            0
+        };
         let stride = std::mem::size_of::<Batch32>();
-        // One worker per CPU, each owning a scratch and walking many column groups.
-        // A thread per group (128 of them on this instance) time-slices the NTT working
-        // set out of L2; the kernel is long enough that the extra threads never pay for
-        // themselves.
-        let thread_n = crate::huge::workers(starts.len());
+        let thread_n = starts.len().min(
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1)
+                .max(1),
+        );
         let mut groups: Vec<(usize, Vec<[u32; N]>)> = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(thread_n);
             for t in 0..thread_n {
@@ -297,16 +305,20 @@ impl CommitmentKey {
                             let c = c0 + i;
                             chunks[i] = &witness[c * len_f162..(c + 1) * len_f162];
                         }
-                        let batches = unsafe {
-                            std::slice::from_raw_parts_mut(
-                                (batch_addr + (c0 * bpc) * stride) as *mut Batch32,
-                                g * bpc,
-                            )
+                        let batches = if keep {
+                            Some(unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (batch_addr + (c0 * bpc) * stride) as *mut Batch32,
+                                    g * bpc,
+                                )
+                            })
+                        } else {
+                            None
                         };
                         cm::commit_limbs_group(
                             &chunks[..g],
                             limbs,
-                            Some(batches),
+                            batches,
                             &mut st,
                             &mut raw,
                         );
@@ -315,7 +327,10 @@ impl CommitmentKey {
                     owned
                 }));
             }
-            handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
         });
         groups.sort_by_key(|(c0, _)| *c0);
         let mut data = Vec::with_capacity(4 * r);
@@ -408,6 +423,18 @@ impl AuxData {
         assert!(r > 0 && len_ring > 0 && len_ring % 32 == 0 && limbs > 0);
         AuxData {
             batches: uninit_batches(r * len_ring / 32),
+            raw: (0..limbs).map(|_| Vec::with_capacity(r)).collect(),
+            chunks: r,
+        }
+    }
+
+    /// An empty buffer for `r` chunks over `limbs` limbs that does not keep the witness
+    /// transform: the commitment skips the non-temporal stores and the fold recomputes the
+    /// base limb's transform from the witness instead of reading it back.
+    pub fn without_transform(r: usize, limbs: usize) -> AuxData {
+        assert!(r > 0 && limbs > 0);
+        AuxData {
+            batches: Vec::new(),
             raw: (0..limbs).map(|_| Vec::with_capacity(r)).collect(),
             chunks: r,
         }

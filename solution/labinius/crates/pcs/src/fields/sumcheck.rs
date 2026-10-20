@@ -11,11 +11,7 @@ pub struct Poly {
 impl Poly {
     pub fn zero(n: usize) -> Self {
         Self {
-            w: [
-                crate::huge::zeroed(n),
-                crate::huge::zeroed(n),
-                crate::huge::zeroed(n),
-            ],
+            w: [vec![0u64; n], vec![0u64; n], vec![0u64; n]],
             n,
         }
     }
@@ -83,39 +79,99 @@ unsafe fn horiz(acc: [__m512i; 12]) -> F162 {
     out
 }
 
+fn worker_count(n: usize) -> usize {
+    if n < 2 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(n)
+}
+
+/// Blocks `first..last` of the round message, accumulated and reduced.
+unsafe fn msg_blocks(a: &Poly, p: &Poly, half: usize, first: usize, last: usize) -> [F162; 2] {
+    if first >= last {
+        return [F162::ZERO, F162::ZERO];
+    }
+    let mut acc0 = [_mm512_setzero_si512(); 12];
+    let mut acci = [_mm512_setzero_si512(); 12];
+    for b in first..last {
+        let j = b * 8;
+        let a0 = load(a, j);
+        let a1 = load(a, j + half);
+        let p0 = load(p, j);
+        let p1 = load(p, j + half);
+        f162::mac_soa8(&mut acc0, a0, p0);
+        f162::mac_soa8(&mut acci, xor3(a0, a1), xor3(p0, p1));
+    }
+    [horiz(acc0), horiz(acci)]
+}
+
+#[inline(always)]
+unsafe fn load_at(w: [*mut u64; 3], i: usize) -> [__m512i; 3] {
+    [
+        _mm512_loadu_si512(w[0].add(i) as *const __m512i),
+        _mm512_loadu_si512(w[1].add(i) as *const __m512i),
+        _mm512_loadu_si512(w[2].add(i) as *const __m512i),
+    ]
+}
+
+#[inline(always)]
+unsafe fn store_at(w: [*mut u64; 3], i: usize, v: [__m512i; 3]) {
+    for k in 0..3 {
+        _mm512_storeu_si512(w[k].add(i) as *mut __m512i, v[k]);
+    }
+}
+
+unsafe fn fold_blocks(
+    a: [*mut u64; 3],
+    p: [*mut u64; 3],
+    half: usize,
+    r: F162,
+    first: usize,
+    last: usize,
+) {
+    let rb = bcast(r);
+    for b in first..last {
+        let j = b * 8;
+        let a0 = load_at(a, j);
+        let a1 = load_at(a, j + half);
+        let p0 = load_at(p, j);
+        let p1 = load_at(p, j + half);
+        store_at(a, j, xor3(a0, f162::mul_soa8(rb, xor3(a0, a1))));
+        store_at(p, j, xor3(p0, f162::mul_soa8(rb, xor3(p0, p1))));
+    }
+}
+
 pub(super) fn msg(a: &Poly, p: &Poly, half: usize) -> [F162; 2] {
     let blocks = half / 8;
-    let threads = if blocks >= 2048 {
-        crate::huge::workers(blocks / 512)
-    } else {
-        1
-    };
-    let mut e0 = F162::ZERO;
-    let mut einf = F162::ZERO;
-    if threads == 1 {
-        if blocks > 0 {
-            let part = msg_blocks_at(a, p, half, 0, blocks);
-            e0 = part[0];
-            einf = part[1];
-        }
-    } else {
-        let mut parts = vec![[F162::ZERO; 2]; threads];
-        let parts_ptr = parts.as_mut_ptr() as usize;
+    let threads = if half >= (1 << 15) { worker_count(blocks) } else { 1 };
+    let per = blocks.div_ceil(threads);
+    let (mut e0, mut einf) = (F162::ZERO, F162::ZERO);
+    if threads > 1 && per > 0 {
+        let mut parts = Vec::with_capacity(threads);
         std::thread::scope(|scope| {
-            for t in 0..threads {
-                let (a, p) = (a, p);
-                scope.spawn(move || {
-                    let b0 = t * blocks / threads;
-                    let b1 = (t + 1) * blocks / threads;
-                    let part = msg_blocks_at(a, p, half, b0, b1);
-                    unsafe { (parts_ptr as *mut [F162; 2]).add(t).write(part) };
-                });
+            let mut handles = Vec::with_capacity(threads);
+            for first in (0..blocks).step_by(per) {
+                let last = (first + per).min(blocks);
+                handles.push(scope.spawn(move || unsafe {
+                    msg_blocks(a, p, half, first, last)
+                }));
+            }
+            for handle in handles {
+                parts.push(handle.join().unwrap());
             }
         });
-        for part in parts {
-            e0 += part[0];
-            einf += part[1];
+        for [x, y] in parts {
+            e0 += x;
+            einf += y;
         }
+    } else {
+        let [x, y] = unsafe { msg_blocks(a, p, half, 0, blocks) };
+        e0 = x;
+        einf = y;
     }
     for j in blocks * 8..half {
         let (a0, a1) = (a.get(j), a.get(j + half));
@@ -126,38 +182,11 @@ pub(super) fn msg(a: &Poly, p: &Poly, half: usize) -> [F162; 2] {
     [e0, einf]
 }
 
-fn msg_blocks_at(a: &Poly, p: &Poly, half: usize, b0: usize, b1: usize) -> [F162; 2] {
-    if b0 == b1 {
-        return [F162::ZERO, F162::ZERO];
-    }
-    unsafe {
-        let mut acc0 = [_mm512_setzero_si512(); 12];
-        let mut acci = [_mm512_setzero_si512(); 12];
-        for b in b0..b1 {
-            let j = b * 8;
-            let a0 = load(a, j);
-            let a1 = load(a, j + half);
-            let p0 = load(p, j);
-            let p1 = load(p, j + half);
-            f162::mac_soa8(&mut acc0, a0, p0);
-            f162::mac_soa8(&mut acci, xor3(a0, a1), xor3(p0, p1));
-        }
-        [horiz(acc0), horiz(acci)]
-    }
-}
-
 pub(super) fn fold(a: &mut Poly, p: &mut Poly, half: usize, r: F162) {
     let blocks = half / 8;
-    let threads = if blocks >= 2048 {
-        crate::huge::workers(blocks / 512)
-    } else {
-        1
-    };
-    if threads == 1 {
-        fold_blocks(a, p, half, r, 0, blocks);
-    } else {
-        // Addresses, not references: workers write disjoint index ranges
-        // (`[b0*8, b1*8)` and that interval shifted by `half`).
+    let threads = if half >= (1 << 15) { worker_count(blocks) } else { 1 };
+    let per = blocks.div_ceil(threads);
+    if threads > 1 && per > 0 {
         let aw = [
             a.w[0].as_mut_ptr() as usize,
             a.w[1].as_mut_ptr() as usize,
@@ -169,70 +198,37 @@ pub(super) fn fold(a: &mut Poly, p: &mut Poly, half: usize, r: F162) {
             p.w[2].as_mut_ptr() as usize,
         ];
         std::thread::scope(|scope| {
-            for t in 0..threads {
-                let (aw, pw) = (aw, pw);
-                scope.spawn(move || {
-                    let b0 = t * blocks / threads;
-                    let b1 = (t + 1) * blocks / threads;
-                    fold_blocks_raw(
+            for first in (0..blocks).step_by(per) {
+                let last = (first + per).min(blocks);
+                scope.spawn(move || unsafe {
+                    fold_blocks(
                         [aw[0] as *mut u64, aw[1] as *mut u64, aw[2] as *mut u64],
                         [pw[0] as *mut u64, pw[1] as *mut u64, pw[2] as *mut u64],
                         half,
                         r,
-                        b0,
-                        b1,
+                        first,
+                        last,
                     );
                 });
             }
         });
+    } else {
+        unsafe {
+            fold_blocks(
+                [a.w[0].as_mut_ptr(), a.w[1].as_mut_ptr(), a.w[2].as_mut_ptr()],
+                [p.w[0].as_mut_ptr(), p.w[1].as_mut_ptr(), p.w[2].as_mut_ptr()],
+                half,
+                r,
+                0,
+                blocks,
+            );
+        }
     }
     for j in blocks * 8..half {
         let (a0, a1) = (a.get(j), a.get(j + half));
         let (p0, p1) = (p.get(j), p.get(j + half));
         a.set(j, a0 + r * (a0 + a1));
         p.set(j, p0 + r * (p0 + p1));
-    }
-}
-
-fn fold_blocks(a: &mut Poly, p: &mut Poly, half: usize, r: F162, b0: usize, b1: usize) {
-    fold_blocks_raw(
-        [a.w[0].as_mut_ptr(), a.w[1].as_mut_ptr(), a.w[2].as_mut_ptr()],
-        [p.w[0].as_mut_ptr(), p.w[1].as_mut_ptr(), p.w[2].as_mut_ptr()],
-        half,
-        r,
-        b0,
-        b1,
-    );
-}
-
-fn fold_blocks_raw(a: [*mut u64; 3], p: [*mut u64; 3], half: usize, r: F162, b0: usize, b1: usize) {
-    unsafe {
-        let rb = bcast(r);
-        for b in b0..b1 {
-            let j = b * 8;
-            let a0 = load_raw(a, j);
-            let a1 = load_raw(a, j + half);
-            let p0 = load_raw(p, j);
-            let p1 = load_raw(p, j + half);
-            store_raw(a, j, xor3(a0, f162::mul_soa8(rb, xor3(a0, a1))));
-            store_raw(p, j, xor3(p0, f162::mul_soa8(rb, xor3(p0, p1))));
-        }
-    }
-}
-
-#[inline(always)]
-unsafe fn load_raw(w: [*mut u64; 3], i: usize) -> [__m512i; 3] {
-    [
-        _mm512_loadu_si512(w[0].add(i) as *const __m512i),
-        _mm512_loadu_si512(w[1].add(i) as *const __m512i),
-        _mm512_loadu_si512(w[2].add(i) as *const __m512i),
-    ]
-}
-
-#[inline(always)]
-unsafe fn store_raw(w: [*mut u64; 3], i: usize, v: [__m512i; 3]) {
-    for k in 0..3 {
-        _mm512_storeu_si512(w[k].add(i) as *mut __m512i, v[k]);
     }
 }
 

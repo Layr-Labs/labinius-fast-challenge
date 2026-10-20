@@ -66,24 +66,49 @@ fn seed() -> [u8; 32] {
     assert_eq!(s.len(), 64);
     core::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("invalid seed"))
 }
-/// The harness witness table: `(1 << LOG_VARS) / 8` BLAKE3 XOF bytes, each 16
-/// little-endian bytes one GHASH word. The timed prover does not recompute it.
-fn load_table(path: &str) -> Vec<B128> {
-    let n = (1 << LOG_VARS) / 128;
-    let table_bytes = n * 16;
-    let mut file = std::fs::File::open(path).expect("open witness table");
-    // The file is already the little-endian `B128` encoding. Read it straight into the
-    // output buffer instead of zeroing a byte buffer and copying it element by element.
-    let mut values: Vec<B128> = Vec::with_capacity(n);
-    unsafe { values.set_len(n) };
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, table_bytes)
-    };
-    std::io::Read::read_exact(&mut file, bytes).expect("witness table has the wrong length");
-    let mut extra = [0u8; 1];
-    let extra_n = std::io::Read::read(&mut file, &mut extra).expect("read witness table");
-    assert_eq!(extra_n, 0, "witness table has the wrong length");
-    values
+/// The harness witness table: `(1 << LOG_VARS) / 8` little-endian BLAKE3 XOF bytes, each 16
+/// bytes one GHASH word, mapped read-only instead of copied.
+struct Table {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl Table {
+    fn words(&self) -> &[B128] {
+        unsafe { core::slice::from_raw_parts(self.ptr as *const B128, self.len / 16) }
+    }
+}
+
+fn load_table(path: &str) -> Table {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn mmap(
+            addr: *mut core::ffi::c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut core::ffi::c_void;
+    }
+    assert!(
+        cfg!(target_endian = "little"),
+        "the table is little-endian"
+    );
+    assert_eq!(core::mem::size_of::<B128>(), 16, "a GHASH word is 16 bytes");
+    let file = std::fs::File::open(path).expect("open witness table");
+    let len = file.metadata().expect("stat witness table").len() as usize;
+    assert_eq!(
+        len,
+        (1 << LOG_VARS) / 8,
+        "witness table has the wrong length"
+    );
+    let ptr = unsafe { mmap(core::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
+    assert!(ptr as isize != -1, "witness table could not be mapped");
+    Table {
+        ptr: ptr as *const u8,
+        len,
+    }
 }
 #[cfg(test)]
 fn trace(seed: &[u8; 32]) -> Vec<B128> {
@@ -200,7 +225,13 @@ fn commitment_coefficients(commitment: &Commitment, primes: &[u16], modulus: u12
     out
 }
 fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
-    let values = load_table(table_path);
+    let load_start = std::time::Instant::now();
+    let table = load_table(table_path);
+    let values = table.words();
+    eprintln!(
+        "labinius-load load_us={}",
+        load_start.elapsed().as_micros()
+    );
     let clock = std::time::Instant::now();
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
@@ -215,8 +246,8 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     );
     let pp = PublicParameters::with_key(p.clone(), rq::MATRIX_SEED, key);
     let setup_time = clock.elapsed();
-    let mut prover = Prover::cold(&pp);
-    let w = Witness::lifted(&p, &values).unwrap();
+    let mut prover = Prover::cold_without_transform(&pp);
+    let w = Witness::lifted(&p, values).unwrap();
     let witness_time = clock.elapsed();
     let (commitment, opening) = prover.commit(&w);
     let commit_time = clock.elapsed();
@@ -228,13 +259,13 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
     let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-    let partials = ws.partial_evals(0, &values, &hi);
+    let partials = ws.partial_evals(0, values, &hi);
     let value = claim(&partials, &lo);
     t.absorb_b128(&[value]);
     t.absorb_b128(&partials);
     let partials_time = clock.elapsed();
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let mut sw = cf::SwitchProver::from_workspace(ws, &values, &[F162::ONE], &batch);
+    let mut sw = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
     let mut rounds = Vec::new();
     let mut coords = Vec::new();
     for _ in 0..LOG_PACKED {
@@ -251,7 +282,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let point = EvaluationPoint::msb_first(&p, &coords);
     let row = w.row_evaluate(&point);
     let challenges = folding_challenges(&mut t, &row);
-    let folded = prover.fold(opening, &FoldingChallenges::of(challenges));
+    let folded = prover.fold_from_witness(opening, &FoldingChallenges::of(challenges), &w);
     let fold_time = clock.elapsed();
     let proof = Proof {
         version: 1,
@@ -418,7 +449,7 @@ mod tests {
         let seed = [11u8; 32];
         let table = table_file(&seed);
         let loaded = load_table(table.path());
-        assert_eq!(loaded, trace(&seed));
+        assert_eq!(loaded.words(), trace(&seed).as_slice());
     }
 
     #[test]

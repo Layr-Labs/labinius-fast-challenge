@@ -67,6 +67,11 @@ pub fn key_image(key: &CommitmentKey) -> Vec<u8> {
 /// The key `image` describes, if it is an image of a key for `modulus` at this shape: one
 /// `[Batch32]` per limb, read in place. `image` must be 64-byte aligned and outlive the key.
 pub fn key_from_image(modulus: u128, image: &'static [u8]) -> Option<CommitmentKey> {
+    // The embedded image is generated only for the default modulus. Its byte
+    // length cannot distinguish different products with the same limb count.
+    if modulus != crate::parameters::MODULUS {
+        return None;
+    }
     let primes = modulus_choice::limbs(modulus).ok()?;
     if image.len() != primes.len() * BATCHES * BATCH_BYTES || image.as_ptr() as usize % 64 != 0 {
         return None;

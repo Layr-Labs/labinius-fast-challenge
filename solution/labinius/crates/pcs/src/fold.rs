@@ -937,6 +937,55 @@ trait WordTransform {
     /// # Safety
     /// AVX-512 F/BW/VL/VBMI/VBMI2/VNNI and GFNI.
     unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32);
+    /// Accumulate this transform paired with the already materialized first one.
+    unsafe fn accumulate(idx: &BinaryIndex32, first: &Batch32,
+        scratch: &mut Batch32, challenge: *const u32, acc: *mut i32);
+}
+
+
+/// The second member of a pair is consumed as each transform block is produced.
+/// Only its current block shares L1 with the first transform and accumulator.
+struct FoldPairSink<const ROWS: usize> {
+    scratch: *mut i16,
+    first: *const i16,
+    challenge: *const u32,
+    acc: *mut i32,
+}
+impl<const ROWS: usize> FoldPairSink<ROWS> {
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn consume(&mut self, block: usize, second: *const i16) {
+        let first = self.first.add(32 * ROWS * block);
+        let cp = self.challenge.add(ROWS * block);
+        let acc = self.acc.add(32 * ROWS * block);
+        for u in 0..ROWS {
+            let a = _mm512_load_si512(first.add(32 * u) as *const __m512i);
+            let b = _mm512_load_si512(second.add(32 * u) as *const __m512i);
+            let c = _mm512_set1_epi32(*cp.add(u) as i32);
+            let lo = _mm512_madd_epi16(_mm512_unpacklo_epi16(a, b), c);
+            let hi = _mm512_madd_epi16(_mm512_unpackhi_epi16(a, b), c);
+            let d = acc.add(32 * u);
+            _mm512_store_si512(d as *mut __m512i,
+                _mm512_add_epi32(_mm512_load_si512(d as *const __m512i), lo));
+            _mm512_store_si512(d.add(16) as *mut __m512i,
+                _mm512_add_epi32(_mm512_load_si512(d.add(16) as *const __m512i), hi));
+        }
+    }
+}
+impl<const ROWS: usize> vb::BlockSink for FoldPairSink<ROWS> {
+    #[inline(always)]
+    unsafe fn dst(&mut self, _: usize) -> *mut i16 { self.scratch }
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn block(&mut self, block: usize, second: *const i16) {
+        self.consume(block, second);
+    }
+}
+impl<const ROWS: usize> vq::BlockSink for FoldPairSink<ROWS> {
+    #[inline(always)]
+    unsafe fn dst(&mut self, _: usize) -> *mut i16 { self.scratch }
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn block(&mut self, block: usize, second: *const i16) {
+        self.consume(block, second);
+    }
 }
 
 struct SplitTransform<const Q: u16>;
@@ -951,12 +1000,32 @@ impl<const Q: u16> WordTransform for SplitTransform<Q> {
             vb::ntt_bin_batch32::<Q>(idx, out);
         }
     }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+    unsafe fn accumulate(idx: &BinaryIndex32, first: &Batch32,
+        scratch: &mut Batch32, challenge: *const u32, acc: *mut i32) {
+        let mut sink = FoldPairSink::<27> {
+            scratch: scratch.v.as_mut_ptr() as *mut i16,
+            first: first.v.as_ptr() as *const i16, challenge, acc,
+        };
+        if Gen::<Q>::LARGE { vl::ntt_bin_batch32_sink::<Q, _>(idx, &mut sink); }
+        else { vb::ntt_bin_batch32_sink::<Q, _>(idx, &mut sink); }
+    }
 }
 
 impl<const Q: u16> WordTransform for QuadTransform<Q> {
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
     unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32) {
         vq::ntt_quad_bin_batch32::<Q>(idx, out);
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+    unsafe fn accumulate(idx: &BinaryIndex32, first: &Batch32,
+        scratch: &mut Batch32, challenge: *const u32, acc: *mut i32) {
+        vq::ntt_quad_bin_batch32_sink::<Q, _>(idx, &mut FoldPairSink::<18> {
+            scratch: scratch.v.as_mut_ptr() as *mut i16,
+            first: first.v.as_ptr() as *const i16, challenge, acc,
+        });
     }
 }
 
@@ -1025,13 +1094,9 @@ fn accumulate_streaming<const Q: u16, T: WordTransform>(
                                     &*(words.as_ptr().add(start) as *const [B128; 128])
                                 };
                                 transform_words::<T>(at(2 * i), &mut idx, &mut w0);
-                                transform_words::<T>(at(2 * i + 1), &mut idx, &mut w1);
-                                accumulate_pair(
-                                    w0.v.as_ptr() as *const i16,
-                                    w1.v.as_ptr() as *const i16,
-                                    ch.pair[i].as_ptr(),
-                                    base.add(32 * N * b),
-                                );
+                                slice_b128_into(at(2 * i + 1), &mut idx);
+                                T::accumulate(&idx, &w0, &mut w1,
+                                    ch.pair[i].as_ptr(), base.add(32 * N * b));
                             }
                             if (2 * (i + 1)) % fold_period(Q) == 0 {
                                 fold_back::<Q>(base, gb * N * 2);
@@ -1095,4 +1160,64 @@ pub fn fold_witness_streaming(
         quad |Q| fold_quad_streaming::<Q>(words, columns, challenges, bpc, workers),
     );
     (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
+}
+
+#[cfg(test)]
+mod streaming_block_tests {
+    use super::*;
+
+    fn compare_pair_sink<const Q: u16, T: WordTransform>() {
+        let mut rng = crate::rng::Rng::new(Q as u64);
+        let mut first = Box::new(Batch32::zero(Representation::Ntt));
+        let mut second = Box::new(Batch32::zero(Representation::Ntt));
+        let mut scratch = Box::new(Batch32::zero(Representation::Ntt));
+        let mut idx = BinaryIndex32::zero();
+        let mut reference = vec![AccVec([0; 16]); N * 2];
+        let mut candidate = reference.clone();
+        let half = ((Q - 1) / 2) as i16;
+        for case in 0..8 {
+            let mut words = || core::array::from_fn::<B128, 128, _>(|_| {
+                B128(match case {
+                    0 => 0,
+                    1 => u128::MAX,
+                    _ => (rng.next_u64() as u128) | ((rng.next_u64() as u128) << 64),
+                })
+            });
+            let a = words();
+            let b = words();
+            let cp = core::array::from_fn::<u32, N, _>(|slot| {
+                let a = match slot % 3 { 0 => -half, 1 => half,
+                    _ => rng.below(Q as u32) as i16 - half };
+                let b = match slot % 3 { 0 => half, 1 => -half,
+                    _ => rng.below(Q as u32) as i16 - half };
+                a as u16 as u32 | ((b as u16 as u32) << 16)
+            });
+            unsafe {
+                transform_words::<T>(&a, &mut idx, &mut first);
+                transform_words::<T>(&b, &mut idx, &mut second);
+                accumulate_pair(first.v.as_ptr() as *const i16,
+                    second.v.as_ptr() as *const i16, cp.as_ptr(),
+                    reference.as_mut_ptr() as *mut i32);
+                slice_b128_into(&b, &mut idx);
+                T::accumulate(&idx, &first, &mut scratch, cp.as_ptr(),
+                    candidate.as_mut_ptr() as *mut i32);
+                for (a, b) in reference.iter().zip(&candidate) {
+                    assert_eq!(a.0, b.0, "prime {Q}, case {case}");
+                }
+                fold_back::<Q>(reference.as_mut_ptr() as *mut i32, N * 2);
+                fold_back::<Q>(candidate.as_mut_ptr() as *mut i32, N * 2);
+            }
+        }
+    }
+
+    #[test]
+    fn block_sink_matches_materialized_pairs_for_all_supported_primes() {
+        compare_pair_sink::<3889, SplitTransform<3889>>();
+        compare_pair_sink::<9721, SplitTransform<9721>>();
+        compare_pair_sink::<17497, SplitTransform<17497>>();
+        compare_pair_sink::<19441, SplitTransform<19441>>();
+        compare_pair_sink::<2917, QuadTransform<2917>>();
+        compare_pair_sink::<4861, QuadTransform<4861>>();
+        compare_pair_sink::<12637, QuadTransform<12637>>();
+    }
 }

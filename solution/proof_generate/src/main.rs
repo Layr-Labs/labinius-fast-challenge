@@ -529,18 +529,9 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let load_time = load_clock.elapsed();
     let workers = threads();
     let clock = std::time::Instant::now();
-    // The switch's buffers are faulted in while the commitment runs: memory work a
-    // compute-bound phase hides.
+    // Workers initialize their own switch-buffer pages when the data is produced.
     let mut eq = cf::HugeBuf::<B128>::new(1 << LOG_PACKED);
     let planes = cf::LeanSwitch::planes(1 << LOG_PACKED);
-    let regions: Vec<(usize, usize)> = core::iter::once(eq.region())
-        .chain(planes.iter().map(|p| p.region()))
-        .collect();
-    let prefault = std::thread::spawn(move || {
-        for (addr, bytes) in regions {
-            unsafe { cf::touch_pages(addr, bytes) };
-        }
-    });
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
     // The table's pages come in on every core; the key is the embedded one when the modulus
@@ -555,7 +546,6 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
     let rows = key.commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP);
-    prefault.join().expect("the prefault thread panicked");
     let commit_time = clock.elapsed();
     let commitment = pack_coefficients(
         &commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, workers),
@@ -598,7 +588,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str) -> Proof {
         &challenges,
         COLUMN_LEN / 128,
         primes[0],
-        workers,
+        workers.min(4),
     ));
     let fold_time = clock.elapsed();
     let proof = Proof {

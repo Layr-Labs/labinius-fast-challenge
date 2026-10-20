@@ -827,6 +827,52 @@ impl<T> Drop for HugeBuf<T> {
 // the expansion on several threads
 // =============================================================================================
 
+/// Four-wide GHASH product. Lane `k` of the result is lane `k` of `a` times lane `k` of `b`
+/// in GF(2^128) with the GHASH polynomial.
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn mul_b128x4(a: __m512i, b: __m512i) -> __m512i {
+    let lo = _mm512_clmulepi64_epi128::<0x00>(a, b);
+    let hi = _mm512_clmulepi64_epi128::<0x11>(a, b);
+    let ax = _mm512_xor_si512(a, _mm512_shuffle_epi32::<0x4E>(a));
+    let bx = _mm512_xor_si512(b, _mm512_shuffle_epi32::<0x4E>(b));
+    let mid = _mm512_xor_si512(
+        _mm512_clmulepi64_epi128::<0x00>(ax, bx),
+        _mm512_xor_si512(lo, hi),
+    );
+    let p_lo = _mm512_xor_si512(lo, _mm512_bslli_epi128::<8>(mid));
+    let p_hi = _mm512_xor_si512(hi, _mm512_bsrli_epi128::<8>(mid));
+    let poly = _mm512_set1_epi64(0x87);
+    let mut acc = p_lo;
+    let mut h = p_hi;
+    for _ in 0..2 {
+        let c_lo = _mm512_clmulepi64_epi128::<0x00>(h, poly);
+        let c_hi = _mm512_clmulepi64_epi128::<0x11>(h, poly);
+        let c = _mm512_xor_si512(c_lo, _mm512_bslli_epi128::<8>(c_hi));
+        let carry = _mm512_bsrli_epi128::<8>(c_hi);
+        acc = _mm512_xor_si512(acc, c);
+        h = carry;
+    }
+    acc
+}
+
+
+/// Write a Kronecker row using four GHASH products per vector; `out` is
+/// writable for `input.len()` words, which need not already be initialized.
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn scale_b128_row(input: &[B128], factor: B128, out: *mut B128) {
+    let lane = _mm_set_epi64x((factor.0 >> 64) as i64, factor.0 as i64);
+    let factor4 = _mm512_broadcast_i32x4(lane);
+    let blocks = input.len() / 4;
+    for block in 0..blocks {
+        let i = 4 * block;
+        let x = _mm512_loadu_si512(input.as_ptr().add(i) as *const __m512i);
+        _mm512_storeu_si512(out.add(i) as *mut __m512i, mul_b128x4(x, factor4));
+    }
+    for i in 4 * blocks..input.len() {
+        out.add(i).write(input[i] * factor);
+    }
+}
+
 /// [`eq_expand_b128_into`] on up to `threads` threads, into the `2^r.len()` words at `out`.
 ///
 /// The serial doubling appends the newest coordinate in the lowest bit of the index, so entry
@@ -847,6 +893,9 @@ pub unsafe fn eq_expand_b128_parallel(r: &[B128], out: *mut B128, threads: usize
     let h = n / 2;
     let high = eq_expand_b128(&r[..n - h]);
     let low = eq_expand_b128(&r[n - h..]);
+    let vector = std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("vpclmulqdq");
     let runs = crate::par::ranges(high.len(), threads, 1);
     let out = out as usize;
     std::thread::scope(|scope| {
@@ -857,8 +906,12 @@ pub unsafe fn eq_expand_b128_parallel(r: &[B128], out: *mut B128, threads: usize
                 for jh in run {
                     let hv = high[jh];
                     let base = unsafe { out.add(jh << h) };
-                    for (jl, &lv) in low.iter().enumerate() {
-                        unsafe { base.add(jl).write(hv * lv) };
+                    if vector {
+                        unsafe { scale_b128_row(low, hv, base) };
+                    } else {
+                        for (jl, &lv) in low.iter().enumerate() {
+                            unsafe { base.add(jl).write(hv * lv) };
+                        }
                     }
                 }
             });
@@ -891,6 +944,9 @@ pub unsafe fn eq_expand_and_partials(
     let high = eq_expand_b128(&r[..n - h]);
     let low = eq_expand_b128(&r[n - h..]);
     debug_assert_eq!(low.len() % TILE, 0, "a stretch is whole tiles");
+    let vector = std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("vpclmulqdq");
     let runs = crate::par::ranges(high.len(), threads, 1);
     let (out, pi0_addr) = (out as usize, pi0.as_ptr() as usize);
     let parts: Vec<Vec<B128>> = std::thread::scope(|scope| {
@@ -905,8 +961,12 @@ pub unsafe fn eq_expand_and_partials(
                     for jh in run {
                         let hv = high[jh];
                         let base = unsafe { out.add(jh << h) };
-                        for (jl, &lv) in low.iter().enumerate() {
-                            unsafe { base.add(jl).write(hv * lv) };
+                        if vector {
+                            unsafe { scale_b128_row(low, hv, base) };
+                        } else {
+                            for (jl, &lv) in low.iter().enumerate() {
+                                unsafe { base.add(jl).write(hv * lv) };
+                            }
                         }
                         unsafe { acc.add_tiles(pi0.add(jh << h), base, low.len() / TILE) };
                     }
@@ -1492,5 +1552,47 @@ mod lean_tests {
         }
         let r = B128(next(&mut x));
         assert_eq!((B128::ONE + r) * b128_inv(B128::ONE + r), B128::ONE);
+    }
+}
+
+#[cfg(test)]
+mod vector_row_tests {
+    use super::*;
+
+    #[test]
+    fn vector_rows_and_parallel_expansion_match_scalar() {
+        let mut state = 0x65f2_7a91_0cba_d837u128;
+        let mut word = || {
+            state ^= state << 23;
+            state ^= state >> 17;
+            state ^= state << 31;
+            B128(state)
+        };
+        let vector = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("vpclmulqdq");
+        if vector {
+            for n in 0..33 {
+                let input: Vec<_> = (0..n).map(|_| word()).collect();
+                let factor = word();
+                let mut out = vec![B128::ZERO; n];
+                unsafe { scale_b128_row(&input, factor, out.as_mut_ptr()) };
+                assert_eq!(out, input.iter().map(|&x| x * factor).collect::<Vec<_>>());
+            }
+        }
+        for log in [0, 7, 15, 16, 17, 18] {
+            let point: Vec<_> = (0..log).map(|_| word()).collect();
+            let expected = eq_expand_b128(&point);
+            for threads in [1, 3, 8] {
+                let mut out = vec![B128::ZERO; 1 << log];
+                unsafe { eq_expand_b128_parallel(&point, out.as_mut_ptr(), threads) };
+                assert_eq!(out, expected, "log={log} threads={threads}");
+                let values: Vec<_> = (0..1 << log).map(|_| word()).collect();
+                let expected_partials = partial_evals(&values, &expected);
+                let fused = unsafe { eq_expand_and_partials(&point, &values, out.as_mut_ptr(), threads) };
+                assert_eq!(out, expected, "fused log={log} threads={threads}");
+                assert_eq!(fused, expected_partials, "partials log={log} threads={threads}");
+            }
+        }
     }
 }

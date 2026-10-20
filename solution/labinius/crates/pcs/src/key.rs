@@ -354,10 +354,48 @@ fn reduce_coefficients<const Q: u16>(coefficients: &[u128], modulus: u128, out: 
 /// 85 MB would cost 4 ms of the very DRAM traffic the non-temporal stores are there to avoid).
 fn uninit_batches(n: usize) -> Vec<Batch32> {
     let mut v: Vec<Batch32> = Vec::with_capacity(n);
+    // The retained transform is several GiB for a large witness. Advise only
+    // complete 2 MiB regions inside this allocation, before its first writes,
+    // so Linux can avoid hundreds of thousands of small-page faults. This is
+    // an optional hint: failure or unavailable huge pages changes no values.
+    #[cfg(target_os = "linux")]
     unsafe {
-        let p = v.as_mut_ptr();
-        for i in 0..n {
-            (*p.add(i)).representation = Representation::Ntt;
+        unsafe extern "C" {
+            fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const HUGE: usize = 2 * 1024 * 1024;
+        const MADV_HUGEPAGE: i32 = 14;
+        let addr = v.as_mut_ptr() as usize;
+        let bytes = n * core::mem::size_of::<Batch32>();
+        let start = (addr + HUGE - 1) & !(HUGE - 1);
+        let end = (addr + bytes) & !(HUGE - 1);
+        if end > start {
+            let _ = madvise(start as *mut core::ffi::c_void, end - start, MADV_HUGEPAGE);
+        }
+    }
+    unsafe {
+        // First-touch the descriptor pages on the same number of workers as
+        // the fold. With huge pages this also spreads their zero-fill cost.
+        if n >= 4096 {
+            let workers = std::thread::available_parallelism()
+                .map_or(1, |p| p.get()).clamp(1, 8);
+            let per = n.div_ceil(workers);
+            std::thread::scope(|scope| {
+                for chunk in v.spare_capacity_mut()[..n].chunks_mut(per) {
+                    scope.spawn(move || {
+                        for batch in chunk {
+                            core::ptr::addr_of_mut!((*batch.as_mut_ptr()).representation)
+                                .write(Representation::Ntt);
+                        }
+                    });
+                }
+            });
+        } else {
+            let p = v.as_mut_ptr();
+            for i in 0..n {
+                core::ptr::addr_of_mut!((*p.add(i)).representation)
+                    .write(Representation::Ntt);
+            }
         }
         v.set_len(n);
     }

@@ -584,17 +584,15 @@ pub fn sample_short_challenges_parallel(
     let threads = threads.clamp(1, n.max(1));
     let mut out = vec![ShortChallenge::zero(); n];
     if n > 0 {
-        let per = n.div_ceil(threads);
+        let runs = crate::par::ranges(n, threads, 1);
         let t_ref = &*t;
-        std::thread::scope(|scope| {
-            for (w, block) in out.chunks_mut(per).enumerate() {
-                let first = w * per;
-                scope.spawn(move || {
-                    for (i, slot) in block.iter_mut().enumerate() {
-                        let reader = t_ref.reader_at(b"short-challenge", (first + i) as u64);
-                        *slot = sample_short_challenge_from(reader, weight, bound);
-                    }
-                });
+        let out_addr = out.as_mut_ptr() as usize;
+        crate::par::pool().run(runs.len(), |w| {
+            // Run `w` owns `out[runs[w]]`.
+            for i in runs[w].clone() {
+                let reader = t_ref.reader_at(b"short-challenge", i as u64);
+                let c = sample_short_challenge_from(reader, weight, bound);
+                unsafe { (out_addr as *mut ShortChallenge).add(i).write(c) };
             }
         });
     }

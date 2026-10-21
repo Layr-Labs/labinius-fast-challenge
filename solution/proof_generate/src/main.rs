@@ -685,6 +685,9 @@ fn commitment_bytes_rows(
     };
     let blocks = columns.div_ceil(32);
     let runs = labinius::par::ranges(blocks, workers, 1);
+    // The blocks are handed out from a shared counter rather than as fixed runs, so a runner
+    // that shares its CPU with another process takes fewer of them.
+    let next = std::sync::atomic::AtomicUsize::new(0);
     let out_addr = out.as_mut_ptr() as usize;
     // One run per logical CPU, placed explicitly for this dispatch and released at its end:
     // this is the first dispatch after the commitment's per-core placement, and the runner
@@ -696,7 +699,11 @@ fn commitment_bytes_rows(
         let mut residues: Vec<Vec<i16>> = (0..limbs).map(|_| vec![0i16; 32 * N]).collect();
         let mut mixed = vec![0u64; limbs];
         let mut at = vec![0u64; limbs];
-        for blk in runs[r].clone() {
+        loop {
+            let blk = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if blk >= blocks {
+                break;
+            }
             let c0 = blk * 32;
             let cols = (columns - c0).min(32);
             for k in 0..limbs {

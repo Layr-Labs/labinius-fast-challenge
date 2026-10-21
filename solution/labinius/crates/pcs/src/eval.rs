@@ -284,7 +284,7 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
             _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
             _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
         ];
-        bf::mac_soa8(&mut acc, x, load_soa8_words(b.add(8 * t)));
+        bf::mac_soa8_word(&mut acc, x, load_soa8_words(b.add(8 * t)));
     }
     let mut out = if blocks > 0 {
         horizontal(acc)
@@ -319,4 +319,27 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
         }
     });
     out
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    #[test]
+    fn word_rows_match_scalar_products() {
+        let mut state = 0x123456789abcdefu64;
+        let mut next = || {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17; state
+        };
+        for log in [0usize, 1, 3, 6, 10] {
+            let p: Vec<_> = (0..log).map(|_| F162([next(), next(), next() & ((1 << 34) - 1)])).collect();
+            let words: Vec<_> = (0..(5 << log)).map(|_| crate::fields::scalar::B128((next() as u128) | ((next() as u128) << 64))).collect();
+            let eq = eq_table(&p);
+            let expected: Vec<_> = words.chunks_exact(1 << log).map(|column|
+                eq.iter().zip(column).fold(F162::ZERO, |a, (&e, &w)| a + e * F162::from_b128(w))).collect();
+            for workers in [1usize, 3, 8] {
+                assert_eq!(row_evaluate_words(&words, &p, workers), expected, "log {log}, workers {workers}");
+            }
+        }
+    }
 }

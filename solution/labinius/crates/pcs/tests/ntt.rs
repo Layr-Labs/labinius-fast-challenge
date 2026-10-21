@@ -31,8 +31,8 @@ mod bin_small {
 
     // ------------------------------------------------------------------ the two kernels
 
-    /// `EXACT`: the two kernels must agree lane by lane in i16 (q = 3889, where neither reduces);
-    /// otherwise only modulo q.
+    /// `EXACT`: the two kernels must agree lane by lane in i16; otherwise only modulo q (the asm
+    /// kernel's s2 = 1 half reuses the s2 = 0 lookups, so its lanes are other representatives).
     fn check_against_asm<const Q: u16, const EXACT: bool>() {
         for polys in batches(64, 0x5EED ^ Q as u64) {
             let idx = idx_of(&elems_of(&polys));
@@ -58,7 +58,7 @@ mod bin_small {
 
     #[test]
     fn matches_asm_3889() {
-        check_against_asm::<3889, true>();
+        check_against_asm::<3889, false>();
     }
 
     #[test]
@@ -247,10 +247,10 @@ mod bin_asm {
                     for r in 0..3 {
                         let (lo, hi) = (nib[ii + 27 * r], nib[ii + 27 * r + 81]);
                         for h in 0..2 {
-                            let s2 = if r == 0 { 0 } else { h };
-                            let x = Self::table(k, s2, r, 0, lo) as i32;
-                            let y = Self::table(k, s2, r, 1, hi) as i32;
-                            let val = if h == 0 { x + y } else { x - y };
+                            // the s2 = 1 half: zeta6^r (x - y) on the s2 = 0 tables, r = 1 negated
+                            let x = Self::table(k, 0, r, 0, lo) as i32;
+                            let y = Self::table(k, 0, r, 1, hi) as i32;
+                            let val = match (h, r) { (0, _) => x + y, (_, 1) => y - x, _ => x - y };
                             six[h][r] = self.see(val);
                             if six[h][r].unsigned_abs() as i32 > self.max[0] {
                                 self.max[0] = six[h][r].unsigned_abs() as i32;
@@ -260,9 +260,11 @@ mod bin_asm {
                     // level 3 (only the omega multiply is left)
                     for h in 0..2 {
                         let (o0, o1, o2) = self.r3(six[h][0], six[h][1], six[h][2]);
-                        v[base + 81 * h + ii] = o0;
-                        v[base + 81 * h + ii + 27] = o1;
-                        v[base + 81 * h + ii + 54] = o2;
+                        // and its outputs rotated by two
+                        let o = if h == 0 { [o0, o1, o2] } else { [o2, o0, o1] };
+                        v[base + 81 * h + ii] = o[0];
+                        v[base + 81 * h + ii + 27] = o[1];
+                        v[base + 81 * h + ii + 54] = o[2];
                     }
                 }
             }

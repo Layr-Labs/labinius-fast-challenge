@@ -1388,10 +1388,10 @@ mod bitsliced {
         terms: Vec<u16>,
     }
 
-    fn plan<const GROUP: usize>(challenges: &[ShortChallenge]) -> (Vec<Group>, [i32; SLOTS]) {
+    /// The schedule of column group `g` (columns `cs`) and its bias differences.
+    fn plan_group<const GROUP: usize>(g: usize, cs: &[ShortChallenge]) -> (Group, [i32; SLOTS + 1]) {
         let mut bias_diff = [0i32; SLOTS + 1];
-        let mut groups = Vec::new();
-        for (g, cs) in challenges.chunks(GROUP).enumerate() {
+        {
             // A term's run `[m, end)` of slots meets slot pair `q` when `2q <= end - 1` and
             // `2q + 1 >= m`, i.e. `q` in `[m / 2, (end - 1) / 2]`; the wrapped run `[0, wrap)`
             // meets pairs `[0, (wrap - 1) / 2]`.
@@ -1463,7 +1463,29 @@ mod bitsliced {
                     }
                 }
             }
+            (group, bias_diff)
+        }
+    }
+
+    fn plan<const GROUP: usize>(challenges: &[ShortChallenge], workers: usize) -> (Vec<Group>, [i32; SLOTS]) {
+        let jobs = challenges.len().div_ceil(GROUP);
+        let group = |g: usize| {
+            let first = g * GROUP;
+            let last = (first + GROUP).min(challenges.len());
+            plan_group::<GROUP>(g, &challenges[first..last])
+        };
+        // The schedule is independent for each public column group; the pool's parked
+        // workers take the groups, and the merge keeps column order.
+        let built: Vec<(Group, [i32; SLOTS + 1])> = if jobs < 4 || workers <= 1 {
+            (0..jobs).map(group).collect()
+        } else {
+            crate::par::pool().map(jobs, group)
+        };
+        let mut groups = Vec::with_capacity(jobs);
+        let mut bias_diff = [0i32; SLOTS + 1];
+        for (group, diff) in built {
             groups.push(group);
+            for (dst, x) in bias_diff.iter_mut().zip(diff) { *dst += x; }
         }
         let mut count = 0;
         let bias = core::array::from_fn(|d| {
@@ -1792,78 +1814,87 @@ mod bitsliced {
         let profile = std::env::var_os("LABINIUS_BITFOLD_PROFILE").is_some();
         #[cfg(test)]
         let plan_start = std::time::Instant::now();
-        let (groups, bias) = plan::<GROUP>(challenges);
+        let (groups, bias) = plan::<GROUP>(challenges, workers);
         #[cfg(test)]
         if profile {
             eprintln!("bitfold plan_us={}", plan_start.elapsed().as_micros());
         }
         let blocks = column_words / LANES;
         let per = blocks.div_ceil(workers.clamp(1, blocks));
-        let mut out = vec![RingElement::zero(Representation::Coefficients); column_words / 4];
-        std::thread::scope(|scope| {
-            for (worker, target) in out.chunks_mut(per * LANES / 4).enumerate() {
-                let groups = &groups;
-                let bias = &bias;
-                scope.spawn(move || unsafe {
+        let tasks = blocks.div_ceil(per);
+        let len = column_words / 4;
+        // Each task zeroes its own output range on its own core; the pool's workers are
+        // already running, so no thread is spawned and no serial pass touches the output.
+        let mut out: Vec<RingElement> = Vec::with_capacity(len);
+        let out_addr = out.as_mut_ptr() as usize;
+        let (groups, bias) = (&groups, &bias);
+        crate::par::pool().run(tasks, |worker| unsafe {
+            let first = worker * per * LANES / 4;
+            let count = (per * LANES / 4).min(len - first);
+            let base = (out_addr as *mut RingElement).add(first);
+            for k in 0..count {
+                base.add(k).write(RingElement::zero(Representation::Coefficients));
+            }
+            let target = core::slice::from_raw_parts_mut(base, count);
+            #[cfg(test)]
+            let mut times = [std::time::Duration::ZERO; 3];
+            let zero = _mm512_setzero_si512();
+            // Zero everywhere the columns do not write: the guards and the padding pair.
+            let mut planes = vec![zero; GUARD + GROUP * STRIDE];
+            let mut acc = vec![zero; 2 * PAIRS * BITS];
+            for (local, output) in target.chunks_mut(LANES / 4).enumerate() {
+                let block = worker * per + local;
+                acc.fill(zero);
+                for group in groups {
                     #[cfg(test)]
-                    let mut times = [std::time::Duration::ZERO; 3];
-                    let zero = _mm512_setzero_si512();
-                    // Zero everywhere the columns do not write: the guards and the padding pair.
-                    let mut planes = vec![zero; GUARD + GROUP * STRIDE];
-                    let mut acc = vec![zero; 2 * PAIRS * BITS];
-                    for (local, output) in target.chunks_mut(LANES / 4).enumerate() {
-                        let block = worker * per + local;
-                        acc.fill(zero);
-                        for group in groups {
-                            #[cfg(test)]
-                            let start = profile.then(std::time::Instant::now);
-                            for j in 0..group.columns {
-                                let src = words.as_ptr().add((group.first + j) * column_words + block * LANES);
-                                slice(src, planes.as_mut_ptr().add(GUARD + j * STRIDE));
-                            }
-                            #[cfg(test)]
-                            if let Some(start) = start { times[0] += start.elapsed(); }
-                            #[cfg(test)]
-                            let start = profile.then(std::time::Instant::now);
-                            for q in 0..PAIRS {
-                                accumulate_pair(
-                                    planes.as_ptr(),
-                                    &group.terms[group.offsets[q]..group.offsets[q + 1]],
-                                    acc.as_mut_ptr().add(2 * q * BITS),
-                                );
-                            }
-                            #[cfg(test)]
-                            if let Some(start) = start { times[1] += start.elapsed(); }
-                        }
-                        #[cfg(test)]
-                        let start = profile.then(std::time::Instant::now);
-                        let mut a = [0i16; LANES];
-                        let mut b = [0i16; LANES];
-                        let mut c = [0i16; LANES];
-                        for i in 0..81 {
-                            unslice(acc.as_ptr().add(i * BITS), &mut a);
-                            unslice(acc.as_ptr().add((81 + i) * BITS), &mut b);
-                            unslice(acc.as_ptr().add((162 + i) * BITS), &mut c);
-                            for lane in 0..LANES {
-                                let w = word_of(lane);
-                                let x = a[lane] as i32 - bias[i];
-                                let y = b[lane] as i32 - bias[81 + i];
-                                let z = c[lane] as i32 - bias[162 + i];
-                                output[w / 4].v[4 * i + w % 4] = i16::try_from(x - z).expect("integer fold overflow");
-                                output[w / 4].v[4 * (81 + i) + w % 4] = i16::try_from(y + z).expect("integer fold overflow");
-                            }
-                        }
-                        #[cfg(test)]
-                        if let Some(start) = start { times[2] += start.elapsed(); }
+                    let start = profile.then(std::time::Instant::now);
+                    for j in 0..group.columns {
+                        let src = words.as_ptr().add((group.first + j) * column_words + block * LANES);
+                        slice(src, planes.as_mut_ptr().add(GUARD + j * STRIDE));
                     }
                     #[cfg(test)]
-                    if profile {
-                        eprintln!("bitfold worker={} slice_us={} add_us={} output_us={}",
-                            worker, times[0].as_micros(), times[1].as_micros(), times[2].as_micros());
+                    if let Some(start) = start { times[0] += start.elapsed(); }
+                    #[cfg(test)]
+                    let start = profile.then(std::time::Instant::now);
+                    for q in 0..PAIRS {
+                        accumulate_pair(
+                            planes.as_ptr(),
+                            &group.terms[group.offsets[q]..group.offsets[q + 1]],
+                            acc.as_mut_ptr().add(2 * q * BITS),
+                        );
                     }
-                });
+                    #[cfg(test)]
+                    if let Some(start) = start { times[1] += start.elapsed(); }
+                }
+                #[cfg(test)]
+                let start = profile.then(std::time::Instant::now);
+                let mut a = [0i16; LANES];
+                let mut b = [0i16; LANES];
+                let mut c = [0i16; LANES];
+                for i in 0..81 {
+                    unslice(acc.as_ptr().add(i * BITS), &mut a);
+                    unslice(acc.as_ptr().add((81 + i) * BITS), &mut b);
+                    unslice(acc.as_ptr().add((162 + i) * BITS), &mut c);
+                    for lane in 0..LANES {
+                        let w = word_of(lane);
+                        let x = a[lane] as i32 - bias[i];
+                        let y = b[lane] as i32 - bias[81 + i];
+                        let z = c[lane] as i32 - bias[162 + i];
+                        output[w / 4].v[4 * i + w % 4] = i16::try_from(x - z).expect("integer fold overflow");
+                        output[w / 4].v[4 * (81 + i) + w % 4] = i16::try_from(y + z).expect("integer fold overflow");
+                    }
+                }
+                #[cfg(test)]
+                if let Some(start) = start { times[2] += start.elapsed(); }
+            }
+            #[cfg(test)]
+            if profile {
+                eprintln!("bitfold worker={} slice_us={} add_us={} output_us={}",
+                    worker, times[0].as_micros(), times[1].as_micros(), times[2].as_micros());
             }
         });
+        // Every task wrote its whole range.
+        unsafe { out.set_len(len) };
         out
     }
 

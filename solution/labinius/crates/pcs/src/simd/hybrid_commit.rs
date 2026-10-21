@@ -11,23 +11,114 @@ const P1:u16=9721;
 const PRODUCT:i64=P0 as i64*P1 as i64;
 pub const MODULUS:u128=PRODUCT as u128*1024;
 pub const CHUNK_BATCHES:usize=7;
+/// Accumulator vectors per 27-slot block: each packs eight slots of two lanes (the last slot
+/// five times), so a column-prime's accumulator is 6 KB.
+const QUADS:usize=4;
+#[repr(C,align(64))]
+struct Acc4 {v:[[i32;16];24*QUADS]}
+impl Acc4 {
+ fn zero()->Box<Self> {
+  unsafe {
+   let mut b=Box::<Self>::new_uninit();
+   core::ptr::write_bytes(b.as_mut_ptr() as *mut u8,0,core::mem::size_of::<Self>());
+   b.assume_init()
+  }
+ }
+}
+/// A lane sums sixteen products per batch, four times [`acc_per_batch`]'s four, so the
+/// fold-back comes every 2 batches for 3889 and every batch for 9721.
+const fn period4(q:u16)->usize {period_for(q,4*acc_per_batch(q))}
+const _:()={
+ let qs=[P0,P1];let mut i=0;
+ while i<2 {
+  assert!(acc_after_reduce(qs[i])+(period4(qs[i]) as i64)*4*acc_per_batch(qs[i])<=i32::MAX as i64);
+  assert!(2*acc_after_reduce(qs[i])<=i32::MAX as i64);
+  i+=1;
+ }
+ assert!(period4(P0)==2 && period4(P1)==1);
+};
+/// Four 16-lane product vectors folded to four lanes each, in lane groups `[p0, p2, p1, p3]`.
+#[inline(always)]
+unsafe fn fold4(p0:__m512i,p1:__m512i,p2:__m512i,p3:__m512i)->__m512i {
+ let u=pack2(p0,p1);let v=pack2(p2,p3);
+ let y=_mm512_permutex2var_epi64(u,_mm512_set_epi64(13,12,7,6,9,8,3,2),v);
+ _mm512_add_epi32(_mm512_mask_blend_epi64(0xCC,u,v),y)
+}
+/// Eight product vectors folded to two lanes each: 64-bit word `h` of lane group `k` holds
+/// `p[4h + [0, 2, 1, 3][k]]`.
+#[inline(always)]
+unsafe fn fold8(p:[__m512i;8])->__m512i {
+ let r0=fold4(p[0],p[1],p[2],p[3]);let r1=fold4(p[4],p[5],p[6],p[7]);
+ _mm512_add_epi32(_mm512_mask_blend_epi64(0xAA,r0,r1),_mm512_alignr_epi8::<8>(r1,r0))
+}
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn reduce4<const Q:u16>(acc:*mut i32) {
+ for j in 0..24*QUADS {
+  let s=_mm512_load_si512(acc.add(16*j) as *const __m512i);
+  _mm512_store_si512(acc.add(16*j) as *mut __m512i,reduce_vec::<Q>(s));
+ }
+}
+#[inline(always)]
+unsafe fn m(k:*const i16,w:__m512i,j:usize)->__m512i {_mm512_madd_epi16(w,_mm512_load_si512(k.add(32*j) as *const __m512i))}
+#[inline(always)]
+unsafe fn rd<const Q:u16>(p:*const i32)->__m512i {reduce_vec::<Q>(_mm512_load_si512(p as *const __m512i))}
+const EVEN:[i32;16]=[0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30];
+const ODD:[i32;16]=[1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31];
+/// Lane `8v + i` is the sum of lanes `2i, 2i + 1` of `[a, b][v]`.
+#[inline(always)]
+unsafe fn hsum2(a:__m512i,b:__m512i)->__m512i {
+ let e=_mm512_loadu_si512(EVEN.as_ptr() as *const __m512i);let o=_mm512_loadu_si512(ODD.as_ptr() as *const __m512i);
+ _mm512_add_epi32(_mm512_permutex2var_epi32(a,e,b),_mm512_permutex2var_epi32(a,o,b))
+}
+/// Slot `s` of a 16-slot run sits in lane `8 (s / 8) + 2 k + (s % 8) / 4`, `k` its lane group
+/// in [`fold8`] order.
+const SLOT_LANE:[i32;16]={
+ let mut x=[0i32;16];let mut s=0;
+ while s<16 {x[s]=(8*(s/8)+2*[0,2,1,3][s%4]+(s%8)/4) as i32;s+=1;}
+ x
+};
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn finish4<const Q:u16>(acc:&Acc4)->[u32;N] {
+ let idx=_mm512_loadu_si512(SLOT_LANE.as_ptr() as *const __m512i);
+ let mut y=[0u32;N];
+ let p=acc.v.as_ptr() as *const i32;
+ for bl in 0..24 {
+  let q=p.add(16*QUADS*bl);
+  let lo=mod_q::<Q>(hsum2(rd::<Q>(q),rd::<Q>(q.add(16))));
+  let hi=mod_q::<Q>(hsum2(rd::<Q>(q.add(32)),rd::<Q>(q.add(48))));
+  let o=y.as_mut_ptr().add(27*bl) as *mut i32;
+  _mm512_storeu_si512(o as *mut __m512i,_mm512_permutexvar_epi32(idx,lo));
+  _mm512_mask_storeu_epi32(o.add(16),0x07ff,_mm512_permutexvar_epi32(idx,hi));
+ }
+ y
+}
 struct TwinSink {buf:*mut i16,a:*const i16,t:*const i16,base:*mut i32,tail:*mut i32}
 impl BlockSink for TwinSink {
  #[inline(always)]unsafe fn dst(&mut self,_:usize)->*mut i16 {self.buf}
  #[target_feature(enable="avx512f,avx512bw")]
  unsafe fn block(&mut self,blk:usize,w:*const i16) {
-  for p in 0..14 {
-   let j0=2*p;let j1=(j0+1).min(26);
+  let a=self.a.add(32*27*blk);let t=self.t.add(32*27*blk);
+  for p in 0..QUADS {
+   let j0=8*p;
+   let j1=j0+1;
+   let j2=j0+2;
+   let j3=(j0+3).min(26);
+   let j4=(j0+4).min(26);
+   let j5=(j0+5).min(26);
+   let j6=(j0+6).min(26);
+   let j7=(j0+7).min(26);
    let w0=_mm512_load_si512(w.add(32*j0) as *const __m512i);
    let w1=_mm512_load_si512(w.add(32*j1) as *const __m512i);
-   let a0=_mm512_load_si512(self.a.add(32*(27*blk+j0)) as *const __m512i);
-   let a1=_mm512_load_si512(self.a.add(32*(27*blk+j1)) as *const __m512i);
-   let t0=_mm512_load_si512(self.t.add(32*(27*blk+j0)) as *const __m512i);
-   let t1=_mm512_load_si512(self.t.add(32*(27*blk+j1)) as *const __m512i);
-   let ba=self.base.add(16*(ACC_PER_BLK*blk+p)) as *mut __m512i;
-   let ta=self.tail.add(16*(ACC_PER_BLK*blk+p)) as *mut __m512i;
-   let bp=pack2(_mm512_madd_epi16(w0,a0),_mm512_madd_epi16(w1,a1));
-   let tp=pack2(_mm512_madd_epi16(w0,t0),_mm512_madd_epi16(w1,t1));
+   let w2=_mm512_load_si512(w.add(32*j2) as *const __m512i);
+   let w3=_mm512_load_si512(w.add(32*j3) as *const __m512i);
+   let w4=_mm512_load_si512(w.add(32*j4) as *const __m512i);
+   let w5=_mm512_load_si512(w.add(32*j5) as *const __m512i);
+   let w6=_mm512_load_si512(w.add(32*j6) as *const __m512i);
+   let w7=_mm512_load_si512(w.add(32*j7) as *const __m512i);
+   let bp=fold8([m(a,w0,j0),m(a,w1,j1),m(a,w2,j2),m(a,w3,j3),m(a,w4,j4),m(a,w5,j5),m(a,w6,j6),m(a,w7,j7)]);
+   let tp=fold8([m(t,w0,j0),m(t,w1,j1),m(t,w2,j2),m(t,w3,j3),m(t,w4,j4),m(t,w5,j5),m(t,w6,j6),m(t,w7,j7)]);
+   let ba=self.base.add(16*(QUADS*blk+p)) as *mut __m512i;
+   let ta=self.tail.add(16*(QUADS*blk+p)) as *mut __m512i;
    _mm512_store_si512(ba,_mm512_add_epi32(_mm512_load_si512(ba),bp));
    _mm512_store_si512(ta,_mm512_add_epi32(_mm512_load_si512(ta),tp));
   }
@@ -63,8 +154,8 @@ struct Out {base:Vec<[u32;N]>,tail:Vec<[u16;N]>}
 #[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 unsafe fn group(cols:&[&[B128]],basekeys:&[&[Batch32]],tailkeys:&[&[Batch32]],nb:usize,chunk:usize)->Out {
  let g=cols.len();assert!(g<=32);
- let mut accs:Vec<Box<Acc>>=(0..g*2).map(|_|Acc::zero()).collect();
- let mut tails:Vec<Box<Acc>>=(0..g*2).map(|_|Acc::zero()).collect();
+ let mut accs:Vec<Box<Acc4>>=(0..g*2).map(|_|Acc4::zero()).collect();
+ let mut tails:Vec<Box<Acc4>>=(0..g*2).map(|_|Acc4::zero()).collect();
  let mut partial0=Batch32::zero(Representation::Ntt);let mut partial1=Batch32::zero(Representation::Ntt);
  let mut total=Batch32::zero(Representation::Coefficients);
  let mut idx=BinaryIndex32::zero();let mut buf=Blk27([0;27*32]);let bp=buf.0.as_mut_ptr();
@@ -77,12 +168,12 @@ unsafe fn group(cols:&[&[B128]],basekeys:&[&[Batch32]],tailkeys:&[&[Batch32]],nb
     t:tailkeys[0][b].v.as_ptr() as *const i16,base:p0,tail:t0});
    vb::ntt_bin_batch32_sink::<P1,_>(&idx,&mut TwinSink{buf:bp,a:basekeys[1][b].v.as_ptr() as *const i16,
     t:tailkeys[1][b].v.as_ptr() as *const i16,base:p1,tail:t1});
-   if (b+1)%red_period(P0)==0 {reduce_acc::<P0>(p0);reduce_acc::<P0>(t0);}
-   if (b+1)%red_period(P1)==0 {reduce_acc::<P1>(p1);reduce_acc::<P1>(t1);}
+   if (b+1)%period4(P0)==0 {reduce4::<P0>(p0);reduce4::<P0>(t0);}
+   if (b+1)%period4(P1)==0 {reduce4::<P1>(p1);reduce4::<P1>(t1);}
   }
   if (b+1)%chunk==0 || b+1==nb {
    for c in 0..g {
-    let a=finish::<P0>(&tails[2*c]);let v=finish::<P1>(&tails[2*c+1]);
+    let a=finish4::<P0>(&tails[2*c]);let v=finish4::<P1>(&tails[2*c+1]);
     for j in 0..648 {partial0.v[j][c]=a[j] as i16;partial1.v[j][c]=v[j] as i16;}
     tails[2*c].v.fill([0;16]);tails[2*c+1].v.fill([0;16]);
    }
@@ -92,7 +183,7 @@ unsafe fn group(cols:&[&[B128]],basekeys:&[&[Batch32]],tailkeys:&[&[Batch32]],nb
   }
  }
  Out{
-  base:(0..g).flat_map(|c|[finish::<P0>(&accs[2*c]),finish::<P1>(&accs[2*c+1])]).collect(),
+  base:(0..g).flat_map(|c|[finish4::<P0>(&accs[2*c]),finish4::<P1>(&accs[2*c+1])]).collect(),
   tail:(0..g).map(|c|core::array::from_fn(|j|(total.v[j][c] as u16)&1023)).collect(),
  }
 }

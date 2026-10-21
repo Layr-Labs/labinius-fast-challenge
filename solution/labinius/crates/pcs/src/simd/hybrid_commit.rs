@@ -211,12 +211,12 @@ impl<const Q:u16,const RED:bool> BlockSink for TSink<Q,RED> {
 /// One column's batch `b` modulo `Q` (`keys[2b]` for 3889, `keys[2b + 1]` for 9721), folded back
 /// when it ends a period.
 #[inline(always)]
-unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,bp:*mut i16,keys:&[KeyBatch],b:usize,acc:*mut i32) {
+unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,keys:&[KeyBatch],b:usize,acc:*mut i32) {
  let k=keys[2*b+if Q==P0 {0} else {1}].v.as_ptr() as *const i16;
  if (b+1)%period(Q)==0 {
-  vb::ntt_bin_batch32_sink::<Q,_>(idx,&mut TSink::<Q,true>{buf:bp,k,acc});
+  vb::ntt_bin_batch32_hybrid::<Q,true>(idx,k,acc);
  } else {
-  vb::ntt_bin_batch32_sink::<Q,_>(idx,&mut TSink::<Q,false>{buf:bp,k,acc});
+  vb::ntt_bin_batch32_hybrid::<Q,false>(idx,k,acc);
  }
 }
 const EVEN:[i32;16]=[0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30];
@@ -383,12 +383,12 @@ fn zeroed_slice<T>(n:usize)->Box<[T]> {
 }
 /// A worker's scratch, allocated once and reused by every group it takes: the accumulators of up
 /// to `gmax` columns (`acc[2c + k]`, column `c`, prime `k`), the two batches the finished tail
-/// chunks are packed into for the inverse transform, the lane-wise CRT total, the index rows and
-/// the kernel's block buffer.
-struct Worker {acc:Box<[GAcc]>,pend:Box<[Batch32]>,total:Box<[Batch32]>,idx:Box<[BinaryIndex32]>,buf:Box<[Blk27]>}
+/// chunks are packed into for the inverse transform, the lane-wise CRT total and index rows.
+/// The fused consumer needs no row-major transform-output block buffer.
+struct Worker {acc:Box<[GAcc]>,pend:Box<[Batch32]>,total:Box<[Batch32]>,idx:Box<[BinaryIndex32]>}
 impl Worker {
  fn new(gmax:usize)->Self {
-  Worker{acc:zeroed_slice(2*gmax),pend:zeroed_slice(2),total:zeroed_slice(1),idx:zeroed_slice(1),buf:zeroed_slice(1)}
+  Worker{acc:zeroed_slice(2*gmax),pend:zeroed_slice(2),total:zeroed_slice(1),idx:zeroed_slice(1)}
  }
 }
 /// Zero lanes `from..32` of every row of `b`.
@@ -409,14 +409,13 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
  let slots=32/g;
  for a in ws.acc[..2*g].iter_mut() {core::ptr::write_bytes(a as *mut GAcc,0,1);}
  core::ptr::write_bytes(&mut ws.total[0] as *mut Batch32,0,1);
- let bp=ws.buf[0].0.as_mut_ptr();
  let mut filled=0usize;
  for b in 0..nb {
   for c in 0..g {
    cols[c].slice_batch(b,&mut ws.idx[0]);
    let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;
-   sink_batch::<P0>(&ws.idx[0],bp,keys,b,a0);
-   sink_batch::<P1>(&ws.idx[0],bp,keys,b,a1);
+   sink_batch::<P0>(&ws.idx[0],keys,b,a0);
+   sink_batch::<P1>(&ws.idx[0],keys,b,a1);
   }
    sync(b);
    if (b+1)%CHUNK_BATCHES==0 || b+1==nb {
@@ -653,6 +652,43 @@ fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,place
 #[cfg(test)]
 mod tests {
  use super::*;
+ /// The fused register consumer equals the original row-major scratch consumer at every
+ /// accumulator lane, including centered fold-back. Arbitrary initial accumulators exercise
+ /// the exact wrapping SIMD operations; centered keys and all-zero/all-one/random nibbles
+ /// cover the production transform inputs and both primes.
+ fn fused_register_sink_check<const Q:u16,const RED:bool>() {
+  let mut state=0xa3e41d7b92c650f1u64 ^ Q as u64;
+  let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
+  let mut key=zeroed_slice::<KeyBatch>(1);
+  let mut got=zeroed_slice::<GAcc>(1);
+  let mut want=zeroed_slice::<GAcc>(1);
+  let mut scratch=Blk27([0;27*32]);
+  let mut idx=BinaryIndex32::zero();
+  for case in 0..24 {
+   for row in &mut idx.rows {for lane in 0..32 {
+    let n=match case {0=>0,1=>15,2=>(lane%16) as u8,_=>(next()&15) as u8};
+    row[2*lane]=n;row[2*lane+1]=16+n;
+   }}
+   for v in &mut key[0].v {for x in v {
+    *x=match case {0=>0,1=>Q as i16/2,2=>-(Q as i16/2),_=>(next()%Q as u64) as i16-Q as i16/2};
+   }}
+   for (a,b) in got[0].v.iter_mut().zip(&mut want[0].v) {for (a,b) in a.iter_mut().zip(b) {
+    *a=match case {0=>0,1=>i32::MAX,2=>i32::MIN,_=>next() as i32};*b=*a;
+   }}
+   unsafe {
+    let kp=key[0].v.as_ptr() as *const i16;
+    vb::ntt_bin_batch32_sink::<Q,_>(&idx,&mut TSink::<Q,RED>{
+     buf:scratch.0.as_mut_ptr(),k:kp,acc:want[0].v.as_mut_ptr() as *mut i32});
+    vb::ntt_bin_batch32_hybrid::<Q,RED>(&idx,kp,got[0].v.as_mut_ptr() as *mut i32);
+   }
+   assert_eq!(got[0].v,want[0].v,"q={Q}, RED={RED}, case={case}");
+  }
+ }
+ #[test]
+ fn fused_register_sink_matches_staged_sink() {
+  fused_register_sink_check::<P0,false>();fused_register_sink_check::<P0,true>();
+  fused_register_sink_check::<P1,false>();fused_register_sink_check::<P1,true>();
+ }
  #[test]
  fn centered_crt_boundaries() {
   unsafe{

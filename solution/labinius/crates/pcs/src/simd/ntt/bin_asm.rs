@@ -465,6 +465,9 @@ macro_rules! level6 {
 
 macro_rules! tail27 {
     ($m4:ident, $m6:ident) => {
+        tail27!($m4, $m6, bfly)
+    };
+    ($m4:ident, $m6:ident, $finish:ident) => {
         concat!(
             level4!($m4 0, 9, 18, 0, 576, 1152, 28),
             level4!($m4 3, 12, 21, 192, 768, 1344, 29),
@@ -504,22 +507,22 @@ macro_rules! tail27 {
             bfly!(11, 14, 17, 28),
             level6!($m6 "", 0, 1, 2, 28),
             level6!($m6 "+16", 6, 7, 8, 29),
-            bfly!(0, 1, 2, 28, 0, 64, 128),
+            $finish!(0, 1, 2, 28, 0, 64, 128),
             level6!($m6 "+32", 3, 4, 5, 28),
-            bfly!(6, 7, 8, 29, 192, 256, 320),
+            $finish!(6, 7, 8, 29, 192, 256, 320),
             level6!($m6 "+48", 18, 19, 20, 29),
-            bfly!(3, 4, 5, 28, 384, 448, 512),
+            $finish!(3, 4, 5, 28, 384, 448, 512),
             level6!($m6 "+64", 24, 25, 26, 28),
-            bfly!(18, 19, 20, 29, 576, 640, 704),
+            $finish!(18, 19, 20, 29, 576, 640, 704),
             level6!($m6 "+80", 21, 22, 23, 29),
-            bfly!(24, 25, 26, 28, 768, 832, 896),
+            $finish!(24, 25, 26, 28, 768, 832, 896),
             level6!($m6 "+96", 9, 10, 11, 28),
-            bfly!(21, 22, 23, 29, 960, 1024, 1088),
+            $finish!(21, 22, 23, 29, 960, 1024, 1088),
             level6!($m6 "+112", 15, 16, 17, 29),
-            bfly!(9, 10, 11, 28, 1152, 1216, 1280),
+            $finish!(9, 10, 11, 28, 1152, 1216, 1280),
             level6!($m6 "+128", 12, 13, 14, 28),
-            bfly!(15, 16, 17, 29, 1344, 1408, 1472),
-            bfly!(12, 13, 14, 28, 1536, 1600, 1664),
+            $finish!(15, 16, 17, 29, 1344, 1408, 1472),
+            $finish!(12, 13, 14, 28, 1536, 1600, 1664),
         )
     };
 }
@@ -634,6 +637,266 @@ unsafe fn tail27_b(
 #[repr(C, align(64))]
 struct Blk([i16; 162 * 32]);
 
+/// The final butterfly without its row-major scratch stores. The values and register
+/// assignments are exactly those of `bfly!`; the arranged sink consumes them immediately.
+macro_rules! bfly_registers {
+    ($a0:literal, $a1:literal, $a2:literal, $t:literal,
+     $o0:literal, $o1:literal, $o2:literal) => {
+        bfly!($a0, $a1, $a2, $t)
+    };
+}
+
+macro_rules! hybrid_store {
+    (plain, $reg:literal, $off:literal) => {
+        concat!("vmovdqa64 [{acc}+", $off, "], zmm", $reg, "\n")
+    };
+    (reduce, $reg:literal, $off:literal) => {
+        concat!(
+            "vpmaddwd zmm31, zmm", $reg, ", [{fold}]\n",
+            "vptestmd k1, zmm", $reg, ", [{fold}+64]\n",
+            "vpaddd zmm31{{k1}}, zmm31, [{fold}+128]\n",
+            "vmovdqa64 [{acc}+", $off, "], zmm31\n",
+        )
+    };
+}
+
+/// Three 8x8 qword transposes and one 4x4 128-bit transpose, in the same output order
+/// as hybrid_commit::tr8/tr4. Each two-source pair first writes the free register and
+/// then overwrites its second input, so only zmm28 is needed as extra transpose storage.
+/// zmm29/30 are the base/tail sums; zmm31 and k1 implement the existing centered fold-back.
+macro_rules! hybrid_register_sink {
+    ($mode:ident) => {
+        concat!(
+            "vpunpcklqdq zmm28, zmm0, zmm2\n",
+            "vpunpckhqdq zmm2, zmm0, zmm2\n",
+            "vpunpcklqdq zmm0, zmm1, zmm6\n",
+            "vpunpckhqdq zmm6, zmm1, zmm6\n",
+            "vpunpcklqdq zmm1, zmm8, zmm7\n",
+            "vpunpckhqdq zmm7, zmm8, zmm7\n",
+            "vpunpcklqdq zmm8, zmm3, zmm5\n",
+            "vpunpckhqdq zmm5, zmm3, zmm5\n",
+            "vshufi64x2 zmm3, zmm28, zmm0, 136\n",
+            "vshufi64x2 zmm0, zmm28, zmm0, 221\n",
+            "vshufi64x2 zmm28, zmm1, zmm8, 136\n",
+            "vshufi64x2 zmm8, zmm1, zmm8, 221\n",
+            "vshufi64x2 zmm1, zmm2, zmm6, 136\n",
+            "vshufi64x2 zmm6, zmm2, zmm6, 221\n",
+            "vshufi64x2 zmm2, zmm7, zmm5, 136\n",
+            "vshufi64x2 zmm5, zmm7, zmm5, 221\n",
+            "vshufi64x2 zmm7, zmm3, zmm28, 136\n",
+            "vshufi64x2 zmm28, zmm3, zmm28, 221\n",
+            "vshufi64x2 zmm3, zmm1, zmm2, 136\n",
+            "vshufi64x2 zmm2, zmm1, zmm2, 221\n",
+            "vshufi64x2 zmm1, zmm0, zmm8, 136\n",
+            "vshufi64x2 zmm8, zmm0, zmm8, 221\n",
+            "vshufi64x2 zmm0, zmm6, zmm5, 136\n",
+            "vshufi64x2 zmm5, zmm6, zmm5, 221\n",
+            "vmovdqa64 zmm29, [{acc}+0]\n",
+            "vmovdqa64 zmm30, [{acc}+64]\n",
+            "vpdpwssd zmm29, zmm7, zmmword ptr [{key}+0]\n",
+            "vpdpwssd zmm30, zmm7, zmmword ptr [{key}+512]\n",
+            "vpdpwssd zmm29, zmm3, zmmword ptr [{key}+64]\n",
+            "vpdpwssd zmm30, zmm3, zmmword ptr [{key}+576]\n",
+            "vpdpwssd zmm29, zmm1, zmmword ptr [{key}+128]\n",
+            "vpdpwssd zmm30, zmm1, zmmword ptr [{key}+640]\n",
+            "vpdpwssd zmm29, zmm0, zmmword ptr [{key}+192]\n",
+            "vpdpwssd zmm30, zmm0, zmmword ptr [{key}+704]\n",
+            "vpdpwssd zmm29, zmm28, zmmword ptr [{key}+256]\n",
+            "vpdpwssd zmm30, zmm28, zmmword ptr [{key}+768]\n",
+            "vpdpwssd zmm29, zmm2, zmmword ptr [{key}+320]\n",
+            "vpdpwssd zmm30, zmm2, zmmword ptr [{key}+832]\n",
+            "vpdpwssd zmm29, zmm8, zmmword ptr [{key}+384]\n",
+            "vpdpwssd zmm30, zmm8, zmmword ptr [{key}+896]\n",
+            "vpdpwssd zmm29, zmm5, zmmword ptr [{key}+448]\n",
+            "vpdpwssd zmm30, zmm5, zmmword ptr [{key}+960]\n",
+            hybrid_store!($mode, 29, 0),
+            hybrid_store!($mode, 30, 64),
+            "vpunpcklqdq zmm28, zmm4, zmm18\n",
+            "vpunpckhqdq zmm18, zmm4, zmm18\n",
+            "vpunpcklqdq zmm4, zmm20, zmm19\n",
+            "vpunpckhqdq zmm19, zmm20, zmm19\n",
+            "vpunpcklqdq zmm20, zmm24, zmm26\n",
+            "vpunpckhqdq zmm26, zmm24, zmm26\n",
+            "vpunpcklqdq zmm24, zmm25, zmm21\n",
+            "vpunpckhqdq zmm21, zmm25, zmm21\n",
+            "vshufi64x2 zmm25, zmm28, zmm4, 136\n",
+            "vshufi64x2 zmm4, zmm28, zmm4, 221\n",
+            "vshufi64x2 zmm28, zmm20, zmm24, 136\n",
+            "vshufi64x2 zmm24, zmm20, zmm24, 221\n",
+            "vshufi64x2 zmm20, zmm18, zmm19, 136\n",
+            "vshufi64x2 zmm19, zmm18, zmm19, 221\n",
+            "vshufi64x2 zmm18, zmm26, zmm21, 136\n",
+            "vshufi64x2 zmm21, zmm26, zmm21, 221\n",
+            "vshufi64x2 zmm26, zmm25, zmm28, 136\n",
+            "vshufi64x2 zmm28, zmm25, zmm28, 221\n",
+            "vshufi64x2 zmm25, zmm20, zmm18, 136\n",
+            "vshufi64x2 zmm18, zmm20, zmm18, 221\n",
+            "vshufi64x2 zmm20, zmm4, zmm24, 136\n",
+            "vshufi64x2 zmm24, zmm4, zmm24, 221\n",
+            "vshufi64x2 zmm4, zmm19, zmm21, 136\n",
+            "vshufi64x2 zmm21, zmm19, zmm21, 221\n",
+            "vmovdqa64 zmm29, [{acc}+128]\n",
+            "vmovdqa64 zmm30, [{acc}+192]\n",
+            "vpdpwssd zmm29, zmm26, zmmword ptr [{key}+1024]\n",
+            "vpdpwssd zmm30, zmm26, zmmword ptr [{key}+1536]\n",
+            "vpdpwssd zmm29, zmm25, zmmword ptr [{key}+1088]\n",
+            "vpdpwssd zmm30, zmm25, zmmword ptr [{key}+1600]\n",
+            "vpdpwssd zmm29, zmm20, zmmword ptr [{key}+1152]\n",
+            "vpdpwssd zmm30, zmm20, zmmword ptr [{key}+1664]\n",
+            "vpdpwssd zmm29, zmm4, zmmword ptr [{key}+1216]\n",
+            "vpdpwssd zmm30, zmm4, zmmword ptr [{key}+1728]\n",
+            "vpdpwssd zmm29, zmm28, zmmword ptr [{key}+1280]\n",
+            "vpdpwssd zmm30, zmm28, zmmword ptr [{key}+1792]\n",
+            "vpdpwssd zmm29, zmm18, zmmword ptr [{key}+1344]\n",
+            "vpdpwssd zmm30, zmm18, zmmword ptr [{key}+1856]\n",
+            "vpdpwssd zmm29, zmm24, zmmword ptr [{key}+1408]\n",
+            "vpdpwssd zmm30, zmm24, zmmword ptr [{key}+1920]\n",
+            "vpdpwssd zmm29, zmm21, zmmword ptr [{key}+1472]\n",
+            "vpdpwssd zmm30, zmm21, zmmword ptr [{key}+1984]\n",
+            hybrid_store!($mode, 29, 128),
+            hybrid_store!($mode, 30, 192),
+            "vpunpcklqdq zmm28, zmm23, zmm22\n",
+            "vpunpckhqdq zmm22, zmm23, zmm22\n",
+            "vpunpcklqdq zmm23, zmm9, zmm11\n",
+            "vpunpckhqdq zmm11, zmm9, zmm11\n",
+            "vpunpcklqdq zmm9, zmm10, zmm15\n",
+            "vpunpckhqdq zmm15, zmm10, zmm15\n",
+            "vpunpcklqdq zmm10, zmm17, zmm16\n",
+            "vpunpckhqdq zmm16, zmm17, zmm16\n",
+            "vshufi64x2 zmm17, zmm28, zmm23, 136\n",
+            "vshufi64x2 zmm23, zmm28, zmm23, 221\n",
+            "vshufi64x2 zmm28, zmm9, zmm10, 136\n",
+            "vshufi64x2 zmm10, zmm9, zmm10, 221\n",
+            "vshufi64x2 zmm9, zmm22, zmm11, 136\n",
+            "vshufi64x2 zmm11, zmm22, zmm11, 221\n",
+            "vshufi64x2 zmm22, zmm15, zmm16, 136\n",
+            "vshufi64x2 zmm16, zmm15, zmm16, 221\n",
+            "vshufi64x2 zmm15, zmm17, zmm28, 136\n",
+            "vshufi64x2 zmm28, zmm17, zmm28, 221\n",
+            "vshufi64x2 zmm17, zmm9, zmm22, 136\n",
+            "vshufi64x2 zmm22, zmm9, zmm22, 221\n",
+            "vshufi64x2 zmm9, zmm23, zmm10, 136\n",
+            "vshufi64x2 zmm10, zmm23, zmm10, 221\n",
+            "vshufi64x2 zmm23, zmm11, zmm16, 136\n",
+            "vshufi64x2 zmm16, zmm11, zmm16, 221\n",
+            "vmovdqa64 zmm29, [{acc}+256]\n",
+            "vmovdqa64 zmm30, [{acc}+320]\n",
+            "vpdpwssd zmm29, zmm15, zmmword ptr [{key}+2048]\n",
+            "vpdpwssd zmm30, zmm15, zmmword ptr [{key}+2560]\n",
+            "vpdpwssd zmm29, zmm17, zmmword ptr [{key}+2112]\n",
+            "vpdpwssd zmm30, zmm17, zmmword ptr [{key}+2624]\n",
+            "vpdpwssd zmm29, zmm9, zmmword ptr [{key}+2176]\n",
+            "vpdpwssd zmm30, zmm9, zmmword ptr [{key}+2688]\n",
+            "vpdpwssd zmm29, zmm23, zmmword ptr [{key}+2240]\n",
+            "vpdpwssd zmm30, zmm23, zmmword ptr [{key}+2752]\n",
+            "vpdpwssd zmm29, zmm28, zmmword ptr [{key}+2304]\n",
+            "vpdpwssd zmm30, zmm28, zmmword ptr [{key}+2816]\n",
+            "vpdpwssd zmm29, zmm22, zmmword ptr [{key}+2368]\n",
+            "vpdpwssd zmm30, zmm22, zmmword ptr [{key}+2880]\n",
+            "vpdpwssd zmm29, zmm10, zmmword ptr [{key}+2432]\n",
+            "vpdpwssd zmm30, zmm10, zmmword ptr [{key}+2944]\n",
+            "vpdpwssd zmm29, zmm16, zmmword ptr [{key}+2496]\n",
+            "vpdpwssd zmm30, zmm16, zmmword ptr [{key}+3008]\n",
+            hybrid_store!($mode, 29, 256),
+            hybrid_store!($mode, 30, 320),
+            "vshufi64x2 zmm0, zmm12, zmm14, 136\n",
+            "vshufi64x2 zmm1, zmm12, zmm14, 221\n",
+            "vshufi64x2 zmm2, zmm13, zmm13, 136\n",
+            "vshufi64x2 zmm3, zmm13, zmm13, 221\n",
+            "vshufi64x2 zmm4, zmm0, zmm2, 136\n",
+            "vshufi64x2 zmm5, zmm1, zmm3, 136\n",
+            "vshufi64x2 zmm6, zmm0, zmm2, 221\n",
+            "vshufi64x2 zmm7, zmm1, zmm3, 221\n",
+            "vmovdqa64 zmm29, [{acc}+384]\n",
+            "vmovdqa64 zmm30, [{acc}+448]\n",
+            "vpdpwssd zmm29, zmm4, zmmword ptr [{key}+3072]\n",
+            "vpdpwssd zmm30, zmm4, zmmword ptr [{key}+3328]\n",
+            "vpdpwssd zmm29, zmm5, zmmword ptr [{key}+3136]\n",
+            "vpdpwssd zmm30, zmm5, zmmword ptr [{key}+3392]\n",
+            "vpdpwssd zmm29, zmm6, zmmword ptr [{key}+3200]\n",
+            "vpdpwssd zmm30, zmm6, zmmword ptr [{key}+3456]\n",
+            "vpdpwssd zmm29, zmm7, zmmword ptr [{key}+3264]\n",
+            "vpdpwssd zmm30, zmm7, zmmword ptr [{key}+3520]\n",
+            hybrid_store!($mode, 29, 384),
+            hybrid_store!($mode, 30, 448),
+        )
+    };
+}
+
+#[repr(C, align(64))]
+struct HybridFold([[i32; 16]; 3]);
+
+const fn hybrid_fold<const Q: u16>() -> HybridFold {
+    let r = (65536 % Q as i32) - Q as i32;
+    HybridFold([
+        [1 | ((r as u16 as i32) << 16); 16],
+        [0x8000; 16],
+        [r; 16],
+    ])
+}
+
+/// The arranged hybrid sink fused with the unchanged 27-slot NTT tail. No transformed
+/// value is stored and reloaded between the butterfly and its multiply-accumulate.
+#[inline(always)]
+unsafe fn tail27_hybrid<const Q: u16, const RED: bool>(
+    bp: *const i16, t4: *const u32, t5: *const u32, t6: *const u32,
+    cv: *const i16, key: *const i16, acc: *mut i32,
+) {
+    macro_rules! run {
+        ($m4:ident, $m6:ident, $red:ident) => {
+            core::arch::asm!(
+                concat!(
+                    "vmovdqa64 zmm27, [{c}]\n",
+                    tail27!($m4, $m6, bfly_registers),
+                    hybrid_register_sink!($red),
+                    "/* {fold} */\n",
+                ),
+                i = in(reg) bp, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,
+                c = in(reg) cv, key = in(reg) key, acc = in(reg) acc,
+                fold = in(reg) &const { hybrid_fold::<Q>() },
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+                out("zmm8") _,
+                out("zmm9") _,
+                out("zmm10") _,
+                out("zmm11") _,
+                out("zmm12") _,
+                out("zmm13") _,
+                out("zmm14") _,
+                out("zmm15") _,
+                out("zmm16") _,
+                out("zmm17") _,
+                out("zmm18") _,
+                out("zmm19") _,
+                out("zmm20") _,
+                out("zmm21") _,
+                out("zmm22") _,
+                out("zmm23") _,
+                out("zmm24") _,
+                out("zmm25") _,
+                out("zmm26") _,
+                out("zmm27") _,
+                out("zmm28") _,
+                out("zmm29") _,
+                out("zmm30") _,
+                out("zmm31") _,
+                out("k1") _,
+                options(nostack)
+            )
+        };
+    }
+    if needs_barrett(Q) {
+        if RED { run!(lut, barrett, reduce); } else { run!(lut, barrett, plain); }
+    } else if RED { run!(plain, plain, reduce); } else { run!(plain, plain, plain); }
+}
+
+
 // ---------------------------------------------------------------------------------------------
 // where the finished blocks go
 // ---------------------------------------------------------------------------------------------
@@ -654,10 +917,23 @@ struct Blk([i16; 162 * 32]);
 /// `dst` must return a 64-byte aligned pointer to 1728 writable bytes (27 vectors); the kernel
 /// writes them and then calls `block` with the same pointer.
 pub trait BlockSink {
+    /// The fused consumer's opaque assembly must stay in one loop body.
+    const REGISTER_SINK: bool = false;
     /// Where block `blk` is to be stored.
     unsafe fn dst(&mut self, blk: usize) -> *mut i16;
     /// Called once the 27 vectors of block `blk` are stored at `dst`.
     unsafe fn block(&mut self, blk: usize, dst: *const i16);
+    /// Finish a 27-slot tail and consume it. Ordinary sinks retain the row-major staging;
+    /// a fused sink may override this while preserving the transform's arithmetic.
+    /// The input and twiddle pointers have the same alignment and extent as tail27_p/b.
+    #[inline(always)]
+    unsafe fn tail(&mut self, blk: usize, bp: *const i16, t4: *const u32,
+                   t5: *const u32, t6: *const u32, cv: *const i16, bar: bool) {
+        let out = self.dst(blk);
+        if bar { tail27_b(bp, out, t4, t5, t6, cv); }
+        else { tail27_p(bp, out, t4, t5, t6, cv); }
+        self.block(blk, out);
+    }
 }
 
 /// The sink of the plain entry points: block `blk` goes to its own place in the output batch and
@@ -741,20 +1017,22 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
 
         // levels 4, 5 and 6: one register-resident asm block per 27-block, handed to the sink.
         let cv = t.cv.as_ptr() as *const i16;
-        for j in 0..6 {
+        // LLVM assigns a very small cost to an opaque asm block. For the fused consumer it
+        // consequently unrolls all six large tails, expanding the hot function from about
+        // 6 KB to over 32 KB. Keep that loop's trip count opaque to the optimizer only:
+        // black_box is the identity, so every call still executes exactly six blocks.
+        let tail_blocks = if S::REGISTER_SINK { core::hint::black_box(6usize) } else { 6 };
+        for j in 0..tail_blocks {
             let kk = 6 * k + j;
-            let (bpj, opj) = (bp.add(32 * 27 * j), sink.dst(kk));
+            let bpj = bp.add(32 * 27 * j);
+            // k is 0..4 and black_box(6) is still 6, hence kk < 24. Pointer arithmetic
+            // avoids introducing bounds checks just because the compiler cannot see that.
             let (t4, t5, t6) = (
-                t.tw4[kk].as_ptr(),
-                t.tw5[3 * kk].as_ptr(),
-                t.tw6[9 * kk].as_ptr(),
+                t.tw4.as_ptr().add(kk).cast::<u32>(),
+                t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
+                t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
             );
-            if bar {
-                tail27_b(bpj, opj, t4, t5, t6, cv);
-            } else {
-                tail27_p(bpj, opj, t4, t5, t6, cv);
-            }
-            sink.block(kk, opj);
+            sink.tail(kk, bpj, t4, t5, t6, cv, bar);
         }
     }
 }
@@ -779,4 +1057,36 @@ pub unsafe fn ntt_bin_batch32_sink<const Q: u16, S: BlockSink>(
     sink: &mut S,
 ) {
     ntt_core::<Q, S>(input, sink);
+}
+
+struct HybridSink<const Q: u16, const RED: bool> {
+    key: *const i16,
+    acc: *mut i32,
+}
+
+impl<const Q: u16, const RED: bool> BlockSink for HybridSink<Q, RED> {
+    const REGISTER_SINK: bool = true;
+    unsafe fn dst(&mut self, _: usize) -> *mut i16 { unreachable!("fused tail has no scratch") }
+    unsafe fn block(&mut self, _: usize, _: *const i16) { unreachable!("fused tail consumes registers") }
+    #[inline(always)]
+    unsafe fn tail(&mut self, blk: usize, bp: *const i16, t4: *const u32,
+                   t5: *const u32, t6: *const u32, cv: *const i16, _: bool) {
+        tail27_hybrid::<Q, RED>(bp, t4, t5, t6, cv,
+            self.key.add(32 * 56 * blk), self.acc.add(16 * 8 * blk));
+    }
+}
+
+/// Binary NTT into the arranged two-stream hybrid accumulator, with no row-major output
+/// scratch. The original NTT entry point remains available as a differential reference.
+///
+/// # Safety
+/// AVX-512F/BW/VL/VBMI/VBMI2/VNNI and GFNI are required. `key` addresses 24*56 aligned
+/// 64-byte key vectors in the arranged hybrid format; `acc` addresses 24*8 aligned i32
+/// vectors. The caller must retain the existing accumulator bound and fold-back schedule.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+pub unsafe fn ntt_bin_batch32_hybrid<const Q: u16, const RED: bool>(
+    input: &BinaryIndex32, key: *const i16, acc: *mut i32,
+) {
+    assert!(Q == 3889 || Q == 9721, "the hybrid commitment's primes");
+    ntt_core::<Q, _>(input, &mut HybridSink::<Q, RED> { key, acc });
 }

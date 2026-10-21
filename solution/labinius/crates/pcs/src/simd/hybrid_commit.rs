@@ -440,12 +440,10 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
    // The witness is the commitment's only DRAM traffic, and the hardware
    // prefetchers do not follow it: a batch's 2 KB chunk of a column sits 256 KB
    // from the same chunk of the neighbouring column, and advances by 2 KB only
-   // after a whole group of columns has been transformed. Touch the chunks that
-   // come next while this one is read and transformed.
-   if prefetch_witness_on() {
-    prefetch_witness(cols[c].as_ptr().add(128*b),2048);
-    if b+1<nb {prefetch_witness(cols[c].as_ptr().add(128*(b+1)),2048);}
-    if c+1<g {prefetch_witness(cols[c+1].as_ptr().add(128*b),2048);}
+   // after a whole group of columns has been transformed. Touch the page starts
+   // of the next column's chunk while this one is read and transformed.
+   if prefetch_witness_on() && c+1<g {
+    prefetch_witness(cols[c+1].as_ptr().add(128*b),2048);
    }
    cols[c].slice_batch(b,&mut ws.idx[0]);
    let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;

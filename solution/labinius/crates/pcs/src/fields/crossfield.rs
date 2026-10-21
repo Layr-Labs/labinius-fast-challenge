@@ -141,6 +141,11 @@ unsafe fn xor3(a: __m512i, b: __m512i, c: __m512i) -> __m512i {
 
 const TILE: usize = 64;
 
+// Canonical F162 values have 162 significant bits. Linear combinations of their
+// basis images therefore have zero bytes 21..23. Keep the 24-plane transpose
+// layout, but leave those three planes explicitly zero instead of applying GFNI.
+const F162_LIVE_BYTES: usize = 162usize.div_ceil(8);
+
 /// `v[k] = sum_j bit_k(pi0[j]) eq_hi[j]`, a `128 x n` by `n x 128` bit product: per tile the
 /// bit-transposed bytes of `pi0` are the matrices, those of `eq_hi` the vectors, and
 /// `acc[h][kb].qword[i].byte[t].bit[k']` sums `V[8kb + 7 - k'][8(8h + i) + t]`.
@@ -407,7 +412,7 @@ fn poly_from_eq(eqs: &[&[B128]], batches: &[Vec<F162>], out: &mut super::sumchec
             let mut acc = [_mm512_setzero_si512(); 24];
             for (eq, m) in eqs.iter().zip(&ms) {
                 transpose_tile(eq.as_ptr().add(TILE * t) as *const u8, &mut xe);
-                for (a, row) in acc.iter_mut().zip(m) {
+                for (a, row) in acc[..F162_LIVE_BYTES].iter_mut().zip(m) {
                     for k in (0..16).step_by(2) {
                         *a = xor3(
                             *a,
@@ -1599,7 +1604,7 @@ unsafe fn map_tile(eq: *const B128, m: &[[u64; 16]; 24], out: &mut [[__m512i; 8]
     let mut xe = [_mm512_setzero_si512(); 16];
     transpose_tile(eq as *const u8, &mut xe);
     let mut acc = [_mm512_setzero_si512(); 24];
-    for (a, row) in acc.iter_mut().zip(m) {
+    for (a, row) in acc[..F162_LIVE_BYTES].iter_mut().zip(m) {
         for k in (0..16).step_by(2) {
             *a = xor3(
                 *a,
@@ -1626,7 +1631,7 @@ unsafe fn map_tile2(
     transpose_tile(eq as *const u8, &mut xe);
     for (m, out) in [(m, out), (mp, outp)] {
         let mut acc = [_mm512_setzero_si512(); 24];
-        for (a, row) in acc.iter_mut().zip(m) {
+        for (a, row) in acc[..F162_LIVE_BYTES].iter_mut().zip(m) {
             for k in (0..16).step_by(2) {
                 *a = xor3(
                     *a,
@@ -2568,5 +2573,57 @@ mod lean_tests {
         }
         let r = B128(next(&mut x));
         assert_eq!((B128::ONE + r) * b128_inv(B128::ONE + r), B128::ONE);
+    }
+}
+
+
+#[cfg(test)]
+mod live_byte_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_maps_match_scalar_with_poisoned_output() {
+        let mut state = 0x1516_1718_1920_2122u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mask = (1u64 << 34) - 1;
+        let mut images: Vec<_> = (0..PACK)
+            .map(|_| F162([next(), next(), next() & mask])).collect();
+        for round in 0..24 {
+            let d = B128(next() as u128 | ((next() as u128) << 64));
+            let composed = compose_scale(&images, d);
+            let (m, mp) = (eq_matrices(&images), eq_matrices(&composed));
+            assert!(m[F162_LIVE_BYTES..].iter().flatten().all(|&x| x == 0));
+            assert!(mp[F162_LIVE_BYTES..].iter().flatten().all(|&x| x == 0));
+            for mode in 0..5 {
+                let words: [B128; TILE] = core::array::from_fn(|i| match mode {
+                    0 | 1 => B128(1u128 << (64 * mode + i)),
+                    2 => B128((1u128 << i) ^ (1u128 << ((i + round + 1) % 128))),
+                    3 => B128(!0),
+                    _ => B128(next() as u128 | ((next() as u128) << 64)),
+                });
+                unsafe {
+                    let poison = [[_mm512_set1_epi64(-1); 8]; 3];
+                    let (mut a, mut b, mut single) = (poison, poison, poison);
+                    map_tile2(words.as_ptr(), &m, &mp, &mut a, &mut b);
+                    map_tile(words.as_ptr(), &m, &mut single);
+                    let lanes = |v| core::mem::transmute::<[[__m512i; 8]; 3], [[[u64; 8]; 8]; 3]>(v);
+                    assert_eq!(lanes(a), lanes(single));
+                    for (out, images) in [(lanes(a), &images), (lanes(b), &composed)] {
+                        for i in 0..TILE {
+                            let actual = F162(core::array::from_fn(|l| out[l][i / 8][i % 8]));
+                            assert_eq!(actual, apply_images(images, words[i]));
+                            assert_eq!(actual.0[2] & !mask, 0);
+                        }
+                    }
+                }
+            }
+            let r = F162([next(), next(), next() & mask]);
+            for (l, lp) in images.iter_mut().zip(composed) { *l += r * lp; }
+        }
     }
 }

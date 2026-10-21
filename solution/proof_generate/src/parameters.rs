@@ -10,6 +10,8 @@ pub const COLUMNS: usize = 1 << COLUMN_LOG;
 pub const COLUMN_LEN: usize = 1 << (LOG_PACKED - COLUMN_LOG as usize);
 /// Ring elements of one column: four `F162` make one element of `R_648`.
 pub const RING_ELEMENTS: usize = COLUMN_LEN / 4;
-/// Two NTT primes plus a 1024 residue. The latter reuses the witness transforms
-/// through a certified exact-integer lift of the fixed public matrix.
-pub const MODULUS:u128=38_712_288_256;
+/// The product of three limbs: no pair of the supported primes reaches the checker's 2^35.03
+/// minimum-modulus threshold, so three are required. This triple keeps the fully splitting 3889
+/// as the base (so the fold stays on `ntt::bin_asm`) and replaces the quadratic 4861 with the
+/// splitting 9721, which measures faster in the commitment than the quadratic kernel.
+pub const MODULUS: u128 = 110_277_094_573;

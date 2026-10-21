@@ -136,6 +136,12 @@ impl CommitmentOpening {
     pub fn residues_mut(&mut self) -> Option<&mut recursion::limbs::Residues> {
         self.residues.as_mut()
     }
+
+    /// The committed columns as centered coefficients modulo each prime, from the raw rows the
+    /// commitment kernel produced.
+    pub fn coefficients(&self, primes: &[u16]) -> Vec<Vec<i16>> {
+        self.aux.coefficients(primes)
+    }
 }
 
 /// A point of `F162^nu` split the way the witness is: `p0` over the row variables (the index

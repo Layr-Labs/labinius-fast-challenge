@@ -58,11 +58,15 @@
 //! coefficients is that tree's ([`intt_gen_batch32`], `ntt::gen_large`'s, or
 //! `ntt::gen_quad`'s).
 use crate::challenge::ShortChallenge;
-use crate::key::AuxData;
+use crate::fields::scalar::{B128, F162};
+use crate::key::{AuxData, CommitmentKey};
 use crate::limb::{dispatch_limb, is_quad};
 use crate::params::{quadratic_slots, N, QS, QS_LARGE, QS_QUAD, QUAD_CLASS_SLOT, QUAD_SLOTS};
 use crate::ring::{Batch32, Representation, RingElement, BASE_PRIME, N162, PRIMES, SLOT_648};
 use crate::simd::commit as cm;
+use crate::simd::ntt::bin_asm as vb;
+use crate::simd::ntt::bin_quad as vqb;
+use crate::simd::transpose_f162::{slice_f162_into, BinaryIndex32};
 use crate::simd::slots as sl;
 use crate::simd::ntt::bin_large as vl;
 use crate::simd::ntt::gen_small::{self as vg, intt_gen_batch32, ntt_gen_batch32};
@@ -643,13 +647,18 @@ fn parallel_batches(vb: &mut [Batch32], f: impl Fn(&mut Batch32) + Sync) {
         .min(n);
     let addr = vb.as_mut_ptr() as usize;
     let stride = std::mem::size_of::<Batch32>();
-    crate::par::pool().run(threads, |t| {
-        let mut i = t;
-        while i < n {
-            unsafe {
-                f(&mut *((addr + i * stride) as *mut Batch32));
-            }
-            i += threads;
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let f = &f;
+            scope.spawn(move || {
+                let mut i = t;
+                while i < n {
+                    unsafe {
+                        f(&mut *((addr + i * stride) as *mut Batch32));
+                    }
+                    i += threads;
+                }
+            });
         }
     });
 }
@@ -704,6 +713,192 @@ pub(crate) fn fold_witness(
         quad |Q| fold_quad::<Q>(aux, challenges, bpc),
     );
     (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
+}
+
+// =============================================================================================
+// the streaming fold
+// =============================================================================================
+
+/// One binary batch, sliced from either the lifted witness or the harness's words, written out
+/// in the transform layout with ordinary (cacheable) stores.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,gfni")]
+unsafe fn transform_batch<const Q: u16, const QUAD: bool>(
+    src: cm::Source<'_>,
+    b: usize,
+    out: *mut i16,
+) {
+    let mut idx = BinaryIndex32::zero();
+    match src {
+        cm::Source::F162(e) => slice_f162_into(
+            &*(e.as_ptr().add(128 * b) as *const [F162; 128]),
+            &mut idx,
+        ),
+        cm::Source::Words(w) => crate::simd::transpose_f162::slice_b128_into(
+            &*(w.as_ptr().add(128 * b) as *const [B128; 128]),
+            &mut idx,
+        ),
+    }
+    if QUAD {
+        vqb::ntt_quad_bin_batch32_sink::<Q, _>(&idx, &mut vqb::OutSink(out));
+    } else if Gen::<Q>::LARGE {
+        vl::ntt_bin_batch32_sink::<Q, _>(&idx, &mut vb::OutSink(out));
+    } else {
+        vb::ntt_bin_batch32_sink::<Q, _>(&idx, &mut vb::OutSink(out));
+    }
+}
+
+type BatchTransform = for<'a> unsafe fn(cm::Source<'a>, usize, *mut i16);
+
+/// One worker's batch positions: for every chunk pair, regenerate both chunks' base-limb
+/// transform for those positions, accumulate them against the pair's challenge, fold back on the
+/// same global chunk cadence, and drain.
+fn stream_positions<const Q: u16>(
+    witness: cm::Source<'_>,
+    len_f162: usize,
+    ch: &ChallengeNtt,
+    transform: BatchTransform,
+    first: usize,
+    last: usize,
+    acc: *mut i32,
+    out: *mut Batch32,
+) {
+    let mut w0 = Batch32::zero(Representation::Ntt);
+    let mut w1 = Batch32::zero(Representation::Ntt);
+    let n = last - first;
+    unsafe {
+        core::ptr::write_bytes(acc, 0, n * N * 2 * 16);
+        for i in 0..ch.pair.len() {
+            let s0 = witness.chunk(2 * i, len_f162);
+            let s1 = witness.chunk(2 * i + 1, len_f162);
+            for (j, b) in (first..last).enumerate() {
+                transform(s0, b, w0.v.as_mut_ptr() as *mut i16);
+                transform(s1, b, w1.v.as_mut_ptr() as *mut i16);
+                accumulate_pair(
+                    w0.v.as_ptr() as *const i16,
+                    w1.v.as_ptr() as *const i16,
+                    ch.pair[i].as_ptr(),
+                    acc.add(32 * N * j),
+                );
+            }
+            if (2 * (i + 1)) % fold_period(Q) == 0 {
+                fold_back::<Q>(acc, n * N * 2);
+            }
+        }
+        fold_back::<Q>(acc, n * N * 2);
+        for (j, b) in (first..last).enumerate() {
+            drain::<Q>(acc.add(32 * N * j), &mut *out.add(b));
+        }
+    }
+}
+
+/// The whole fold over the witness: batch positions are partitioned across workers, so every
+/// transform is computed exactly once and each worker drains its own positions. No combine step
+/// is needed.
+fn stream_drive<const Q: u16>(
+    witness: cm::Source<'_>,
+    key: &CommitmentKey,
+    ch: &ChallengeNtt,
+    transform: BatchTransform,
+) -> Vec<Batch32> {
+    let bpc = key.len_ring() / 32;
+    let len_f162 = key.len_f162();
+    let pairs = ch.pair.len();
+    assert_eq!(
+        witness.len(),
+        2 * pairs * len_f162,
+        "the witness does not cover the fold's chunks"
+    );
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(bpc);
+    let per = bpc.div_ceil(threads);
+    let mut out: Vec<Batch32> = (0..bpc)
+        .map(|_| Batch32::zero(Representation::Ntt))
+        .collect();
+    let mut accs: Vec<Vec<AccVec>> = (0..threads)
+        .map(|_| vec![AccVec([0i32; 16]); per * N * 2])
+        .collect();
+    let out_base = out.as_mut_ptr() as usize;
+    let acc_ptrs: Vec<usize> = accs.iter_mut().map(|a| a.as_mut_ptr() as usize).collect();
+    std::thread::scope(|scope| {
+        for (t, &acc) in acc_ptrs.iter().enumerate() {
+            let first = t * per;
+            let last = ((t + 1) * per).min(bpc);
+            if first >= last {
+                continue;
+            }
+            scope.spawn(move || {
+                stream_positions::<Q>(
+                    witness,
+                    len_f162,
+                    ch,
+                    transform,
+                    first,
+                    last,
+                    acc as *mut i32,
+                    out_base as *mut Batch32,
+                )
+            });
+        }
+    });
+    out
+}
+
+fn fold_streaming_split<const Q: u16>(
+    witness: cm::Source<'_>,
+    key: &CommitmentKey,
+    challenges: &[ShortChallenge],
+) -> Vec<RingElement> {
+    let ch = challenge_ntt::<Q>(challenges);
+    let mut vb = stream_drive::<Q>(witness, key, &ch, transform_batch::<Q, false>);
+    parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
+    let bpc = vb.len();
+    (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
+}
+
+fn fold_streaming_quad<const Q: u16>(
+    witness: cm::Source<'_>,
+    key: &CommitmentKey,
+    challenges: &[ShortChallenge],
+) -> Vec<RingElement> {
+    let ch = challenge_ntt_quad_base::<Q>(challenges);
+    let mut vb = stream_drive::<Q>(witness, key, &ch, transform_batch::<Q, true>);
+    parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
+    let bpc = vb.len();
+    (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
+}
+
+/// `v = sum_j c_j W_j` modulo the base prime, regenerating the witness transform from the lifted
+/// witness instead of reading it back from a materialised [`AuxData`].
+pub(crate) fn fold_witness_streaming(
+    witness: &[F162],
+    key: &CommitmentKey,
+    challenges: &[ShortChallenge],
+    q: u16,
+) -> Vec<RingElement> {
+    let src = cm::Source::F162(witness);
+    dispatch_limb!(
+        q,
+        split |Q| fold_streaming_split::<Q>(src, key, challenges),
+        quad |Q| fold_streaming_quad::<Q>(src, key, challenges),
+    )
+}
+
+/// The same fold over the harness's little-endian `B128` words.
+pub(crate) fn fold_witness_streaming_words(
+    witness: &[B128],
+    key: &CommitmentKey,
+    challenges: &[ShortChallenge],
+    q: u16,
+) -> Vec<RingElement> {
+    let src = cm::Source::Words(witness);
+    dispatch_limb!(
+        q,
+        split |Q| fold_streaming_split::<Q>(src, key, challenges),
+        quad |Q| fold_streaming_quad::<Q>(src, key, challenges),
+    )
 }
 
 const QUAD_COMPONENT_SLOT: [[u16; N162]; 4] = {
@@ -900,1106 +1095,4 @@ pub(crate) fn fold_columns_slots(
     out: &mut [[i16; N162]; 4],
 ) {
     dispatch_limb!(q, |Q| fold_columns_limb::<Q>(challenges, columns, out))
-}
-
-// =============================================================================================
-// the streaming fold: the transform regenerated from the words instead of kept
-// =============================================================================================
-//
-// At the challenge's shape the kept base-limb transform is `columns * bpc` batches of 41472
-// bytes — 5.4 GB for 2^24 words — written once with non-temporal stores, faulted in, read once
-// here and freed at exit. One binary transform of a batch is a few hundred cycles per ring
-// element, so regenerating it from the words costs less than streaming it, and the prover's
-// footprint drops to the words themselves.
-//
-// The accumulation is [`accumulate`]'s exactly: the same `accumulate_pair` over the same
-// lazily reduced kernel output (`ntt_bin_batch32` writes the values `MacKeep` streamed out), the
-// same fold-back cadence, the same `drain` and inverse transform, so the fold is bit for bit the
-// one the kept transform gives. Each worker owns a run of batch positions and regenerates the
-// `(column, position)` transforms it needs, so every transform is computed exactly once.
-
-use crate::fields::scalar::B128;
-use crate::simd::ntt::bin_asm as vb;
-use crate::simd::ntt::bin_quad as vq;
-use crate::simd::transpose_f162::{slice_b128_into, BinaryIndex32};
-
-/// The binary transform of a base limb's tree, as a type so that a splitting prime only ever
-/// instantiates the splitting kernels and a quadratic-slot prime only the quadratic one (the
-/// kernels' tables are built at compile time for their own class of prime).
-trait WordTransform {
-    /// `NTT_q(w)` of the 32 binary ring elements `idx` indexes, lazily reduced, in `out`.
-    ///
-    /// # Safety
-    /// AVX-512 F/BW/VL/VBMI/VBMI2/VNNI and GFNI.
-    unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32);
-}
-
-struct SplitTransform<const Q: u16>;
-struct QuadTransform<const Q: u16>;
-
-impl<const Q: u16> WordTransform for SplitTransform<Q> {
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-    unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32) {
-        if Gen::<Q>::LARGE {
-            vl::ntt_bin_batch32::<Q>(idx, out);
-        } else {
-            vb::ntt_bin_batch32::<Q>(idx, out);
-        }
-    }
-}
-
-impl<const Q: u16> WordTransform for QuadTransform<Q> {
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-    unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32) {
-        vq::ntt_quad_bin_batch32::<Q>(idx, out);
-    }
-}
-
-/// `NTT_q(w)` of the 32 binary ring elements formed by `words`, lazily reduced, in `out`.
-///
-/// # Safety
-/// AVX-512 F/BW/VL/VBMI/VBMI2/VNNI and GFNI.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn transform_words<T: WordTransform>(
-    words: &[B128; 128],
-    idx: &mut BinaryIndex32,
-    out: &mut Batch32,
-) {
-    slice_b128_into(words, idx);
-    T::transform(idx, out);
-}
-
-/// [`accumulate`] with the witness transform regenerated from `words`: `v_ntt` modulo `Q`,
-/// centered, one `Batch32` per batch position. `words` is `columns` columns of `128 * bpc`
-/// words each.
-fn accumulate_streaming<const Q: u16, T: WordTransform>(
-    words: &[B128],
-    columns: usize,
-    ch: &ChallengeNtt,
-    bpc: usize,
-    workers: usize,
-) -> Vec<Batch32> {
-    let pairs = ch.pair.len();
-    assert_eq!(2 * pairs, columns, "one challenge per column, paired");
-    let column_words = 128 * bpc;
-    assert_eq!(words.len(), columns * column_words, "the words are not whole columns");
-    let g = G.min(bpc);
-    let groups: Vec<usize> = (0..bpc).step_by(g).collect();
-    let workers = workers.clamp(1, groups.len());
-    let mut out: Vec<Batch32> = (0..bpc)
-        .map(|_| Batch32::zero(Representation::Ntt))
-        .collect();
-    let out_addr = out.as_mut_ptr() as usize;
-    let stride = std::mem::size_of::<Batch32>();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    crate::par::pool().run(workers, |_| {
-        let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
-        let base = acc.as_mut_ptr() as *mut i32;
-        let mut idx = BinaryIndex32::zero();
-        let mut w0 = Box::new(Batch32::zero(Representation::Ntt));
-        let mut w1 = Box::new(Batch32::zero(Representation::Ntt));
-        loop {
-            let gi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if gi >= groups.len() {
-                break;
-            }
-            let b0 = groups[gi];
-            let gb = g.min(bpc - b0);
-            for v in acc.iter_mut() {
-                *v = AccVec([0i32; 16]);
-            }
-            unsafe {
-                for i in 0..pairs {
-                    for b in 0..gb {
-                        let at = |j: usize| {
-                            let start = j * column_words + 128 * (b0 + b);
-                            &*(words.as_ptr().add(start) as *const [B128; 128])
-                        };
-                        transform_words::<T>(at(2 * i), &mut idx, &mut w0);
-                        transform_words::<T>(at(2 * i + 1), &mut idx, &mut w1);
-                        accumulate_pair(
-                            w0.v.as_ptr() as *const i16,
-                            w1.v.as_ptr() as *const i16,
-                            ch.pair[i].as_ptr(),
-                            base.add(32 * N * b),
-                        );
-                    }
-                    if (2 * (i + 1)) % fold_period(Q) == 0 {
-                        fold_back::<Q>(base, gb * N * 2);
-                    }
-                }
-                for b in 0..gb {
-                    let dst = &mut *((out_addr + (b0 + b) * stride) as *mut Batch32);
-                    drain::<Q>(base.add(32 * N * b), dst);
-                }
-            }
-        }
-    });
-    out
-}
-
-fn fold_split_streaming<const Q: u16>(
-    words: &[B128],
-    columns: usize,
-    challenges: &[ShortChallenge],
-    bpc: usize,
-    workers: usize,
-) -> Vec<Batch32> {
-    let ch = challenge_ntt::<Q>(challenges);
-    let mut vb = accumulate_streaming::<Q, SplitTransform<Q>>(words, columns, &ch, bpc, workers);
-    parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
-    vb
-}
-
-fn fold_quad_streaming<const Q: u16>(
-    words: &[B128],
-    columns: usize,
-    challenges: &[ShortChallenge],
-    bpc: usize,
-    workers: usize,
-) -> Vec<Batch32> {
-    let ch = challenge_ntt_quad_base::<Q>(challenges);
-    let mut vb = accumulate_streaming::<Q, QuadTransform<Q>>(words, columns, &ch, bpc, workers);
-    parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
-    vb
-}
-
-/// [`fold_witness`] from the `B128` words the witness was lifted from, with the base-limb
-/// transform regenerated on the fly rather than read from an [`AuxData`]: the same `v`, in
-/// coefficient form modulo the base prime `q`, centered. `words` is `columns` columns of
-/// `128 * bpc` words; `workers` bounds the threads.
-pub fn fold_witness_streaming(
-    words: &[B128],
-    columns: usize,
-    challenges: &[ShortChallenge],
-    bpc: usize,
-    q: u16,
-    workers: usize,
-) -> Vec<RingElement> {
-    assert_eq!(challenges.len(), columns, "one challenge per column");
-    assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
-    let vb = dispatch_limb!(
-        q,
-        split |Q| fold_split_streaming::<Q>(words, columns, challenges, bpc, workers),
-        quad |Q| fold_quad_streaming::<Q>(words, columns, challenges, bpc, workers),
-    );
-    (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
-}
-
-// =============================================================================================
-// the fold from the words with bit-sliced counters
-// =============================================================================================
-//
-// [`crate::fold_bits`] computes `v` without any transform: a few vector operations per
-// challenge term on 512-lane bit planes of the words. This is the driver: the GFNI transpose of
-// the library feeds the planes, the blocks go out over the pool, and two runtime checks guard
-// the result — the GFNI transposer is compared with the portable one on one block (and
-// replaced by it if they differ), and one batch position of the fold is recomputed through the
-// transform path by the caller (`fold_witness_positions`) and compared.
-
-use crate::fold_bits::{self as fb, Challenge, Lanes, Transposer};
-use crate::simd::transpose_f162::transpose8x8_q;
-use crate::fields::bitmat::{transpose_tile, GF_IDENT};
-
-/// The library's GFNI tile transpose, continued to bit planes: per 64-word tile the byte
-/// transpose, the 8x8 bit transpose of every qword (`gf2p8affine` by the identity), and an 8x8
-/// byte transpose, which leaves qword `t` of vector `k` holding bit `8 k + t` of the tile's
-/// 64 words in `word_at` order; a qword transpose across the eight tiles then assembles each
-/// plane's 512 lanes.
-///
-/// Which plane index a given (`k`, `t`) lands on depends on the affine's bit convention, so the
-/// driver derives the plane permutation at run time against the portable transposer.
-pub struct Gfni {
-    /// `plane[q]` is produced at raw index `perm[q]`.
-    perm: [u8; fb::WORD_BITS],
-    /// The word lane `l` carries.
-    map: fn(usize) -> usize,
-}
-
-impl Gfni {
-    /// A transposer validated against the portable one on `sample` (512 words), under each
-    /// candidate lane order: `None` when no lane order and permutation of its raw planes
-    /// reproduces the portable planes.
-    pub fn validated(sample: &[u128]) -> Option<Gfni> {
-        assert!(sample.len() >= fb::LANES);
-        let mut raw = [fb::V::zero(); fb::WORD_BITS];
-        unsafe { gfni_raw_planes(sample.as_ptr(), &mut raw) };
-        let raw_words: Vec<[u64; 8]> = raw.iter().map(|v| v.words()).collect();
-        let candidates: [fn(usize) -> usize; 2] = [fb::lane_word_reversed8, fb::lane_word];
-        'maps: for map in candidates {
-            let mut want = [fb::V::zero(); fb::WORD_BITS];
-            unsafe { fb::portable_planes(sample.as_ptr(), &mut want, map) };
-            let mut perm = [0u8; fb::WORD_BITS];
-            let mut used = [false; fb::WORD_BITS];
-            for (q, w) in want.iter().enumerate() {
-                let w = w.words();
-                let Some(at) = (0..fb::WORD_BITS).find(|&i| !used[i] && raw_words[i] == w) else {
-                    continue 'maps;
-                };
-                used[at] = true;
-                perm[q] = at as u8;
-            }
-            return Some(Gfni { perm, map });
-        }
-        None
-    }
-}
-
-/// The raw planes of the GFNI path, before the permutation.
-///
-/// # Safety
-/// AVX-512 F/BW/VBMI and GFNI; `words` addresses 512 readable `u128`.
-#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
-unsafe fn gfni_raw_planes(words: *const u128, out: &mut [fb::V; fb::WORD_BITS]) {
-    // Byte (8 t + i) of the output takes byte (8 i + t) of the input: an 8x8 byte transpose.
-    let idx: [u8; 64] = core::array::from_fn(|o| (8 * (o % 8) + o / 8) as u8);
-    let t8 = _mm512_loadu_si512(idx.as_ptr() as *const __m512i);
-    let ident = _mm512_set1_epi64(GF_IDENT);
-    let mut u = [[_mm512_setzero_si512(); 16]; 8];
-    let mut xp = [_mm512_setzero_si512(); 16];
-    for tile in 0..8 {
-        transpose_tile(words.add(64 * tile) as *const u8, &mut xp);
-        for k in 0..16 {
-            let bits = _mm512_gf2p8affine_epi64_epi8::<0>(ident, xp[k]);
-            u[tile][k] = _mm512_permutexvar_epi8(t8, bits);
-        }
-    }
-    for k in 0..16 {
-        let o = transpose8x8_q(core::array::from_fn(|tile| u[tile][k]));
-        for t in 0..8 {
-            out[8 * k + t] = fb::V(o[t]);
-        }
-    }
-}
-
-impl Transposer for Gfni {
-    unsafe fn planes<L: Lanes>(&self, words: *const u128, out: &mut [L; fb::WORD_BITS]) {
-        let mut raw = [fb::V::zero(); fb::WORD_BITS];
-        gfni_raw_planes(words, &mut raw);
-        for q in 0..fb::WORD_BITS {
-            out[q] = L::from_words(raw[self.perm[q] as usize].words());
-        }
-    }
-    fn lane_word(&self, l: usize) -> usize {
-        (self.map)(l)
-    }
-}
-
-/// `v = sum_j c_j W_j` from the words with the bit-sliced counters, in coefficient form,
-/// centered: the same elements [`fold_witness_streaming`] returns. `words` is `columns`
-/// columns of `column_words` words (a multiple of 512). Blocks of 128 elements go out over the
-/// pool.
-pub fn fold_witness_bits(
-    words: &[B128],
-    columns: usize,
-    column_words: usize,
-    challenges: &[ShortChallenge],
-) -> Vec<RingElement> {
-    assert_eq!(challenges.len(), columns, "one challenge per column");
-    assert!(column_words % fb::LANES == 0 && words.len() == columns * column_words);
-    let cs: Vec<Challenge> = challenges
-        .iter()
-        .map(|c| Challenge {
-            positions: c.positions,
-            signs: c.signs,
-            weight: c.weight,
-        })
-        .collect();
-    let raw = words.as_ptr() as usize;
-    let elements = column_words / 4;
-    let blocks = elements / fb::BLOCK_ELEMENTS;
-    let reach = fb::Reach::of(&cs);
-    let mut out: Vec<[i16; N]> = vec![[0i16; N]; elements];
-    let out_addr = out.as_mut_ptr() as usize;
-    let sample = &words[..fb::LANES];
-    let gfni = Gfni::validated(unsafe { core::slice::from_raw_parts(sample.as_ptr() as *const u128, fb::LANES) });
-    FOLD_USED_GFNI.store(gfni.is_some(), std::sync::atomic::Ordering::Relaxed);
-    let run_block = |block: usize| {
-        let chunk = unsafe {
-            core::slice::from_raw_parts_mut(
-                (out_addr as *mut [i16; N]).add(block * fb::BLOCK_ELEMENTS),
-                fb::BLOCK_ELEMENTS,
-            )
-        };
-        let raw = raw as *const u128;
-        unsafe {
-            match &gfni {
-                Some(t) => fb::fold_block::<fb::V, Gfni>(raw, columns, column_words, &cs, &reach, block, t, chunk),
-                None => fb::fold_block::<fb::V, fb::Portable>(raw, columns, column_words, &cs, &reach, block, &fb::Portable, chunk),
-            }
-        }
-    };
-    crate::par::pool().run(blocks, run_block);
-    out.into_iter()
-        .map(|v| RingElement {
-            v,
-            representation: Representation::Coefficients,
-        })
-        .collect()
-}
-
-/// Whether the last [`fold_witness_bits`] ran on the GFNI transposer (else the portable one),
-/// for the profile line.
-pub static FOLD_USED_GFNI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// [`fold_witness_streaming`] restricted to the batch positions `positions` (32 ring elements
-/// each): element `32 b + i` of the fold for `b` in `positions`, in order — the transform path's
-/// answer, for checking another path against.
-pub fn fold_witness_positions(
-    words: &[B128],
-    columns: usize,
-    challenges: &[ShortChallenge],
-    bpc: usize,
-    q: u16,
-    positions: core::ops::Range<usize>,
-) -> Vec<RingElement> {
-    assert_eq!(challenges.len(), columns, "one challenge per column");
-    assert!(bpc > 0 && words.len() == columns * 128 * bpc && positions.end <= bpc);
-    let vb = dispatch_limb!(
-        q,
-        split |Q| {
-            let ch = challenge_ntt::<Q>(challenges);
-            let mut vb = accumulate_streaming_positions::<Q, SplitTransform<Q>>(words, columns, &ch, bpc, positions.clone());
-            parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
-            vb
-        },
-        quad |Q| {
-            let ch = challenge_ntt_quad_base::<Q>(challenges);
-            let mut vb = accumulate_streaming_positions::<Q, QuadTransform<Q>>(words, columns, &ch, bpc, positions.clone());
-            parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
-            vb
-        },
-    );
-    (0..32 * vb.len()).map(|i| vb[i / 32].get(i % 32)).collect()
-}
-
-/// [`accumulate_streaming`] over the batch positions `positions` only, one position per task.
-fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
-    words: &[B128],
-    columns: usize,
-    ch: &ChallengeNtt,
-    bpc: usize,
-    positions: core::ops::Range<usize>,
-) -> Vec<Batch32> {
-    let pairs = ch.pair.len();
-    assert_eq!(2 * pairs, columns, "one challenge per column, paired");
-    let column_words = 128 * bpc;
-    let n = positions.len();
-    let mut out: Vec<Batch32> = (0..n).map(|_| Batch32::zero(Representation::Ntt)).collect();
-    let out_addr = out.as_mut_ptr() as usize;
-    let stride = std::mem::size_of::<Batch32>();
-    let first = positions.start;
-    crate::par::pool().run(n, |i| {
-        let b = first + i;
-        let mut acc = vec![AccVec([0i32; 16]); N * 2];
-        let base = acc.as_mut_ptr() as *mut i32;
-        let mut idx = BinaryIndex32::zero();
-        let mut w0 = Box::new(Batch32::zero(Representation::Ntt));
-        let mut w1 = Box::new(Batch32::zero(Representation::Ntt));
-        unsafe {
-            for p in 0..pairs {
-                let at = |j: usize| {
-                    let start = j * column_words + 128 * b;
-                    &*(words.as_ptr().add(start) as *const [B128; 128])
-                };
-                transform_words::<T>(at(2 * p), &mut idx, &mut w0);
-                transform_words::<T>(at(2 * p + 1), &mut idx, &mut w1);
-                accumulate_pair(
-                    w0.v.as_ptr() as *const i16,
-                    w1.v.as_ptr() as *const i16,
-                    ch.pair[p].as_ptr(),
-                    base,
-                );
-                if (2 * (p + 1)) % fold_period(Q) == 0 {
-                    fold_back::<Q>(base, N * 2);
-                }
-            }
-            let dst = &mut *((out_addr + i * stride) as *mut Batch32);
-            drain::<Q>(base, dst);
-        }
-    });
-    out
-}
-
-/// Exact integer fold directly from the binary words, using 512-lane bit-sliced counters.
-/// Shapes without whole 512-word blocks or with more than 32767 challenge terms retain the
-/// NTT implementation. For honest challenge instances the exact coefficients equal its
-/// centered residues; this path performs no modular reconstruction.
-pub fn fold_witness_bitsliced(
-    words: &[B128],
-    columns: usize,
-    challenges: &[ShortChallenge],
-    bpc: usize,
-    q: u16,
-    workers: usize,
-) -> Vec<RingElement> {
-    assert_eq!(challenges.len(), columns, "one challenge per column");
-    assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
-    if bpc % 4 != 0 || challenges.iter().map(|c| c.weight).sum::<usize>() > 32767 {
-        return fold_witness_streaming(words, columns, challenges, bpc, q, workers);
-    }
-    bitsliced::fold_words(words, challenges, 128 * bpc, workers)
-}
-
-// Exact fold of the binary witness, independent of commitment-modulus arithmetic.
-mod bitsliced {
-    //! Integer convolution in Z[Y]/(Y^243 + 1), followed by reduction modulo
-    //! Y^162 - Y^81 + 1. Since (Y^81 + 1)(Y^162 - Y^81 + 1) = Y^243 + 1,
-    //! this gives exactly the original ring product, with no probabilistic reconstruction.
-    //!
-    //! A negative bit contribution is accumulated as its complement, with a scalar bias removed
-    //! at the end: -b = (1-b)-1. The counter therefore only adds unsigned bit planes. Its low six
-    //! bits use a 64-input carry-save tree (two ternlogs per full adder); the carry into bit six
-    //! ripples through the remaining nine bits once per 64 inputs. The 15-bit counter cannot
-    //! overflow when the total challenge weight is at most 32767.
-    use super::{B128, Representation, RingElement, ShortChallenge};
-    use crate::fields::bitmat;
-    use crate::simd::transpose_f162::transpose8x8_q;
-    use core::arch::x86_64::*;
-
-    const LANES: usize = 512;
-    const SLOTS: usize = 243;
-    const BITS: usize = 15;
-    /// 31 columns per group: 31 * 259 planes keep the qword offsets in u16 and halve the
-    /// zero padding of the 64-input chunks against 16; about 840 KB of planes, counters and
-    /// schedule per worker, two hyperthread siblings inside one 2 MB L2.
-    const COL_GROUP: usize = 31;
-    /// Planes per column: a zero guard, the 128 direct planes, a zero guard, the 128
-    /// complemented planes, and the next column's leading guard. Every term's 128-plane run is
-    /// flanked by zero planes, so a window of two consecutive slots reads a zero wherever the
-    /// term does not reach, with no edge cases in the schedule.
-    const STRIDE: usize = 259;
-    /// Plane index of column `j`'s first direct plane; `GUARD + j * STRIDE - 1` is its leading
-    /// zero guard, and planes 0 and 1 (the padding pair of a short chunk) are both zero.
-    const GUARD: usize = 2;
-    const COMPLEMENT: usize = 129;
-    /// Slot pairs `(2q, 2q + 1)`; the odd slot of the last pair (243) is a dummy.
-    const PAIRS: usize = SLOTS.div_ceil(2);
-    // At most 31 columns keep qword offsets in u16 and two plane/counter buffers within 2 MiB.
-    // The offsets use x86's scale-8 addressing directly, avoiding a shift per input.
-    const _: () = assert!((GUARD + COL_GROUP * STRIDE) * 8 <= u16::MAX as usize);
-
-    struct Group {
-        first: usize,
-        columns: usize,
-        /// `terms[offsets[q] .. offsets[q + 1]]` is the schedule of slot pair `q`, padded to a
-        /// multiple of 64 with offset 0 (planes 0 and 1 are zero).
-        offsets: [usize; PAIRS + 1],
-        terms: Vec<u16>,
-    }
-
-    fn plan<const GROUP: usize>(challenges: &[ShortChallenge]) -> (Vec<Group>, [i32; SLOTS]) {
-        let mut bias_diff = [0i32; SLOTS + 1];
-        let mut groups = Vec::new();
-        for (g, cs) in challenges.chunks(GROUP).enumerate() {
-            // A term's run `[m, end)` of slots meets slot pair `q` when `2q <= end - 1` and
-            // `2q + 1 >= m`, i.e. `q` in `[m / 2, (end - 1) / 2]`; the wrapped run `[0, wrap)`
-            // meets pairs `[0, (wrap - 1) / 2]`.
-            let mut count_diff = [0i32; PAIRS + 1];
-            let mut shifts = Vec::with_capacity(cs.len() * 32);
-            for (j, c) in cs.iter().enumerate() {
-                assert!(c.weight <= c.positions.len());
-                for t in 0..c.weight {
-                    let m = c.positions[t] as usize;
-                    assert!(m < 162);
-                    let negative = ((c.signs >> t) & 1 != 0) ^ (m % 2 != 0);
-                    shifts.push((j as u16, m as u8, negative));
-                    let end = (m + 128).min(SLOTS);
-                    count_diff[m / 2] += 1;
-                    count_diff[(end - 1) / 2 + 1] -= 1;
-                    if negative {
-                        bias_diff[m] += 1;
-                        bias_diff[end] -= 1;
-                    }
-                    let wrap = (m + 128).saturating_sub(SLOTS);
-                    if wrap != 0 {
-                        count_diff[0] += 1;
-                        count_diff[(wrap - 1) / 2 + 1] -= 1;
-                        if !negative {
-                            bias_diff[0] += 1;
-                            bias_diff[wrap] -= 1;
-                        }
-                    }
-                }
-            }
-            let mut group = Group {
-                first: g * GROUP,
-                columns: cs.len(),
-                offsets: [0; PAIRS + 1],
-                terms: Vec::new(),
-            };
-            let mut count = 0i32;
-            for q in 0..PAIRS {
-                count += count_diff[q];
-                debug_assert!(count >= 0);
-                group.offsets[q + 1] = group.offsets[q] + (count as usize).div_ceil(64) * 64;
-            }
-            // Offset 0 is the padding pair (planes 0 and 1 are zero), not a column's plane.
-            group.terms.resize(group.offsets[PAIRS], 0);
-            let mut at: [usize; PAIRS] = core::array::from_fn(|q| group.offsets[q]);
-            for (j, m, negative) in shifts {
-                let m = m as usize;
-                let end = (m + 128).min(SLOTS);
-                let column = GUARD + j as usize * STRIDE;
-                // The plane of slot `2q` for a run starting at plane `run` and slot `m`:
-                // `run + 2q - m`, which is the guard before the run when `2q = m - 1`; the
-                // odd slot reads one plane further, the guard after the run when `2q + 1 = end`.
-                let run = column + COMPLEMENT * negative as usize;
-                for q in m / 2..=(end - 1) / 2 {
-                    // The range-difference pass reserved one entry for this exact term in q.
-                    debug_assert!(at[q] < group.offsets[q + 1]);
-                    let plane = (run + 2 * q).wrapping_sub(m);
-                    unsafe { *group.terms.as_mut_ptr().add(at[q]) = (8 * plane) as u16; }
-                    at[q] += 1;
-                }
-                let wrap = (m + 128).saturating_sub(SLOTS);
-                if wrap != 0 {
-                    let run = column + COMPLEMENT * !negative as usize + (end - m);
-                    for q in 0..=(wrap - 1) / 2 {
-                        debug_assert!(at[q] < group.offsets[q + 1]);
-                        let plane = run + 2 * q;
-                        unsafe { *group.terms.as_mut_ptr().add(at[q]) = (8 * plane) as u16; }
-                        at[q] += 1;
-                    }
-                }
-            }
-            groups.push(group);
-        }
-        let mut count = 0;
-        let bias = core::array::from_fn(|d| {
-            count += bias_diff[d];
-            count
-        });
-        (groups, bias)
-    }
-
-    #[repr(C, align(64))]
-    struct Aligned<T>(T);
-
-    const fn swap_index(mask: usize, value: usize) -> [u8; 64] {
-        let mut out = [0; 64];
-        let mut p = 0;
-        while p < 64 {
-            out[p] = (64 * ((p & mask != 0) as usize) + (p & !mask) + value) as u8;
-            p += 1;
-        }
-        out
-    }
-
-    static SWAPS: Aligned<[[[u8; 64]; 2]; 4]> = Aligned([
-        [swap_index(8, 0), swap_index(8, 8)],
-        [swap_index(4, 0), swap_index(4, 4)],
-        [swap_index(2, 0), swap_index(2, 2)],
-        [swap_index(1, 0), swap_index(1, 1)],
-    ]);
-
-    /// Exactly bitmat's byte transpose, specialized to four fixed rounds. Both the vector-slot
-    /// bit and the byte-position bit exchanged in round r are 3-r. Constant pair indices let
-    /// the compiler keep all sixteen vectors in registers instead of indexing a stack array.
-    #[inline(always)]
-    unsafe fn transpose_tile(src: *const B128, z: &mut [__m512i; 16]) {
-        for i in 0..16 {
-            z[i] = _mm512_loadu_si512((src as *const u8).add(64 * i) as *const __m512i);
-        }
-        macro_rules! pair {
-            ($a:literal, $b:literal, $i0:ident, $i1:ident) => {{
-                let (a, b) = (z[$a], z[$b]);
-                z[$a] = _mm512_permutex2var_epi8(a, $i0, b);
-                z[$b] = _mm512_permutex2var_epi8(a, $i1, b);
-            }};
-        }
-        let i0 = _mm512_load_si512(SWAPS.0[0][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[0][1].as_ptr() as *const __m512i);
-        pair!(0, 8, i0, i1); pair!(1, 9, i0, i1); pair!(2, 10, i0, i1); pair!(3, 11, i0, i1);
-        pair!(4, 12, i0, i1); pair!(5, 13, i0, i1); pair!(6, 14, i0, i1); pair!(7, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[1][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[1][1].as_ptr() as *const __m512i);
-        pair!(0, 4, i0, i1); pair!(1, 5, i0, i1); pair!(2, 6, i0, i1); pair!(3, 7, i0, i1);
-        pair!(8, 12, i0, i1); pair!(9, 13, i0, i1); pair!(10, 14, i0, i1); pair!(11, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[2][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[2][1].as_ptr() as *const __m512i);
-        pair!(0, 2, i0, i1); pair!(1, 3, i0, i1); pair!(4, 6, i0, i1); pair!(5, 7, i0, i1);
-        pair!(8, 10, i0, i1); pair!(9, 11, i0, i1); pair!(12, 14, i0, i1); pair!(13, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[3][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[3][1].as_ptr() as *const __m512i);
-        pair!(0, 1, i0, i1); pair!(2, 3, i0, i1); pair!(4, 5, i0, i1); pair!(6, 7, i0, i1);
-        pair!(8, 9, i0, i1); pair!(10, 11, i0, i1); pair!(12, 13, i0, i1); pair!(14, 15, i0, i1);
-    }
-
-    // Byte transpose inside each vector, and its inverse with reversed GFNI matrix rows.
-    const PERM: Aligned<[u8; 64]> = Aligned({
-        let mut a = [0; 64];
-        let mut i = 0;
-        while i < 64 {
-            a[i] = (8 * (i % 8) + i / 8) as u8;
-            i += 1;
-        }
-        a
-    });
-    const BACK: Aligned<[u8; 64]> = Aligned({
-        let mut a = [0; 64];
-        let mut i = 0;
-        while i < 64 {
-            a[i] = (8 * (7 - i % 8) + i / 8) as u8;
-            i += 1;
-        }
-        a
-    });
-
-    /// Lane l corresponds to this source word. GFNI reverses the eight matrix rows; the byte
-    /// transpose uses bitmat's public word permutation. No permutation is needed in the hot loop.
-    fn word_of(l: usize) -> usize {
-        64 * (l / 64) + bitmat::word_at((l % 64 & !7) + 7 - l % 8)
-    }
-
-    /// The 128 direct planes of a block of 512 words to `out`, and their complements to
-    /// `out + COMPLEMENT`; the guard planes around them are the caller's.
-    #[inline(always)]
-    unsafe fn slice(words: *const B128, out: *mut __m512i) {
-        let zero = _mm512_setzero_si512();
-        let mut tiles = [[zero; 16]; 8];
-        for t in 0..8 {
-            transpose_tile(words.add(64 * t), &mut tiles[t]);
-        }
-        let perm = _mm512_load_si512(PERM.0.as_ptr() as *const __m512i);
-        let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
-        let ones = _mm512_set1_epi32(-1);
-        for b in 0..16 {
-            let rows = core::array::from_fn(|t| {
-                _mm512_permutexvar_epi8(
-                    perm,
-                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, tiles[t][b]),
-                )
-            });
-            let planes = transpose8x8_q(rows);
-            for p in 0..8 {
-                _mm512_store_si512(out.add(8 * b + p), planes[p]);
-                _mm512_store_si512(out.add(COMPLEMENT + 8 * b + p), _mm512_xor_si512(planes[p], ones));
-            }
-        }
-    }
-
-    /// Three equally weighted bit planes -> sum and double-weight carry.
-    #[inline(always)]
-    unsafe fn csa(sum: &mut __m512i, a: __m512i, b: __m512i) -> __m512i {
-        // `vpternlogq` overwrites its first operand, so taking both outputs from the three
-        // originals costs a register copy per full adder. Instead the sum is formed in place
-        // and the carry is read off `(a, sum', b)`: with `sum = sum' ^ a ^ b`, the majority is
-        // `a` when `a == b` and `!sum'` otherwise, truth table 0xb2. The carry can then land on
-        // `a` or `b`, both dead afterwards.
-        *sum = _mm512_ternarylogic_epi64::<0x96>(*sum, a, b);
-        _mm512_ternarylogic_epi64::<0xb2>(a, *sum, b)
-    }
-
-    // Isolate the counter's register allocation from the transpose's many vector constants.
-    #[inline(never)]
-    unsafe fn accumulate(planes: *const __m512i, terms: &[u16], acc: *mut __m512i) {
-        let planes = planes as *const u64;
-        let mut b0 = _mm512_load_si512(acc);
-        let mut b1 = _mm512_load_si512(acc.add(1));
-        let mut b2 = _mm512_load_si512(acc.add(2));
-        let mut b3 = _mm512_load_si512(acc.add(3));
-        let mut b4 = _mm512_load_si512(acc.add(4));
-        let mut b5 = _mm512_load_si512(acc.add(5));
-        let mut b6 = _mm512_load_si512(acc.add(6));
-        let mut b7 = _mm512_load_si512(acc.add(7));
-        let mut b8 = _mm512_load_si512(acc.add(8));
-        let mut b9 = _mm512_load_si512(acc.add(9));
-        let mut b10 = _mm512_load_si512(acc.add(10));
-        let mut b11 = _mm512_load_si512(acc.add(11));
-        let mut b12 = _mm512_load_si512(acc.add(12));
-        let mut b13 = _mm512_load_si512(acc.add(13));
-        let mut b14 = _mm512_load_si512(acc.add(14));
-        for input in terms.chunks_exact(64) {
-            let t = input.as_ptr();
-            macro_rules! two {
-                ($off:expr) => {{
-                    let a = _mm512_load_si512(planes.add(*t.add($off) as usize) as *const __m512i);
-                    let b = _mm512_load_si512(planes.add(*t.add($off + 1) as usize) as *const __m512i);
-                    csa(&mut b0, a, b)
-                }};
-            }
-            macro_rules! four {
-                ($off:expr) => {{ let a = two!($off); let b = two!($off + 2); csa(&mut b1, a, b) }};
-            }
-            macro_rules! eight {
-                ($off:expr) => {{ let a = four!($off); let b = four!($off + 4); csa(&mut b2, a, b) }};
-            }
-            macro_rules! sixteen {
-                ($off:expr) => {{ let a = eight!($off); let b = eight!($off + 8); csa(&mut b3, a, b) }};
-            }
-            macro_rules! thirty_two {
-                ($off:expr) => {{ let a = sixteen!($off); let b = sixteen!($off + 16); csa(&mut b4, a, b) }};
-            }
-            let a = thirty_two!(0);
-            let b = thirty_two!(32);
-            let mut carry = csa(&mut b5, a, b);
-            macro_rules! ripple {
-                ($bit:ident) => {{
-                    let old = $bit;
-                    $bit = _mm512_xor_si512(old, carry);
-                    carry = _mm512_and_si512(old, carry);
-                }};
-            }
-            ripple!(b6); ripple!(b7); ripple!(b8); ripple!(b9);
-            ripple!(b10); ripple!(b11); ripple!(b12); ripple!(b13);
-            b14 = _mm512_xor_si512(b14, carry);
-        }
-        _mm512_store_si512(acc, b0);
-        _mm512_store_si512(acc.add(1), b1);
-        _mm512_store_si512(acc.add(2), b2);
-        _mm512_store_si512(acc.add(3), b3);
-        _mm512_store_si512(acc.add(4), b4);
-        _mm512_store_si512(acc.add(5), b5);
-        _mm512_store_si512(acc.add(6), b6);
-        _mm512_store_si512(acc.add(7), b7);
-        _mm512_store_si512(acc.add(8), b8);
-        _mm512_store_si512(acc.add(9), b9);
-        _mm512_store_si512(acc.add(10), b10);
-        _mm512_store_si512(acc.add(11), b11);
-        _mm512_store_si512(acc.add(12), b12);
-        _mm512_store_si512(acc.add(13), b13);
-        _mm512_store_si512(acc.add(14), b14);
-    }
-
-    /// Two consecutive slots at once: every scheduled offset is the plane of the even slot, and
-    /// the odd slot's plane is the next one, so one scalar offset serves two vector loads. Each
-    /// slot keeps the six low counter bits of a 64-input tree in registers, plus a two-bit
-    /// counter of the trees' weight-64 carries; every third chunk that counter is added into
-    /// the nine upper counter bits in memory.
-    #[inline(never)]
-    unsafe fn accumulate_pair(planes: *const __m512i, terms: &[u16], acc: *mut __m512i) {
-        let planes = planes as *const u64;
-        let (even, odd) = (acc, acc.add(BITS));
-        let mut s0: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(even.add(b)));
-        let mut s1: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(odd.add(b)));
-        // The weight-64 carries of up to three chunks, in registers at weights 64 and 128;
-        // every third chunk they are added into the nine upper counter bits in memory.
-        let zero = _mm512_setzero_si512();
-        let (mut h0, mut h1) = ([zero; 2], [zero; 2]);
-        let mut pending = 0usize;
-        macro_rules! flush {
-            ($slot:ident, $h:ident) => {{
-                let p = $slot.add(6);
-                let m6 = _mm512_load_si512(p);
-                _mm512_store_si512(p, _mm512_xor_si512(m6, $h[0]));
-                let mut carry = _mm512_and_si512(m6, $h[0]);
-                let p = $slot.add(7);
-                let m7 = _mm512_load_si512(p);
-                let x = _mm512_ternarylogic_epi64::<0x96>(m7, $h[1], carry);
-                _mm512_store_si512(p, x);
-                carry = _mm512_ternarylogic_epi64::<0xb2>($h[1], x, carry);
-                for b in 8..BITS - 1 {
-                    let p = $slot.add(b);
-                    let old = _mm512_load_si512(p);
-                    _mm512_store_si512(p, _mm512_xor_si512(old, carry));
-                    carry = _mm512_and_si512(old, carry);
-                }
-                let p = $slot.add(BITS - 1);
-                _mm512_store_si512(p, _mm512_xor_si512(_mm512_load_si512(p), carry));
-                $h = [zero; 2];
-            }};
-        }
-        for input in terms.chunks_exact(64) {
-            let t = input.as_ptr();
-            macro_rules! two {
-                ($off:expr) => {{
-                    let pa = planes.add(*t.add($off) as usize);
-                    let pb = planes.add(*t.add($off + 1) as usize);
-                    let a0 = _mm512_load_si512(pa as *const __m512i);
-                    let b0 = _mm512_load_si512(pb as *const __m512i);
-                    let a1 = _mm512_load_si512(pa.add(8) as *const __m512i);
-                    let b1 = _mm512_load_si512(pb.add(8) as *const __m512i);
-                    (csa(&mut s0[0], a0, b0), csa(&mut s1[0], a1, b1))
-                }};
-            }
-            macro_rules! level {
-                ($bit:literal, $lower:ident, $off:expr) => {{
-                    let (x0, x1) = $lower!($off);
-                    let (y0, y1) = $lower!($off + (1 << $bit));
-                    (csa(&mut s0[$bit], x0, y0), csa(&mut s1[$bit], x1, y1))
-                }};
-            }
-            macro_rules! four { ($off:expr) => { level!(1, two, $off) }; }
-            macro_rules! eight { ($off:expr) => { level!(2, four, $off) }; }
-            macro_rules! sixteen { ($off:expr) => { level!(3, eight, $off) }; }
-            macro_rules! thirty_two { ($off:expr) => { level!(4, sixteen, $off) }; }
-            let (c0, c1) = level!(5, thirty_two, 0);
-            // Two-bit register counters of the weight-64 carries: three chunks fit.
-            let up = _mm512_and_si512(h0[0], c0);
-            h0[0] = _mm512_xor_si512(h0[0], c0);
-            h0[1] = _mm512_xor_si512(h0[1], up);
-            let up = _mm512_and_si512(h1[0], c1);
-            h1[0] = _mm512_xor_si512(h1[0], c1);
-            h1[1] = _mm512_xor_si512(h1[1], up);
-            pending += 1;
-            if pending == 3 {
-                flush!(even, h0);
-                flush!(odd, h1);
-                pending = 0;
-            }
-        }
-        if pending != 0 {
-            flush!(even, h0);
-            flush!(odd, h1);
-        }
-        for b in 0..6 {
-            _mm512_store_si512(even.add(b), s0[b]);
-            _mm512_store_si512(odd.add(b), s1[b]);
-        }
-    }
-
-    /// Inverse bit transpose to 512 ordinary 16-bit lane counts.
-    #[inline(always)]
-    unsafe fn unslice(acc: *const __m512i, out: &mut [i16; LANES]) {
-        let zero = _mm512_setzero_si512();
-        let lo = transpose8x8_q(core::array::from_fn(|b| _mm512_load_si512(acc.add(b))));
-        let hi = transpose8x8_q(core::array::from_fn(|b| {
-            if b == 7 { zero } else { _mm512_load_si512(acc.add(8 + b)) }
-        }));
-        let perm = _mm512_load_si512(BACK.0.as_ptr() as *const __m512i);
-        let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
-        let first = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
-        let second = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
-        for t in 0..8 {
-            let l = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, lo[t]));
-            let h = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, hi[t]));
-            let a = _mm512_unpacklo_epi8(l, h);
-            let b = _mm512_unpackhi_epi8(l, h);
-            let dst = out.as_mut_ptr().add(64 * t) as *mut __m512i;
-            _mm512_storeu_si512(dst, _mm512_permutex2var_epi64(a, first, b));
-            _mm512_storeu_si512(dst.add(1), _mm512_permutex2var_epi64(a, second, b));
-        }
-    }
-
-    pub(super) fn fold_words(
-        words: &[B128],
-        challenges: &[ShortChallenge],
-        column_words: usize,
-        workers: usize,
-    ) -> Vec<RingElement> {
-        fold_config::<COL_GROUP>(words, challenges, column_words, workers)
-    }
-
-    fn fold_config<const GROUP: usize>(
-        words: &[B128],
-        challenges: &[ShortChallenge],
-        column_words: usize,
-        workers: usize,
-    ) -> Vec<RingElement> {
-        assert!(GROUP > 0 && (GUARD + GROUP * STRIDE) * 8 <= u16::MAX as usize);
-        #[cfg(test)]
-        let profile = std::env::var_os("LABINIUS_BITFOLD_PROFILE").is_some();
-        #[cfg(test)]
-        let plan_start = std::time::Instant::now();
-        let (groups, bias) = plan::<GROUP>(challenges);
-        #[cfg(test)]
-        if profile {
-            eprintln!("bitfold plan_us={}", plan_start.elapsed().as_micros());
-        }
-        let blocks = column_words / LANES;
-        let per = blocks.div_ceil(workers.clamp(1, blocks));
-        let mut out = vec![RingElement::zero(Representation::Coefficients); column_words / 4];
-        std::thread::scope(|scope| {
-            for (worker, target) in out.chunks_mut(per * LANES / 4).enumerate() {
-                let groups = &groups;
-                let bias = &bias;
-                scope.spawn(move || unsafe {
-                    #[cfg(test)]
-                    let mut times = [std::time::Duration::ZERO; 3];
-                    let zero = _mm512_setzero_si512();
-                    // Zero everywhere the columns do not write: the guards and the padding pair.
-                    let mut planes = vec![zero; GUARD + GROUP * STRIDE];
-                    let mut acc = vec![zero; 2 * PAIRS * BITS];
-                    for (local, output) in target.chunks_mut(LANES / 4).enumerate() {
-                        let block = worker * per + local;
-                        acc.fill(zero);
-                        for group in groups {
-                            #[cfg(test)]
-                            let start = profile.then(std::time::Instant::now);
-                            for j in 0..group.columns {
-                                let src = words.as_ptr().add((group.first + j) * column_words + block * LANES);
-                                slice(src, planes.as_mut_ptr().add(GUARD + j * STRIDE));
-                            }
-                            #[cfg(test)]
-                            if let Some(start) = start { times[0] += start.elapsed(); }
-                            #[cfg(test)]
-                            let start = profile.then(std::time::Instant::now);
-                            for q in 0..PAIRS {
-                                accumulate_pair(
-                                    planes.as_ptr(),
-                                    &group.terms[group.offsets[q]..group.offsets[q + 1]],
-                                    acc.as_mut_ptr().add(2 * q * BITS),
-                                );
-                            }
-                            #[cfg(test)]
-                            if let Some(start) = start { times[1] += start.elapsed(); }
-                        }
-                        #[cfg(test)]
-                        let start = profile.then(std::time::Instant::now);
-                        let mut a = [0i16; LANES];
-                        let mut b = [0i16; LANES];
-                        let mut c = [0i16; LANES];
-                        for i in 0..81 {
-                            unslice(acc.as_ptr().add(i * BITS), &mut a);
-                            unslice(acc.as_ptr().add((81 + i) * BITS), &mut b);
-                            unslice(acc.as_ptr().add((162 + i) * BITS), &mut c);
-                            for lane in 0..LANES {
-                                let w = word_of(lane);
-                                let x = a[lane] as i32 - bias[i];
-                                let y = b[lane] as i32 - bias[81 + i];
-                                let z = c[lane] as i32 - bias[162 + i];
-                                output[w / 4].v[4 * i + w % 4] = i16::try_from(x - z).expect("integer fold overflow");
-                                output[w / 4].v[4 * (81 + i) + w % 4] = i16::try_from(y + z).expect("integer fold overflow");
-                            }
-                        }
-                        #[cfg(test)]
-                        if let Some(start) = start { times[2] += start.elapsed(); }
-                    }
-                    #[cfg(test)]
-                    if profile {
-                        eprintln!("bitfold worker={} slice_us={} add_us={} output_us={}",
-                            worker, times[0].as_micros(), times[1].as_micros(), times[2].as_micros());
-                    }
-                });
-            }
-        });
-        out
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::challenge::{sample_short_challenge, Transcript, DEFAULT_BOUND, DEFAULT_WEIGHT};
-
-        fn table(n: usize) -> Vec<B128> {
-            let mut h = blake3::Hasher::new_keyed(&[81; 32]);
-            h.update(b"labinius-fast/binary-table/v1");
-            let mut out = vec![B128(0); n];
-            let bytes = unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, 16 * n) };
-            h.finalize_xof().fill(bytes);
-            out
-        }
-
-        fn challenges(n: usize) -> Vec<ShortChallenge> {
-            let mut t = Transcript::new(b"labinius/test/bitfold");
-            (0..n).map(|_| sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0).collect()
-        }
-
-        #[test]
-        fn bitfold_transpose_and_counter() {
-            let words = table(LANES);
-            unsafe {
-                let zero = _mm512_setzero_si512();
-                let mut planes = vec![zero; STRIDE];
-                slice(words.as_ptr(), planes.as_mut_ptr());
-                for p in 0..128 {
-                    let bits: [u64; 8] = core::mem::transmute(planes[p]);
-                    let neg: [u64; 8] = core::mem::transmute(planes[COMPLEMENT + p]);
-                    for lane in 0..LANES {
-                        let expected = (words[word_of(lane)].0 >> p) as u64 & 1;
-                        assert_eq!(bits[lane / 64] >> (lane % 64) & 1, expected, "plane {p}, lane {lane}");
-                        assert_eq!(neg[lane / 64] >> (lane % 64) & 1, expected ^ 1);
-                    }
-                }
-                let mut acc = vec![zero; BITS];
-                let terms: Vec<u16> = (0..128u16).cycle().take(32704).collect();
-                let offsets: Vec<u16> = terms.iter().map(|p| 8 * p).collect();
-                accumulate(planes.as_ptr(), &offsets, acc.as_mut_ptr());
-                let mut counts = [0i16; LANES];
-                unslice(acc.as_ptr(), &mut counts);
-                for lane in 0..LANES {
-                    let expected: usize = terms.iter().map(|&p| (words[word_of(lane)].0 >> p & 1) as usize).sum();
-                    assert_eq!(counts[lane] as usize, expected, "lane {lane}");
-                }
-                // Exercise the very top of the declared counter range, including zero padding.
-                acc.fill(zero);
-                planes[0] = zero;
-                planes[1] = _mm512_set1_epi32(-1);
-                let mut terms = vec![8; 32768];
-                terms[32767] = 0;
-                accumulate(planes.as_ptr(), &terms, acc.as_mut_ptr());
-                unslice(acc.as_ptr(), &mut counts);
-                assert_eq!(counts, [32767; LANES]);
-            }
-        }
-
-        // Independent schoolbook reduction, including the high terms requiring two reductions.
-        fn scalar(words: &[B128], cs: &[ShortChallenge], column_words: usize) -> Vec<RingElement> {
-            (0..column_words / 4).map(|r| {
-                let mut raw = [0i32; 4 * (128 + 162)];
-                for (j, c) in cs.iter().enumerate() {
-                    for t in 0..c.weight {
-                        let m = c.positions[t] as usize;
-                        let sign = if ((c.signs >> t) & 1 != 0) ^ (m % 2 != 0) { -1 } else { 1 };
-                        for k in 0..4 {
-                            let w = words[j * column_words + 4 * r + k].0;
-                            for p in 0..128 {
-                                raw[4 * (p + m) + k] += sign * ((w >> p) & 1) as i32;
-                            }
-                        }
-                    }
-                }
-                for d in (648..raw.len()).rev() {
-                    let value = raw[d];
-                    raw[d - 324] += value;
-                    raw[d - 648] -= value;
-                }
-                let mut out = RingElement::zero(Representation::Coefficients);
-                for (v, x) in out.v.iter_mut().zip(raw) { *v = i16::try_from(x).unwrap(); }
-                out
-            }).collect()
-        }
-
-        #[test]
-        fn bitfold_matches_schoolbook_and_ntt() {
-            let columns = (COL_GROUP + 2).next_multiple_of(2);
-            let words = table(columns * LANES);
-            let cs = challenges(columns);
-            let exact = fold_words(&words, &cs, LANES, 2);
-            assert_eq!(exact, scalar(&words, &cs, LANES));
-            for q in [3889, 2917, 4861, 9721, 12637, 17497, 19441] {
-                assert_eq!(exact, super::super::fold_witness_streaming(&words, columns, &cs, 4, q, 2), "q {q}");
-            }
-            // All degrees, both signs, all four X components, and zero/all-one input patterns.
-            for sign in [0, 1] {
-                let cs: Vec<_> = (0..162).map(|m| {
-                    let mut c = ShortChallenge::zero();
-                    c.positions[0] = m;
-                    c.weight = 1;
-                    c.signs = sign;
-                    c
-                }).collect();
-                let words: Vec<_> = (0..cs.len() * LANES).map(|i| B128(if i % 7 == 0 { 0 } else { u128::MAX })).collect();
-                assert_eq!(fold_words(&words, &cs, LANES, 2), scalar(&words, &cs, LANES));
-            }
-        }
-
-        #[test]
-        #[ignore = "full 2^24-word challenge instance; run explicitly on the box"]
-        fn bitfold_full_instance_matches_streaming() {
-            let words = table(1 << 24);
-            let cs = challenges(1024);
-            let mut exact = None;
-            for (group, workers) in [(16, 4), (31, 4), (31, 2), (16, 2)] {
-                let start = std::time::Instant::now();
-                let v = match group {
-                    16 => fold_config::<16>(&words, &cs, 1 << 14, workers),
-                    31 => fold_config::<31>(&words, &cs, 1 << 14, workers),
-                    _ => unreachable!(),
-                };
-                eprintln!("bitfold group={} workers={} exact_us={}", group, workers, start.elapsed().as_micros());
-                if let Some(previous) = &exact {
-                    assert_eq!(&v, previous);
-                } else {
-                    exact = Some(v);
-                }
-            }
-            let start = std::time::Instant::now();
-            let old = super::super::fold_witness_streaming(&words, 1024, &cs, 128, 3889, 4);
-            eprintln!("bitfold ntt_us={}", start.elapsed().as_micros());
-            assert_eq!(exact.unwrap(), old);
-        }
-    }
-
 }

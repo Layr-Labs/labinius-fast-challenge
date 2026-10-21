@@ -118,6 +118,89 @@ fn columns_quad<const Q: u16>(
     }
 }
 
+/// The committed columns as centered coefficients modulo each prime, straight from the raw
+/// NTT-domain rows the commitment kernel produced: one inverse transform per 32 columns per
+/// limb, with the rows centered on the way in. This is the direct form of
+/// [`column_coefficients`], which first splits each row into its four `R_162` components and
+/// recombines them before the same inverse transform.
+pub fn coefficients_from_rows(
+    raw: &[Vec<[u32; N]>],
+    columns: usize,
+    primes: &[u16],
+) -> Vec<Vec<i16>> {
+    assert_eq!(raw.len(), primes.len());
+    let mut out = Vec::with_capacity(primes.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = primes
+            .iter()
+            .enumerate()
+            .map(|(limb, &q)| {
+                let rows = &raw[limb];
+                scope.spawn(move || {
+                    assert_eq!(rows.len(), columns);
+                    let mut o = vec![0i16; columns * N];
+                    dispatch_limb!(
+                        q,
+                        split |Q| rows_split::<Q>(rows, columns, &mut o),
+                        quad |Q| rows_quad::<Q>(rows, columns, &mut o),
+                    );
+                    o
+                })
+            })
+            .collect();
+        for h in handles {
+            out.push(h.join().unwrap());
+        }
+    });
+    out
+}
+
+fn rows_split<const Q: u16>(rows: &[[u32; N]], columns: usize, out: &mut [i16]) {
+    let q = Q as i32;
+    let half = (q - 1) / 2;
+    let mut batch = Batch32::zero(Representation::Ntt);
+    for first in (0..columns).step_by(32) {
+        let cols = (columns - first).min(32);
+        batch.v.iter_mut().for_each(|row| *row = [0i16; 32]);
+        batch.representation = Representation::Ntt;
+        for p in 0..cols {
+            let r = &rows[first + p];
+            for i in 0..N {
+                let x = r[i] as i32;
+                batch.v[i][p] = if x > half { (x - q) as i16 } else { x as i16 };
+            }
+        }
+        unsafe {
+            if Inv::<Q>::LARGE {
+                vgl::intt_gen_batch32::<Q>(&mut batch);
+            } else {
+                intt_gen_batch32::<Q>(&mut batch);
+            }
+        }
+        drain(&batch, first, cols, out);
+    }
+}
+
+fn rows_quad<const Q: u16>(rows: &[[u32; N]], columns: usize, out: &mut [i16]) {
+    let q = Q as i32;
+    let half = (q - 1) / 2;
+    let mut batch = Batch32::zero(Representation::Ntt);
+    for first in (0..columns).step_by(32) {
+        let cols = (columns - first).min(32);
+        batch.v.iter_mut().for_each(|row| *row = [0i16; 32]);
+        batch.representation = Representation::Ntt;
+        for p in 0..cols {
+            let r = &rows[first + p];
+            for i in 0..N {
+                let x = r[i] as i32;
+                batch.v[i][p] = if x > half { (x - q) as i16 } else { x as i16 };
+            }
+        }
+        unsafe { intt_quad_gen_batch32::<Q>(&mut batch) };
+        drain(&batch, first, cols, out);
+    }
+}
+
 pub fn column_coefficients(
     matrix: &VerticallyAlignedMatrix<PowerOfThreeRingElementWithLimbs>,
     primes: &[u16],
@@ -256,51 +339,5 @@ impl Garner {
             normsq += magnitude * magnitude;
         }
         normsq
-    }
-}
-
-// =============================================================================================
-// coefficients straight from the kernel's rows
-// =============================================================================================
-
-/// The inverse transform of one limb on a batch of centered NTT-domain rows, whichever tree the
-/// limb runs: the step `residual` takes to read a commitment back as coefficients.
-fn inverse_rows(q: u16, batch: &mut Batch32) {
-    batch.representation = Representation::Ntt;
-    unsafe {
-        dispatch_limb!(
-            q,
-            small |Q| intt_gen_batch32::<Q>(batch),
-            large |Q| vgl::intt_gen_batch32::<Q>(batch),
-            quad |Q| intt_quad_gen_batch32::<Q>(batch),
-        )
-    }
-}
-
-/// The coefficients modulo `q` of up to 32 commitments given as the kernel's 648 rows in
-/// `[0, q)` (the `[u32; N]` `simd::commit` finishes with, and `AuxData::commitment` holds):
-/// centered into a batch, one inverse transform, then column `p`'s `N` coefficients at
-/// `out[p * N..]` as `i16` representatives.
-///
-/// This is the direct form of [`column_coefficients`], which first splits the rows into the
-/// four `R_162` components and then recombines them; `residual` reads `A v - sum c_j C_j` back
-/// through exactly this inverse, so the two agree.
-pub fn coefficients_from_rows(q: u16, rows: &[&[u32; N]], out: &mut [i16]) {
-    assert!(!rows.is_empty() && rows.len() <= 32, "a batch holds 32 columns");
-    assert_eq!(out.len(), rows.len() * N);
-    let half = ((q - 1) / 2) as u32;
-    let mut batch = Batch32::zero(Representation::Ntt);
-    for (p, column) in rows.iter().enumerate() {
-        for u in 0..N {
-            let x = column[u];
-            debug_assert!(x < q as u32, "a row is not reduced");
-            batch.v[u][p] = if x > half { (x as i32 - q as i32) as i16 } else { x as i16 };
-        }
-    }
-    inverse_rows(q, &mut batch);
-    for p in 0..rows.len() {
-        for i in 0..N {
-            out[p * N + i] = batch.v[i][p];
-        }
     }
 }

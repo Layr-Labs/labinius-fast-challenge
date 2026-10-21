@@ -1,6 +1,6 @@
 use crate::challenge::Transcript;
-use crate::fields::scalar::F162;
-use crate::fold::fold_witness;
+use crate::fields::scalar::{B128, F162};
+use crate::fold::{fold_witness, fold_witness_streaming, fold_witness_streaming_words};
 use crate::key::{AuxData, CommitmentKey};
 use crate::labrador;
 use crate::recursion;
@@ -23,6 +23,7 @@ pub struct Prover {
     key: Arc<CommitmentKey>,
     setup: Option<Arc<recursion::setup::Setup>>,
     workspace: Option<AuxData>,
+    keep_transform: bool,
 }
 
 impl Prover {
@@ -34,6 +35,7 @@ impl Prover {
             key: pp.key.clone(),
             setup: pp.recursion.clone(),
             workspace: None,
+            keep_transform: true,
         };
         let verifier = Verifier::new(pp);
         let witness = Witness {
@@ -63,6 +65,20 @@ impl Prover {
             key: pp.key.clone(),
             setup: pp.recursion.clone(),
             workspace: None,
+            keep_transform: true,
+        }
+    }
+
+    /// A cold prover that does not keep the base limb's witness transform: the commitment
+    /// skips the non-temporal copies and [`fold_from_witness`](Self::fold_from_witness)
+    /// regenerates the transform from the witness in fold-sized windows.
+    pub fn cold_without_transform(pp: &PublicParameters) -> Prover {
+        Prover {
+            params: pp.params.clone(),
+            key: pp.key.clone(),
+            setup: pp.recursion.clone(),
+            workspace: None,
+            keep_transform: false,
         }
     }
 
@@ -75,11 +91,55 @@ impl Prover {
         // disjoint batches, so the kernel zero-fill happens inside that parallel write instead
         // of as an extra 42 MB pass before it.
         let mut aux = self.workspace.take().unwrap_or_else(|| {
-            AuxData::new(self.key.len_ring(), self.params.columns(), self.key.limbs())
+            if self.keep_transform {
+                AuxData::new(self.key.len_ring(), self.params.columns(), self.key.limbs())
+            } else {
+                AuxData::without_transform(self.params.columns(), self.key.limbs())
+            }
         });
         let matrix = self
             .key
             .commit_into_aux(&witness.elements, self.params.columns(), &mut aux);
+        let columns = matrix.cols();
+        let primes = self.params.primes();
+        let (value, residues) = match &self.setup {
+            None if self.params.dropped_bits() > 0 => {
+                let dropped = crate::bd::drop_bits(&matrix, &primes, self.params.dropped_bits());
+                (CommitmentValue::Dropped(Arc::new(dropped)), None)
+            }
+            None => (CommitmentValue::Matrix(matrix), None),
+            Some(setup) => {
+                let residues = recursion::limbs::residues(&matrix, &primes);
+                let parts: Vec<&[i16]> = (0..setup.residues.len())
+                    .map(|k| residues.flat(k))
+                    .collect();
+                let t_y = Arc::new(setup.key_y.commit_blocks(&parts));
+                (CommitmentValue::Recursive(t_y), Some(residues))
+            }
+        };
+        (
+            Commitment {
+                primes,
+                columns,
+                value,
+            },
+            CommitmentOpening { aux, residues },
+        )
+    }
+
+    /// [`commit`](Self::commit) over the harness's little-endian GHASH words: the commitment
+    /// front end lifts each 128-word batch into its index rows, so no lifted witness exists.
+    pub fn commit_words(&mut self, witness: &[B128]) -> (Commitment, CommitmentOpening) {
+        let mut aux = self.workspace.take().unwrap_or_else(|| {
+            if self.keep_transform {
+                AuxData::new(self.key.len_ring(), self.params.columns(), self.key.limbs())
+            } else {
+                AuxData::without_transform(self.params.columns(), self.key.limbs())
+            }
+        });
+        let matrix = self
+            .key
+            .commit_into_aux_words(witness, self.params.columns(), &mut aux);
         let columns = matrix.cols();
         let primes = self.params.primes();
         let (value, residues) = match &self.setup {
@@ -143,6 +203,42 @@ impl Prover {
             &opening.aux,
             &challenges.challenges,
             self.key.len_ring() / 32,
+            self.key.prime(0),
+        );
+        self.workspace = Some(opening.aux);
+        FoldedWitness { elements }
+    }
+
+    /// The same fold over an opening that kept no witness transform: the base limb's transform
+    /// is regenerated from `witness` a column pair at a time and consumed immediately, so the
+    /// multi-gigabyte buffer the commitment did not write is never read back.
+    pub fn fold_from_witness(
+        &mut self,
+        opening: CommitmentOpening,
+        challenges: &FoldingChallenges,
+        witness: &Witness,
+    ) -> FoldedWitness {
+        let elements = fold_witness_streaming(
+            &witness.elements,
+            &self.key,
+            &challenges.challenges,
+            self.key.prime(0),
+        );
+        self.workspace = Some(opening.aux);
+        FoldedWitness { elements }
+    }
+
+    /// [`fold_from_witness`](Self::fold_from_witness) over the harness's words.
+    pub fn fold_from_witness_words(
+        &mut self,
+        opening: CommitmentOpening,
+        challenges: &FoldingChallenges,
+        witness: &[B128],
+    ) -> FoldedWitness {
+        let elements = fold_witness_streaming_words(
+            witness,
+            &self.key,
+            &challenges.challenges,
             self.key.prime(0),
         );
         self.workspace = Some(opening.aux);

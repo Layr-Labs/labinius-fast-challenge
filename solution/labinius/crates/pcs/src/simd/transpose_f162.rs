@@ -31,7 +31,7 @@
 //!    nibble and sets the +16 of the odd byte — three port-5 uops per two rows where the
 //!    one-row-at-a-time form would need four, and no masked load (a merge-masked
 //!    `vmovdqu64` costs a p0/p5 uop on top of the load on this core).
-use crate::fields::scalar::F162;
+use crate::fields::scalar::{B128, F162};
 use core::arch::x86_64::*;
 use core::mem::MaybeUninit;
 
@@ -359,23 +359,21 @@ pub unsafe fn slice_f162_into(elems: &[F162; 128], out: &mut BinaryIndex32) {
     slice_raw(elems.as_ptr() as *const u8, out)
 }
 
+/// The same rows for the harness's little-endian GHASH words: 128 words are staged as the 128
+/// lifted `F162` (two limbs, zero top limb) in a 3 KB L1 buffer and fed to the unchanged front
+/// end.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+pub unsafe fn slice_b128_into(elems: &[B128; 128], out: &mut BinaryIndex32) {
+    let mut lift = [F162::ZERO; 128];
+    for (dst, &src) in lift.iter_mut().zip(elems) {
+        *dst = F162([src.0 as u64, (src.0 >> 64) as u64, 0]);
+    }
+    slice_f162_into(&lift, out);
+}
+
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
 pub unsafe fn slice_f162(elems: &[F162; 128]) -> BinaryIndex32 {
     let mut out = BinaryIndex32::zero();
     slice_f162_into(elems, &mut out);
     out
-}
-
-/// The same index rows for 128 words of `B128`, the lifted witness read in place: a lifted
-/// `F162` is the word's two limbs and a zero top limb, so the 128 words are staged as 128 `F162`
-/// in an L1-resident buffer (3 KB, written once per batch, a few cycles per ring element against
-/// the transform's hundreds) and sliced exactly as [`slice_f162_into`] slices them.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-pub unsafe fn slice_b128_into(words: &[crate::fields::scalar::B128; 128], out: &mut BinaryIndex32) {
-    let mut staged: MaybeUninit<A64<[F162; 128]>> = MaybeUninit::uninit();
-    let dst = (*staged.as_mut_ptr()).0.as_mut_ptr();
-    for (i, w) in words.iter().enumerate() {
-        dst.add(i).write(F162::from_b128(*w));
-    }
-    slice_raw(dst as *const u8, out)
 }

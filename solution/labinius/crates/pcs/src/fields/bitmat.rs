@@ -1,107 +1,10 @@
 //! Byte transposes of 64-word tiles, so that `vgf2p8affineqb` — `out.byte[t].bit[i] =
 //! <A.byte[7 - i], x.byte[t]>`, an 8x8x8 block product per qword — sees eight different words in
-//! each qword. Each `vpermt2b` index comes from the two bit layouts around it ([`round_idx`]);
-//! the byte order inside a tile is the scramble [`word_at`].
+//! each qword. The byte order inside a tile is the scramble [`word_at`].
 use core::arch::x86_64::*;
-use std::sync::OnceLock;
 
 /// `affine(ident, D)` is the bit transpose of each qword of `D`.
 pub const GF_IDENT: i64 = 0x8040_2010_0804_0201u64 as i64;
-
-const E: [u8; 6] = [0, 1, 2, 3, 4, 5];
-const K: [u8; 4] = [10, 11, 12, 13];
-const C: [u8; 3] = [20, 21, 22];
-
-/// `zmm[s]`: the logical bit in vector-index bit `s` from the top; `pos[b]`: in position bit `5 - b`.
-#[derive(Clone)]
-struct Layout {
-    zmm: Vec<u8>,
-    pos: [u8; 6],
-}
-
-impl Layout {
-    fn slot_of(&self, id: u8) -> Option<usize> {
-        self.zmm.iter().position(|&x| x == id)
-    }
-
-    fn value(&self, id: u8, z: usize, p: usize) -> usize {
-        if let Some(s) = self.slot_of(id) {
-            (z >> (self.zmm.len() - 1 - s)) & 1
-        } else {
-            let b = self.pos.iter().position(|&x| x == id).expect("a placed bit");
-            (p >> (5 - b)) & 1
-        }
-    }
-}
-
-/// One round moves one bit between a vector slot and a byte position; the two vectors differing
-/// in that slot feed the two outputs, and this is the index for the output whose new bit is `v`.
-fn round_idx(from: &Layout, to: &Layout, v: usize) -> [u8; 64] {
-    let slot = (0..to.zmm.len())
-        .find(|&s| from.zmm[s] != to.zmm[s])
-        .expect("one slot moves");
-    let mut idx = [0u8; 64];
-    let z = v << (to.zmm.len() - 1 - slot);
-    for (p, i) in idx.iter_mut().enumerate() {
-        let mut q = 0;
-        for b in 0..6 {
-            q |= to.value(from.pos[b], z, p) << (5 - b);
-        }
-        let s = to.value(from.zmm[slot], z, p);
-        *i = ((s << 6) | q) as u8;
-    }
-    idx
-}
-
-fn rounds(mut layout: Layout, steps: &[(usize, usize)]) -> Vec<[[u8; 64]; 2]> {
-    steps
-        .iter()
-        .map(|&(slot, pos_bit)| {
-            let mut next = layout.clone();
-            let out = next.zmm[slot];
-            next.zmm[slot] = next.pos[pos_bit];
-            next.pos[pos_bit] = out;
-            let r = [round_idx(&layout, &next, 0), round_idx(&layout, &next, 1)];
-            layout = next;
-            r
-        })
-        .collect()
-}
-
-struct Tables {
-    input: Vec<[[u8; 64]; 2]>,
-    output: Vec<[[u8; 64]; 2]>,
-    output_fix: [u8; 64],
-}
-
-fn tables() -> &'static Tables {
-    static T: OnceLock<Tables> = OnceLock::new();
-    T.get_or_init(|| {
-        let input = rounds(
-            Layout {
-                zmm: vec![E[5], E[4], E[3], E[2]],
-                pos: [E[1], E[0], K[3], K[2], K[1], K[0]],
-            },
-            &[(0, 2), (1, 3), (2, 4), (3, 5)],
-        );
-        let after = Layout {
-            zmm: vec![C[2], C[1], C[0]],
-            pos: [E[1], E[0], E[5], E[4], E[3], E[2]],
-        };
-        let output = rounds(after, &[(0, 2), (1, 3), (2, 4)]);
-        // pos is now [E1, E0, C2, C1, C0, E2]; the qword order is [E2, E1, E0, C2, C1, C0].
-        let mut output_fix = [0u8; 64];
-        for (p, f) in output_fix.iter_mut().enumerate() {
-            let (e2, e1, e0, c) = ((p >> 5) & 1, (p >> 4) & 1, (p >> 3) & 1, p & 7);
-            *f = ((e1 << 5) | (e0 << 4) | (c << 1) | e2) as u8;
-        }
-        Tables {
-            input,
-            output,
-            output_fix,
-        }
-    })
-}
 
 /// The word at byte position `p` of a transposed tile.
 #[inline]
@@ -109,47 +12,142 @@ pub fn word_at(p: usize) -> usize {
     (((p >> 5) & 1) << 1) | ((p >> 4) & 1) | ((p & 0xf) << 2)
 }
 
-#[inline(always)]
-unsafe fn idx(v: &[u8; 64]) -> __m512i {
-    _mm512_loadu_si512(v.as_ptr() as *const __m512i)
-}
-
-#[inline(always)]
-unsafe fn apply_round(z: &mut [__m512i], slot_bit: usize, r: &[[u8; 64]; 2]) {
-    let (i0, i1) = (idx(&r[0]), idx(&r[1]));
-    for z0 in 0..z.len() {
-        if z0 & slot_bit != 0 {
-            continue;
-        }
-        let z1 = z0 | slot_bit;
-        let (a, b) = (z[z0], z[z1]);
-        z[z0] = _mm512_permutex2var_epi8(a, i0, b);
-        z[z1] = _mm512_permutex2var_epi8(a, i1, b);
-    }
-}
-
 /// `out[k].byte[p]` = byte `k` of word `word_at(p)` of the 64 words at `src`.
+///
+/// Within each 128-bit lane `L` (`0..4`), `word_at(16*L + r) = 4*r + L`, which is lane `L` of
+/// input vector `r` (`0..16`). A 4-round `vpunpcklbw`/`vpunpckhbw` butterfly across strides
+/// `8, 4, 2, 1` transposes the 16x16 bytes inside each 128-bit lane in 64 single-uOp instructions
+/// with zero index registers.
 #[inline(always)]
 pub unsafe fn transpose_tile(src: *const u8, out: &mut [__m512i; 16]) {
-    let t = tables();
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = _mm512_loadu_si512(src.add(64 * i) as *const __m512i);
-    }
-    for (r, round) in t.input.iter().enumerate() {
-        apply_round(out, 8 >> r, round);
-    }
+    let z0 = _mm512_loadu_si512(src as *const __m512i);
+    let z1 = _mm512_loadu_si512(src.add(64) as *const __m512i);
+    let z2 = _mm512_loadu_si512(src.add(128) as *const __m512i);
+    let z3 = _mm512_loadu_si512(src.add(192) as *const __m512i);
+    let z4 = _mm512_loadu_si512(src.add(256) as *const __m512i);
+    let z5 = _mm512_loadu_si512(src.add(320) as *const __m512i);
+    let z6 = _mm512_loadu_si512(src.add(384) as *const __m512i);
+    let z7 = _mm512_loadu_si512(src.add(448) as *const __m512i);
+    let z8 = _mm512_loadu_si512(src.add(512) as *const __m512i);
+    let z9 = _mm512_loadu_si512(src.add(576) as *const __m512i);
+    let z10 = _mm512_loadu_si512(src.add(640) as *const __m512i);
+    let z11 = _mm512_loadu_si512(src.add(704) as *const __m512i);
+    let z12 = _mm512_loadu_si512(src.add(768) as *const __m512i);
+    let z13 = _mm512_loadu_si512(src.add(832) as *const __m512i);
+    let z14 = _mm512_loadu_si512(src.add(896) as *const __m512i);
+    let z15 = _mm512_loadu_si512(src.add(960) as *const __m512i);
+
+    let a0 = _mm512_unpacklo_epi8(z0, z8);
+    let a8 = _mm512_unpackhi_epi8(z0, z8);
+    let a1 = _mm512_unpacklo_epi8(z1, z9);
+    let a9 = _mm512_unpackhi_epi8(z1, z9);
+    let a2 = _mm512_unpacklo_epi8(z2, z10);
+    let a10 = _mm512_unpackhi_epi8(z2, z10);
+    let a3 = _mm512_unpacklo_epi8(z3, z11);
+    let a11 = _mm512_unpackhi_epi8(z3, z11);
+    let a4 = _mm512_unpacklo_epi8(z4, z12);
+    let a12 = _mm512_unpackhi_epi8(z4, z12);
+    let a5 = _mm512_unpacklo_epi8(z5, z13);
+    let a13 = _mm512_unpackhi_epi8(z5, z13);
+    let a6 = _mm512_unpacklo_epi8(z6, z14);
+    let a14 = _mm512_unpackhi_epi8(z6, z14);
+    let a7 = _mm512_unpacklo_epi8(z7, z15);
+    let a15 = _mm512_unpackhi_epi8(z7, z15);
+
+    let b0 = _mm512_unpacklo_epi8(a0, a4);
+    let b4 = _mm512_unpackhi_epi8(a0, a4);
+    let b1 = _mm512_unpacklo_epi8(a1, a5);
+    let b5 = _mm512_unpackhi_epi8(a1, a5);
+    let b2 = _mm512_unpacklo_epi8(a2, a6);
+    let b6 = _mm512_unpackhi_epi8(a2, a6);
+    let b3 = _mm512_unpacklo_epi8(a3, a7);
+    let b7 = _mm512_unpackhi_epi8(a3, a7);
+    let b8 = _mm512_unpacklo_epi8(a8, a12);
+    let b12 = _mm512_unpackhi_epi8(a8, a12);
+    let b9 = _mm512_unpacklo_epi8(a9, a13);
+    let b13 = _mm512_unpackhi_epi8(a9, a13);
+    let b10 = _mm512_unpacklo_epi8(a10, a14);
+    let b14 = _mm512_unpackhi_epi8(a10, a14);
+    let b11 = _mm512_unpacklo_epi8(a11, a15);
+    let b15 = _mm512_unpackhi_epi8(a11, a15);
+
+    let c0 = _mm512_unpacklo_epi8(b0, b2);
+    let c2 = _mm512_unpackhi_epi8(b0, b2);
+    let c1 = _mm512_unpacklo_epi8(b1, b3);
+    let c3 = _mm512_unpackhi_epi8(b1, b3);
+    let c4 = _mm512_unpacklo_epi8(b4, b6);
+    let c6 = _mm512_unpackhi_epi8(b4, b6);
+    let c5 = _mm512_unpacklo_epi8(b5, b7);
+    let c7 = _mm512_unpackhi_epi8(b5, b7);
+    let c8 = _mm512_unpacklo_epi8(b8, b10);
+    let c10 = _mm512_unpackhi_epi8(b8, b10);
+    let c9 = _mm512_unpacklo_epi8(b9, b11);
+    let c11 = _mm512_unpackhi_epi8(b9, b11);
+    let c12 = _mm512_unpacklo_epi8(b12, b14);
+    let c14 = _mm512_unpackhi_epi8(b12, b14);
+    let c13 = _mm512_unpacklo_epi8(b13, b15);
+    let c15 = _mm512_unpackhi_epi8(b13, b15);
+
+    out[0] = _mm512_unpacklo_epi8(c0, c1);
+    out[1] = _mm512_unpackhi_epi8(c0, c1);
+    out[2] = _mm512_unpacklo_epi8(c2, c3);
+    out[3] = _mm512_unpackhi_epi8(c2, c3);
+    out[4] = _mm512_unpacklo_epi8(c4, c5);
+    out[5] = _mm512_unpackhi_epi8(c4, c5);
+    out[6] = _mm512_unpacklo_epi8(c6, c7);
+    out[7] = _mm512_unpackhi_epi8(c6, c7);
+    out[8] = _mm512_unpacklo_epi8(c8, c9);
+    out[9] = _mm512_unpackhi_epi8(c8, c9);
+    out[10] = _mm512_unpacklo_epi8(c10, c11);
+    out[11] = _mm512_unpackhi_epi8(c10, c11);
+    out[12] = _mm512_unpacklo_epi8(c12, c13);
+    out[13] = _mm512_unpackhi_epi8(c12, c13);
+    out[14] = _mm512_unpacklo_epi8(c14, c15);
+    out[15] = _mm512_unpackhi_epi8(c14, c15);
 }
 
 /// `planes[c].byte[p]` = byte `c` of word `word_at(p)` becomes `out[g].qword[i].byte[c]` of word
 /// `8g + i`.
 #[inline(always)]
-pub unsafe fn untranspose_planes(mut planes: [__m512i; 8]) -> [__m512i; 8] {
-    let t = tables();
-    for (r, round) in t.output.iter().enumerate() {
-        apply_round(&mut planes, 4 >> r, round);
-    }
-    let fix = idx(&t.output_fix);
-    planes.map(|z| _mm512_permutexvar_epi8(fix, z))
+pub unsafe fn untranspose_planes(planes: [__m512i; 8]) -> [__m512i; 8] {
+    let a0 = _mm512_unpacklo_epi8(planes[0], planes[4]);
+    let a4 = _mm512_unpackhi_epi8(planes[0], planes[4]);
+    let a1 = _mm512_unpacklo_epi8(planes[1], planes[5]);
+    let a5 = _mm512_unpackhi_epi8(planes[1], planes[5]);
+    let a2 = _mm512_unpacklo_epi8(planes[2], planes[6]);
+    let a6 = _mm512_unpackhi_epi8(planes[2], planes[6]);
+    let a3 = _mm512_unpacklo_epi8(planes[3], planes[7]);
+    let a7 = _mm512_unpackhi_epi8(planes[3], planes[7]);
+
+    let b0 = _mm512_unpacklo_epi8(a0, a2);
+    let b2 = _mm512_unpackhi_epi8(a0, a2);
+    let b1 = _mm512_unpacklo_epi8(a1, a3);
+    let b3 = _mm512_unpackhi_epi8(a1, a3);
+    let b4 = _mm512_unpacklo_epi8(a4, a6);
+    let b6 = _mm512_unpackhi_epi8(a4, a6);
+    let b5 = _mm512_unpacklo_epi8(a5, a7);
+    let b7 = _mm512_unpackhi_epi8(a5, a7);
+
+    let c0 = _mm512_unpacklo_epi8(b0, b1);
+    let c1 = _mm512_unpackhi_epi8(b0, b1);
+    let c2 = _mm512_unpacklo_epi8(b2, b3);
+    let c3 = _mm512_unpackhi_epi8(b2, b3);
+    let c4 = _mm512_unpacklo_epi8(b4, b5);
+    let c5 = _mm512_unpackhi_epi8(b4, b5);
+    let c6 = _mm512_unpacklo_epi8(b6, b7);
+    let c7 = _mm512_unpackhi_epi8(b6, b7);
+
+    let fix = _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7);
+    [
+        _mm512_permutexvar_epi64(fix, c0),
+        _mm512_permutexvar_epi64(fix, c1),
+        _mm512_permutexvar_epi64(fix, c2),
+        _mm512_permutexvar_epi64(fix, c3),
+        _mm512_permutexvar_epi64(fix, c4),
+        _mm512_permutexvar_epi64(fix, c5),
+        _mm512_permutexvar_epi64(fix, c6),
+        _mm512_permutexvar_epi64(fix, c7),
+    ]
 }
 
 #[cfg(test)]

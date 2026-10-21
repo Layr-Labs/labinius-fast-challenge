@@ -145,6 +145,13 @@ struct Work {
     bg: [u64; 4 * 48],
 }
 
+/// B128 paths emit index rows directly and need only the plane-pair scratch.
+#[repr(C, align(64))]
+struct B128Work {
+    u: [u64; 192],
+    v: [u64; 192],
+}
+
 /// The 48 bit-sliced columns `(k, w, g)` of one batch.
 #[repr(C, align(64))]
 struct Cols([__m512i; 48]);
@@ -443,24 +450,44 @@ unsafe fn interleave8_tr(cp: *const __m512i, k0: usize, w: usize, tr: __m512i, d
     }
 }
 
-/// [`gather8`] with an all-zero fourth stream: `unpack{lo,hi}(c, 0)` are zero-masked loads.
+/// Phases 3 and 4 for B128 inputs (where planes 128..192 are zero): only `u[128..136]` and
+/// `v[128..136]` are zeroed for the partial loads at `t = 0`, and `t >= 8` uses [`gather8_z_regs`].
 #[inline(always)]
-unsafe fn gather8_z(p0: *const i64, p1: *const i64, p2: *const i64, dst: *mut u64) {
-    let a = _mm512_loadu_si512(p0 as *const __m512i);
-    let b = _mm512_loadu_si512(p1 as *const __m512i);
-    let l01 = _mm512_unpacklo_epi64(a, b);
-    let h01 = _mm512_unpackhi_epi64(a, b);
-    let l23 = _mm512_maskz_loadu_epi64(0x55, p2);
-    let h23 = _mm512_maskz_loadu_epi64(0x55, p2.add(1));
-    let s0 = _mm512_shuffle_i64x2::<0x44>(l01, l23);
-    let s1 = _mm512_shuffle_i64x2::<0xEE>(l01, l23);
-    let s2 = _mm512_shuffle_i64x2::<0x44>(h01, h23);
-    let s3 = _mm512_shuffle_i64x2::<0xEE>(h01, h23);
-    let o = dst as *mut __m512i;
-    _mm512_store_si512(o, _mm512_shuffle_i64x2::<0x88>(s0, s2));
-    _mm512_store_si512(o.add(1), _mm512_shuffle_i64x2::<0xDD>(s0, s2));
-    _mm512_store_si512(o.add(2), _mm512_shuffle_i64x2::<0x88>(s1, s3));
-    _mm512_store_si512(o.add(3), _mm512_shuffle_i64x2::<0xDD>(s1, s3));
+unsafe fn uv_b128_to_rows(wk: *mut B128Work, out: &mut BinaryIndex32) {
+    let u = (*wk).u.as_mut_ptr();
+    let v = (*wk).v.as_mut_ptr();
+    _mm512_store_si512(u.add(128) as *mut __m512i, _mm512_setzero_si512());
+    _mm512_store_si512(v.add(128) as *mut __m512i, _mm512_setzero_si512());
+    let op = out.rows.as_mut_ptr() as *mut __m512i;
+    // Fixed groups avoid dynamic bounds checks and keep the gather outputs in registers.
+    macro_rules! emit8 {
+        ($r:ident, $t:expr, $side:literal) => {{
+            index_pair($r[0], op.add(4 * ($t + 0) + $side));
+            index_pair(_mm512_shuffle_i64x2::<0xEE>($r[0], $r[0]), op.add(4 * ($t + 1) + $side));
+            index_pair($r[1], op.add(4 * ($t + 2) + $side));
+            index_pair(_mm512_shuffle_i64x2::<0xEE>($r[1], $r[1]), op.add(4 * ($t + 3) + $side));
+            index_pair($r[2], op.add(4 * ($t + 4) + $side));
+            index_pair(_mm512_shuffle_i64x2::<0xEE>($r[2], $r[2]), op.add(4 * ($t + 5) + $side));
+            index_pair($r[3], op.add(4 * ($t + 6) + $side));
+            index_pair(_mm512_shuffle_i64x2::<0xEE>($r[3], $r[3]), op.add(4 * ($t + 7) + $side));
+        }};
+    }
+    let r = gather8_regs(u.cast(), v.add(40).cast(), u.add(81).cast(), v.add(121).cast());
+    emit8!(r, 0, 0);
+    for i in 1..5 {
+        let t = 8 * i;
+        let r = gather8_z_regs(u.add(t).cast(), v.add(t+40).cast(), u.add(t+81).cast());
+        emit8!(r, t, 0);
+    }
+    let r = gather8_z_regs(u.add(40).cast(), v.add(80).cast(), u.add(121).cast());
+    index_pair(r[0], op.add(160));
+    let r = gather8_regs(v.cast(), u.add(41).cast(), v.add(81).cast(), u.add(122).cast());
+    emit8!(r, 0, 2);
+    for i in 1..5 {
+        let t = 8 * i;
+        let r = gather8_z_regs(v.add(t).cast(), u.add(t+41).cast(), v.add(t+81).cast());
+        emit8!(r, t, 2);
+    }
 }
 
 /// 128 `B128` words (2048 contiguous bytes at `base`) -> the kernel's index rows.
@@ -470,7 +497,7 @@ unsafe fn slice_b128_raw(base: *const u8, out: &mut BinaryIndex32) {
     let cp = cols.as_mut_ptr() as *mut __m512i;
     columns_b128(base, cp);
 
-    let mut work: MaybeUninit<Work> = MaybeUninit::uninit();
+    let mut work: MaybeUninit<B128Work> = MaybeUninit::uninit();
     let wk = work.as_mut_ptr();
     let u = (*wk).u.as_mut_ptr();
     let v = (*wk).v.as_mut_ptr();
@@ -479,47 +506,137 @@ unsafe fn slice_b128_raw(base: *const u8, out: &mut BinaryIndex32) {
         interleave8_tr(cp, 0, w, tr, u.add(64 * w));
         interleave8_tr(cp, 2, w, tr, v.add(64 * w));
     }
-    // planes 128.. are zero; phase 3 reads u[128..130] and v[128] through its partial loads
-    _mm512_store_si512(u.add(128) as *mut __m512i, _mm512_setzero_si512());
-    _mm512_store_si512(v.add(128) as *mut __m512i, _mm512_setzero_si512());
+    uv_b128_to_rows(wk, out);
+}
 
-    // phase 3 as in `slice_raw`; the fourth stream (v[t+121..], u[t+122..]) is all zero from
-    // t = 8 on
-    let (ag, bg) = ((*wk).ag.as_mut_ptr(), (*wk).bg.as_mut_ptr());
-    gather8(
-        u as *const i64,
-        v.add(40) as *const i64,
-        u.add(81) as *const i64,
-        v.add(121) as *const i64,
-        ag,
-    );
-    for i in 1..6 {
-        let t = 8 * i;
-        gather8_z(
-            u.add(t) as *const i64,
-            v.add(t + 40) as *const i64,
-            u.add(t + 81) as *const i64,
-            ag.add(4 * t),
-        );
+/// Rows of the network that holds lane `pos`'s element after the byte transpose below: the
+/// 16-row unpack network leaves byte position `pos` of each output lane holding input row
+/// `ORDER[pos]`, so loading lane `7 - pos` (`pos < 8`) or `23 - pos` (`pos >= 8`) into that row
+/// puts lanes 7..0 and 15..8 into the two qwords, which is the order the GFNI transpose wants.
+const ORDER: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+const fn row_lane() -> [usize; 16] {
+    let mut t = [0usize; 16];
+    let mut pos = 0;
+    while pos < 16 {
+        t[ORDER[pos]] = if pos < 8 { 7 - pos } else { 23 - pos };
+        pos += 1;
     }
-    gather8(
-        v as *const i64,
-        u.add(41) as *const i64,
-        v.add(81) as *const i64,
-        u.add(122) as *const i64,
-        bg,
-    );
-    for i in 1..5 {
-        let t = 8 * i;
-        gather8_z(
-            v.add(t) as *const i64,
-            u.add(t + 41) as *const i64,
-            v.add(t + 81) as *const i64,
-            bg.add(4 * t),
-        );
-    }
+    t
+}
+const ROW_LANE: [usize; 16] = row_lane();
+static LANE_IU: A64<[i64; 8]> = A64([0, 1, 8, 9, 2, 3, 10, 11]);
+static LANE_IV: A64<[i64; 8]> = A64([4, 5, 12, 13, 6, 7, 14, 15]);
 
-    index_rows(ag, bg, out);
+/// The index rows of 32 ring elements given as one pointer per lane to its 4 `B128` words
+/// (coefficient `4m + k` of the element is bit `m` of word `k`), read in place.
+///
+/// A 16 x 16 byte transpose per 128-bit lane (64 unpacks per 16 elements) leaves, for each byte
+/// position `B` of each word, the 32 lanes' bytes in four qwords; one GFNI affine transposes the
+/// 8 x 8 bit blocks into 8-lane mask bytes and one `vpermb` interleaves words 0/1 (2/3) into the
+/// plane pairs `u` (`v`) that [`uv_b128_to_rows`] consumes.
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+pub unsafe fn slice_b128_lanes_into(
+    elems: &[*const crate::fields::scalar::B128; 32],
+    out: &mut BinaryIndex32,
+) {
+    let mut work: MaybeUninit<B128Work> = MaybeUninit::uninit();
+    let wk = work.as_mut_ptr();
+    let u = (*wk).u.as_mut_ptr();
+    let v = (*wk).v.as_mut_ptr();
+    let mut g: MaybeUninit<[[__m512i; 16]; 2]> = MaybeUninit::uninit();
+    let gp = g.as_mut_ptr() as *mut [__m512i; 16];
+    for h in 0..2 {
+        let mut r: [__m512i; 16] = core::array::from_fn(|row| {
+            _mm512_loadu_si512(elems[16 * h + ROW_LANE[row]] as *const __m512i)
+        });
+        macro_rules! stage {
+            ($lo:ident, $hi:ident) => {{
+                let n: [__m512i; 16] = core::array::from_fn(|j| {
+                    let (x, y) = (r[j / 2], r[j / 2 + 8]);
+                    if j % 2 == 0 { $lo(x, y) } else { $hi(x, y) }
+                });
+                r = n;
+            }};
+        }
+        stage!(_mm512_unpacklo_epi8, _mm512_unpackhi_epi8);
+        stage!(_mm512_unpacklo_epi16, _mm512_unpackhi_epi16);
+        stage!(_mm512_unpacklo_epi32, _mm512_unpackhi_epi32);
+        stage!(_mm512_unpacklo_epi64, _mm512_unpackhi_epi64);
+        gp.add(h).write(r);
+    }
+    let g = g.assume_init_ref();
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    let qt = _mm512_load_si512(BYTE_TR.0.as_ptr() as *const __m512i);
+    let iu = _mm512_load_si512(LANE_IU.0.as_ptr() as *const __m512i);
+    let iv = _mm512_load_si512(LANE_IV.0.as_ptr() as *const __m512i);
+    for b in 0..16 {
+        let tu = _mm512_permutex2var_epi64(g[0][b], iu, g[1][b]);
+        let tv = _mm512_permutex2var_epi64(g[0][b], iv, g[1][b]);
+        let mu = _mm512_permutexvar_epi8(qt, _mm512_gf2p8affine_epi64_epi8::<0>(ident, tu));
+        let mv = _mm512_permutexvar_epi8(qt, _mm512_gf2p8affine_epi64_epi8::<0>(ident, tv));
+        _mm512_store_si512(u.add(8 * b) as *mut __m512i, mu);
+        _mm512_store_si512(v.add(8 * b) as *mut __m512i, mv);
+    }
+    uv_b128_to_rows(wk, out);
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+pub unsafe fn slice_b128_lanes(elems: &[*const crate::fields::scalar::B128; 32]) -> BinaryIndex32 {
+    let mut out = BinaryIndex32::zero();
+    slice_b128_lanes_into(elems, &mut out);
+    out
+}
+
+/// [`slice_b128_lanes_into`] for a 16-column pair batch: lane `2 * l + e` (`l in 0..16`,
+/// `e in 0..2`) is read at `cols[l].add(4 * e)`, avoiding constructing a 32-pointer array per
+/// batch.
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+pub unsafe fn slice_b128_cols16_into(
+    cols: &[*const crate::fields::scalar::B128; 16],
+    out: &mut BinaryIndex32,
+) {
+    let mut work: MaybeUninit<B128Work> = MaybeUninit::uninit();
+    let wk = work.as_mut_ptr();
+    let u = (*wk).u.as_mut_ptr();
+    let v = (*wk).v.as_mut_ptr();
+    let mut g: MaybeUninit<[[__m512i; 16]; 2]> = MaybeUninit::uninit();
+    let gp = g.as_mut_ptr() as *mut [__m512i; 16];
+    for h in 0..2 {
+        let mut r: [__m512i; 16] = core::array::from_fn(|row| {
+            let lane = 16 * h + ROW_LANE[row];
+            _mm512_loadu_si512(cols[lane >> 1].add(4 * (lane & 1)) as *const __m512i)
+        });
+        macro_rules! stage {
+            ($lo:ident, $hi:ident) => {{
+                let n: [__m512i; 16] = core::array::from_fn(|j| {
+                    let (x, y) = (r[j / 2], r[j / 2 + 8]);
+                    if j % 2 == 0 { $lo(x, y) } else { $hi(x, y) }
+                });
+                r = n;
+            }};
+        }
+        stage!(_mm512_unpacklo_epi8, _mm512_unpackhi_epi8);
+        stage!(_mm512_unpacklo_epi16, _mm512_unpackhi_epi16);
+        stage!(_mm512_unpacklo_epi32, _mm512_unpackhi_epi32);
+        stage!(_mm512_unpacklo_epi64, _mm512_unpackhi_epi64);
+        gp.add(h).write(r);
+    }
+    let g = g.assume_init_ref();
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    let qt = _mm512_load_si512(BYTE_TR.0.as_ptr() as *const __m512i);
+    let iu = _mm512_load_si512(LANE_IU.0.as_ptr() as *const __m512i);
+    let iv = _mm512_load_si512(LANE_IV.0.as_ptr() as *const __m512i);
+    for b in 0..16 {
+        let tu = _mm512_permutex2var_epi64(g[0][b], iu, g[1][b]);
+        let tv = _mm512_permutex2var_epi64(g[0][b], iv, g[1][b]);
+        let mu = _mm512_permutexvar_epi8(qt, _mm512_gf2p8affine_epi64_epi8::<0>(ident, tu));
+        let mv = _mm512_permutexvar_epi8(qt, _mm512_gf2p8affine_epi64_epi8::<0>(ident, tv));
+        _mm512_store_si512(u.add(8 * b) as *mut __m512i, mu);
+        _mm512_store_si512(v.add(8 * b) as *mut __m512i, mv);
+    }
+    uv_b128_to_rows(wk, out);
 }
 
 /// The same index rows for 128 words of `B128`, the lifted witness read in place (a lifted
@@ -543,4 +660,58 @@ pub unsafe fn slice_b128_staged_into(
         dst.add(i).write(F162::from_b128(*w));
     }
     slice_raw(dst as *const u8, out)
+}
+
+#[inline(always)]
+unsafe fn gather8_regs(p0: *const i64, p1: *const i64, p2: *const i64, p3: *const i64) -> [__m512i;4] {
+    let a = _mm512_loadu_si512(p0 as *const __m512i);
+    let b = _mm512_loadu_si512(p1 as *const __m512i);
+    let c = _mm512_loadu_si512(p2 as *const __m512i);
+    let d = _mm512_loadu_si512(p3 as *const __m512i);
+    let l01 = _mm512_unpacklo_epi64(a, b);
+    let h01 = _mm512_unpackhi_epi64(a, b);
+    let l23 = _mm512_unpacklo_epi64(c, d);
+    let h23 = _mm512_unpackhi_epi64(c, d);
+    let s0 = _mm512_shuffle_i64x2::<0x44>(l01, l23);
+    let s1 = _mm512_shuffle_i64x2::<0xEE>(l01, l23);
+    let s2 = _mm512_shuffle_i64x2::<0x44>(h01, h23);
+    let s3 = _mm512_shuffle_i64x2::<0xEE>(h01, h23);
+    [
+        _mm512_shuffle_i64x2::<0x88>(s0, s2),
+        _mm512_shuffle_i64x2::<0xDD>(s0, s2),
+        _mm512_shuffle_i64x2::<0x88>(s1, s3),
+        _mm512_shuffle_i64x2::<0xDD>(s1, s3),
+    ]
+}
+#[inline(always)]
+unsafe fn gather8_z_regs(p0: *const i64, p1: *const i64, p2: *const i64) -> [__m512i;4] {
+    let a = _mm512_loadu_si512(p0 as *const __m512i);
+    let b = _mm512_loadu_si512(p1 as *const __m512i);
+    let l01 = _mm512_unpacklo_epi64(a, b);
+    let h01 = _mm512_unpackhi_epi64(a, b);
+    let l23 = _mm512_maskz_loadu_epi64(0x55, p2);
+    let h23 = _mm512_maskz_loadu_epi64(0x55, p2.add(1));
+    let s0 = _mm512_shuffle_i64x2::<0x44>(l01, l23);
+    let s1 = _mm512_shuffle_i64x2::<0xEE>(l01, l23);
+    let s2 = _mm512_shuffle_i64x2::<0x44>(h01, h23);
+    let s3 = _mm512_shuffle_i64x2::<0xEE>(h01, h23);
+    [
+        _mm512_shuffle_i64x2::<0x88>(s0, s2),
+        _mm512_shuffle_i64x2::<0xDD>(s0, s2),
+        _mm512_shuffle_i64x2::<0x88>(s1, s3),
+        _mm512_shuffle_i64x2::<0xDD>(s1, s3),
+    ]
+}
+/// Consume a 32-byte plane group directly; the upper half of src is unused.
+#[inline(always)]
+unsafe fn index_pair(src: __m512i, op: *mut __m512i) {
+ let ident = _mm512_set1_epi64(GF_IDENT);
+ let am = _mm512_load_si512(AFFINE_BOTH.0.as_ptr() as *const __m512i);
+ let n = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(am, src));
+ let a = _mm512_permutexvar_epi8(_mm512_load_si512(DUP_A.0.as_ptr() as *const __m512i), n);
+ let b = _mm512_permutexvar_epi8(_mm512_load_si512(DUP_B.0.as_ptr() as *const __m512i), n);
+ let p16 = _mm512_load_si512(PLUS16.0.as_ptr() as *const __m512i);
+ let lo4 = _mm512_set1_epi8(15);
+ _mm512_store_si512(op, _mm512_ternarylogic_epi32::<0xEA>(a,lo4,p16));
+ _mm512_store_si512(op.add(1), _mm512_ternarylogic_epi32::<0xEA>(b,lo4,p16));
 }

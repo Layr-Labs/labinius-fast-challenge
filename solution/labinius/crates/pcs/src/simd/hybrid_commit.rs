@@ -56,8 +56,8 @@ const fn r16c(q:u16)->i32 {(65536%q as i32)-q as i32}
 const fn acc_after_reduce_c(q:u16)->i64 {32768*(1+r16c(q).unsigned_abs() as i64)}
 /// Batches between two fold-backs of both streams: the largest power of two P with
 /// `acc_after_reduce_c + P * per_batch <= i32::MAX` (2 for 3889, 1 for 9721, as for the folded
-/// accumulator, whose lanes also gain sixteen products per batch). The tail stream restarts from
-/// zero at every chunk, which only shortens its runs.
+/// accumulator, whose lanes also gain sixteen products per batch). The tail stream restarts with
+/// a small fold seed at every chunk, which only shortens its runs.
 const fn period(q:u16)->usize {
  let mut p=1usize;
  while acc_after_reduce_c(q)+2*(p as i64)*per_batch(q)<=i32::MAX as i64 {p*=2;}
@@ -78,6 +78,7 @@ const _:()={
  let qs=[P0,P1];let mut i=0;
  while i<2 {
   let q=qs[i];
+  assert!((q as i64)/2<=acc_after_reduce_c(q)); // every initial/restart seed
   assert!(acc_after_reduce_c(q)+(period(q) as i64)*per_batch(q)<=i32::MAX as i64);
   // finish_base folds every lane back (to at most acc_after_reduce) and sums at most four
   assert!(4*acc_after_reduce(q)<=i32::MAX as i64);
@@ -90,14 +91,36 @@ const _:()={
  assert!(2*(P0 as i32)<=gen_small::TwI::<P0>::IN_BOUND && 2*(P1 as i32)<=gen_small::TwI::<P1>::IN_BOUND);
 };
 
-/// [`reduce_vec`] with the centered weight [`r16c`]: `l + (h + c) r16c`, at most
-/// `acc_after_reduce_c` (same three uops).
+/// Biased centered fold-back in two instructions. XOR makes the signed low word
+/// `unsigned_low - 32768`, so the dot product is congruent to `x - 32768` modulo Q.
+/// Both signed words remain in [-32768,32767], preserving `acc_after_reduce_c`.
+/// Each stream starts with [`fold_seed`] to cancel all of its later fold biases.
 #[inline(always)]
 unsafe fn reduce_vec_c<const Q:u16>(x:__m512i)->__m512i {
  let k=_mm512_set1_epi32(1|((r16c(Q) as u16 as i32)<<16));
- let r=_mm512_madd_epi16(x,k);
- let m=_mm512_test_epi32_mask(x,_mm512_set1_epi32(0x8000));
- _mm512_mask_add_epi32(r,m,r,_mm512_set1_epi32(r16c(Q)))
+ _mm512_madd_epi16(_mm512_xor_si512(x,_mm512_set1_epi32(0x8000)),k)
+}
+/// The centered bias for the reductions at absolute batch boundaries in [start,end).
+/// Reductions keep their existing global period even when a tail chunk restarts.
+/// Reducing the count first avoids overflow for large public shapes. A seed is smaller
+/// than `acc_after_reduce_c`, so the original accumulation and tail-sum bounds still hold.
+#[inline(always)]
+fn fold_seed<const Q:u16>(start:usize,end:usize)->i32 {
+ let count=end/period(Q)-start/period(Q);
+ let v=((count%(Q as usize))*32768%(Q as usize)) as i32;
+ if v>Q as i32/2 {v-Q as i32} else {v}
+}
+/// Initialize both streams once per group. The base runs through all nb batches; the
+/// tail runs through the first chunk and is seeded for the next chunk when consumed.
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn seed_acc<const Q:u16>(acc:&mut GAcc,nb:usize) {
+ let base=_mm512_set1_epi32(fold_seed::<Q>(0,nb));
+ let tail=_mm512_set1_epi32(fold_seed::<Q>(0,nb.min(CHUNK_BATCHES)));
+ let p=acc.v.as_mut_ptr() as *mut __m512i;
+ for j in 0..24*ABLK/2 {
+  _mm512_store_si512(p.add(2*j),base);
+  _mm512_store_si512(p.add(2*j+1),tail);
+ }
 }
 /// `q^-1 mod 2^16` (Newton).
 const fn qinv16(q:u16)->u32 {
@@ -171,7 +194,7 @@ unsafe fn tr4(r0:__m512i,r1:__m512i,r2:__m512i,r3:__m512i)->[__m512i;4] {
 
 /// The multiply-accumulate sink. With `RED` (the batch that ends a fold-back period) every
 /// accumulator vector is folded back ([`reduce_vec_c`]) on its way back to memory: the same values
-/// a separate pass over the column's accumulators after the batch would leave, without that
+/// a separate biased fold-back pass after the batch would leave, without that
 /// pass's 192 loads and stores. (Software prefetching of the keys, of the next batch into L2 or
 /// of the next block into L1, only measured slower: the hardware streamers already follow the
 /// sequential key reads, and the extra requests compete for the fill buffers.)
@@ -263,14 +286,14 @@ const ODD4:[i32;16]=[1,3,5,7,9,11,13,15,17,21,25,29,29,29,29,29];
 /// `4L .. 4L + 4` and `16 + 4L .. 16 + 4L + 4` in words `8L .. 8L + 8` (128-bit lane `L`).
 const fn row_word(r:usize)->usize {if r<16 {8*(r/4)+r%4} else {8*((r-16)/4)+4+(r-16)%4}}
 /// The tail stream's 27 row sums of block `blk` as i16 representatives (`|r| < 2q`, see [`red16`])
-/// in the words [`row_word`] names, the stream's accumulators cleared for the next chunk. The raw
+/// in the words [`row_word`] names, the stream's accumulators seeded for the next chunk. The raw
 /// lanes are summed without folding them back first ([`tail_row_bound`]).
 #[inline(always)]
-unsafe fn tail_words<const Q:u16>(acc:*mut i32,blk:usize)->__m512i {
+unsafe fn tail_words<const Q:u16>(acc:*mut i32,blk:usize,next_seed:__m512i)->__m512i {
  let p=acc.add(16*ABLK*blk+16) as *mut __m512i;
  let t0=_mm512_load_si512(p);let t1=_mm512_load_si512(p.add(2));
  let t2=_mm512_load_si512(p.add(4));let t3=_mm512_load_si512(p.add(6));
- for g in 0..4 {_mm512_store_si512(p.add(2*g),_mm512_setzero_si512());}
+ for g in 0..4 {_mm512_store_si512(p.add(2*g),next_seed);}
  let e=_mm512_loadu_si512(EVEN.as_ptr() as *const __m512i);let o=_mm512_loadu_si512(ODD.as_ptr() as *const __m512i);
  let lo=_mm512_add_epi32(_mm512_permutex2var_epi32(t0,e,t1),_mm512_permutex2var_epi32(t0,o,t1));
  let t3=_mm512_add_epi32(t3,_mm512_shuffle_epi32::<0x4E>(t3));
@@ -322,17 +345,18 @@ unsafe fn put16(x:&[__m512i;16],pend:*mut [i16;32],blk:usize,l0:usize) {
 }
 /// The tail chunks of a group's `g` columns modulo `Q` (accumulators `acc[2c + k]`), column `c`
 /// into lane `lane0 + c` of `pend` as representatives inside the inverse transform's input bound,
-/// the accumulators cleared for the next chunk. Whole aligned halves of the lanes go through
+/// the accumulators seeded for the next chunk. Whole aligned halves of the lanes go through
 /// [`put16`]; other group sizes (only tests use them) are scattered lane by lane.
 #[target_feature(enable="avx512f,avx512bw")]
-unsafe fn finish_tails<const Q:u16>(acc:*mut GAcc,k:usize,g:usize,pend:&mut Batch32,lane0:usize) {
+unsafe fn finish_tails<const Q:u16>(acc:*mut GAcc,k:usize,g:usize,pend:&mut Batch32,lane0:usize,next_start:usize,next_end:usize) {
+ let next_seed=_mm512_set1_epi32(fold_seed::<Q>(next_start,next_end));
  let col=|c:usize| (*acc.add(2*c+k)).v.as_mut_ptr() as *mut i32;
  let pv=pend.v.as_mut_ptr();
  if g%16==0 && lane0%16==0 {
   for h in 0..g/16 {
    for blk in 0..24 {
     let mut x=[_mm512_setzero_si512();16];
-    for c in 0..16 {x[c]=tail_words::<Q>(col(16*h+c),blk);}
+    for c in 0..16 {x[c]=tail_words::<Q>(col(16*h+c),blk,next_seed);}
     put16(&x,pv,blk,lane0+16*h);
    }
   }
@@ -340,7 +364,7 @@ unsafe fn finish_tails<const Q:u16>(acc:*mut GAcc,k:usize,g:usize,pend:&mut Batc
   for c in 0..g {
    for blk in 0..24 {
     let mut t=[0i16;32];
-    _mm512_storeu_si512(t.as_mut_ptr() as *mut __m512i,tail_words::<Q>(col(c),blk));
+    _mm512_storeu_si512(t.as_mut_ptr() as *mut __m512i,tail_words::<Q>(col(c),blk,next_seed));
     for r in 0..27 {(*pv.add(27*blk+r))[lane0+c]=t[row_word(r)];}
    }
   }
@@ -407,7 +431,7 @@ unsafe fn clear_lanes(b:&mut Batch32,from:usize) {
 unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mut Worker,out:*mut [u32;N],mut sync:F) {
  let g=cols.len();assert!(g>=1 && 2*g<=ws.acc.len() && keys.len()==2*nb);
  let slots=32/g;
- for a in ws.acc[..2*g].iter_mut() {core::ptr::write_bytes(a as *mut GAcc,0,1);}
+ for c in 0..g {seed_acc::<P0>(&mut ws.acc[2*c],nb);seed_acc::<P1>(&mut ws.acc[2*c+1],nb);}
  core::ptr::write_bytes(&mut ws.total[0] as *mut Batch32,0,1);
  let mut filled=0usize;
  for b in 0..nb {
@@ -421,8 +445,9 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
    if (b+1)%CHUNK_BATCHES==0 || b+1==nb {
     let (p0,p1)=ws.pend.split_at_mut(1);
     let acc=ws.acc.as_mut_ptr();
-    finish_tails::<P0>(acc,0,g,&mut p0[0],filled*g);
-    finish_tails::<P1>(acc,1,g,&mut p1[0],filled*g);
+    let next_end=(b+1+CHUNK_BATCHES).min(nb);
+    finish_tails::<P0>(acc,0,g,&mut p0[0],filled*g,b+1,next_end);
+    finish_tails::<P1>(acc,1,g,&mut p1[0],filled*g,b+1,next_end);
     filled+=1;
    if filled==slots || b+1==nb {
     // lanes of unfilled slots still hold the previous flush's coefficients

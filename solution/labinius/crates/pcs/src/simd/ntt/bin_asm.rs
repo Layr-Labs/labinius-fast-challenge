@@ -652,9 +652,8 @@ macro_rules! hybrid_store {
     };
     (reduce, $reg:literal, $off:literal) => {
         concat!(
-            "vpmaddwd zmm31, zmm", $reg, ", [{fold}]\n",
-            "vptestmd k1, zmm", $reg, ", [{fold}+64]\n",
-            "vpaddd zmm31{{k1}}, zmm31, [{fold}+128]\n",
+            "vpxord zmm31, zmm", $reg, ", [{fold}+64]\n",
+            "vpmaddwd zmm31, zmm31, [{fold}]\n",
             "vmovdqa64 [{acc}+", $off, "], zmm31\n",
         )
     };
@@ -663,7 +662,8 @@ macro_rules! hybrid_store {
 /// Three 8x8 qword transposes and one 4x4 128-bit transpose, in the same output order
 /// as hybrid_commit::tr8/tr4. Each two-source pair first writes the free register and
 /// then overwrites its second input, so only zmm28 is needed as extra transpose storage.
-/// zmm29/30 are the base/tail sums; zmm31 and k1 implement the existing centered fold-back.
+/// zmm29/30 are the base/tail sums; zmm31 implements the biased two-instruction fold-back.
+/// Each fold subtracts 32768 modulo Q; hybrid_commit preloads the complete stream bias.
 macro_rules! hybrid_register_sink {
     ($mode:ident) => {
         concat!(
@@ -824,14 +824,13 @@ macro_rules! hybrid_register_sink {
 }
 
 #[repr(C, align(64))]
-struct HybridFold([[i32; 16]; 3]);
+struct HybridFold([[i32; 16]; 2]);
 
 const fn hybrid_fold<const Q: u16>() -> HybridFold {
     let r = (65536 % Q as i32) - Q as i32;
     HybridFold([
         [1 | ((r as u16 as i32) << 16); 16],
         [0x8000; 16],
-        [r; 16],
     ])
 }
 
@@ -1078,6 +1077,10 @@ impl<const Q: u16, const RED: bool> BlockSink for HybridSink<Q, RED> {
 
 /// Binary NTT into the arranged two-stream hybrid accumulator, with no row-major output
 /// scratch. The original NTT entry point remains available as a differential reference.
+///
+/// With RED, every lane is folded to a representative of `x - 32768` modulo Q.
+/// The caller must seed each stream with its total future reduction count times 32768
+/// modulo Q, as hybrid_commit does, or otherwise compensate this fixed bias.
 ///
 /// # Safety
 /// AVX-512F/BW/VL/VBMI/VBMI2/VNNI and GFNI are required. `key` addresses 24*56 aligned

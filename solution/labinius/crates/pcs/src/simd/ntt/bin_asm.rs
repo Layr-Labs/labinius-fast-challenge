@@ -1090,3 +1090,8 @@ pub unsafe fn ntt_bin_batch32_hybrid<const Q: u16, const RED: bool>(
     assert!(Q == 3889 || Q == 9721, "the hybrid commitment's primes");
     ntt_core::<Q, _>(input, &mut HybridSink::<Q, RED> { key, acc });
 }
+
+// Offline proof of per-row output bounds for public-key fold scheduling.
+#[path = "bin_bounds_certificate.rs"]
+mod bounds_certificate;
+pub use bounds_certificate::proved_binary_row_bounds;

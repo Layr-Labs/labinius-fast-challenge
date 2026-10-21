@@ -45,6 +45,9 @@ const EMBEDDED_KEY_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/key.bi
 static EMBEDDED_KEY: Aligned64<[u8; EMBEDDED_KEY_LEN]> =
     Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")));
 
+// Generated from the same public key pair in build.rs; absent on unsupported build hosts.
+static EMBEDDED_REDUCTIONS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hybrid-red.bin"));
+
 const LIMIT: u64 = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -1364,7 +1367,15 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
     let rows = if let Some(keys) = arranged {
-        labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,HYBRID_GROUP)
+        if EMBEDDED_REDUCTIONS.len()==keygen::BATCHES && EMBEDDED_REDUCTIONS.iter().all(|&v|v&!3==0) {
+            // The sidecar was certified from this exact embedded key pair in build.rs.
+            unsafe {
+                labinius::simd::commit::hybrid::commit_columns_rows_arranged_scheduled(
+                    keys,EMBEDDED_REDUCTIONS,&columns,workers,HYBRID_GROUP)
+            }
+        } else {
+            labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,HYBRID_GROUP)
+        }
     } else if modulus==modulus_choice::HYBRID_MODULUS {
         let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
         labinius::simd::commit::hybrid::commit_columns_rows(&key(),&tail,&columns,workers,HYBRID_GROUP)
@@ -1477,29 +1488,8 @@ fn monotonic_ns() -> u128 {
     ts.sec as u128 * 1_000_000_000 + ts.nsec as u128
 }
 
-/// Run every thread of this process under `SCHED_IDLE`: on a CPU where another runnable task
-/// appears (a timer's wakeup, a kernel worker, the runner's agent) that task runs at once instead
-/// of waiting for one of the prover's threads to be preempted. The prover still has every CPU
-/// nothing else wants, which on an otherwise idle host is all of them. Threads created later
-/// inherit the policy. Lowering one's own policy needs no privilege; a refusal changes nothing.
-/// `LABINIUS_NORMAL_SCHED` (any value) keeps the default policy, for A/B measurements.
-fn yield_to_everything_else() {
-    #[repr(C)]
-    struct SchedParam {
-        priority: i32,
-    }
-    extern "C" {
-        fn sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> i32;
-    }
-    const SCHED_IDLE: i32 = 5;
-    unsafe { sched_setscheduler(0, SCHED_IDLE, &SchedParam { priority: 0 }) };
-}
-
 fn main() {
     let main_ns = monotonic_ns();
-    if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
-        yield_to_everything_else();
-    }
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 5 || args.len() == 7,
@@ -2024,6 +2014,9 @@ mod tests {
         assert_eq!(image.len(), 2 * keygen::BATCHES * hybrid::KEY_BATCH_BYTES);
         if EMBEDDED_HYBRID.0.is_empty() { return; }
         assert!(EMBEDDED_HYBRID.0[..] == image[..], "the embedded arranged image differs");
+        let schedule = hybrid::arranged_schedule(&key, &tail);
+        assert_eq!(schedule.len(), keygen::BATCHES);
+        assert_eq!(EMBEDDED_REDUCTIONS, &schedule[..], "embedded schedule differs from its exact keys");
         assert!(hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES).is_some());
         assert!(hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES - 1).is_none());
     }

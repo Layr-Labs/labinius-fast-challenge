@@ -63,9 +63,10 @@ const fn period(q:u16)->usize {
  while acc_after_reduce_c(q)+2*(p as i64)*per_batch(q)<=i32::MAX as i64 {p*=2;}
  p
 }
-/// A tail-stream row sum at the end of a chunk, formed from the raw lanes: at most `period - 1`
-/// batches since the last fold-back, two lanes per row (8-row groups) or four lanes of half the
-/// growth (the 4-row group).
+/// Default periodic tail bound: at most `period - 1` batches since a fold-back,
+/// with two lanes per row (8-row groups) or four lanes of half the growth.
+/// The optional public-key schedule proves its raw row sums separately in
+/// `fold_certificate` before use.
 const fn tail_row_bound(q:u16)->i64 {
  let rem=(period(q)-1) as i64;
  let max8=2*(acc_after_reduce_c(q)+rem*per_batch(q));
@@ -209,11 +210,11 @@ impl<const Q:u16,const RED:bool> BlockSink for TSink<Q,RED> {
  }
 }
 /// One column's batch `b` modulo `Q` (`keys[2b]` for 3889, `keys[2b + 1]` for 9721), folded back
-/// when it ends a period.
+/// when the validated periodic or public-key schedule requests a fold-back.
 #[inline(always)]
-unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,keys:&[KeyBatch],b:usize,acc:*mut i32) {
+unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,keys:&[KeyBatch],b:usize,acc:*mut i32,reduce:bool) {
  let k=keys[2*b+if Q==P0 {0} else {1}].v.as_ptr() as *const i16;
- if (b+1)%period(Q)==0 {
+ if reduce {
   vb::ntt_bin_batch32_hybrid::<Q,true>(idx,k,acc);
  } else {
   vb::ntt_bin_batch32_hybrid::<Q,false>(idx,k,acc);
@@ -404,18 +405,22 @@ unsafe fn clear_lanes(b:&mut Batch32,from:usize) {
 /// column's tail is the sum of its lanes of the total. Writes `out[3c .. 3c + 3]`.
 /// `sync(b)` is called once batch `b`'s keys have been read for every column of the group.
 #[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mut Worker,out:*mut [u32;N],mut sync:F) {
+unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mut Worker,out:*mut [u32;N],mut sync:F,schedule:Option<&[u8]>) {
  let g=cols.len();assert!(g>=1 && 2*g<=ws.acc.len() && keys.len()==2*nb);
  let slots=32/g;
  for a in ws.acc[..2*g].iter_mut() {core::ptr::write_bytes(a as *mut GAcc,0,1);}
  core::ptr::write_bytes(&mut ws.total[0] as *mut Batch32,0,1);
  let mut filled=0usize;
  for b in 0..nb {
+  // One public decision per batch, shared by all columns and 24 transform blocks.
+  let flags=schedule.map_or_else(||{
+   u8::from((b+1)%period(P0)==0) | (u8::from((b+1)%period(P1)==0)<<1)
+  },|s|s[b]);
   for c in 0..g {
    cols[c].slice_batch(b,&mut ws.idx[0]);
    let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;
-   sink_batch::<P0>(&ws.idx[0],keys,b,a0);
-   sink_batch::<P1>(&ws.idx[0],keys,b,a1);
+   sink_batch::<P0>(&ws.idx[0],keys,b,a0,flags&1!=0);
+   sink_batch::<P1>(&ws.idx[0],keys,b,a1,flags&2!=0);
   }
    sync(b);
    if (b+1)%CHUNK_BATCHES==0 || b+1==nb {
@@ -488,6 +493,14 @@ pub fn keys_from_image(image:&'static [u8],nb:usize)->Option<&'static [KeyBatch]
  if !cfg!(target_endian="little") || image.len()!=2*nb*KEY_BATCH_BYTES || image.as_ptr() as usize%64!=0 {return None;}
  Some(unsafe{core::slice::from_raw_parts(image.as_ptr() as *const KeyBatch,2*nb)})
 }
+/// Build the reduction sidecar from this pair of public keys. This is offline work;
+/// no witness values or instance seed enter either the row bounds or the schedule.
+pub fn arranged_schedule(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey)->Vec<u8> {
+ fold_certificate::certify_global_fold_schedule(&arrange_keys(base,tail,1))
+}
+#[path="hybrid_fold_certificate.rs"]
+mod fold_certificate;
+
 /// Both keys of every batch in the sink's arrangement: `keys[2b]` modulo 3889, `keys[2b + 1]`
 /// modulo 9721.
 pub fn arrange_keys(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey,workers:usize)->Box<[KeyBatch]> {
@@ -555,6 +568,22 @@ pub fn commit_columns_rows(
 /// [`commit_columns_rows`] against keys already in the sink's arrangement ([`arrange_keys`],
 /// [`keys_from_image`]): `keys[2b]`, `keys[2b + 1]` for each batch of 128 words of a column.
 pub fn commit_columns_rows_arranged(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,group_size:usize)->Vec<[u32;N]> {
+ commit_columns_rows_arranged_impl(keys,columns,workers,group_size,None)
+}
+/// Commit with a public fold-back certificate generated alongside this exact key image.
+/// The sidecar has one byte per batch: bit 0 reduces modulo 3889, bit 1 modulo 9721.
+///
+/// # Safety
+/// `schedule` must have been certified for these exact keys, their complete batch count,
+/// the current binary NTT, and CHUNK_BATCHES. A prefix of a certified pair is not generally
+/// certified: its final short tail may require another reduction. Use the safe default
+/// entry point for arbitrary keys without this certificate.
+pub unsafe fn commit_columns_rows_arranged_scheduled(keys:&[KeyBatch],schedule:&[u8],columns:&[&[B128]],workers:usize,group_size:usize)->Vec<[u32;N]> {
+ assert_eq!(schedule.len(),keys.len()/2,"one reduction flag byte per key batch");
+ assert!(schedule.iter().all(|&x|x&!3==0),"invalid reduction flags");
+ commit_columns_rows_arranged_impl(keys,columns,workers,group_size,Some(schedule))
+}
+fn commit_columns_rows_arranged_impl(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,group_size:usize,schedule:Option<&[u8]>)->Vec<[u32;N]> {
  assert!(!columns.is_empty(),"at least one witness column");
  let nb=keys.len()/2;
  assert!(nb>0 && keys.len()==2*nb,"two arranged key batches per batch");
@@ -566,7 +595,7 @@ pub fn commit_columns_rows_arranged(keys:&[KeyBatch],columns:&[&[B128]],workers:
  let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;
  let paired=if workers>=2 && workers%2==0 && columns.len()>g {crate::par::CorePlacement::for_sibling_pairs(workers)} else {None};
  if let Some(placement)=paired {
-  commit_paired(keys,columns,workers,g,Some(&placement),dst);
+  commit_paired(keys,columns,workers,g,Some(&placement),dst,schedule);
  } else {
   let groups=columns.len().div_ceil(g);let workers=workers.clamp(1,groups);
   let next=std::sync::atomic::AtomicUsize::new(0);
@@ -579,7 +608,7 @@ pub fn commit_columns_rows_arranged(keys:&[KeyBatch],columns:&[&[B128]],workers:
     if gi>=groups {break;}
     let c0=gi*g;let gc=g.min(columns.len()-c0);
     let ws=ws.get_or_insert_with(||Worker::new(g));
-    unsafe{group(&columns[c0..c0+gc],&keys,nb,ws,(dst as *mut [u32;N]).add(3*c0),|_|{})};
+    unsafe{group(&columns[c0..c0+gc],&keys,nb,ws,(dst as *mut [u32;N]).add(3*c0),|_|{},schedule)};
    }
   });
  }
@@ -607,7 +636,7 @@ const SIBLING_WAIT:std::time::Duration=std::time::Duration::from_micros(500);
 /// whichever sibling comes first, so every column is committed whatever the pool's runners do;
 /// a sibling that keeps the other waiting longer than [`SIBLING_WAIT`] (descheduled, or its
 /// task not started) ends the waiting for the rest of the run.
-fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,placement:Option<&crate::par::CorePlacement>,dst:usize) {
+fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,placement:Option<&crate::par::CorePlacement>,dst:usize,schedule:Option<&[u8]>) {
  use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
  let nb=keys.len()/2;
  let pairs=workers/2;let sg=2*g;
@@ -643,7 +672,7 @@ fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,place
      spins+=1;
      if spins%64==0 && start.elapsed()>SIBLING_WAIT {coupled.store(false,Ordering::Relaxed);return;}
     }
-   })};
+   },schedule)};
   }
   // nothing more to wait for
   mine.store(usize::MAX/2,Ordering::Release);
@@ -765,9 +794,14 @@ mod tests {
   // the sibling-pair schedule, without placement: ragged groups, empty halves, more pairs
   // than groups
   let keys=arrange_keys(&base,&tail,3);
+  let schedule=fold_certificate::certify_global_fold_schedule(&keys);
+  for (workers,g) in [(3usize,1usize),(3,16),(8,16),(8,32)] {
+   let got=unsafe{commit_columns_rows_arranged_scheduled(&keys,&schedule,&cols,workers,g)};
+   assert_eq!(got,want,"certified public-key schedule ({workers} workers, {g} columns)");
+  }
   for (workers,g) in [(2usize,1usize),(2,16),(4,3),(4,16),(6,8),(8,16),(8,32)] {
    let mut rows:Vec<[u32;N]>=Vec::with_capacity(ncols*3);
-   commit_paired(&keys,&cols,workers,g,None,rows.as_mut_ptr() as usize);
+   commit_paired(&keys,&cols,workers,g,None,rows.as_mut_ptr() as usize,None);
    unsafe{rows.set_len(ncols*3);}
    assert!(rows==want,"paired schedule ({workers} workers, {g} columns each) differs from the reference");
   }

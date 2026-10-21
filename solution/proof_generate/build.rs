@@ -27,10 +27,15 @@ fn main() {
     println!("cargo:rerun-if-changed=src/parameters.rs");
     println!("cargo:rerun-if-changed=src/rq.rs");
     println!("cargo:rerun-if-changed=build.rs");
-    let (image, tail, hybrid) = images();
+    println!("cargo:rerun-if-changed=../labinius/crates/pcs/src/simd/hybrid_commit.rs");
+    println!("cargo:rerun-if-changed=../labinius/crates/pcs/src/simd/hybrid_fold_certificate.rs");
+    println!("cargo:rerun-if-changed=../labinius/crates/pcs/src/simd/ntt/bin_asm.rs");
+    println!("cargo:rerun-if-changed=../labinius/crates/pcs/src/simd/ntt/bin_bounds_certificate.rs");
+    let (image, tail, hybrid, reductions) = images();
     std::fs::write(dir.join("key.bin"), image).expect("write the key image");
     std::fs::write(dir.join("tail-key.bin"), tail).expect("write the auxiliary key image");
     std::fs::write(dir.join("hybrid-key.bin"), hybrid).expect("write the arranged hybrid key image");
+    std::fs::write(dir.join("hybrid-red.bin"), reductions).expect("write the certified reduction sidecar");
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -48,24 +53,25 @@ fn host_can_run() -> bool {
 /// the hybrid commitment's sink (`labinius::simd::commit::hybrid::arranged_image`), each key
 /// built once.
 #[cfg(target_arch = "x86_64")]
-fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     // The library's kernels need these features at run time. A build host without them (for
     // instance a cross-build for the scored CPU) writes empty images and the prover builds the
     // keys when it runs; the scored runner has every one of them.
     if !host_can_run() {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let key = keygen::build_key(parameters::MODULUS);
     let image = keygen::key_image(&key);
     if parameters::MODULUS != modulus_choice::HYBRID_MODULUS {
-        return (image, Vec::new(), Vec::new());
+        return (image, Vec::new(), Vec::new(), Vec::new());
     }
     let tail = keygen::build_tail_key(parameters::MODULUS);
     let hybrid = labinius::simd::commit::hybrid::arranged_image(&key, &tail);
-    (image, keygen::key_image(&tail), hybrid)
+    let reductions = labinius::simd::commit::hybrid::arranged_schedule(&key, &tail);
+    (image, keygen::key_image(&tail), hybrid, reductions)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    (Vec::new(), Vec::new(), Vec::new())
+fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
 }

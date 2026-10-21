@@ -699,6 +699,9 @@ fn commitment_bytes_rows(
     };
     let blocks = columns.div_ceil(32);
     let runs = labinius::par::ranges(blocks, workers, 1);
+    // The blocks are handed out from a shared counter rather than as fixed runs, so a runner
+    // that shares its CPU with another process takes fewer of them.
+    let next = std::sync::atomic::AtomicUsize::new(0);
     let out_addr = out.as_mut_ptr() as usize;
     // One run per logical CPU, placed explicitly for this dispatch and released at its end:
     // this is the first dispatch after the commitment's per-core placement, and the runner
@@ -710,7 +713,11 @@ fn commitment_bytes_rows(
         let mut residues: Vec<Vec<i16>> = (0..limbs).map(|_| vec![0i16; 32 * N]).collect();
         let mut mixed = vec![0u64; limbs];
         let mut at = vec![0u64; limbs];
-        for blk in runs[r].clone() {
+        loop {
+            let blk = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if blk >= blocks {
+                break;
+            }
             let c0 = blk * 32;
             let cols = (columns - c0).min(32);
             for k in 0..limbs {
@@ -962,10 +969,10 @@ const PREFIX_SETS: usize = 32;
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 /// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
-/// a host of two-thread cores the two threads of a core take the halves of each 32-column group,
-/// so each batch of the arranged keys, 168 KB, is read from L3 once per 32 columns; 32 per
-/// worker measured 1.8 ms slower (L2 pressure).
-const HYBRID_GROUP: usize = 32;
+/// a host of two-thread cores the two threads of a core take the halves of each group; 32 per
+/// worker measured 1.8 ms slower (L2 pressure) and the official 8488C profiles confirm it:
+/// `commit_us` 244.6 ms at 32 against 241.3 ms at 16.
+const HYBRID_GROUP: usize = 16;
 /// The group size the commitment runs with: columns per worker, which sets how much
 /// of the arranged key is reused from L2 and how large the accumulators get.
 fn hybrid_group() -> usize {

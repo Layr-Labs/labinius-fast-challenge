@@ -1364,6 +1364,8 @@ mod bitsliced {
     /// zero padding of the 64-input chunks against 16; about 840 KB of planes, counters and
     /// schedule per worker, two hyperthread siblings inside one 2 MB L2.
     const COL_GROUP: usize = 31;
+    /// Parts of the column groups per block in the fold's dynamic task hand-out.
+    const PARTS: usize = 2;
     /// Planes per column: a zero guard, the 128 direct planes, a zero guard, the 128
     /// complemented planes, and the next column's leading guard. Every term's 128-plane run is
     /// flanked by zero planes, so a window of two consecutive slots reads a zero wherever the
@@ -1881,6 +1883,17 @@ mod bitsliced {
         for s in 0..SLOTS {
             unslice(acc.add(s * BITS), &mut counts[s]);
         }
+        write_counts(counts, bias, output);
+    }
+
+    /// The output stage of [`write_block`] from counts already unsliced (and possibly summed
+    /// over several parts of the column groups).
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+    unsafe fn write_counts(
+        counts: &[[i16; LANES]],
+        bias: &[i32; SLOTS],
+        output: *mut RingElement,
+    ) {
         for e in 0..LANES / 4 {
             core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
         }
@@ -1956,54 +1969,50 @@ mod bitsliced {
             eprintln!("bitfold plan_us={}", plan_start.elapsed().as_micros());
         }
         let blocks = column_words / LANES;
-        let per = blocks.div_ceil(workers.clamp(1, blocks));
-        let tasks = blocks.div_ceil(per);
         let len = column_words / 4;
         // Counters and bias are at most the total weight (checked by the caller), which is
         // what lets the output stage subtract them in i16 lanes.
         assert!(bias.iter().all(|&b| (0..=i16::MAX as i32).contains(&b)));
-        // Each task writes its own output range on its own core; the pool's workers are
-        // already running, so no thread is spawned and no serial pass touches the output.
+        // Tasks are (block, part of the column groups), handed out dynamically so a busy or
+        // shared core does fewer of them; the second part of a block to finish adds its counts
+        // to the first's (counts are additive and stay within the total weight) and writes.
+        let parts = PARTS.min(groups.len().max(1));
+        let cuts: Vec<usize> = (0..=parts).map(|i| groups.len() * i / parts).collect();
+        let tasks = blocks * parts;
+        let pending: Vec<std::sync::Mutex<Vec<Vec<[i16; LANES]>>>> =
+            (0..blocks).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
         let mut out: Vec<RingElement> = Vec::with_capacity(len);
         let out_addr = out.as_mut_ptr() as usize;
-        let (groups, bias) = (&groups, &bias);
-        crate::par::pool().run(tasks, |worker| unsafe {
-            let first = worker * per * LANES / 4;
-            let count = (per * LANES / 4).min(len - first);
-            let base = (out_addr as *mut RingElement).add(first);
-            #[cfg(test)]
-            let mut times = [std::time::Duration::ZERO; 3];
+        let (groups, bias, cuts, pending, next) = (&groups, &bias, &cuts, &pending, &next);
+        crate::par::pool().run(workers.clamp(1, tasks), |_| unsafe {
             let zero = _mm512_setzero_si512();
             // Zero everywhere the columns do not write: the guards and the padding pair.
             let mut planes = vec![zero; GUARD + GROUP * STRIDE];
             let mut acc = vec![zero; 2 * PAIRS * BITS];
-            let mut counts = vec![[0i16; LANES]; SLOTS];
-            for local in 0..count / (LANES / 4) {
-                let block = worker * per + local;
-                let output = base.add(local * (LANES / 4));
+            loop {
+                let task = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if task >= tasks {
+                    break;
+                }
+                let (block, part) = (task / parts, task % parts);
                 acc.fill(zero);
-                for (gi, group) in groups.iter().enumerate() {
-                    #[cfg(test)]
-                    let start = profile.then(std::time::Instant::now);
+                let range = cuts[part]..cuts[part + 1];
+                for gi in range.clone() {
+                    let group = &groups[gi];
                     for j in 0..group.columns {
                         let src = words.as_ptr().add((group.first + j) * column_words + block * LANES);
                         // What the next call slices: this group's next column, else the next
-                        // group's first, else the next block's first column.
-                        let next = if j + 1 < group.columns {
+                        // group's first, else this block's start (harmless).
+                        let next_src = if j + 1 < group.columns {
                             src.add(column_words)
-                        } else if gi + 1 < groups.len() {
+                        } else if gi + 1 < range.end {
                             words.as_ptr().add(groups[gi + 1].first * column_words + block * LANES)
-                        } else if block + 1 < blocks {
-                            words.as_ptr().add((block + 1) * LANES)
                         } else {
                             src
                         };
-                        slice(src, planes.as_mut_ptr().add(GUARD + j * STRIDE), next);
+                        slice(src, planes.as_mut_ptr().add(GUARD + j * STRIDE), next_src);
                     }
-                    #[cfg(test)]
-                    if let Some(start) = start { times[0] += start.elapsed(); }
-                    #[cfg(test)]
-                    let start = profile.then(std::time::Instant::now);
                     for q in 0..PAIRS {
                         accumulate_pair(
                             planes.as_ptr(),
@@ -2011,19 +2020,29 @@ mod bitsliced {
                             acc.as_mut_ptr().add(2 * q * BITS),
                         );
                     }
-                    #[cfg(test)]
-                    if let Some(start) = start { times[1] += start.elapsed(); }
                 }
-                #[cfg(test)]
-                let start = profile.then(std::time::Instant::now);
-                write_block(acc.as_ptr(), &mut counts, bias, output);
-                #[cfg(test)]
-                if let Some(start) = start { times[2] += start.elapsed(); }
-            }
-            #[cfg(test)]
-            if profile {
-                eprintln!("bitfold worker={} slice_us={} add_us={} output_us={}",
-                    worker, times[0].as_micros(), times[1].as_micros(), times[2].as_micros());
+                let mut counts = vec![[0i16; LANES]; SLOTS];
+                for s in 0..SLOTS {
+                    unslice(acc.as_ptr().add(s * BITS), &mut counts[s]);
+                }
+                let mut done = {
+                    let mut v = pending[block].lock().unwrap();
+                    v.push(counts);
+                    if v.len() < parts {
+                        continue;
+                    }
+                    core::mem::take(&mut *v)
+                };
+                let mut total = done.pop().unwrap();
+                for other in &done {
+                    for (t, o) in total.iter_mut().zip(other) {
+                        for (a, b) in t.iter_mut().zip(o) {
+                            *a += *b;
+                        }
+                    }
+                }
+                let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
+                write_counts(&total, bias, output);
             }
         });
         // Every task wrote its whole range.

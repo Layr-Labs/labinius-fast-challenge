@@ -442,6 +442,191 @@ pub fn commit_columns_rows_arranged(keys:&[KeyBatch],columns:&[&[B128]],workers:
  unsafe{rows.set_len(columns.len()*3);}
  rows
 }
+// =============================================================================================
+// column-pair layout: lanes are 16 columns x 2 consecutive ring elements
+// =============================================================================================
+//
+// Lane 2l+e of a transform batch is ring element 2b+e of column l of a 16-column group, so the
+// two lanes `vpmaddwd` pairs belong to the same column and multiply the two key elements
+// (A_{2b}, A_{2b+1}), which are the same for every column: one `vpdpwssd` with a broadcast dword
+// per slot and key accumulates 16 columns at once, with no lane folding at all.
+
+/// The keys of both primes and both streams in the pair layout, one flat buffer of four
+/// streams: stream `s = 2*prime + (0 for A, 1 for the 1024 lift)` holds, for pair batch `b` and
+/// slot `j`, the dword `(A_{2b}[j], A_{2b+1}[j])` at `s * np * 648 + 648 b + j`, where `np` is
+/// the number of pair batches of a column.
+pub fn pair_keys(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey,workers:usize)->Vec<u32> {
+ let rows=[base.row(0),tail.row(0),base.row(1),tail.row(1)];
+ let nb=rows[0].len();let np=16*nb;
+ let mut k:Vec<u32>=Vec::with_capacity(4*np*648);
+ unsafe{k.set_len(4*np*648);}
+ let addr=k.as_mut_ptr() as usize;
+ let runs=crate::par::ranges(4*nb,workers.max(1),1);
+ crate::par::pool().run(runs.len(),|r|{
+  for t in runs[r].clone() {
+   let (s,b)=(t/nb,t%nb);let src=&rows[s][b];
+   let dst=(addr as *mut u32).wrapping_add(s*np*648);
+   for h in 0..16 {
+    for j in 0..648 {
+     let lo=src.v[j][2*h] as u16 as u32;let hi=src.v[j][2*h+1] as u16 as u32;
+     unsafe{dst.add((16*b+h)*648+j).write(lo|(hi<<16));}
+    }
+   }
+  }
+ });
+ k
+}
+
+/// One dword-product step bound: two products of a lazily reduced transform lane and a centered
+/// key lane.
+const fn pair_per_batch(q:u16)->i64 {2*w_bound(q)*a_bound(q)}
+/// Pair batches between two fold-backs: the largest power of two P with
+/// `acc_after_reduce + P * pair_per_batch <= i32::MAX`.
+const fn pair_period(q:u16)->usize {
+ let mut p=1usize;
+ while acc_after_reduce(q)+2*(p as i64)*pair_per_batch(q)<=i32::MAX as i64 {p*=2;}
+ p
+}
+const PP0:usize=pair_period(P0);const PP1:usize=pair_period(P1);
+const _:()=assert!(acc_after_reduce(P0)+(PP0 as i64)*pair_per_batch(P0)<=i32::MAX as i64);
+const _:()=assert!(acc_after_reduce(P1)+(PP1 as i64)*pair_per_batch(P1)<=i32::MAX as i64);
+/// Pair batches per certified chunk (the chunk is `CHUNK_BATCHES * 32` ring elements).
+const CHUNK_PAIRS:usize=CHUNK_BATCHES*16;
+/// Tasks per 16-column group (contiguous runs of whole certified chunks).
+const PARTS:usize=4;
+/// Pair batches transformed in lockstep per accumulator read-modify-write.
+const LOCK:usize=2;
+const _:()=assert!(CHUNK_PAIRS%PP0==0 && CHUNK_PAIRS%PP1==0 && PP0%LOCK==0 && PP1%LOCK==0 && CHUNK_PAIRS%LOCK==0);
+
+#[repr(C,align(64))]
+pub struct PAcc { pub v:[[i32;16];648] }
+impl PAcc {
+ fn zero()->Box<PAcc> {
+  unsafe{let mut b=Box::<PAcc>::new_uninit();core::ptr::write_bytes(b.as_mut_ptr() as *mut u8,0,core::mem::size_of::<PAcc>());b.assume_init()}
+ }
+}
+
+/// The pair sink for `H` consecutive pair batches at once: all `H` products enter each
+/// accumulator in one read-modify-write (`red` when the last of them closes a fold-back period).
+struct MultiSink<const Q:u16,const H:usize> {bufs:[*mut i16;H],ka:*const u32,kt:*const u32,aa:*mut i32,at:*mut i32,red:bool}
+impl<const Q:u16,const H:usize> vb::MultiBlockSink<H> for MultiSink<Q,H> {
+ #[inline(always)]unsafe fn dsts(&mut self,_:usize)->[*mut i16;H] {self.bufs}
+ #[target_feature(enable="avx512f,avx512bw,avx512vnni")]
+ unsafe fn blocks(&mut self,blk:usize,w:[*mut i16;H]) {
+  let s0=27*blk;
+  for j in 0..27 {
+   let pa=self.aa.add(16*(s0+j)) as *mut __m512i;
+   let pt=self.at.add(16*(s0+j)) as *mut __m512i;
+   let mut a=_mm512_load_si512(pa);
+   let mut t=_mm512_load_si512(pt);
+   for h in 0..H {
+    let x=_mm512_load_si512(w[h].add(32*j) as *const __m512i);
+    a=_mm512_dpwssd_epi32(a,x,_mm512_set1_epi32(*self.ka.add(648*h+s0+j) as i32));
+    t=_mm512_dpwssd_epi32(t,x,_mm512_set1_epi32(*self.kt.add(648*h+s0+j) as i32));
+   }
+   if self.red {a=reduce_vec::<Q>(a);t=reduce_vec::<Q>(t);}
+   _mm512_store_si512(pa,a);
+   _mm512_store_si512(pt,t);
+  }
+ }
+}
+/// Slot sums in [0, q) as i16 into lanes 0..16 of `out` (lanes 16..32 are left as they are).
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn pacc_to_batch<const Q:u16>(a:&PAcc,out:&mut Batch32) {
+ let p=a.v.as_ptr() as *const __m512i;
+ for j in 0..648 {
+  let r=mod_q::<Q>(_mm512_load_si512(p.add(j)));
+  _mm256_store_si256(out.v[j].as_mut_ptr() as *mut __m256i,_mm512_cvtepi32_epi16(r));
+ }
+}
+struct PairOut {base:Vec<[[u32;N];2]>,tail:Vec<[u16;N]>}
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+/// The pair batches `range` (its start a multiple of the certified chunk) of a group of up to 16
+/// columns: base sums in [0, q) and the 1024 residue of the tail, both additive over ranges.
+unsafe fn group_pairs(cols:&[&[B128]],keys:&[u32],np:usize,range:core::ops::Range<usize>)->PairOut {
+ let g=cols.len();assert!(g<=16);
+ let mut acc:[Box<PAcc>;4]=core::array::from_fn(|_|PAcc::zero());
+ let mut partial0=Batch32::zero(Representation::Ntt);let mut partial1=Batch32::zero(Representation::Ntt);
+ let mut total=Batch32::zero(Representation::Coefficients);
+ let mut idx:[BinaryIndex32;LOCK]=core::array::from_fn(|_|BinaryIndex32::zero());
+ let mut bufs:[Blk27;LOCK]=core::array::from_fn(|_|Blk27([0;27*32]));
+ let bps:[*mut i16;LOCK]=core::array::from_fn(|h|bufs[h].0.as_mut_ptr());
+ #[repr(C,align(64))] struct Staged([F162;128]);
+ let mut staged=Staged([F162::ZERO;128]);
+ let ka:[*const u32;4]=core::array::from_fn(|s|keys.as_ptr().add(s*np*648));
+ assert!(range.start%CHUNK_PAIRS==0 && (range.end-range.start)%LOCK==0 && range.end<=np);
+ // LOCK pair batches per step: their transforms run in lockstep and their products enter each
+ // accumulator in one read-modify-write.
+ for b in range.clone().step_by(LOCK) {
+  for h in 0..LOCK {
+   for l in 0..g {
+    let src=cols[l].as_ptr().add(8*(b+h));
+    for m in 0..8 {staged.0[8*l+m]=F162::from_b128(*src.add(m));}
+   }
+   crate::simd::transpose_f162::slice_f162_into(&staged.0,&mut idx[h]);
+  }
+  let (a0,t0,a1,t1)={let [x,y,z,w]=&mut acc;(x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32,z.v.as_mut_ptr() as *mut i32,w.v.as_mut_ptr() as *mut i32)};
+  let ins:[&BinaryIndex32;LOCK]=core::array::from_fn(|h|&idx[h]);
+  vb::ntt_bin_batch32_multi_sink::<P0,LOCK,_>(ins,&mut MultiSink::<P0,LOCK>{bufs:bps,ka:ka[0].add(648*b),kt:ka[1].add(648*b),aa:a0,at:t0,red:(b+LOCK)%PP0==0});
+  vb::ntt_bin_batch32_multi_sink::<P1,LOCK,_>(ins,&mut MultiSink::<P1,LOCK>{bufs:bps,ka:ka[2].add(648*b),kt:ka[3].add(648*b),aa:a1,at:t1,red:(b+LOCK)%PP1==0});
+  if (b+LOCK)%CHUNK_PAIRS==0 || b+LOCK==range.end {
+   pacc_to_batch::<P0>(&acc[1],&mut partial0);pacc_to_batch::<P1>(&acc[3],&mut partial1);
+   acc[1].v.fill([0;16]);acc[3].v.fill([0;16]);
+   partial0.representation=Representation::Ntt;partial1.representation=Representation::Ntt;
+   gen_small::intt_gen_batch32::<P0>(&mut partial0);gen_small::intt_gen_batch32::<P1>(&mut partial1);
+   crt_accumulate(&partial0,&partial1,&mut total);
+  }
+ }
+ let mut base=vec![[[0u32;N];2];g];
+ let mut tmp=Batch32::zero(Representation::Ntt);
+ for (k,a) in [(0usize,&acc[0]),(1,&acc[2])] {
+  if k==0 {pacc_to_batch::<P0>(a,&mut tmp);} else {pacc_to_batch::<P1>(a,&mut tmp);}
+  for j in 0..N {for l in 0..g {base[l][k][j]=tmp.v[j][l] as u32;}}
+ }
+ PairOut{base,tail:(0..g).map(|l|core::array::from_fn(|j|(total.v[j][l] as u16)&1023)).collect()}
+}
+
+/// [`commit_columns_rows`] in the column-pair layout: groups of 16 columns, one pass over the
+/// pair keys per group.
+pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+ assert!(!columns.is_empty(),"at least one witness column");
+ let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
+ assert_eq!(len%8,0);let np=len/8;
+ assert_eq!(keys.len(),4*np*648);
+ let g=16;let groups=columns.len().div_ceil(g);let workers=workers.clamp(1,groups);
+ // Uninitialised: the groups partition the columns and each writes all three rows of its own.
+ let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;
+ // Each group's pair batches are cut at certified-chunk boundaries into PARTS tasks, so the
+ // dynamic hand-out ends with short tasks; the last part of a group to finish adds the parts.
+ let cut:Vec<usize>=(0..=PARTS).map(|i|if i==PARTS {np} else {(np*i/PARTS)/CHUNK_PAIRS*CHUNK_PAIRS}).collect();
+ let tasks=groups*PARTS;
+ let slots:Vec<std::sync::Mutex<Vec<PairOut>>>=(0..groups).map(|_|std::sync::Mutex::new(Vec::new())).collect();
+ let next=std::sync::atomic::AtomicUsize::new(0);
+ let placement=crate::par::CorePlacement::for_workers(workers);
+ crate::par::pool().run(workers,|worker|{
+  let _guard=placement.as_ref().and_then(|p|p.pin(worker));
+  loop {
+   let t=next.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+   if t>=tasks {break;}
+   let (gi,part)=(t/PARTS,t%PARTS);
+   let c0=gi*g;let gc=g.min(columns.len()-c0);
+   let out=unsafe{group_pairs(&columns[c0..c0+gc],keys,np,cut[part]..cut[part+1])};
+   let parts={let mut v=slots[gi].lock().unwrap();v.push(out);if v.len()<PARTS {continue;} core::mem::take(&mut *v)};
+   for c in 0..gc {
+    let base0:[u32;N]=core::array::from_fn(|j|parts.iter().map(|o|o.base[c][0][j]).sum::<u32>()%P0 as u32);
+    let base1:[u32;N]=core::array::from_fn(|j|parts.iter().map(|o|o.base[c][1][j]).sum::<u32>()%P1 as u32);
+    let tail:[u32;N]=core::array::from_fn(|j|parts.iter().map(|o|o.tail[c][j] as u32).sum::<u32>()&1023);
+    unsafe{
+     let p=(dst as *mut [u32;N]).add((c0+c)*3);
+     p.write(base0);p.add(1).write(base1);p.add(2).write(tail);
+    }
+   }
+  }
+ });
+ unsafe{rows.set_len(columns.len()*3);}
+ rows
+}
+
 #[cfg(test)]
 mod tests {
  use super::*;

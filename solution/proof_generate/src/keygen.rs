@@ -110,3 +110,15 @@ pub fn build_tail_key(modulus:u128)->CommitmentKey {
     let matrix=rq::ajtai_matrix(modulus,RING_ELEMENTS);
     build_tail_key_from_matrix(&matrix)
 }
+
+/// The embedded column-pair image as the flat `u32` buffer `hybrid::pair_keys` builds, if it
+/// has the size of one at this shape. `image` must be 64-byte aligned.
+#[allow(dead_code)]
+pub fn pair_words(image: &'static [u8]) -> Option<&'static [u32]> {
+    let words = 4 * (crate::parameters::RING_ELEMENTS / 2) * 648;
+    if image.len() != 4 * words || image.as_ptr() as usize % 64 != 0 {
+        return None;
+    }
+    assert!(cfg!(target_endian = "little"), "the image is little-endian");
+    Some(unsafe { std::slice::from_raw_parts(image.as_ptr() as *const u32, words) })
+}

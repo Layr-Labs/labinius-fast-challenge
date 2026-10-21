@@ -37,8 +37,9 @@ const ABLK:usize=8;
 /// `27 blk + 8 g + s` of A, vector `.. + 8 + q` the same of T. The 4-row group: vector
 /// `KBLK blk + 48 + c` holds in its 128-bit slot `s` the lanes `8c .. 8c + 8` of row
 /// `27 blk + 24 + s` of A (zero for `s = 3`), vector `.. + 4 + c` the same of T. 84 KB.
+/// A certified RED byte follows the vectors; alignment adds 63 serialized zero padding bytes.
 #[repr(C,align(64))]
-pub struct KeyBatch {v:[[i16;32];24*KBLK]}
+pub struct KeyBatch {v:[[i16;32];24*KBLK],reduce:u8}
 /// One column-prime's accumulators: vector `ABLK blk + 2 g` is the base stream of group `g` of
 /// block `blk` (8-row groups: lanes `2s, 2s + 1` sum row `8 g + s`; the 4-row group: lanes
 /// `4s .. 4s + 4` sum row `24 + s`), the next one its tail stream. 12 KB.
@@ -209,11 +210,12 @@ impl<const Q:u16,const RED:bool> BlockSink for TSink<Q,RED> {
  }
 }
 /// One column's batch `b` modulo `Q` (`keys[2b]` for 3889, `keys[2b + 1]` for 9721), folded back
-/// when it ends a period.
+/// according to the actual-key certificate stored with that batch.
 #[inline(always)]
 unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,keys:&[KeyBatch],b:usize,acc:*mut i32) {
- let k=keys[2*b+if Q==P0 {0} else {1}].v.as_ptr() as *const i16;
- if (b+1)%period(Q)==0 {
+ let key=&keys[2*b+if Q==P0 {0} else {1}];
+ let k=key.v.as_ptr() as *const i16;
+ if key.reduce!=0 {
   vb::ntt_bin_batch32_hybrid::<Q,true>(idx,k,acc);
  } else {
   vb::ntt_bin_batch32_hybrid::<Q,false>(idx,k,acc);
@@ -480,6 +482,77 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
   }));
  }
 }
+// BEGIN PORTABLE REDUCTION CERTIFICATE: integer arithmetic and slice access only.
+// A batch adds at most W times the sum of its actual absolute key coefficients to
+// each i32 lane. This also bounds every prefix of its dot-product chain. All vectors
+// of a prime share one RED flag; tail lanes restart after every certified chunk.
+const CERT_LANES:usize=24*4*2*16;
+fn cert_lane(blk:usize,g:usize,stream:usize,l:usize)->usize {((blk*4+g)*2+stream)*16+l}
+fn cert_growth(key:&KeyBatch,q:u16,out:&mut [i64]) {
+ assert_eq!(out.len(),CERT_LANES);
+ let w=w_bound(q);let half=(q/2) as i64;
+ for blk in 0..24 {for g in 0..4 {for stream in 0..2 {for l in 0..16 {
+  let (start,n)=if g<3 {(KBLK*blk+16*g+8*stream,8)}else{(KBLK*blk+48+4*stream,4)};
+  let mut sum=0i64;
+  for i in 0..n {for j in 0..2 {
+   let a=(key.v[start+i][2*l+j] as i64).abs();
+   assert!(a<=half,"uncentered hybrid key");
+   sum+=a;
+  }}
+  if g==3 && l>=12 {assert_eq!(sum,0,"nonzero hybrid padding lane");}
+  out[cert_lane(blk,g,stream,l)]=w*sum;
+ }}}}
+}
+fn cert_tail_max(bounds:&[i64])->i64 {
+ let mut maximum=0;
+ for blk in 0..24 {for g in 0..4 {
+  let (rows,width)=if g<3 {(8,2)}else{(3,4)};
+  for row in 0..rows {
+   let mut sum=0;
+   for j in 0..width {sum+=bounds[cert_lane(blk,g,1,row*width+j)];}
+   maximum=maximum.max(sum);
+  }
+ }}
+ maximum
+}
+fn certify_reductions(keys:&mut [KeyBatch]) {
+ assert!(!keys.is_empty() && keys.len()%2==0,"two nonempty hybrid key limbs");
+ let nb=keys.len()/2;
+ // Three reusable buffers, 72 KiB; no full-key growth table or witness data.
+ let mut bounds=vec![0i64;CERT_LANES];
+ let mut current=vec![0i64;CERT_LANES];let mut next=vec![0i64;CERT_LANES];
+ for (prime,q) in [(0usize,P0),(1,P1)] {
+  bounds.fill(0);
+  cert_growth(&keys[prime],q,&mut current);
+  for b in 0..nb {
+   for (a,delta) in bounds.iter_mut().zip(&current) {
+    assert!(*a+*delta<=i32::MAX as i64,"hybrid accumulator certificate overflow");
+    *a+=*delta;
+   }
+   let flush=(b+1)%CHUNK_BATCHES==0 || b+1==nb;
+   let mut needs_next=false;
+   if b+1<nb {
+    cert_growth(&keys[2*(b+1)+prime],q,&mut next);
+    needs_next=bounds.iter().zip(&next).enumerate().any(|(i,(a,delta))|{
+     let after=if flush && (i/16)%2==1 {0}else{*a};
+     after+*delta>i32::MAX as i64
+    });
+   }
+   // Keep prime 9721's established every-batch reduction. Prime 3889 folds only
+   // to satisfy the current tail flush or protect the next batch's dot products.
+   let red=q==P1 || needs_next || (flush && cert_tail_max(&bounds)>bias(q));
+   keys[2*b+prime].reduce=red as u8;
+   if red {for a in &mut bounds {if *a!=0 {*a=acc_after_reduce_c(q);}}}
+   if flush {
+    assert!(cert_tail_max(&bounds)<=bias(q),"hybrid tail certificate overflow");
+    for (i,a) in bounds.iter_mut().enumerate() {if (i/16)%2==1 {*a=0;}}
+   }
+   core::mem::swap(&mut current,&mut next);
+  }
+ }
+}
+// END PORTABLE REDUCTION CERTIFICATE.
+
 /// One batch of one prime's base and tail keys in the sink's arrangement ([`KeyBatch`]).
 fn arrange(a:&Batch32,t:&Batch32,out:&mut KeyBatch) {
  for blk in 0..24 {
@@ -502,32 +575,35 @@ fn check_keys(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey) {
 }
 /// Bytes of one arranged key batch.
 pub const KEY_BATCH_BYTES:usize=core::mem::size_of::<KeyBatch>();
-const _:()=assert!(KEY_BATCH_BYTES==24*KBLK*64 && core::mem::align_of::<KeyBatch>()==64);
+const _:()=assert!(KEY_BATCH_BYTES==24*KBLK*64+64 && core::mem::align_of::<KeyBatch>()==64);
 /// Both keys of every batch in the sink's arrangement as bytes, `keys[2b]` (modulo 3889) and
 /// `keys[2b + 1]` (modulo 9721) in order: the public-parameter image a build script embeds so
 /// that the prover reads the arranged keys in place ([`keys_from_image`]).
 pub fn arranged_image(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey)->Vec<u8> {
- check_keys(base,tail);
- let nb=base.row(0).len();
- let mut out=Vec::with_capacity(2*nb*KEY_BATCH_BYTES);
- let mut kb:Box<[KeyBatch]>=zeroed_slice(1);
- for i in 0..2*nb {
-  arrange(&base.row(i%2)[i/2],&tail.row(i%2)[i/2],&mut kb[0]);
-  for row in kb[0].v.iter() {for &x in row {out.extend_from_slice(&x.to_le_bytes());}}
+ let keys=arrange_keys(base,tail,crate::par::threads());
+ let mut out=Vec::with_capacity(keys.len()*KEY_BATCH_BYTES);
+ for key in keys.iter() {
+  for row in &key.v {for &x in row {out.extend_from_slice(&x.to_le_bytes());}}
+  out.push(key.reduce);out.extend_from_slice(&[0u8;63]);
  }
  out
 }
 /// The arranged keys of `nb` batches an [`arranged_image`] holds, read in place (`image` must be
 /// 64-byte aligned; `None` for any other length).
 pub fn keys_from_image(image:&'static [u8],nb:usize)->Option<&'static [KeyBatch]> {
- if !cfg!(target_endian="little") || image.len()!=2*nb*KEY_BATCH_BYTES || image.as_ptr() as usize%64!=0 {return None;}
- Some(unsafe{core::slice::from_raw_parts(image.as_ptr() as *const KeyBatch,2*nb)})
+ let count=nb.checked_mul(2)?;
+ if nb==0 || !cfg!(target_endian="little") || image.len()!=count.checked_mul(KEY_BATCH_BYTES)? || image.as_ptr() as usize%64!=0 {return None;}
+ // Only images produced with the new layout are accepted. The flag is a byte,
+ // so inspect it before constructing the aligned typed view.
+ if image.chunks_exact(KEY_BATCH_BYTES).any(|b|b[24*KBLK*64]>1) {return None;}
+ Some(unsafe{core::slice::from_raw_parts(image.as_ptr() as *const KeyBatch,count)})
 }
 /// Both keys of every batch in the sink's arrangement: `keys[2b]` modulo 3889, `keys[2b + 1]`
 /// modulo 9721.
 pub fn arrange_keys(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey,workers:usize)->Box<[KeyBatch]> {
  check_keys(base,tail);
  let nb=base.row(0).len();
+ assert!(nb>0,"at least one hybrid key batch");
  let mut keys:Box<[KeyBatch]>=zeroed_slice(2*nb);
  let kp=keys.as_mut_ptr() as usize;
  let tasks=workers.clamp(1,2*nb);
@@ -538,6 +614,7 @@ pub fn arrange_keys(base:&crate::key::CommitmentKey,tail:&crate::key::Commitment
    i+=tasks;
   }
  });
+ certify_reductions(&mut keys);
  keys
 }
 pub fn certify(raw:&[[i16;648]],chunk_batches:usize)->i64 {
@@ -687,6 +764,47 @@ fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,place
 #[cfg(test)]
 mod tests {
  use super::*;
+ // Pure certificate tests are extractable with the portable block above.
+ fn certificate_fixture(nb:usize,case:usize)->Vec<KeyBatch> {
+  let mut state=0x475d91e3a8b2c6f1u64;
+  (0..2*nb).map(|i|{
+   let q=if i%2==0 {P0}else{P1};
+   let mut key=KeyBatch{v:[[0i16;32];24*KBLK],reduce:0};
+   for row in &mut key.v {for x in row {
+    state^=state<<13;state^=state>>7;state^=state<<17;
+    *x=match case {0=>0,1=>q as i16/2,2=>-(q as i16/2),_=>(state%q as u64) as i16-q as i16/2};
+   }}
+   for blk in 0..24 {for stream in 0..2 {for c in 0..4 {
+    key.v[KBLK*blk+48+4*stream+c][24..32].fill(0);
+   }}}
+   key
+  }).collect()
+ }
+ #[test]
+ fn actual_key_reduction_certificate_boundaries() {
+  for nb in [1,7,9] {for case in 0..4 {
+   let mut keys=certificate_fixture(nb,case);
+   certify_reductions(&mut keys);
+   for pair in keys.chunks_exact(2) {
+    assert!(pair[0].reduce<=1);assert_eq!(pair[1].reduce,1);
+    if case==0 {assert_eq!(pair[0].reduce,0);}
+   }
+  }}
+  let mut bad=vec![0i64;CERT_LANES];
+  bad[cert_lane(0,0,1,0)]=bias(P0);bad[cert_lane(0,0,1,1)]=1;
+  assert!(cert_tail_max(&bad)>bias(P0));
+  bad[cert_lane(0,0,1,1)]=0;assert_eq!(cert_tail_max(&bad),bias(P0));
+  bad.fill(0);bad[cert_lane(0,3,1,0)]=bias(P0);bad[cert_lane(0,3,1,3)]=1;
+  assert!(cert_tail_max(&bad)>bias(P0));
+ }
+ #[test]
+ #[should_panic(expected="two nonempty hybrid key limbs")]
+ fn reduction_certificate_rejects_empty() {certify_reductions(&mut []);}
+ #[test]
+ #[should_panic(expected="two nonempty hybrid key limbs")]
+ fn reduction_certificate_rejects_odd_key_count() {
+  let mut keys=certificate_fixture(1,0);keys.pop();certify_reductions(&mut keys);
+ }
  /// The fused register consumer equals the original row-major scratch consumer at every
  /// accumulator lane, including centered fold-back. Arbitrary initial accumulators exercise
  /// the exact wrapping SIMD operations; centered keys and all-zero/all-one/random nibbles

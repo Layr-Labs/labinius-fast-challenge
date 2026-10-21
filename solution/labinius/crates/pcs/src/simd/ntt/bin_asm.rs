@@ -660,12 +660,24 @@ macro_rules! hybrid_store {
     };
 }
 
+/// The first batch of a tail chunk starts from the additive identity in registers.
+/// Other batches retain their tail sum. This replaces clearing the stored tail after
+/// each completed chunk and loading those zeroes on the next batch.
+macro_rules! hybrid_tail_start {
+    (load, $off:literal) => {
+        concat!("vmovdqa64 zmm30, [{acc}+", $off, "]\n")
+    };
+    (zero, $off:literal) => {
+        "vpxord zmm30, zmm30, zmm30\n"
+    };
+}
+
 /// Three 8x8 qword transposes and one 4x4 128-bit transpose, in the same output order
 /// as hybrid_commit::tr8/tr4. Each two-source pair first writes the free register and
 /// then overwrites its second input, so only zmm28 is needed as extra transpose storage.
 /// zmm29/30 are the base/tail sums; zmm31 and k1 implement the existing centered fold-back.
 macro_rules! hybrid_register_sink {
-    ($mode:ident) => {
+    ($mode:ident, $tail:ident) => {
         concat!(
             "vpunpcklqdq zmm28, zmm0, zmm2\n",
             "vpunpckhqdq zmm2, zmm0, zmm2\n",
@@ -692,7 +704,7 @@ macro_rules! hybrid_register_sink {
             "vshufi64x2 zmm0, zmm6, zmm5, 136\n",
             "vshufi64x2 zmm5, zmm6, zmm5, 221\n",
             "vmovdqa64 zmm29, [{acc}+0]\n",
-            "vmovdqa64 zmm30, [{acc}+64]\n",
+            hybrid_tail_start!($tail, 64),
             "vpdpwssd zmm29, zmm7, zmmword ptr [{key}+0]\n",
             "vpdpwssd zmm30, zmm7, zmmword ptr [{key}+512]\n",
             "vpdpwssd zmm29, zmm3, zmmword ptr [{key}+64]\n",
@@ -736,7 +748,7 @@ macro_rules! hybrid_register_sink {
             "vshufi64x2 zmm4, zmm19, zmm21, 136\n",
             "vshufi64x2 zmm21, zmm19, zmm21, 221\n",
             "vmovdqa64 zmm29, [{acc}+128]\n",
-            "vmovdqa64 zmm30, [{acc}+192]\n",
+            hybrid_tail_start!($tail, 192),
             "vpdpwssd zmm29, zmm26, zmmword ptr [{key}+1024]\n",
             "vpdpwssd zmm30, zmm26, zmmword ptr [{key}+1536]\n",
             "vpdpwssd zmm29, zmm25, zmmword ptr [{key}+1088]\n",
@@ -780,7 +792,7 @@ macro_rules! hybrid_register_sink {
             "vshufi64x2 zmm23, zmm11, zmm16, 136\n",
             "vshufi64x2 zmm16, zmm11, zmm16, 221\n",
             "vmovdqa64 zmm29, [{acc}+256]\n",
-            "vmovdqa64 zmm30, [{acc}+320]\n",
+            hybrid_tail_start!($tail, 320),
             "vpdpwssd zmm29, zmm15, zmmword ptr [{key}+2048]\n",
             "vpdpwssd zmm30, zmm15, zmmword ptr [{key}+2560]\n",
             "vpdpwssd zmm29, zmm17, zmmword ptr [{key}+2112]\n",
@@ -808,7 +820,7 @@ macro_rules! hybrid_register_sink {
             "vshufi64x2 zmm6, zmm0, zmm2, 221\n",
             "vshufi64x2 zmm7, zmm1, zmm3, 221\n",
             "vmovdqa64 zmm29, [{acc}+384]\n",
-            "vmovdqa64 zmm30, [{acc}+448]\n",
+            hybrid_tail_start!($tail, 448),
             "vpdpwssd zmm29, zmm4, zmmword ptr [{key}+3072]\n",
             "vpdpwssd zmm30, zmm4, zmmword ptr [{key}+3328]\n",
             "vpdpwssd zmm29, zmm5, zmmword ptr [{key}+3136]\n",
@@ -838,17 +850,17 @@ const fn hybrid_fold<const Q: u16>() -> HybridFold {
 /// The arranged hybrid sink fused with the unchanged 27-slot NTT tail. No transformed
 /// value is stored and reloaded between the butterfly and its multiply-accumulate.
 #[inline(always)]
-unsafe fn tail27_hybrid<const Q: u16, const RED: bool>(
+unsafe fn tail27_hybrid<const Q: u16, const RED: bool, const RESET_TAIL: bool>(
     bp: *const i16, t4: *const u32, t5: *const u32, t6: *const u32,
     cv: *const i16, key: *const i16, acc: *mut i32,
 ) {
     macro_rules! run {
-        ($m4:ident, $m6:ident, $red:ident) => {
+        ($m4:ident, $m6:ident, $red:ident, $tail:ident) => {
             core::arch::asm!(
                 concat!(
                     "vmovdqa64 zmm27, [{c}]\n",
                     tail27!($m4, $m6, bfly_registers),
-                    hybrid_register_sink!($red),
+                    hybrid_register_sink!($red, $tail),
                     "/* {fold} */\n",
                 ),
                 i = in(reg) bp, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,
@@ -891,9 +903,14 @@ unsafe fn tail27_hybrid<const Q: u16, const RED: bool>(
             )
         };
     }
-    if needs_barrett(Q) {
-        if RED { run!(lut, barrett, reduce); } else { run!(lut, barrett, plain); }
-    } else if RED { run!(plain, plain, reduce); } else { run!(plain, plain, plain); }
+    macro_rules! dispatch {
+        ($tail:ident) => {
+            if needs_barrett(Q) {
+                if RED { run!(lut, barrett, reduce, $tail); } else { run!(lut, barrett, plain, $tail); }
+            } else if RED { run!(plain, plain, reduce, $tail); } else { run!(plain, plain, plain, $tail); }
+        };
+    }
+    if RESET_TAIL { dispatch!(zero); } else { dispatch!(load); }
 }
 
 
@@ -1059,34 +1076,36 @@ pub unsafe fn ntt_bin_batch32_sink<const Q: u16, S: BlockSink>(
     ntt_core::<Q, S>(input, sink);
 }
 
-struct HybridSink<const Q: u16, const RED: bool> {
+struct HybridSink<const Q: u16, const RED: bool, const RESET_TAIL: bool> {
     key: *const i16,
     acc: *mut i32,
 }
 
-impl<const Q: u16, const RED: bool> BlockSink for HybridSink<Q, RED> {
+impl<const Q: u16, const RED: bool, const RESET_TAIL: bool> BlockSink for HybridSink<Q, RED, RESET_TAIL> {
     const REGISTER_SINK: bool = true;
     unsafe fn dst(&mut self, _: usize) -> *mut i16 { unreachable!("fused tail has no scratch") }
     unsafe fn block(&mut self, _: usize, _: *const i16) { unreachable!("fused tail consumes registers") }
     #[inline(always)]
     unsafe fn tail(&mut self, blk: usize, bp: *const i16, t4: *const u32,
                    t5: *const u32, t6: *const u32, cv: *const i16, _: bool) {
-        tail27_hybrid::<Q, RED>(bp, t4, t5, t6, cv,
+        tail27_hybrid::<Q, RED, RESET_TAIL>(bp, t4, t5, t6, cv,
             self.key.add(32 * 56 * blk), self.acc.add(16 * 8 * blk));
     }
 }
 
 /// Binary NTT into the arranged two-stream hybrid accumulator, with no row-major output
-/// scratch. The original NTT entry point remains available as a differential reference.
+/// scratch. `RESET_TAIL` starts a new tail chunk without loading the previous tail;
+/// the ordinary accumulator always continues unchanged. The original NTT entry point
+/// remains available as a differential reference.
 ///
 /// # Safety
 /// AVX-512F/BW/VL/VBMI/VBMI2/VNNI and GFNI are required. `key` addresses 24*56 aligned
 /// 64-byte key vectors in the arranged hybrid format; `acc` addresses 24*8 aligned i32
 /// vectors. The caller must retain the existing accumulator bound and fold-back schedule.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-pub unsafe fn ntt_bin_batch32_hybrid<const Q: u16, const RED: bool>(
+pub unsafe fn ntt_bin_batch32_hybrid<const Q: u16, const RED: bool, const RESET_TAIL: bool>(
     input: &BinaryIndex32, key: *const i16, acc: *mut i32,
 ) {
     assert!(Q == 3889 || Q == 9721, "the hybrid commitment's primes");
-    ntt_core::<Q, _>(input, &mut HybridSink::<Q, RED> { key, acc });
+    ntt_core::<Q, _>(input, &mut HybridSink::<Q, RED, RESET_TAIL> { key, acc });
 }

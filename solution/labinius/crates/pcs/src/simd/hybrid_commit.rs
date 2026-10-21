@@ -208,15 +208,26 @@ impl<const Q:u16,const RED:bool> BlockSink for TSink<Q,RED> {
   Self::put(pb,sb);Self::put(pt,st);
  }
 }
+/// A tail chunk starts with an additive-identity accumulator. The final partial
+/// chunk uses the same rule; no tail is carried across the CHUNK_BATCHES boundary.
+#[inline(always)]
+const fn starts_tail_chunk(batch:usize)->bool {batch%CHUNK_BATCHES==0}
+
 /// One column's batch `b` modulo `Q` (`keys[2b]` for 3889, `keys[2b + 1]` for 9721), folded back
-/// when it ends a period.
+/// when it ends a period. A new tail starts in registers; the base stream always continues.
 #[inline(always)]
 unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,keys:&[KeyBatch],b:usize,acc:*mut i32) {
  let k=keys[2*b+if Q==P0 {0} else {1}].v.as_ptr() as *const i16;
- if (b+1)%period(Q)==0 {
-  vb::ntt_bin_batch32_hybrid::<Q,true>(idx,k,acc);
+ if starts_tail_chunk(b) {
+  if (b+1)%period(Q)==0 {
+   vb::ntt_bin_batch32_hybrid::<Q,true,true>(idx,k,acc);
+  } else {
+   vb::ntt_bin_batch32_hybrid::<Q,false,true>(idx,k,acc);
+  }
+ } else if (b+1)%period(Q)==0 {
+  vb::ntt_bin_batch32_hybrid::<Q,true,false>(idx,k,acc);
  } else {
-  vb::ntt_bin_batch32_hybrid::<Q,false>(idx,k,acc);
+  vb::ntt_bin_batch32_hybrid::<Q,false,false>(idx,k,acc);
  }
 }
 const EVEN:[i32;16]=[0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30];
@@ -263,14 +274,14 @@ const ODD4:[i32;16]=[1,3,5,7,9,11,13,15,17,21,25,29,29,29,29,29];
 /// `4L .. 4L + 4` and `16 + 4L .. 16 + 4L + 4` in words `8L .. 8L + 8` (128-bit lane `L`).
 const fn row_word(r:usize)->usize {if r<16 {8*(r/4)+r%4} else {8*((r-16)/4)+4+(r-16)%4}}
 /// The tail stream's 27 row sums of block `blk` as i16 representatives (`|r| < 2q`, see [`red16`])
-/// in the words [`row_word`] names, the stream's accumulators cleared for the next chunk. The raw
-/// lanes are summed without folding them back first ([`tail_row_bound`]).
+/// in the words [`row_word`] names. The raw lanes are summed without folding them back first
+/// ([`tail_row_bound`]). No clearing pass follows: the next chunk's first sink starts its tail
+/// in registers, and the base stream must remain intact.
 #[inline(always)]
 unsafe fn tail_words<const Q:u16>(acc:*mut i32,blk:usize)->__m512i {
  let p=acc.add(16*ABLK*blk+16) as *mut __m512i;
  let t0=_mm512_load_si512(p);let t1=_mm512_load_si512(p.add(2));
  let t2=_mm512_load_si512(p.add(4));let t3=_mm512_load_si512(p.add(6));
- for g in 0..4 {_mm512_store_si512(p.add(2*g),_mm512_setzero_si512());}
  let e=_mm512_loadu_si512(EVEN.as_ptr() as *const __m512i);let o=_mm512_loadu_si512(ODD.as_ptr() as *const __m512i);
  let lo=_mm512_add_epi32(_mm512_permutex2var_epi32(t0,e,t1),_mm512_permutex2var_epi32(t0,o,t1));
  let t3=_mm512_add_epi32(t3,_mm512_shuffle_epi32::<0x4E>(t3));
@@ -322,7 +333,7 @@ unsafe fn put16(x:&[__m512i;16],pend:*mut [i16;32],blk:usize,l0:usize) {
 }
 /// The tail chunks of a group's `g` columns modulo `Q` (accumulators `acc[2c + k]`), column `c`
 /// into lane `lane0 + c` of `pend` as representatives inside the inverse transform's input bound,
-/// the accumulators cleared for the next chunk. Whole aligned halves of the lanes go through
+/// leaving the accumulators intact. Whole aligned halves of the lanes go through
 /// [`put16`]; other group sizes (only tests use them) are scattered lane by lane.
 #[target_feature(enable="avx512f,avx512bw")]
 unsafe fn finish_tails<const Q:u16>(acc:*mut GAcc,k:usize,g:usize,pend:&mut Batch32,lane0:usize) {
@@ -691,7 +702,7 @@ mod tests {
  /// accumulator lane, including centered fold-back. Arbitrary initial accumulators exercise
  /// the exact wrapping SIMD operations; centered keys and all-zero/all-one/random nibbles
  /// cover the production transform inputs and both primes.
- fn fused_register_sink_check<const Q:u16,const RED:bool>() {
+ fn fused_register_sink_check<const Q:u16,const RED:bool,const RESET_TAIL:bool>() {
   let mut state=0xa3e41d7b92c650f1u64 ^ Q as u64;
   let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
   let mut key=zeroed_slice::<KeyBatch>(1);
@@ -710,19 +721,60 @@ mod tests {
    for (a,b) in got[0].v.iter_mut().zip(&mut want[0].v) {for (a,b) in a.iter_mut().zip(b) {
     *a=match case {0=>0,1=>i32::MAX,2=>i32::MIN,_=>next() as i32};*b=*a;
    }}
+   // The staged reference receives the explicit zeroes the old flush wrote.
+   // Leave the fused sink's tail poisoned, so a mistaken load is observable.
+   if RESET_TAIL {
+    for (i,v) in want[0].v.iter_mut().enumerate() {if i%2==1 {v.fill(0);}}
+   }
    unsafe {
     let kp=key[0].v.as_ptr() as *const i16;
     vb::ntt_bin_batch32_sink::<Q,_>(&idx,&mut TSink::<Q,RED>{
      buf:scratch.0.as_mut_ptr(),k:kp,acc:want[0].v.as_mut_ptr() as *mut i32});
-    vb::ntt_bin_batch32_hybrid::<Q,RED>(&idx,kp,got[0].v.as_mut_ptr() as *mut i32);
+    vb::ntt_bin_batch32_hybrid::<Q,RED,RESET_TAIL>(&idx,kp,got[0].v.as_mut_ptr() as *mut i32);
    }
-   assert_eq!(got[0].v,want[0].v,"q={Q}, RED={RED}, case={case}");
+   assert_eq!(got[0].v,want[0].v,"q={Q}, RED={RED}, RESET_TAIL={RESET_TAIL}, case={case}");
   }
  }
  #[test]
  fn fused_register_sink_matches_staged_sink() {
-  fused_register_sink_check::<P0,false>();fused_register_sink_check::<P0,true>();
-  fused_register_sink_check::<P1,false>();fused_register_sink_check::<P1,true>();
+  fused_register_sink_check::<P0,false,false>();fused_register_sink_check::<P0,true,false>();
+  fused_register_sink_check::<P1,false,false>();fused_register_sink_check::<P1,true,false>();
+  fused_register_sink_check::<P0,false,true>();fused_register_sink_check::<P0,true,true>();
+  fused_register_sink_check::<P1,false,true>();fused_register_sink_check::<P1,true,true>();
+ }
+ /// Independent scalar state machine: moving the reset from a flush to the
+ /// next chunk start preserves every emitted sum, even when scratch is reused.
+ /// This test needs no SIMD and can be extracted with starts_tail_chunk.
+ #[test]
+ fn tail_chunk_start_matches_clear_after_flush() {
+  for nb in [1usize,6,7,8,13,14,15,127,128,129] {
+   for period in [1usize,2] {
+    let mut stale=[i32::MIN,i32::MAX,17,-29];
+    for reuse in 0..3usize {
+     let mut cleared=[0i32;4];
+     let mut base_old=[0i32;4];let mut base_new=base_old;
+     for b in 0..nb {
+      if starts_tail_chunk(b) {stale.fill(0);}
+      for lane in 0..4 {
+       let x=((b*197+lane*43+reuse*71)%10001) as i32-5000;
+       cleared[lane]=cleared[lane].wrapping_add(x);
+       stale[lane]=stale[lane].wrapping_add(x);
+       base_old[lane]=base_old[lane].wrapping_add(x);
+       base_new[lane]=base_new[lane].wrapping_add(x);
+       if (b+1)%period==0 {
+        cleared[lane]%=9721;stale[lane]%=9721;
+        base_old[lane]%=9721;base_new[lane]%=9721;
+       }
+      }
+      assert_eq!(base_old,base_new,"ordinary stream changed");
+      if (b+1)%CHUNK_BATCHES==0 || b+1==nb {
+       assert_eq!(cleared,stale,"nb={nb} period={period} reuse={reuse} batch={b}");
+       cleared.fill(0);
+      }
+     }
+    }
+   }
+  }
  }
  #[test]
  fn centered_crt_boundaries() {
@@ -773,6 +825,27 @@ mod tests {
   let expected=*pos.iter().chain(neg.iter()).max().unwrap();
   assert_eq!(certify(&raw,CHUNK_BATCHES),expected);
  }
+ /// Exact and partial chunk boundaries, with one worker reusing its scratch for
+ /// a full group and a ragged final group. The reference still clears at flush.
+ #[test]
+ fn tail_reset_chunk_boundaries_match_reference() {
+  use crate::key::CommitmentKey;
+  use crate::ring::Modulus;
+  for nb in [1usize,6,7,8,14,15] {
+   let len=128*nb;let ncols=3;
+   let base=CommitmentKey::random(len,11,Modulus::Q3889_FS_S,&[Modulus::Q9721_FS_S]);
+   let tail=CommitmentKey::random(len,12,Modulus::Q3889_FS_S,&[Modulus::Q9721_FS_S]);
+   let mut x=0x325437de9a01b6c5u128;
+   let words:Vec<B128>=(0..len*ncols).map(|_|{
+    x^=x<<13;x^=x>>7;x^=x<<17;B128(x)
+   }).collect();
+   let cols:Vec<&[B128]>=words.chunks_exact(len).collect();
+   let want=reference::commit_columns_rows(&base,&tail,&cols,1,2);
+   let got=commit_columns_rows(&base,&tail,&cols,1,2);
+   assert!(got==want,"tail reset differs at {nb} batches");
+  }
+ }
+
  /// The transposed-group sink against the folded-lane implementation it replaced, bit for bit,
  /// on random centered keys and random columns: 128 batches (fold-backs at both periods,
  /// 19 tail chunks, several full and partial lane flushes), every group size from 1 to 32

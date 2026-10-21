@@ -41,7 +41,9 @@ use parameters::{COLUMNS, COLUMN_LEN, COLUMN_LOG, LOG_PACKED, LOG_VARS, MODULUS,
 /// batches are read in place.
 #[repr(C, align(64))]
 struct Aligned64<T>(T);
+#[cfg(test)]
 const EMBEDDED_KEY_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")).len();
+#[cfg(test)]
 static EMBEDDED_KEY: Aligned64<[u8; EMBEDDED_KEY_LEN]> =
     Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")));
 
@@ -104,6 +106,7 @@ mod sys {
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         pub fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+        pub fn _exit(status: i32) -> !;
     }
     pub const PROT_NONE: i32 = 0;
     pub const PROT_READ: i32 = 1;
@@ -447,10 +450,18 @@ impl Table {
 /// kernel has it (older kernels refuse it, harmlessly), one read per page otherwise (the
 /// fault-around maps a run of pages per fault). A read-only touch, so it runs on another thread
 /// while the key is built.
-fn populate_words(words: &[B128], keys: &[u8], threads: usize) {
+fn populate_words(words: &[B128], keys: &[u8], comm_addr: usize, comm_bytes: usize, threads: usize) {
     let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
     let kruns = labinius::par::ranges(keys.len(), threads, 4096);
-    labinius::par::pool().run(runs.len().max(kruns.len()), |i| {
+    let pages = comm_bytes.div_ceil(POPULATE_CHUNK);
+    labinius::par::pool().run(runs.len().max(kruns.len()).max(pages), |i| {
+        if i < pages && comm_addr != 0 {
+            let at = i * POPULATE_CHUNK;
+            unsafe {
+                core::ptr::write_volatile((comm_addr + at) as *mut u8, 0);
+                core::ptr::write_volatile((comm_addr + (at + POPULATE_CHUNK).min(comm_bytes) - 1) as *mut u8, 0);
+            }
+        }
         if let Some(r) = kruns.get(i) {
             populate_part(keys[r.clone()].as_ptr() as usize, r.len());
         }
@@ -504,12 +515,16 @@ fn trace(seed: &[u8; 32]) -> Vec<B128> {
         .map(|v| B128(u128::from_le_bytes(v.try_into().unwrap())))
         .collect()
 }
-fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
+fn transcript_prefix(seed: &[u8; 32], modulus: u128) -> Transcript {
     let mut t = Transcript::new(b"labinius-fast/v1");
     t.absorb_bytes(seed);
     t.absorb_u64(LOG_VARS as u64);
     t.absorb_u64(COLUMN_LOG as u64);
     t.absorb_bytes(&modulus.to_le_bytes());
+    t
+}
+fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
+    let mut t = transcript_prefix(seed, modulus);
     // The 3.3 MB commitment hashed as blake3's subtrees on every core: the same transcript.
     t.absorb_bytes_parallel(commitment, threads());
     t
@@ -949,7 +964,9 @@ fn fold_checked(
 
 /// One commitment task per physical core, temporarily placed by the key's
 /// worker entry point; eight columns share each pass over the public key.
+#[cfg(test)]
 const EMBEDDED_TAIL_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/tail-key.bin")).len();
+#[cfg(test)]
 static EMBEDDED_TAIL:Aligned64<[u8;EMBEDDED_TAIL_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/tail-key.bin")));
 /// Both hybrid keys (base and tail, both primes) in the hybrid sink's arrangement, precomputed
 /// by `build.rs` from the same public keys as the two images above (empty when the build host
@@ -1064,6 +1081,27 @@ impl ProofLayout {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn encode_folded_avx512(elements: &[labinius::RingElement648], mut dst: *mut u8) {
+    use core::arch::x86_64::*;
+    for e in elements {
+        let src = e.v.as_ptr();
+        let mut j = 0;
+        while j + 16 <= N {
+            let v = _mm256_loadu_si256(src.add(j) as *const __m256i);
+            _mm512_storeu_si512(dst as *mut __m512i, _mm512_cvtepi16_epi32(v));
+            dst = dst.add(64);
+            j += 16;
+        }
+        while j < N {
+            (dst as *mut i32).write_unaligned(((*src.add(j)) as i32).to_le());
+            dst = dst.add(4);
+            j += 1;
+        }
+    }
+}
+
 /// The codec's encoding of `parts`, written into `out` (`layout.len()` bytes): the small
 /// fields on this thread, the commitment and the folded witness (`i32` little-endian per
 /// coefficient) in parallel on the pool.
@@ -1072,6 +1110,15 @@ impl ProofLayout {
 /// `out` must be valid for writes of `layout.len()` bytes, and `layout` must be
 /// [`ProofLayout::of_parts`]`(parts)`.
 unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
+    encode_into_ex(parts, layout, out, false);
+}
+
+unsafe fn encode_into_ex(
+    parts: &ProofParts,
+    layout: &ProofLayout,
+    out: *mut u8,
+    commitment_already_copied: bool,
+) {
     let put = |at: &mut usize, bytes: &[u8]| {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(*at), bytes.len());
         *at += bytes.len();
@@ -1109,11 +1156,17 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
             .all(|e| e.representation == Representation::Coefficients),
         "a fold is in coefficient form"
     );
-    // A few commitment slices and many folded runs, taken dynamically.
+    // A few commitment slices (unless already copied by idle workers) and many folded runs.
     let ctasks = 4;
-    let cruns = labinius::par::ranges(parts.commitment.len(), ctasks, 4096);
+    let cruns = if commitment_already_copied {
+        Vec::new()
+    } else {
+        labinius::par::ranges(parts.commitment.len(), ctasks, 4096)
+    };
     let fruns = labinius::par::ranges(elements.len(), 4 * threads(), 1);
     let (addr, folded_at) = (out as usize, layout.folded_at());
+    #[cfg(target_arch = "x86_64")]
+    let has_avx512 = std::arch::is_x86_feature_detected!("avx512f");
     labinius::par::pool().run(cruns.len() + fruns.len(), |i| {
         let out = addr as *mut u8;
         if i < cruns.len() {
@@ -1127,6 +1180,11 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
         }
         let r = fruns[i - cruns.len()].clone();
         let mut dst = out.add(folded_at + FOLDED_BYTES * N * r.start);
+        #[cfg(target_arch = "x86_64")]
+        if has_avx512 {
+            encode_folded_avx512(&elements[r], dst);
+            return;
+        }
         let mut wide = [0i32; N];
         for e in &elements[r] {
             for (w, &c) in wide.iter_mut().zip(e.v.iter()) {
@@ -1141,17 +1199,11 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
 /// The proof file, created and mapped while the prover runs: the pool's idle workers create it
 /// at its exact final length (blocks preallocated), map it at a 2 MB-aligned address with huge
 /// pages requested, and fault its page-cache pages in (`MADV_POPULATE_WRITE`, 2 MB per idle
-/// chunk, on the workers idle while the key is set up), so that at the end the proof is encoded
-/// straight into mapped pages on every core. Written with `write`, the 14 MB proof cost ~3.5 ms
-/// on one core after the prover's last phase (ext4 allocates, reserves and copies page by page
-/// under the inode lock). With ext4's large folios the aligned mapping is mostly 2 MB page-cache
-/// folios mapped by PMDs: faulting them in runs in parallel, and the exit drops a few PMDs
-/// instead of 3400 dirty PTEs (~0.6 ms).
+/// chunk), so that at the end the proof is encoded straight into mapped pages on every core.
 struct Output {
     state: std::sync::Arc<OutputState>,
-    job: &'static labinius::par::IdleJob,
     populate: std::sync::OnceLock<&'static labinius::par::IdleJob>,
-    /// The commitment's bytes, allocated at the start and faulted in by the setup's idle work.
+    /// The commitment's bytes, allocated at the start and faulted in by `populate_words`.
     commitment: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
@@ -1162,6 +1214,8 @@ struct OutputState {
     /// Faulting the pages in failed (a kernel without `MADV_POPULATE_WRITE`): the encoding
     /// faults them itself.
     populate_failed: std::sync::atomic::AtomicBool,
+    comm_src_ptr: std::sync::atomic::AtomicUsize,
+    comm_copied_bytes: std::sync::atomic::AtomicUsize,
 }
 
 struct Mapped {
@@ -1238,18 +1292,37 @@ impl OutputState {
         self.map.get_or_init(|| self.create_and_map()).as_ref()
     }
 
-    /// Idle chunk `i`: create and map the file (`i == 0`), or fault in its `i - 1`-th piece.
-    fn chunk(&self, i: usize) {
+    /// Idle chunk `i`: create and map the file (`i == 0`), or fault in its `i - 1`-th piece
+    /// (and copy any overlapping slice of the finished commitment into the mapped pages).
+    fn chunk(&self, i: usize, comm_ptr: usize, comm_len: usize) {
         use std::sync::atomic::Ordering;
         let Some(m) = self.mapped() else { return };
-        if i == 0 || self.populate_failed.load(Ordering::Relaxed) {
+        if i == 0 {
             return;
         }
         let at = (i - 1) * POPULATE_CHUNK;
         let len = POPULATE_CHUNK.min(self.layout.len() - at);
         #[cfg(target_os = "linux")]
-        if unsafe { sys::madvise((m.addr + at) as *mut _, len, sys::MADV_POPULATE_WRITE) } != 0 {
+        if !self.populate_failed.load(Ordering::Relaxed)
+            && unsafe { sys::madvise((m.addr + at) as *mut _, len, sys::MADV_POPULATE_WRITE) } != 0
+        {
             self.populate_failed.store(true, Ordering::Relaxed);
+        }
+        if comm_ptr != 0 && comm_len == self.layout.commitment_bytes {
+            let c0 = ProofLayout::HEAD;
+            let c1 = c0 + comm_len;
+            let s = at.max(c0);
+            let e = (at + len).min(c1);
+            if s < e {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (comm_ptr + (s - c0)) as *const u8,
+                        (m.addr + s) as *mut u8,
+                        e - s,
+                    );
+                }
+                self.comm_copied_bytes.fetch_add(e - s, Ordering::Release);
+            }
         }
     }
 }
@@ -1262,59 +1335,43 @@ impl Output {
             layout,
             map: std::sync::OnceLock::new(),
             populate_failed: std::sync::atomic::AtomicBool::new(false),
+            comm_src_ptr: std::sync::atomic::AtomicUsize::new(0),
+            comm_copied_bytes: std::sync::atomic::AtomicUsize::new(0),
         });
-        // Idle work for the workers while the key is set up: create and map the file, build
-        // the challenge sampler's tables (needed ~290 ms in, by the folding challenges), read
-        // the CPU topology the commitment's placement asks for, and fault in the commitment's
-        // buffer, a huge page per chunk.
-        let mut commitment = vec![0u8; layout.commitment_bytes];
-        let (addr, bytes) = (commitment.as_mut_ptr() as usize, commitment.len());
-        let pages = bytes.div_ceil(POPULATE_CHUNK);
-        let worker_state = state.clone();
-        let job = labinius::par::pool().idle(3 + pages, move |i| match i {
-            0 => worker_state.chunk(0),
-            1 => labinius::challenge::warm(),
-            2 => labinius::par::warm_topology(),
-            // The buffer is not touched by anyone else before `write` or `commitment_buffer`
-            // quiesces this job; writing a zero where the fresh mapping already reads zero.
-            _ => unsafe {
-                let at = (i - 3) * POPULATE_CHUNK;
-                core::ptr::write_volatile((addr + at) as *mut u8, 0);
-                core::ptr::write_volatile((addr + (at + POPULATE_CHUNK).min(bytes) - 1) as *mut u8, 0);
-            },
-        });
+        let commitment = vec![0u8; layout.commitment_bytes];
         Output {
             state,
-            job,
             populate: std::sync::OnceLock::new(),
             commitment: std::sync::Mutex::new(Some(commitment)),
         }
     }
 
-    /// The commitment's buffer, once the setup's idle work is over (stopped if it is not).
+    /// Take the pre-allocated commitment buffer.
     fn commitment_buffer(&self) -> Option<Vec<u8>> {
-        labinius::par::pool().quiesce(self.job);
         self.commitment.lock().unwrap().take()
     }
 
-    /// Fault the file's pages in on the idle workers, 2 MB per chunk. Called where the main
-    /// thread is about to work alone (the transcript absorbing the commitment): a worker still
-    /// in a chunk when a dispatch arrives delays it, and the commitment's coarse work units
-    /// turn any delay at its start into a delay of its end.
-    ///
-    /// `first` are anonymous regions to fault in before the file, one chunk each (writable,
-    /// and only ever populated: `MADV_POPULATE_WRITE` leaves what they hold as it is).
-    fn populate(&self, first: Vec<(usize, usize)>) {
+    /// Fault the switch planes, warm the challenge sampler tables, and map + fault the proof file
+    /// (and copy the finished commitment bytes into the mapped file) on the idle workers during
+    /// the single-threaded window between `partials_blocks` and the switch's binding pass.
+    fn populate(&self, first: Vec<(usize, usize)>, comm_ptr: usize, comm_len: usize) {
+        self.state.comm_src_ptr.store(comm_ptr, std::sync::atomic::Ordering::Release);
         let chunks = self.state.layout.len().div_ceil(POPULATE_CHUNK);
         let worker_state = self.state.clone();
-        let job = labinius::par::pool().idle(first.len() + chunks, move |i| match first.get(i) {
-            #[cfg(target_os = "linux")]
-            Some(&(addr, len)) => unsafe {
-                sys::madvise(addr as *mut _, len, sys::MADV_POPULATE_WRITE);
-            },
-            #[cfg(not(target_os = "linux"))]
-            Some(_) => {}
-            None => worker_state.chunk(i - first.len() + 1),
+        let nfirst = first.len();
+        let job = labinius::par::pool().idle(nfirst + 2 + chunks, move |i| {
+            if let Some(&(addr, len)) = first.get(i) {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    sys::madvise(addr as *mut _, len, sys::MADV_POPULATE_WRITE);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = (addr, len);
+            } else if i == nfirst {
+                labinius::challenge::warm();
+            } else {
+                worker_state.chunk(i - nfirst - 1, comm_ptr, comm_len);
+            }
         });
         let _ = self.populate.set(job);
     }
@@ -1322,14 +1379,19 @@ impl Output {
     /// Write the proof: encoded into the mapping when it has the expected layout, else through
     /// the codec into a freshly truncated file.
     fn write(self, parts: ProofParts) {
-        labinius::par::pool().quiesce(self.job);
         if let Some(job) = self.populate.get() {
             labinius::par::pool().quiesce(job);
         }
         let layout = ProofLayout::of_parts(&parts);
         if layout == self.state.layout {
             if let Some(m) = self.state.mapped() {
-                unsafe { encode_into(&parts, &layout, m.addr as *mut u8) };
+                use std::sync::atomic::Ordering;
+                let comm_copied = !parts.commitment.is_empty()
+                    && self.state.comm_src_ptr.load(Ordering::Acquire)
+                        == parts.commitment.as_ptr() as usize
+                    && self.state.comm_copied_bytes.load(Ordering::Acquire)
+                        == parts.commitment.len();
+                unsafe { encode_into_ex(&parts, &layout, m.addr as *mut u8, comm_copied) };
                 // The pages are the file's; the exit unmaps them.
                 return;
             }
@@ -1357,19 +1419,17 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let clock = std::time::Instant::now();
     // The pool's workers are started here, once; every parallel phase runs on them.
     let _ = labinius::par::pool();
-    // The switch's buffers: huge pages requested, faulted in by their first writers on every
-    // core. (A thread touching them during the commitment ran on a hyperthread sibling of a
-    // commitment worker and cost the commitment more than it saved the expansion.)
+    // Read CPU topology on the main thread while worker threads finish spawning, so it is
+    // guaranteed ready before commitment without racing an IdleJob against populate_words.
+    labinius::par::warm_topology();
     let planes = cf::LeanSwitch::planes(1 << LOG_PACKED);
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
-    // The table's pages come in on every core; the key is the embedded one when the modulus
-    // is the default and the build host could compute it, and is built otherwise.
-    // ... and so do the embedded arranged keys' (otherwise a page-cache fault per 64 KB inside
-    // the commitment, taken by all its workers at once as they reach the same batches: measured
-    // 2 ms of commitment for 0.3-0.5 ms here).
+    let mut comm_buf = output.and_then(|o| o.commitment_buffer()).unwrap_or_else(|| {
+        vec![0u8; COLUMNS * N * rq::coefficient_bytes(modulus)]
+    });
     let image: &[u8] = if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS { &EMBEDDED_HYBRID.0 } else { &[] };
-    populate_words(values, image, workers);
+    populate_words(values, image, comm_buf.as_mut_ptr() as usize, comm_buf.len(), workers);
     let matrix_time = clock.elapsed();
     // The hybrid modulus commits against the embedded arranged keys when the build host made
     // them; otherwise the key (and the tail key) come from their images or are built.
@@ -1378,37 +1438,61 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     } else {
         None
     };
-    let key = || match keygen::key_from_image(modulus, &EMBEDDED_KEY.0) {
-        Some(key) => key,
-        None => keygen::build_key(modulus),
+    let key = || {
+        #[cfg(test)]
+        if let Some(key) = keygen::key_from_image(modulus, &EMBEDDED_KEY.0) {
+            return key;
+        }
+        keygen::build_key(modulus)
     };
     let setup_time = clock.elapsed();
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
-    let rows = if let Some(keys) = arranged {
-        labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,hybrid_group())
-    } else if modulus==modulus_choice::HYBRID_MODULUS {
-        let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
-        labinius::simd::commit::hybrid::commit_columns_rows(&key(),&tail,&columns,workers,HYBRID_GROUP)
-    } else {key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
-    let commit_time = clock.elapsed();
-    let buffer = output.and_then(|o| o.commitment_buffer());
-    let commitment = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer);
-    let recombine_time = clock.elapsed();
-    // Huge pages: a few page-table entries to drop. (A thread of its own to free it, as the
-    // baseline did, is a ninth runnable thread beside eight busy ones.)
-    drop(rows);
-    if let Some(output) = output {
-        // The pages of the switch's binding pass first: they are written ~10 ms from here,
-        // and faulting them in there stalls the pass's runners.
-        let bound = ((1usize << LOG_PACKED) / PREFIX_SETS * 8).min(planes[0].len() * 8);
-        let first = planes.iter().flat_map(|p| {
-            let (addr, _) = p.region();
-            (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
-        });
-        output.populate(first.collect());
-    }
-    let mut t = transcript(seed, modulus, &commitment);
+    let (commitment, commit_time, recombine_time, mut t) = if let Some(keys) = arranged {
+        let g = hybrid_group().clamp(1, 32).min(COLUMNS);
+        let mut t = transcript_prefix(seed, modulus);
+        let absorb = t.begin_absorb_bytes_parallel(comm_buf.len(), g * N * 5, COLUMNS.div_ceil(g));
+        let (comm_ptr, comm_len) = (comm_buf.as_ptr() as usize, comm_buf.len());
+        labinius::simd::commit::hybrid::commit_columns_bytes_arranged(
+            keys,
+            &columns,
+            workers,
+            g,
+            &mut comm_buf,
+            |gi| {
+                if let Some(pa) = &absorb {
+                    unsafe { pa.notify_group_done(gi, comm_ptr as *const u8, comm_len) };
+                }
+            },
+        );
+        let ct = clock.elapsed();
+        t.finish_absorb_bytes_parallel(absorb, &comm_buf, workers);
+        let rt = clock.elapsed();
+        (comm_buf, ct, rt, t)
+    } else {
+        let rows = if modulus == modulus_choice::HYBRID_MODULUS {
+            let tail = {
+                #[cfg(test)]
+                {
+                    keygen::key_from_image(modulus, &EMBEDDED_TAIL.0)
+                        .unwrap_or_else(|| keygen::build_tail_key(modulus))
+                }
+                #[cfg(not(test))]
+                {
+                    keygen::build_tail_key(modulus)
+                }
+            };
+            labinius::simd::commit::hybrid::commit_columns_rows(&key(), &tail, &columns, workers, HYBRID_GROUP)
+        } else {
+            key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)
+        };
+        let ct = clock.elapsed();
+        let commitment = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, Some(comm_buf));
+        let rt = clock.elapsed();
+        drop(rows);
+        let t = transcript(seed, modulus, &commitment);
+        (commitment, ct, rt, t)
+    };
     let (lo, hi) = point(&mut t);
     // A coordinate equal to one (probability 2^-128 per coordinate) has no half ratio: the
     // baseline's prover over its own full workspace takes over for the whole switch.
@@ -1418,6 +1502,18 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     } else {
         Some(cf::eq_expand_and_partials_factored_blocks::<PREFIX_SETS>(&hi, values, workers))
     };
+    if let Some(output) = output {
+        // Started right as the main thread enters the ~1.5 ms single-threaded phase
+        // (partials_from_sets + claim + LeanSwitch setup + 5 prefix rounds of message_from_blocks),
+        // so the 7 idle workers fault in the switch planes, warm challenge tables, and map/fault
+        // the proof file without colliding with transcript or partials_blocks.
+        let bound = ((1usize << LOG_PACKED) / PREFIX_SETS * 8).min(planes[0].len() * 8);
+        let first = planes.iter().flat_map(|p| {
+            let (addr, _) = p.region();
+            (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
+        });
+        output.populate(first.collect(), commitment.as_ptr() as usize, commitment.len());
+    }
     let partials = match &prefix_sets {
         Some((sets, _)) => cf::partials_from_sets(sets, &hi),
         None => {
@@ -1522,6 +1618,7 @@ fn main() {
     if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
         yield_to_everything_else();
     }
+    let _ = labinius::par::pool();
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 5 || args.len() == 7,
@@ -1554,7 +1651,12 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
+    // The proof is on disk; nothing the destructors or libc exit handlers would do is observable.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        sys::_exit(0)
+    };
+    #[cfg(not(target_os = "linux"))]
     std::process::exit(0);
 }
 
@@ -2061,10 +2163,62 @@ mod tests {
         let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
         let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,4);
         let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,3,None);
+        let fused=labinius::simd::commit::hybrid::commit_columns_bytes(&key,&tail,&cols,3,4);
+        assert_eq!(fused,coefficients,"fused commitment bytes must match commitment_bytes_rows");
         let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
         for c in 0..columns {
             let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
             assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);
+        }
+    }
+
+    #[test]
+    fn fused_hybrid_commitment_bytes_and_streaming_transcript_match() {
+        let q = modulus_choice::HYBRID_MODULUS;
+        let primes = modulus_choice::limbs(q).unwrap();
+        let p = params(&primes);
+        let ring = 128usize;
+        let columns = 37usize;
+        let matrix = rq::ajtai_matrix(q, ring);
+        let key = CommitmentKey::from_coefficients(ring * 4, &matrix, q, p.base, &p.extra_moduli);
+        let tail = keygen::build_tail_key_from_matrix(&matrix);
+        let arranged = labinius::simd::commit::hybrid::arrange_keys(&key, &tail, 3);
+        let mut t = Transcript::new(b"fused-hybrid-regression");
+        let values = t.sample_b128(b"binary", ring * 4 * columns);
+        let cols: Vec<&[B128]> = values.chunks_exact(ring * 4).collect();
+        let rows = labinius::simd::commit::hybrid::commit_columns_rows_arranged(&arranged, &cols, 3, 16);
+        let expected = commitment_bytes_rows(&rows, &primes, q, columns, 3, None);
+        for (workers, g) in [(1usize, 1usize), (2, 4), (3, 8), (4, 16), (4, 32)] {
+            let mut got = vec![0u8; columns * N * 5];
+            labinius::simd::commit::hybrid::commit_columns_bytes_arranged(
+                &arranged, &cols, workers, g, &mut got, |_| {},
+            );
+            assert_eq!(got, expected, "fused bytes mismatch at workers={workers}, g={g}");
+        }
+        // Test on-the-fly streaming parallel transcript absorption on full commitment size.
+        let seed = [0x42u8; 32];
+        let full_len = COLUMNS * N * 5;
+        let mut full_bytes = vec![0u8; full_len];
+        for (i, b) in full_bytes.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(131) ^ (i >> 7)) as u8;
+        }
+        let mut t_ref = transcript(&seed, q, &full_bytes);
+        let (lo_ref, hi_ref) = point(&mut t_ref);
+        for g in [16usize, 32] {
+            let num_groups = COLUMNS.div_ceil(g);
+            let group_bytes = g * N * 5;
+            let mut t_stream = transcript_prefix(&seed, q);
+            let pa = t_stream.begin_absorb_bytes_parallel(full_len, group_bytes, num_groups);
+            assert!(pa.is_some());
+            let (ptr, len) = (full_bytes.as_ptr() as usize, full_bytes.len());
+            labinius::par::pool().run(num_groups, |gi| {
+                if let Some(pa) = &pa {
+                    unsafe { pa.notify_group_done(gi, ptr as *const u8, len) };
+                }
+            });
+            t_stream.finish_absorb_bytes_parallel(pa, &full_bytes, 4);
+            let (lo_got, hi_got) = point(&mut t_stream);
+            assert_eq!((lo_got, hi_got), (lo_ref.clone(), hi_ref.clone()), "streaming transcript mismatch for g={g}");
         }
     }
 

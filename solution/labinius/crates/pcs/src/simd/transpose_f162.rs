@@ -443,9 +443,90 @@ unsafe fn interleave8_tr(cp: *const __m512i, k0: usize, w: usize, tr: __m512i, d
     }
 }
 
-/// [`gather8`] with an all-zero fourth stream: `unpack{lo,hi}(c, 0)` are zero-masked loads.
 #[inline(always)]
-unsafe fn gather8_z(p0: *const i64, p1: *const i64, p2: *const i64, dst: *mut u64) {
+unsafe fn emit_pair(
+    src: __m512i,
+    ident: __m512i,
+    am: __m512i,
+    da: __m512i,
+    db: __m512i,
+    lo4: __m512i,
+    p16: __m512i,
+    op: *mut __m512i,
+    slot: usize,
+) {
+    let n = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(am, src));
+    let a = _mm512_permutexvar_epi8(da, n);
+    let b = _mm512_permutexvar_epi8(db, n);
+    _mm512_store_si512(
+        op.add(slot),
+        _mm512_ternarylogic_epi32::<0xEA>(a, lo4, p16),
+    );
+    _mm512_store_si512(
+        op.add(slot + 1),
+        _mm512_ternarylogic_epi32::<0xEA>(b, lo4, p16),
+    );
+}
+
+#[inline(always)]
+unsafe fn gather8_emit(
+    p0: *const i64,
+    p1: *const i64,
+    p2: *const i64,
+    p3: *const i64,
+    ident: __m512i,
+    am: __m512i,
+    da: __m512i,
+    db: __m512i,
+    lo4: __m512i,
+    p16: __m512i,
+    op: *mut __m512i,
+    base_slot: usize,
+) {
+    let a = _mm512_loadu_si512(p0 as *const __m512i);
+    let b = _mm512_loadu_si512(p1 as *const __m512i);
+    let c = _mm512_loadu_si512(p2 as *const __m512i);
+    let d = _mm512_loadu_si512(p3 as *const __m512i);
+    let l01 = _mm512_unpacklo_epi64(a, b);
+    let h01 = _mm512_unpackhi_epi64(a, b);
+    let l23 = _mm512_unpacklo_epi64(c, d);
+    let h23 = _mm512_unpackhi_epi64(c, d);
+    let s0 = _mm512_shuffle_i64x2::<0x44>(l01, l23);
+    let s1 = _mm512_shuffle_i64x2::<0xEE>(l01, l23);
+    let s2 = _mm512_shuffle_i64x2::<0x44>(h01, h23);
+    let s3 = _mm512_shuffle_i64x2::<0xEE>(h01, h23);
+    // `index_rows` consumes the gather vectors as 32-byte row-pair groups: vector j's lower
+    // half feeds `t = 2j` (slots `8j`, `8j + 1`) and its upper half feeds `t = 2j + 1` (slots
+    // `8j + 4`, `8j + 5`), `am` reading only bytes 0..31 of each 64-byte load.
+    for (j, src) in [
+        _mm512_shuffle_i64x2::<0x88>(s0, s2),
+        _mm512_shuffle_i64x2::<0xDD>(s0, s2),
+        _mm512_shuffle_i64x2::<0x88>(s1, s3),
+        _mm512_shuffle_i64x2::<0xDD>(s1, s3),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        emit_pair(src, ident, am, da, db, lo4, p16, op, base_slot + 8 * j);
+        let up = _mm512_shuffle_i64x2::<0x4E>(src, src);
+        emit_pair(up, ident, am, da, db, lo4, p16, op, base_slot + 8 * j + 4);
+    }
+}
+
+#[inline(always)]
+unsafe fn gather8_z_emit<const ONLY_FIRST: bool>(
+    p0: *const i64,
+    p1: *const i64,
+    p2: *const i64,
+    ident: __m512i,
+    am: __m512i,
+    da: __m512i,
+    db: __m512i,
+    lo4: __m512i,
+    p16: __m512i,
+    op: *mut __m512i,
+    base_slot: usize,
+) {
     let a = _mm512_loadu_si512(p0 as *const __m512i);
     let b = _mm512_loadu_si512(p1 as *const __m512i);
     let l01 = _mm512_unpacklo_epi64(a, b);
@@ -453,24 +534,43 @@ unsafe fn gather8_z(p0: *const i64, p1: *const i64, p2: *const i64, dst: *mut u6
     let l23 = _mm512_maskz_loadu_epi64(0x55, p2);
     let h23 = _mm512_maskz_loadu_epi64(0x55, p2.add(1));
     let s0 = _mm512_shuffle_i64x2::<0x44>(l01, l23);
-    let s1 = _mm512_shuffle_i64x2::<0xEE>(l01, l23);
     let s2 = _mm512_shuffle_i64x2::<0x44>(h01, h23);
-    let s3 = _mm512_shuffle_i64x2::<0xEE>(h01, h23);
-    let o = dst as *mut __m512i;
-    _mm512_store_si512(o, _mm512_shuffle_i64x2::<0x88>(s0, s2));
-    _mm512_store_si512(o.add(1), _mm512_shuffle_i64x2::<0xDD>(s0, s2));
-    _mm512_store_si512(o.add(2), _mm512_shuffle_i64x2::<0x88>(s1, s3));
-    _mm512_store_si512(o.add(3), _mm512_shuffle_i64x2::<0xDD>(s1, s3));
+    let v0 = _mm512_shuffle_i64x2::<0x88>(s0, s2);
+    emit_pair(v0, ident, am, da, db, lo4, p16, op, base_slot);
+    if !ONLY_FIRST {
+        let s1 = _mm512_shuffle_i64x2::<0xEE>(l01, l23);
+        let s3 = _mm512_shuffle_i64x2::<0xEE>(h01, h23);
+        let v1 = _mm512_shuffle_i64x2::<0xDD>(s0, s2);
+        let v2 = _mm512_shuffle_i64x2::<0x88>(s1, s3);
+        let v3 = _mm512_shuffle_i64x2::<0xDD>(s1, s3);
+        // v0's lower half is already written; emit its upper half (t = 8i + 1) plus both
+        // halves of v1..v3 (t = 8i + 2 .. 8i + 8): vector j's lower half is the `8j`-slot
+        // pair, its upper half the `8j + 4` pair.
+        let up0 = _mm512_shuffle_i64x2::<0x4E>(v0, v0);
+        emit_pair(up0, ident, am, da, db, lo4, p16, op, base_slot + 4);
+        for (j, src) in [v1, v2, v3].into_iter().enumerate() {
+            emit_pair(src, ident, am, da, db, lo4, p16, op, base_slot + 8 * j + 8);
+            let up = _mm512_shuffle_i64x2::<0x4E>(src, src);
+            emit_pair(up, ident, am, da, db, lo4, p16, op, base_slot + 8 * j + 12);
+        }
+    }
 }
 
 /// 128 `B128` words (2048 contiguous bytes at `base`) -> the kernel's index rows.
+#[repr(C, align(64))]
+struct WorkB128 {
+    u: [u64; 136],
+    v: [u64; 136],
+}
+
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+#[inline]
 unsafe fn slice_b128_raw(base: *const u8, out: &mut BinaryIndex32) {
     let mut cols: MaybeUninit<Cols> = MaybeUninit::uninit();
     let cp = cols.as_mut_ptr() as *mut __m512i;
     columns_b128(base, cp);
 
-    let mut work: MaybeUninit<Work> = MaybeUninit::uninit();
+    let mut work: MaybeUninit<WorkB128> = MaybeUninit::uninit();
     let wk = work.as_mut_ptr();
     let u = (*wk).u.as_mut_ptr();
     let v = (*wk).v.as_mut_ptr();
@@ -483,49 +583,59 @@ unsafe fn slice_b128_raw(base: *const u8, out: &mut BinaryIndex32) {
     _mm512_store_si512(u.add(128) as *mut __m512i, _mm512_setzero_si512());
     _mm512_store_si512(v.add(128) as *mut __m512i, _mm512_setzero_si512());
 
-    // phase 3 as in `slice_raw`; the fourth stream (v[t+121..], u[t+122..]) is all zero from
-    // t = 8 on
-    let (ag, bg) = ((*wk).ag.as_mut_ptr(), (*wk).bg.as_mut_ptr());
-    gather8(
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    let am = _mm512_load_si512(AFFINE_BOTH.0.as_ptr() as *const __m512i);
+    let da = _mm512_load_si512(DUP_A.0.as_ptr() as *const __m512i);
+    let db = _mm512_load_si512(DUP_B.0.as_ptr() as *const __m512i);
+    let p16 = _mm512_load_si512(PLUS16.0.as_ptr() as *const __m512i);
+    let lo4 = _mm512_set1_epi8(0x0f);
+    let op = out.rows.as_mut_ptr() as *mut __m512i;
+
+    gather8_emit(
         u as *const i64,
         v.add(40) as *const i64,
         u.add(81) as *const i64,
         v.add(121) as *const i64,
-        ag,
+        ident, am, da, db, lo4, p16, op, 0,
     );
-    for i in 1..6 {
+    for i in 1..5 {
         let t = 8 * i;
-        gather8_z(
+        gather8_z_emit::<false>(
             u.add(t) as *const i64,
             v.add(t + 40) as *const i64,
             u.add(t + 81) as *const i64,
-            ag.add(4 * t),
+            ident, am, da, db, lo4, p16, op, 4 * t,
         );
     }
-    gather8(
+    gather8_z_emit::<true>(
+        u.add(40) as *const i64,
+        v.add(80) as *const i64,
+        u.add(121) as *const i64,
+        ident, am, da, db, lo4, p16, op, 160,
+    );
+    gather8_emit(
         v as *const i64,
         u.add(41) as *const i64,
         v.add(81) as *const i64,
         u.add(122) as *const i64,
-        bg,
+        ident, am, da, db, lo4, p16, op, 2,
     );
     for i in 1..5 {
         let t = 8 * i;
-        gather8_z(
+        gather8_z_emit::<false>(
             v.add(t) as *const i64,
             u.add(t + 41) as *const i64,
             v.add(t + 81) as *const i64,
-            bg.add(4 * t),
+            ident, am, da, db, lo4, p16, op, 4 * t + 2,
         );
     }
-
-    index_rows(ag, bg, out);
 }
 
 /// The same index rows for 128 words of `B128`, the lifted witness read in place (a lifted
 /// `F162` is the word's two limbs and a zero top limb): byte-identical to [`slice_f162_into`] of
 /// the 128 lifted words, without staging them and without the zero limb's share of the work.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+#[inline]
 pub unsafe fn slice_b128_into(words: &[crate::fields::scalar::B128; 128], out: &mut BinaryIndex32) {
     slice_b128_raw(words.as_ptr() as *const u8, out)
 }

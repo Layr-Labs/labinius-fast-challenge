@@ -586,6 +586,7 @@ impl BatchSource for &[B128] {
         self.len()
     }
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+    #[inline]
     unsafe fn slice_batch(&self, b: usize, out: &mut BinaryIndex32) {
         slice_b128_into(&*(self.as_ptr().add(128 * b) as *const [B128; 128]), out)
     }

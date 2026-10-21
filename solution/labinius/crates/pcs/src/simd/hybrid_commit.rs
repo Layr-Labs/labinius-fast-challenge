@@ -684,6 +684,276 @@ fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,place
   mine.store(usize::MAX/2,Ordering::Release);
  });
 }
+
+#[inline(always)]
+unsafe fn base_words<const Q:u16>(acc:*const i32,blk:usize)->__m512i {
+ let p=acc.add(16*ABLK*blk) as *const __m512i;
+ let t0=_mm512_load_si512(p);let t1=_mm512_load_si512(p.add(2));
+ let t2=_mm512_load_si512(p.add(4));let t3=_mm512_load_si512(p.add(6));
+ let e=_mm512_loadu_si512(EVEN.as_ptr() as *const __m512i);let o=_mm512_loadu_si512(ODD.as_ptr() as *const __m512i);
+ let lo=_mm512_add_epi32(_mm512_permutex2var_epi32(t0,e,t1),_mm512_permutex2var_epi32(t0,o,t1));
+ let t3=_mm512_add_epi32(t3,_mm512_shuffle_epi32::<0x4E>(t3));
+ let e=_mm512_loadu_si512(EVEN4.as_ptr() as *const __m512i);let o=_mm512_loadu_si512(ODD4.as_ptr() as *const __m512i);
+ let hi=_mm512_add_epi32(_mm512_permutex2var_epi32(t2,e,t3),_mm512_permutex2var_epi32(t2,o,t3));
+ _mm512_packs_epi32(red16::<Q>(lo),red16::<Q>(hi))
+}
+
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn finish_bases<const Q:u16>(acc:*const GAcc,k:usize,g:usize,pend:&mut Batch32) {
+ let col=|c:usize| (*acc.add(2*c+k)).v.as_ptr() as *const i32;
+ let pv=pend.v.as_mut_ptr();
+ if g%16==0 {
+  for h in 0..g/16 {
+   for blk in 0..24 {
+    let mut x=[_mm512_setzero_si512();16];
+    for c in 0..16 {x[c]=base_words::<Q>(col(16*h+c),blk);}
+    put16(&x,pv,blk,16*h);
+   }
+  }
+ } else {
+  for c in 0..g {
+   for blk in 0..24 {
+    let mut t=[0i16;32];
+    _mm512_storeu_si512(t.as_mut_ptr() as *mut __m512i,base_words::<Q>(col(c),blk));
+    for r in 0..27 {(*pv.add(27*blk+r))[c]=t[row_word(r)];}
+   }
+  }
+ }
+ if g<32 {clear_lanes(pend,g);}
+ pend.representation=Representation::Ntt;
+ gen_small::intt_gen_batch32::<Q>(pend);
+}
+
+#[inline(always)]
+unsafe fn tr8_i16_lanes(x:&[__m512i;8])->[__m512i;8] {
+ let a0=_mm512_unpacklo_epi16(x[0],x[1]);let a1=_mm512_unpackhi_epi16(x[0],x[1]);
+ let a2=_mm512_unpacklo_epi16(x[2],x[3]);let a3=_mm512_unpackhi_epi16(x[2],x[3]);
+ let a4=_mm512_unpacklo_epi16(x[4],x[5]);let a5=_mm512_unpackhi_epi16(x[4],x[5]);
+ let a6=_mm512_unpacklo_epi16(x[6],x[7]);let a7=_mm512_unpackhi_epi16(x[6],x[7]);
+ let b0=_mm512_unpacklo_epi32(a0,a2);let b1=_mm512_unpackhi_epi32(a0,a2);
+ let b2=_mm512_unpacklo_epi32(a1,a3);let b3=_mm512_unpackhi_epi32(a1,a3);
+ let b4=_mm512_unpacklo_epi32(a4,a6);let b5=_mm512_unpackhi_epi32(a4,a6);
+ let b6=_mm512_unpacklo_epi32(a5,a7);let b7=_mm512_unpackhi_epi32(a5,a7);
+ [_mm512_unpacklo_epi64(b0,b4),_mm512_unpackhi_epi64(b0,b4),
+  _mm512_unpacklo_epi64(b1,b5),_mm512_unpackhi_epi64(b1,b5),
+  _mm512_unpacklo_epi64(b2,b6),_mm512_unpackhi_epi64(b2,b6),
+  _mm512_unpacklo_epi64(b3,b7),_mm512_unpackhi_epi64(b3,b7)]
+}
+
+static LIFT_BYTES:[u8;64]={
+ let mut t=[0u8;64];let mut k=0;
+ while k<40 {t[k]=((k/5)*8+k%5) as u8;k+=1;}
+ t
+};
+
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn emit_group_bytes(r0:&Batch32,r1:&Batch32,total:&mut Batch32,g:usize,slots:usize,out:*mut u8) {
+ const INV:u16=inv_mod(P0 as u64,P1 as u64) as u16;
+ const W:i16=Params::<P1>::to_mont(INV);
+ const WP:i16=Params::<P1>::mont_pre(W);
+ if g!=32 && g!=16 {
+  for j in 0..N {
+   for c in 0..g {
+    let mut s=0u16;
+    for k in 0..slots {s=s.wrapping_add(total.v[j][k*g+c] as u16);}
+    total.v[j][c]=s as i16;
+   }
+  }
+ }
+ let p0v=_mm512_set1_epi16(P0 as i16);
+ let p1v=_mm512_set1_epi16(P1 as i16);
+ let wv=_mm512_set1_epi16(W);
+ let wpv=_mm512_set1_epi16(WP);
+ let k153=_mm512_set1_epi16(153);
+ let m1023=_mm512_set1_epi16(1023);
+ let q0_64=_mm512_set1_epi64(P0 as i64);
+ let prod_64=_mm512_set1_epi64(PRODUCT);
+ let pick=_mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
+ let keep:__mmask64=(1u64<<40)-1;
+ for jb in 0..N/8 {
+  let j0=8*jb;
+  let mut av_rows=[_mm512_setzero_si512();8];
+  let mut u_rows=[_mm512_setzero_si512();8];
+  let mut dig_rows=[_mm512_setzero_si512();8];
+  for r in 0..8 {
+   let j=j0+r;
+   let av=canonical(_mm512_load_si512(r0.v[j].as_ptr() as *const __m512i),P0 as i16);
+   let bv=canonical(_mm512_load_si512(r1.v[j].as_ptr() as *const __m512i),P1 as i16);
+   let tv=_mm512_load_si512(total.v[j].as_ptr() as *const __m512i);
+   let tl=if g==16 {_mm512_add_epi16(tv,_mm512_shuffle_i64x2::<0xEE>(tv,tv))} else {tv};
+   let d=_mm512_sub_epi16(bv,av);
+   let m=_mm512_mullo_epi16(d,wpv);
+   let h=_mm512_mulhi_epi16(d,wv);
+   let u=canonical(_mm512_sub_epi16(h,_mm512_mulhi_epi16(m,p1v)),P1 as i16);
+   let val_lo=_mm512_add_epi16(av,_mm512_mullo_epi16(u,p0v));
+   let dig=_mm512_and_si512(_mm512_mullo_epi16(_mm512_sub_epi16(tl,val_lo),k153),m1023);
+   av_rows[r]=av;
+   u_rows[r]=u;
+   dig_rows[r]=dig;
+  }
+  let av_t=tr8_i16_lanes(&av_rows);
+  let u_t=tr8_i16_lanes(&u_rows);
+  let dig_t=tr8_i16_lanes(&dig_rows);
+  macro_rules! store_lane {
+   ($L:literal) => {
+    for w in 0..8 {
+     let c=8*$L+w;
+     if c<g {
+      let a64=_mm512_cvtepu16_epi64(_mm512_extracti32x4_epi32::<$L>(av_t[w]));
+      let u64=_mm512_cvtepu16_epi64(_mm512_extracti32x4_epi32::<$L>(u_t[w]));
+      let d64=_mm512_cvtepu16_epi64(_mm512_extracti32x4_epi32::<$L>(dig_t[w]));
+      let val=_mm512_add_epi64(a64,_mm512_mul_epu32(u64,q0_64));
+      let lifted=_mm512_add_epi64(val,_mm512_mul_epu32(d64,prod_64));
+      _mm512_mask_storeu_epi8(
+       out.add((c*N+j0)*5) as *mut i8,
+       keep,
+       _mm512_permutexvar_epi8(pick,lifted),
+      );
+     }
+    }
+   };
+  }
+  store_lane!(0);
+  store_lane!(1);
+  store_lane!(2);
+  store_lane!(3);
+ }
+}
+
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn group_bytes<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mut Worker,out:*mut u8,mut sync:F) {
+ let g=cols.len();assert!(g>=1 && 2*g<=ws.acc.len() && keys.len()==2*nb);
+ let slots=32/g;
+ for a in ws.acc[..2*g].iter_mut() {core::ptr::write_bytes(a as *mut GAcc,0,1);}
+ core::ptr::write_bytes(&mut ws.total[0] as *mut Batch32,0,1);
+ let mut filled=0usize;
+ for b in 0..nb {
+  for c in 0..g {
+   if prefetch_witness_on() {
+    prefetch_witness(cols[c].as_ptr().add(128*b),2048);
+    if b+1<nb {prefetch_witness(cols[c].as_ptr().add(128*(b+1)),2048);}
+    if c+1<g {prefetch_witness(cols[c+1].as_ptr().add(128*b),2048);}
+   }
+   cols[c].slice_batch(b,&mut ws.idx[0]);
+   let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;
+   sink_batch::<P0>(&ws.idx[0],keys,b,a0);
+   sink_batch::<P1>(&ws.idx[0],keys,b,a1);
+  }
+  sync(b);
+  if (b+1)%CHUNK_BATCHES==0 || b+1==nb {
+   let (p0,p1)=ws.pend.split_at_mut(1);
+   let acc=ws.acc.as_mut_ptr();
+   finish_tails::<P0>(acc,0,g,&mut p0[0],filled*g);
+   finish_tails::<P1>(acc,1,g,&mut p1[0],filled*g);
+   filled+=1;
+   if filled==slots || b+1==nb {
+    if filled*g<32 {clear_lanes(&mut p0[0],filled*g);clear_lanes(&mut p1[0],filled*g);}
+    p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
+    gen_small::intt_gen_batch32::<P0>(&mut p0[0]);gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
+    crt_accumulate(&p0[0],&p1[0],&mut ws.total[0]);
+    filled=0;
+   }
+  }
+ }
+ let (p0,p1)=ws.pend.split_at_mut(1);
+ let acc=ws.acc.as_ptr();
+ finish_bases::<P0>(acc,0,g,&mut p0[0]);
+ finish_bases::<P1>(acc,1,g,&mut p1[0]);
+ emit_group_bytes(&p0[0],&p1[0],&mut ws.total[0],g,slots,out);
+}
+
+fn commit_paired_bytes<D:Fn(usize)+Sync>(
+ keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,
+ placement:Option<&crate::par::CorePlacement>,dst:usize,on_group_done:&D,
+) {
+ use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
+ let nb=keys.len()/2;
+ let pairs=workers/2;let sg=2*g;
+ let groups=columns.len().div_ceil(sg);
+ let rounds=groups+1;
+ let next=AtomicUsize::new(0);
+ let slots:Vec<std::sync::OnceLock<usize>>=(0..pairs*rounds).map(|_|std::sync::OnceLock::new()).collect();
+ let done:Vec<Progress>=(0..2*pairs).map(|_|Progress(AtomicUsize::new(0))).collect();
+ let coupled:Vec<AtomicBool>=(0..pairs).map(|_|AtomicBool::new(true)).collect();
+ crate::par::pool().run(2*pairs,|worker|{
+  let _guard=placement.and_then(|p|p.pin(worker));
+  let (pair,s)=(worker/2,worker%2);
+  let mine=&done[worker].0;let other=&done[worker^1].0;let coupled=&coupled[pair];
+  let mut ws:Option<Worker>=None;
+  for r in 0..rounds {
+   let gi=*slots[pair*rounds+r].get_or_init(||next.fetch_add(1,Ordering::Relaxed));
+   if gi>=groups {break;}
+   let c0=gi*sg;let gc=sg.min(columns.len()-c0);
+   let h=gc.min(g);
+   let (lo,n)=if s==0 {(c0,h)} else {(c0+h,gc-h)};
+   let base=r*nb;
+   if n==0 {mine.store(base+nb,Ordering::Release);continue;}
+   let ws=ws.get_or_insert_with(||Worker::new(g));
+   unsafe{group_bytes(&columns[lo..lo+n],keys,nb,ws,(dst as *mut u8).add(5*N*lo),|b|{
+    let d=base+b+1;
+    mine.store(d,Ordering::Release);
+    if !coupled.load(Ordering::Relaxed) {return;}
+    if other.load(Ordering::Acquire)+LEAD>=d {return;}
+    let start=std::time::Instant::now();
+    let mut spins=0u32;
+    while other.load(Ordering::Acquire)+LEAD<d {
+     core::hint::spin_loop();
+     spins+=1;
+     if spins%64==0 && start.elapsed()>SIBLING_WAIT {coupled.store(false,Ordering::Relaxed);return;}
+    }
+   })};
+   on_group_done(2*gi+s);
+  }
+  mine.store(usize::MAX/2,Ordering::Release);
+ });
+}
+
+/// Commit `columns` against `keys` and fuse the inverse NTT recombination and CRT lift into each
+/// `group_size`-column group, writing the `5 * N * columns.len()` wire bytes straight into `out`
+/// without allocating the intermediate 8 MB `rows` vector. Calls `on_group_done(gi)` as each
+/// group `gi` (`gi * g .. (gi + 1) * g`) finishes writing its commitment bytes.
+pub fn commit_columns_bytes_arranged<D:Fn(usize)+Sync>(
+ keys:&[KeyBatch],columns:&[&[B128]],workers:usize,group_size:usize,out:&mut [u8],on_group_done:D,
+) {
+ assert!(!columns.is_empty(),"at least one witness column");
+ assert_eq!(out.len(),columns.len()*N*5,"5 bytes per coefficient");
+ let nb=keys.len()/2;
+ assert!(nb>0 && keys.len()==2*nb,"two arranged key batches per batch");
+ for c in columns {assert_eq!(c.len(),128*nb,"128 words per key batch");}
+ let g=group_size.clamp(1,32).min(columns.len());
+ let dst=out.as_mut_ptr() as usize;
+ let paired=if workers>=2 && workers%2==0 && columns.len()>g {crate::par::CorePlacement::for_sibling_pairs(workers)} else {None};
+ if let Some(placement)=paired {
+  commit_paired_bytes(keys,columns,workers,g,Some(&placement),dst,&on_group_done);
+ } else {
+  let groups=columns.len().div_ceil(g);let workers=workers.clamp(1,groups);
+  let next=std::sync::atomic::AtomicUsize::new(0);
+  let placement=crate::par::CorePlacement::for_workers(workers);
+  crate::par::pool().run(workers,|worker|{
+   let _guard=placement.as_ref().and_then(|p|p.pin(worker));
+   let mut ws:Option<Worker>=None;
+   loop {
+    let gi=next.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+    if gi>=groups {break;}
+    let c0=gi*g;let gc=g.min(columns.len()-c0);
+    let ws=ws.get_or_insert_with(||Worker::new(g));
+    unsafe{group_bytes(&columns[c0..c0+gc],keys,nb,ws,(dst as *mut u8).add(5*N*c0),|_|{})};
+    on_group_done(gi);
+   }
+  });
+ }
+}
+
+pub fn commit_columns_bytes(
+ base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey,
+ columns:&[&[B128]],workers:usize,group_size:usize,
+)->Vec<u8> {
+ check_keys(base,tail);
+ for c in columns {assert_eq!(c.len(),base.len_f162());}
+ let mut out=vec![0u8;columns.len()*N*5];
+ commit_columns_bytes_arranged(&arrange_keys(base,tail,workers),columns,workers,group_size,&mut out,|_|{});
+ out
+}
 #[cfg(test)]
 mod tests {
  use super::*;

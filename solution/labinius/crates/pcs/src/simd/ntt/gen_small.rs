@@ -185,7 +185,27 @@ impl<const Q: u16> Tw<Q> {
 
 #[inline(always)]
 unsafe fn bc(p: *const u32) -> __m512i {
-    _mm512_set1_epi32(p.read() as i32)
+    let r: __m512i;
+    core::arch::asm!(
+        "vpbroadcastd {0}, dword ptr [{1}]",
+        out(zmm_reg) r,
+        in(reg) p,
+        options(pure, readonly, nostack, preserves_flags)
+    );
+    r
+}
+
+#[inline(always)]
+unsafe fn mulhi(a: __m512i, b: __m512i) -> __m512i {
+    let r: __m512i;
+    core::arch::asm!(
+        "vpmulhw {0}, {1}, {2}",
+        out(zmm_reg) r,
+        in(zmm_reg) a,
+        in(zmm_reg) b,
+        options(pure, nomem, nostack, preserves_flags)
+    );
+    r
 }
 
 #[inline(always)]
@@ -202,8 +222,8 @@ unsafe fn st(p: *mut __m512i, j: usize, x: __m512i) {
 #[inline(always)]
 unsafe fn mont(a: __m512i, wp: __m512i, w: __m512i, q: __m512i) -> __m512i {
     let m = _mm512_mullo_epi16(a, wp);
-    let hi = _mm512_mulhi_epi16(a, w);
-    _mm512_sub_epi16(hi, _mm512_mulhi_epi16(m, q))
+    let hi = mulhi(a, w);
+    _mm512_sub_epi16(hi, mulhi(m, q))
 }
 
 /// `vpmulhrsw`-based partial reduction: 2 multiply uops, `|r| <= 0.899q / 0.809q`.
@@ -732,90 +752,73 @@ unsafe fn ir2(y0: __m512i, y1: __m512i, zp: __m512i, z: __m512i, q: __m512i) -> 
 #[inline(always)]
 unsafe fn center(x: __m512i, q: __m512i, half: __m512i, nhalf: __m512i) -> __m512i {
     let hi = _mm512_cmpgt_epi16_mask(x, half);
-    let x = _mm512_mask_sub_epi16(x, hi, x, q);
     let lo = _mm512_cmplt_epi16_mask(x, nhalf);
+    let x = _mm512_mask_sub_epi16(x, hi, x, q);
     _mm512_mask_add_epi16(x, lo, x, q)
 }
 
-/// Level 6 (the first inverse level) for one 27-block. The three loaded values are Barretted
-/// here: at the declared input bound even `y1 - y2` leaves i16, and this is the only place the
-/// input is touched, so no separate reduction pass is needed.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn ipass_d<const Q: u16>(p: *mut __m512i, k4: usize) {
+/// Levels 6 and 5 fused in registers for each 9-subblock of one 27-block, followed by Level 4.
+/// A 9-subblock `9 * bb .. 9 * bb + 9` is three degree-3 subrings at Level 6 (`ipass_d`) followed
+/// immediately by three butterflies across those three subrings at Level 5 (`ipass_c5`), needing
+/// only 9 data registers at a time (no intermediate memory round-trip between Levels 6 and 5).
+#[inline(always)]
+unsafe fn ipass_dc4<const Q: u16>(p: *mut __m512i, k4: usize) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
     let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
     let t6 = TwI::<Q>::IL6.as_ptr().add(36 * k4);
-    let base = k4 * 27;
-    for g in 0..9 {
-        let b = base + 3 * g;
-        let (mut y0, mut y1, mut y2) = (ld(p, b), ld(p, b + 1), ld(p, b + 2));
-        if TwI::<Q>::BAR_IN {
-            y0 = barrett(y0, bv, q);
-            y1 = barrett(y1, bv, q);
-            y2 = barrett(y2, bv, q);
-        }
-        let (mut s, a1, a2) = ir3(y0, y1, y2, t6.add(4 * g), omp, om, q);
-        if TwI::<Q>::BAR_S6 {
-            s = barrett(s, bv, q);
-        }
-        st(p, b, s);
-        st(p, b + 1, a1);
-        st(p, b + 2, a2);
-    }
-}
-
-/// Level 5 for one 27-block: 3 groups of 9 vectors, 3 butterflies each. The Barrett flag is
-/// indexed by `j`, the position class inside the 9-block: only `j = 0` inherits an untwiddled
-/// level-6 output in all three inputs.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn ipass_c5<const Q: u16>(p: *mut __m512i, k4: usize) {
-    let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
-    let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
-    let omp = bc(Tw::<Q>::OM.as_ptr());
-    let om = bc(Tw::<Q>::OM.as_ptr().add(1));
     let t5 = TwI::<Q>::IL5.as_ptr().add(12 * k4);
-    let base = k4 * 27;
-    for bb in 0..3 {
-        macro_rules! bf {
-            ($j:literal) => {{
-                let b = base + 9 * bb + $j;
-                let (mut s, a1, a2) = ir3(
-                    ld(p, b),
-                    ld(p, b + 3),
-                    ld(p, b + 6),
-                    t5.add(4 * bb),
-                    omp,
-                    om,
-                    q,
-                );
-                if TwI::<Q>::BAR_S5[$j] {
-                    s = barrett(s, bv, q);
-                }
-                st(p, b, s);
-                st(p, b + 3, a1);
-                st(p, b + 6, a2);
-            }};
-        }
-        bf!(0);
-        bf!(1);
-        bf!(2);
-    }
-}
-
-/// Level 4 for one 27-block: 9 butterflies, one per position class `i` of the 9-block.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn ipass_c4<const Q: u16>(p: *mut __m512i, k4: usize) {
-    let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
-    let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
-    let omp = bc(Tw::<Q>::OM.as_ptr());
-    let om = bc(Tw::<Q>::OM.as_ptr().add(1));
     let t4 = TwI::<Q>::IL4.as_ptr().add(4 * k4);
     let base = k4 * 27;
-    // written out so that `BAR_S4[i]` is a compile-time constant: LLVM leaves a 9-trip loop
-    // rolled, and a per-iteration load-and-branch on the flag costs more than the Barrett.
-    macro_rules! bf {
+    for bb in 0..3 {
+        let b0 = base + 9 * bb;
+        let t6b = t6.add(12 * bb);
+        let t5b = t5.add(4 * bb);
+        macro_rules! d3 {
+            ($off:literal, $tw_off:literal) => {{
+                let (mut y0, mut y1, mut y2) = (ld(p, b0 + $off), ld(p, b0 + $off + 1), ld(p, b0 + $off + 2));
+                if TwI::<Q>::BAR_IN {
+                    y0 = barrett(y0, bv, q);
+                    y1 = barrett(y1, bv, q);
+                    y2 = barrett(y2, bv, q);
+                }
+                let (mut s, a1, a2) = ir3(y0, y1, y2, t6b.add($tw_off), omp, om, q);
+                if TwI::<Q>::BAR_S6 {
+                    s = barrett(s, bv, q);
+                }
+                (s, a1, a2)
+            }};
+        }
+        let (v0, v1, v2) = d3!(0, 0);
+        let (v3, v4, v5) = d3!(3, 4);
+        let (v6, v7, v8) = d3!(6, 8);
+
+        let (mut s0, a10, a20) = ir3(v0, v3, v6, t5b, omp, om, q);
+        if TwI::<Q>::BAR_S5[0] {
+            s0 = barrett(s0, bv, q);
+        }
+        st(p, b0, s0);
+        st(p, b0 + 3, a10);
+        st(p, b0 + 6, a20);
+
+        let (mut s1, a11, a21) = ir3(v1, v4, v7, t5b, omp, om, q);
+        if TwI::<Q>::BAR_S5[1] {
+            s1 = barrett(s1, bv, q);
+        }
+        st(p, b0 + 1, s1);
+        st(p, b0 + 4, a11);
+        st(p, b0 + 7, a21);
+
+        let (mut s2, a12, a22) = ir3(v2, v5, v8, t5b, omp, om, q);
+        if TwI::<Q>::BAR_S5[2] {
+            s2 = barrett(s2, bv, q);
+        }
+        st(p, b0 + 2, s2);
+        st(p, b0 + 5, a12);
+        st(p, b0 + 8, a22);
+    }
+    macro_rules! bf4 {
         ($i:literal) => {{
             let b = base + $i;
             let (mut s, a1, a2) = ir3(ld(p, b), ld(p, b + 9), ld(p, b + 18), t4, omp, om, q);
@@ -827,15 +830,15 @@ unsafe fn ipass_c4<const Q: u16>(p: *mut __m512i, k4: usize) {
             st(p, b + 18, a2);
         }};
     }
-    bf!(0);
-    bf!(1);
-    bf!(2);
-    bf!(3);
-    bf!(4);
-    bf!(5);
-    bf!(6);
-    bf!(7);
-    bf!(8);
+    bf4!(0);
+    bf4!(1);
+    bf4!(2);
+    bf4!(3);
+    bf4!(4);
+    bf4!(5);
+    bf4!(6);
+    bf4!(7);
+    bf4!(8);
 }
 
 /// Levels 3 and 2 for one 162-block, the mirror of [`pass_b`]: 27 groups of 6 vectors, 2 inverse
@@ -940,15 +943,18 @@ unsafe fn ipass_a<const Q: u16>(p: *mut __m512i) {
 ///
 /// # Safety
 /// The host must have AVX-512 F/BW/VL; `b` must be 64-byte aligned (`Batch32` is).
-#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+#[inline(always)]
 pub unsafe fn intt_gen_batch32<const Q: u16>(b: &mut Batch32) {
     debug_assert_eq!(b.representation, Representation::Ntt);
+    intt_gen_batch32_inner::<Q>(b);
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn intt_gen_batch32_inner<const Q: u16>(b: &mut Batch32) {
     let p = b.v.as_mut_ptr() as *mut __m512i;
     for blk in 0..4 {
         for k4 in 6 * blk..6 * blk + 6 {
-            ipass_d::<Q>(p, k4);
-            ipass_c5::<Q>(p, k4);
-            ipass_c4::<Q>(p, k4);
+            ipass_dc4::<Q>(p, k4);
         }
         ipass_b::<Q>(p, blk);
     }

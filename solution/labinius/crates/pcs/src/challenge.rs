@@ -216,6 +216,68 @@ impl Stream {
     }
 }
 
+/// State for hashing a large absorbed byte slice in pieces on the fly as producer groups
+/// finish writing their respective byte ranges.
+pub struct ParallelAbsorb {
+    plain: Hasher,
+    head: u64,
+    x: u64,
+    subtrees: Vec<(usize, u64)>,
+    pieces: Vec<(u64, u64)>,
+    req_mask: Vec<u64>,
+    done_groups: std::sync::atomic::AtomicU64,
+    claimed_pieces: std::sync::atomic::AtomicU64,
+    cvs: Vec<std::cell::UnsafeCell<ChainingValue>>,
+}
+
+unsafe impl Sync for ParallelAbsorb {}
+unsafe impl Send for ParallelAbsorb {}
+
+impl ParallelAbsorb {
+    #[inline]
+    fn hash_piece(&self, p: usize, bytes: &[u8]) -> ChainingValue {
+        let (start, len) = self.pieces[p];
+        if start == 0 {
+            let mut h = self.plain.clone();
+            h.update(&bytes[..(len - self.head) as usize]);
+            h.finalize_non_root()
+        } else {
+            let mut h = Hasher::new();
+            h.set_input_offset(start);
+            h.update(&bytes[(start - self.head) as usize..(start + len - self.head) as usize]);
+            h.finalize_non_root()
+        }
+    }
+
+    /// Notify that group `gi` has finished writing its range into `bytes` (`bytes_ptr`, `bytes_len`),
+    /// and immediately hash any blake3 subtree pieces whose required groups are now all complete
+    /// while those bytes are still hot in L1/L2 cache.
+    ///
+    /// # Safety
+    /// `bytes_ptr` must address `bytes_len` bytes, and all bytes of group `gi` must have been
+    /// written before this call.
+    pub unsafe fn notify_group_done(&self, gi: usize, bytes_ptr: *const u8, bytes_len: usize) {
+        use std::sync::atomic::Ordering;
+        if gi >= 64 {
+            return;
+        }
+        let gbit = 1u64 << gi;
+        let done = self.done_groups.fetch_or(gbit, Ordering::AcqRel) | gbit;
+        let bytes = core::slice::from_raw_parts(bytes_ptr, bytes_len);
+        let mut claimed = self.claimed_pieces.load(Ordering::Relaxed);
+        for (p, &req) in self.req_mask.iter().enumerate() {
+            let pbit = 1u64 << p;
+            if (claimed & pbit) == 0 && (done & req) == req {
+                let prev = self.claimed_pieces.fetch_or(pbit, Ordering::Relaxed);
+                claimed = prev | pbit;
+                if (prev & pbit) == 0 {
+                    *self.cvs[p].get() = self.hash_piece(p, bytes);
+                }
+            }
+        }
+    }
+}
+
 /// A blake3 Fiat-Shamir transcript: absorb, then derive.
 ///
 /// Every derivation clones the absorbing state, appends a per-transcript sample counter and a
@@ -235,6 +297,127 @@ impl Transcript {
         state.update(&(domain.len() as u64).to_le_bytes());
         state.update(domain);
         Transcript { state, counter: 0 }
+    }
+
+    /// Prepare to absorb a byte slice of length `bytes_len` produced in `num_groups` contiguous
+    /// groups of `group_bytes` bytes each (the last group taking any remainder).
+    pub fn begin_absorb_bytes_parallel(
+        &self,
+        bytes_len: usize,
+        group_bytes: usize,
+        num_groups: usize,
+    ) -> Option<ParallelAbsorb> {
+        const PIECE: u64 = 64 * CHUNK_LEN;
+        if self.state.depth != 0
+            || group_bytes == 0
+            || num_groups == 0
+            || num_groups > 64
+            || (bytes_len as u64) < 4 * PIECE
+        {
+            return None;
+        }
+        let mut plain = self.state.tail.clone();
+        plain.update(&(bytes_len as u64).to_le_bytes());
+        let head = plain.count();
+        if head >= PIECE {
+            return None;
+        }
+        let end = head + bytes_len as u64;
+        let x = (end - 1) / CHUNK_LEN * CHUNK_LEN;
+        let mut subtrees = Vec::new();
+        let mut pieces = Vec::new();
+        let mut at = 0u64;
+        for bit in (0..64).rev() {
+            let size = 1u64 << bit;
+            if x & size == 0 {
+                continue;
+            }
+            let piece = size.min(PIECE);
+            subtrees.push((pieces.len(), size / piece));
+            for k in 0..size / piece {
+                pieces.push((at + k * piece, piece));
+            }
+            at += size;
+        }
+        if pieces.len() > 64 {
+            return None;
+        }
+        let req_mask: Vec<u64> = pieces
+            .iter()
+            .map(|&(start, len)| {
+                let b_start = if start == 0 { 0 } else { (start - head) as usize };
+                let b_end = (start + len - head) as usize;
+                let g0 = b_start / group_bytes;
+                let g1 = ((b_end - 1) / group_bytes).min(num_groups - 1);
+                let mut m = 0u64;
+                for g in g0..=g1 {
+                    m |= 1u64 << g;
+                }
+                m
+            })
+            .collect();
+        let cvs = (0..pieces.len())
+            .map(|_| std::cell::UnsafeCell::new([0u8; 32]))
+            .collect();
+        Some(ParallelAbsorb {
+            plain,
+            head,
+            x,
+            subtrees,
+            pieces,
+            req_mask,
+            done_groups: std::sync::atomic::AtomicU64::new(0),
+            claimed_pieces: std::sync::atomic::AtomicU64::new(0),
+            cvs,
+        })
+    }
+
+    /// Complete an on-the-fly parallel absorption started by [`begin_absorb_bytes_parallel`],
+    /// or fall back to [`absorb_bytes_parallel`] if `pa` is `None`.
+    pub fn finish_absorb_bytes_parallel(
+        &mut self,
+        pa: Option<ParallelAbsorb>,
+        bytes: &[u8],
+        threads: usize,
+    ) {
+        let Some(pa) = pa else {
+            return self.absorb_bytes_parallel(bytes, threads);
+        };
+        use std::sync::atomic::Ordering;
+        let claimed = pa.claimed_pieces.load(Ordering::Acquire);
+        for p in 0..pa.pieces.len() {
+            let pbit = 1u64 << p;
+            if (claimed & pbit) == 0
+                && (pa.claimed_pieces.fetch_or(pbit, Ordering::Relaxed) & pbit) == 0
+            {
+                unsafe { *pa.cvs[p].get() = pa.hash_piece(p, bytes) };
+            }
+        }
+        let cvs: Vec<ChainingValue> = pa
+            .cvs
+            .into_iter()
+            .map(|c| c.into_inner())
+            .collect();
+        let mut left = [[0u8; 32]; MAX_DEPTH];
+        for (d, &(first, count)) in pa.subtrees.iter().enumerate() {
+            let mut level: Vec<ChainingValue> = cvs[first..first + count as usize].to_vec();
+            while level.len() > 1 {
+                level = level
+                    .chunks_exact(2)
+                    .map(|p| hazmat::merge_subtrees_non_root(&p[0], &p[1], Mode::Hash))
+                    .collect();
+            }
+            left[d] = level[0];
+        }
+        let mut tail = Hasher::new();
+        tail.set_input_offset(pa.x);
+        tail.update(&bytes[(pa.x - pa.head) as usize..]);
+        self.state = Stream {
+            left,
+            depth: pa.subtrees.len(),
+            offset: pa.x,
+            tail,
+        };
     }
 
     /// [`absorb_bytes`](Self::absorb_bytes), with a large input hashed on up to `threads`

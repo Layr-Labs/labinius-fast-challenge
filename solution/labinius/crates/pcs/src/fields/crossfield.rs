@@ -961,6 +961,38 @@ unsafe fn scale_b128_row(input: &[B128], factor: B128, out: *mut B128) {
     }
 }
 
+/// [`scale_b128_row`] XOR-accumulated into `acc`.
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn scale_b128_row_xor(input: &[B128], factor: B128, acc: *mut B128) {
+    let f = _mm_set_epi64x((factor.0 >> 64) as i64, factor.0 as i64);
+    let poly128 = _mm_set_epi64x(0, 0x87);
+    let kh = _mm_clmulepi64_si128::<0x01>(f, poly128);
+    let k = _mm_xor_si128(kh, _mm_slli_si128::<8>(f));
+    let b = _mm512_broadcast_i32x4(f);
+    let k = _mm512_broadcast_i32x4(k);
+    let poly = _mm512_set1_epi64(0x87);
+    for i in (0..input.len() / 4 * 4).step_by(4) {
+        let a = _mm512_loadu_si512(input.as_ptr().add(i) as *const __m512i);
+        let y0 = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(a, b),
+            _mm512_clmulepi64_epi128::<0x01>(a, k),
+        );
+        let y1 = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x10>(a, b),
+            _mm512_clmulepi64_epi128::<0x11>(a, k),
+        );
+        let lo = _mm512_xor_si512(y0, _mm512_bslli_epi128::<8>(y1));
+        let hi = _mm512_bsrli_epi128::<8>(y1);
+        let res = _mm512_xor_si512(lo, _mm512_clmulepi64_epi128::<0x00>(hi, poly));
+        let prev = _mm512_loadu_si512(acc.add(i) as *const __m512i);
+        _mm512_storeu_si512(acc.add(i) as *mut __m512i, _mm512_xor_si512(prev, res));
+    }
+    for i in input.len() / 4 * 4..input.len() {
+        let prev = *acc.add(i);
+        acc.add(i).write(prev + input[i] * factor);
+    }
+}
+
 #[cfg(test)]
 mod ghash_fixed_tests {
     use super::*;
@@ -1177,7 +1209,6 @@ unsafe fn partials_blocks<const G: usize>(
         let pi0 = pi0_addr as *const B128;
         let mut acc: Vec<RawAcc> = vec![[[_mm512_setzero_si512(); 16]; 2]; G];
         let mut scratch = RowScratch::new(groups);
-        let mut row = vec![B128::ZERO; low.len()];
         loop {
             let c = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if c >= chunks {
@@ -1185,9 +1216,9 @@ unsafe fn partials_blocks<const G: usize>(
             }
             let end = ((c + 1) * chunk).min(rows);
             for jh in c * chunk..end {
-                scale_b128_row(&low, high[jh], row.as_mut_ptr());
+                scale_and_slice_eq_row(&low, high[jh], scratch.xs.as_mut_ptr());
                 let next_row = if jh + 1 < end { pi0.add((jh + 1) << h) } else { core::ptr::null() };
-                partials_row(&mut acc, pi0.add(jh << h), block_len, row.as_ptr(), groups, &mut scratch, next_row);
+                partials_row(&mut acc, pi0.add(jh << h), block_len, groups, &mut scratch, next_row);
             }
         }
         acc
@@ -1210,111 +1241,185 @@ unsafe fn partials_blocks<const G: usize>(
 /// .bit[k']` sums `V[8k + 7 - k'][8(8h + i) + t]`.
 type RawAcc = [[__m512i; 16]; 2];
 
-/// `vpermt2b` indices taking eight words held in two vectors (words 0..4, then 4..8) to
-/// `out[h].qword[l].byte[s] = byte 8h + l of word s`.
 #[repr(C, align(64))]
 struct GroupIdx([[u8; 64]; 2]);
 
-static GROUP_IDX: GroupIdx = GroupIdx({
-    let mut t = [[0u8; 64]; 2];
-    let mut h = 0;
-    while h < 2 {
-        let mut l = 0;
-        while l < 8 {
-            let mut s = 0;
-            while s < 8 {
-                t[h][8 * l + s] = (if s >= 4 { 64 } else { 0 } | (16 * (s & 3) + 8 * h + l)) as u8;
-                s += 1;
-            }
-            l += 1;
+#[repr(C, align(64))]
+struct GroupPerm([u8; 64]);
+
+/// `vpermb` index taking 8 qwords unpacked by `_mm512_unpacklo_epi64(z0, z1)` (or `unpackhi`)
+/// where word `s` (`0..8`) sits at qword `2 * (s & 3) + (s >> 2)` to
+/// `out.qword[l].byte[s] = byte l of word s`.
+static GROUP_PERM: GroupPerm = GroupPerm({
+    let mut t = [0u8; 64];
+    let mut l = 0;
+    while l < 8 {
+        let mut s = 0;
+        while s < 8 {
+            t[8 * l + s] = (8 * (2 * (s & 3) + (s >> 2)) + l) as u8;
+            s += 1;
         }
-        h += 1;
+        l += 1;
     }
     t
 });
 
-/// The eight words at `p` bit-sliced across the words: `out[h].qword[l].byte[j].bit[s]` is bit
-/// `8(8h + l) + j` of word `7 - s`. Two byte permutes and two bit transposes.
+/// The eight words `(z0, z1)` bit-sliced across the words: `out[h].qword[l].byte[j].bit[s]` is bit
+/// `8(8h + l) + j` of word `7 - s`. Uses `vpunpcklqdq`/`vpunpckhqdq` + `vpermb` (0 Port-0 uOps)
+/// instead of `vpermt2b` so Port 0 stays free for GFNI.
 #[inline(always)]
-unsafe fn slice_group(p: *const B128, idx: &[__m512i; 2], ident: __m512i) -> [__m512i; 2] {
-    let z0 = _mm512_loadu_si512(p as *const __m512i);
-    let z1 = _mm512_loadu_si512(p.add(4) as *const __m512i);
+unsafe fn slice_group_vecs(z0: __m512i, z1: __m512i, perm: __m512i, ident: __m512i) -> [__m512i; 2] {
+    let u0 = _mm512_unpacklo_epi64(z0, z1);
+    let u1 = _mm512_unpackhi_epi64(z0, z1);
     [
-        affine(ident, _mm512_permutex2var_epi8(z0, idx[0], z1)),
-        affine(ident, _mm512_permutex2var_epi8(z0, idx[1], z1)),
+        affine(ident, _mm512_permutexvar_epi8(perm, u0)),
+        affine(ident, _mm512_permutexvar_epi8(perm, u1)),
     ]
 }
 
-/// Per-runner buffers of [`partials_row`]: the row's `eq` and one block's words, sliced.
+#[inline(always)]
+unsafe fn slice_group(p: *const B128, perm: __m512i, ident: __m512i) -> [__m512i; 2] {
+    let z0 = _mm512_loadu_si512(p as *const __m512i);
+    let z1 = _mm512_loadu_si512(p.add(4) as *const __m512i);
+    slice_group_vecs(z0, z1, perm, ident)
+}
+
+/// Fused [`scale_b128_row`] + [`slice_group`] for the row's `eq` stretch, writing directly into
+/// `xs` without materializing an intermediate `row` buffer.
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+unsafe fn scale_and_slice_eq_row(low: &[B128], factor: B128, xs: *mut [__m512i; 2]) {
+    debug_assert_eq!(low.len() % 8, 0);
+    let f = _mm_set_epi64x((factor.0 >> 64) as i64, factor.0 as i64);
+    let poly128 = _mm_set_epi64x(0, 0x87);
+    let kh = _mm_clmulepi64_si128::<0x01>(f, poly128);
+    let k = _mm_xor_si128(kh, _mm_slli_si128::<8>(f));
+    let b = _mm512_broadcast_i32x4(f);
+    let k = _mm512_broadcast_i32x4(k);
+    let poly = _mm512_set1_epi64(0x87);
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    let perm = _mm512_load_si512(GROUP_PERM.0.as_ptr() as *const __m512i);
+    let scale4 = |p: *const B128| -> __m512i {
+        let a = _mm512_loadu_si512(p as *const __m512i);
+        let y0 = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x00>(a, b),
+            _mm512_clmulepi64_epi128::<0x01>(a, k),
+        );
+        let y1 = _mm512_xor_si512(
+            _mm512_clmulepi64_epi128::<0x10>(a, b),
+            _mm512_clmulepi64_epi128::<0x11>(a, k),
+        );
+        let lo = _mm512_xor_si512(y0, _mm512_bslli_epi128::<8>(y1));
+        let hi = _mm512_bsrli_epi128::<8>(y1);
+        _mm512_xor_si512(lo, _mm512_clmulepi64_epi128::<0x00>(hi, poly))
+    };
+    let groups = low.len() / 8;
+    for g in 0..groups {
+        let z0 = scale4(low.as_ptr().add(8 * g));
+        let z1 = scale4(low.as_ptr().add(8 * g + 4));
+        *xs.add(g) = slice_group_vecs(z0, z1, perm, ident);
+    }
+}
+
+/// Per-runner buffers of [`partials_row`]: the row's sliced `eq` (`xs`) and the upper half of one
+/// block's sliced words (`aps1`).
 struct RowScratch {
     xs: Vec<[__m512i; 2]>,
-    aps: Vec<[__m512i; 2]>,
+    aps1: Vec<__m512i>,
 }
 
 impl RowScratch {
     fn new(groups: usize) -> Self {
         let z = unsafe { _mm512_setzero_si512() };
-        RowScratch { xs: vec![[z; 2]; groups], aps: vec![[z; 2]; groups] }
+        RowScratch { xs: vec![[z; 2]; groups], aps1: vec![z; groups] }
     }
 }
 
 /// The partials of one row: for every block `q`, `acc[q] += sum_j eq[j] bit(words[q stride + j])`
-/// over the `8 groups` words of the row. The row's `eq` is sliced once; per block the words are
-/// sliced into a buffer whose qwords are the broadcast matrices, and each half of the block's
-/// accumulator stays in registers across the row: 256 products per 64 words, no transposes
-/// beyond the two permutes per eight words.
+/// over the `8 groups` words of the row.
 ///
-/// The words of the next block (or, after the last block, `next_row`'s first block when it is
-/// not null) are prefetched during each block's products, which are long enough to cover the
-/// memory latency: the words then arrive while the GFNI port is busy instead of after it.
+/// Instead of splitting the 32 accumulator vectors of `acc_q` by `h in 0..2` (which required
+/// broadcasting every word-matrix qword `m0[k]`, `m1[k]` twice and slicing all 64 groups in a
+/// separate Port-5-bound loop), we split by `kp in 0..2` (`k in 0..8` and `k in 8..16`), keeping
+/// `acc_q[0][8*kp..8*kp+8]` and `acc_q[1][8*kp..8*kp+8]` (16 ZMMs total) in registers together.
+/// Each matrix qword is broadcast once and applied to both `h = 0` and `h = 1`, and during `kp = 0`
+/// `slice_group` runs inline on Port 5 in parallel with the Port-0 GFNI instructions.
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni")]
 #[inline(never)]
 unsafe fn partials_row(
-    acc: &mut [RawAcc], words: *const B128, stride: usize, eq: *const B128, groups: usize,
+    acc: &mut [RawAcc], words: *const B128, stride: usize, groups: usize,
     scratch: &mut RowScratch, next_row: *const B128,
 ) {
-    debug_assert!(groups % 2 == 0 && scratch.xs.len() >= groups);
+    debug_assert!(groups % 2 == 0 && scratch.xs.len() >= groups && scratch.aps1.len() >= groups);
     let ident = _mm512_set1_epi64(GF_IDENT);
-    let idx = [
-        _mm512_load_si512(GROUP_IDX.0[0].as_ptr() as *const __m512i),
-        _mm512_load_si512(GROUP_IDX.0[1].as_ptr() as *const __m512i),
-    ];
-    let xs = scratch.xs.as_mut_ptr();
-    for g in 0..groups {
-        *xs.add(g) = slice_group(eq.add(8 * g), &idx, ident);
-    }
-    let aps = scratch.aps.as_mut_ptr();
+    let perm = _mm512_load_si512(GROUP_PERM.0.as_ptr() as *const __m512i);
+    let xs = scratch.xs.as_ptr();
+    let aps1 = scratch.aps1.as_mut_ptr();
     let blocks = acc.len();
+    #[repr(C, align(64))]
+    struct PairM([[i64; 8]; 2]);
+    let mut m_lo = PairM([[0; 8]; 2]);
     for (q, acc_q) in acc.iter_mut().enumerate() {
         let w = words.add(q * stride);
-        for g in 0..groups {
-            *aps.add(g) = slice_group(w.add(8 * g), &idx, ident);
-        }
         let next = if q + 1 < blocks { w.add(stride) } else { next_row };
-        for (h, acc_qh) in acc_q.iter_mut().enumerate() {
-            let mut a = *acc_qh;
+        // Pass kp = 0 (k in 0..8): slice_group inline, consume low half, stash high half in aps1.
+        {
+            let mut a0: [__m512i; 8] = core::array::from_fn(|k| acc_q[0][k]);
+            let mut a1: [__m512i; 8] = core::array::from_fn(|k| acc_q[1][k]);
             let mut g = 0;
             while g < groups {
                 if !next.is_null() {
-                    // One group of the next block per pair of groups here: half the groups
-                    // in each of the two passes.
-                    let p = next.add(8 * (h * groups / 2 + g / 2)) as *const i8;
+                    let p = next.add(8 * (g / 2)) as *const i8;
                     _mm_prefetch::<_MM_HINT_T1>(p);
                     _mm_prefetch::<_MM_HINT_T1>(p.add(64));
                 }
-                let x0 = (*xs.add(g))[h];
-                let x1 = (*xs.add(g + 1))[h];
-                let m0 = aps.add(g) as *const i64;
-                let m1 = aps.add(g + 1) as *const i64;
-                for k in 0..16 {
-                    a[k] = xor3(
-                        a[k],
-                        affine(x0, _mm512_set1_epi64(*m0.add(k))),
-                        affine(x1, _mm512_set1_epi64(*m1.add(k))),
-                    );
+                let [s0_0, s0_1] = slice_group(w.add(8 * g), perm, ident);
+                let [s1_0, s1_1] = slice_group(w.add(8 * (g + 1)), perm, ident);
+                _mm512_store_si512(m_lo.0[0].as_mut_ptr() as *mut __m512i, s0_0);
+                _mm512_store_si512(m_lo.0[1].as_mut_ptr() as *mut __m512i, s1_0);
+                *aps1.add(g) = s0_1;
+                *aps1.add(g + 1) = s1_1;
+                let [x0_0, x0_1] = *xs.add(g);
+                let [x1_0, x1_1] = *xs.add(g + 1);
+                for k in 0..8 {
+                    let b0 = _mm512_set1_epi64(m_lo.0[0][k]);
+                    let b1 = _mm512_set1_epi64(m_lo.0[1][k]);
+                    a0[k] = xor3(a0[k], affine(x0_0, b0), affine(x1_0, b1));
+                    a1[k] = xor3(a1[k], affine(x0_1, b0), affine(x1_1, b1));
                 }
                 g += 2;
             }
-            *acc_qh = a;
+            for k in 0..8 {
+                acc_q[0][k] = a0[k];
+                acc_q[1][k] = a1[k];
+            }
+        }
+        // Pass kp = 1 (k in 8..16): consume stashed high half from aps1.
+        {
+            let mut a0: [__m512i; 8] = core::array::from_fn(|k| acc_q[0][8 + k]);
+            let mut a1: [__m512i; 8] = core::array::from_fn(|k| acc_q[1][8 + k]);
+            let mut g = 0;
+            while g < groups {
+                if !next.is_null() {
+                    let p = next.add(8 * (groups / 2 + g / 2)) as *const i8;
+                    _mm_prefetch::<_MM_HINT_T1>(p);
+                    _mm_prefetch::<_MM_HINT_T1>(p.add(64));
+                }
+                let [x0_0, x0_1] = *xs.add(g);
+                let [x1_0, x1_1] = *xs.add(g + 1);
+                let m0 = aps1.add(g) as *const i64;
+                let m1 = aps1.add(g + 1) as *const i64;
+                for k in 0..8 {
+                    let b0 = _mm512_set1_epi64(*m0.add(k));
+                    let b1 = _mm512_set1_epi64(*m1.add(k));
+                    a0[k] = xor3(a0[k], affine(x0_0, b0), affine(x1_0, b1));
+                    a1[k] = xor3(a1[k], affine(x0_1, b0), affine(x1_1, b1));
+                }
+                g += 2;
+            }
+            for k in 0..8 {
+                acc_q[0][8 + k] = a0[k];
+                acc_q[1][8 + k] = a1[k];
+            }
         }
     }
 }
@@ -1391,8 +1496,11 @@ fn partials_from_blocks(v: &[Vec<B128>], r_hi: &[B128]) -> Vec<B128> {
         (0..prefix).filter(|&k| q & (1 << (prefix - 1 - k)) != 0)
             .fold(B128::ONE, |a, k| a * c[k])
     }).collect();
-    (0..PACK).map(|b| v.iter().zip(&scales)
-        .fold(B128::ZERO, |a, (v, &c)| a + c * v[b])).collect()
+    let mut out = vec![B128::ZERO; PACK];
+    for (vq, &scale) in v.iter().zip(&scales) {
+        unsafe { scale_b128_row_xor(vq, scale, out.as_mut_ptr()) };
+    }
+    out
 }
 
 // =============================================================================================
@@ -1751,8 +1859,18 @@ unsafe fn message_range(
 /// Words ahead of the current eight that [`materialize_prefix_range`] prefetches in each stream.
 const MATERIALIZE_AHEAD: usize = 64;
 
+#[inline(always)]
+unsafe fn bcast4(x: F162) -> [__m512i; 4] {
+    [
+        _mm512_set1_epi64(x.0[0] as i64),
+        _mm512_set1_epi64(x.0[1] as i64),
+        _mm512_set1_epi64(x.0[2] as i64),
+        _mm512_set1_epi64((x.0[0] ^ x.0[1]) as i64),
+    ]
+}
+
 unsafe fn materialize_prefix_range(
-    words: *const B128, len: usize, weights: &[[__m512i; 3]],
+    words: *const B128, len: usize, weights: &[[__m512i; 4]],
     dst: [*mut u64; 3], range: core::ops::Range<usize>,
 ) {
     let mut j0 = range.start;
@@ -1761,19 +1879,19 @@ unsafe fn materialize_prefix_range(
         for (s, ws) in weights.chunks(BIND_WAYS).enumerate() {
             let q0 = s * BIND_WAYS;
             for j in (j0..j1).step_by(8) {
-                let mut acc = [_mm512_setzero_si512(); 12];
-                for (i, &weight) in ws.iter().enumerate() {
-                    // The streams' lines 1 KB ahead: sixteen read streams per runner, and the
-                    // hardware prefetcher does not run far enough ahead of the clmul work on
-                    // all of them (measured 9.4 -> 8.1 ms for the round; 0.5 KB and 1.5 KB
-                    // ahead are both slower, 32 KB much slower). A prefetch past the end of the
-                    // table is harmless.
+                let a = words.wrapping_add(j + MATERIALIZE_AHEAD + q0 * len) as *const i8;
+                _mm_prefetch::<_MM_HINT_T0>(a);
+                _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64));
+                let (b0, b1) = split_words(words.add(j + q0 * len));
+                let mut acc = super::f162::prods_soa8_word10(ws[0], b0, b1);
+                for (i, &weight) in ws.iter().enumerate().skip(1) {
                     let a = words.wrapping_add(j + MATERIALIZE_AHEAD + (q0 + i) * len) as *const i8;
                     _mm_prefetch::<_MM_HINT_T0>(a);
                     _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64));
-                    super::f162::mac_soa8_word(&mut acc, weight, load_words(words.add(j + (q0 + i) * len)));
+                    let (b0, b1) = split_words(words.add(j + (q0 + i) * len));
+                    super::f162::mac_soa8_word10(&mut acc, weight, b0, b1);
                 }
-                let mut v = super::f162::reduce_soa8(acc);
+                let mut v = super::f162::reduce_soa8_word10(acc);
                 if s > 0 {
                     v = xor3p(v, load_p(Src::Planes(dst.map(|p| p as *const u64)), j));
                 }
@@ -1884,6 +2002,43 @@ impl EqView<'_> {
             EqView::Factored(f) => EqSrc::Factored { high: f.high.as_ptr(), low: f.low.as_ptr(), h: f.h },
         }
     }
+}
+
+/// `[sum_b L(s0[b]) X^b, sum_b L'(s1[b]) X^b]` via GFNI [`map_tile`] + [`super::f162::mac_soa8_word`],
+/// avoiding allocating `psi_table`s and running scalar `psi` lookups and scalar `F162` products.
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni,vpclmulqdq")]
+unsafe fn mapped_monomial_sum(
+    s0: &[B128; PACK],
+    s1: &[B128; PACK],
+    ml: &[[u64; 16]; 24],
+    mlp: &[[u64; 16]; 24],
+) -> [F162; 2] {
+    let zero = _mm512_setzero_si512();
+    let mut acc0 = [zero; 12];
+    let mut acc1 = [zero; 12];
+    let mut av0 = [[zero; 8]; 3];
+    let mut av1 = [[zero; 8]; 3];
+    for tile in 0..PACK / TILE {
+        map_tile(s0.as_ptr().add(TILE * tile), ml, &mut av0);
+        map_tile(s1.as_ptr().add(TILE * tile), mlp, &mut av1);
+        for g in 0..8 {
+            let sh = 8 * g;
+            let m = _mm512_setr_epi64(
+                (1u64 << sh) as i64,
+                (1u64 << (sh + 1)) as i64,
+                (1u64 << (sh + 2)) as i64,
+                (1u64 << (sh + 3)) as i64,
+                (1u64 << (sh + 4)) as i64,
+                (1u64 << (sh + 5)) as i64,
+                (1u64 << (sh + 6)) as i64,
+                (1u64 << (sh + 7)) as i64,
+            );
+            let mono = if tile == 0 { [m, zero, zero] } else { [zero, m, zero] };
+            super::f162::mac_soa8_word(&mut acc0, [av0[0][g], av0[1][g], av0[2][g]], mono);
+            super::f162::mac_soa8_word(&mut acc1, [av1[0][g], av1[1][g], av1[2][g]], mono);
+        }
+    }
+    [horiz8(acc0), horiz8(acc1)]
 }
 
 /// The most prefix coordinates the partial sets of a [`LeanSwitch`] may cover.
@@ -2051,25 +2206,30 @@ impl<'a> LeanSwitch<'a> {
                 .fold(B128::ONE, |a, i| a * ratios[i])
         }).collect();
         let rs = self.prefix_r;
-        let tables = [psi_table(&self.l), psi_table(&self.lp)];
+        let ml = eq_matrices(&self.l);
+        let mlp = eq_matrices(&self.lp);
         let mut msg = [F162::ZERO; 2];
+        let mut p0 = [B128::ZERO; PACK];
+        let mut p1 = [B128::ZERO; PACK];
         for z in 0..1usize << k {
             let weight = (0..k).fold(F162::ONE, |a, i| {
                 a * if z & (1 << (k - 1 - i)) != 0 { rs[i] } else { F162::ONE + rs[i] }
             });
-            let mut terms = [F162::ZERO; 2];
-            for b in 0..PACK {
-                let mut sums = [B128::ZERO; 2];
-                for (s, &scale) in scales.iter().enumerate() {
-                    let group = (z << (prefix - k)) | s;
-                    sums[0] = sums[0] + scale * sets[group][b];
-                    sums[1] = sums[1] + scale * (sets[group][b] + sets[group | (1 << suffix)][b]);
+            p0.fill(B128::ZERO);
+            p1.fill(B128::ZERO);
+            for (s, &scale) in scales.iter().enumerate() {
+                let group = (z << (prefix - k)) | s;
+                unsafe {
+                    scale_b128_row_xor(&sets[group], scale, p0.as_mut_ptr());
+                    scale_b128_row_xor(&sets[group | (1 << suffix)], scale, p1.as_mut_ptr());
                 }
-                let mut monomial = F162::ZERO;
-                monomial.0[b / 64] = 1 << (b % 64);
-                for t in 0..2 { terms[t] += psi(&tables[t], sums[t]) * monomial; }
             }
-            for t in 0..2 { msg[t] += weight * terms[t]; }
+            for b in 0..PACK {
+                p1[b] = p0[b] + p1[b];
+            }
+            let terms = unsafe { mapped_monomial_sum(&p0, &p1, &ml, &mlp) };
+            msg[0] += weight * terms[0];
+            msg[1] += weight * terms[1];
         }
         msg
     }
@@ -2193,17 +2353,57 @@ impl<'a> LeanSwitch<'a> {
                 self.round += 1;
                 return;
             }
-            let weights: Vec<_> = weights.into_iter().map(|w| unsafe { bcast3(w) }).collect();
+            let weights: Vec<_> = weights.into_iter().map(|w| unsafe { bcast4(w) }).collect();
             let words = self.pi0.as_ptr() as usize;
             let dst = dst.map(|p| p as usize);
+            if hh >= TILE && hh % TILE == 0 {
+                // Fuse p_d materialization (for both j in 0..hh and j + hh in hh..half) with
+                // round d's message computation while both 16-48 KB stretches of `dst` are still
+                // hot in L1/L2 cache, avoiding a 12 MB L3/DRAM reload pass and a second dispatch.
+                let ml = eq_matrices(&self.l);
+                let mlp = eq_matrices(&self.lp);
+                let eq = self.eq.src();
+                let chunk = (hh / (16 * self.threads)).clamp(TILE, 1 << 11) & !(TILE - 1);
+                let chunks = hh.div_ceil(chunk);
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let ways = if chunks % 2 == 0 { 2 } else { 1 };
+                let runners = self.threads.min(chunks);
+                let parts: Vec<[F162; 2]> = crate::par::pool().map(runners, |_| {
+                    let mut m = [F162::ZERO; 2];
+                    let dst_mut = dst.map(|p| p as *mut u64);
+                    let src_planes = Src::Planes(dst.map(|p| p as *const u64));
+                    loop {
+                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if k >= chunks {
+                            break;
+                        }
+                        let c = (k % ways) * (chunks / ways) + k / ways;
+                        let r0 = c * chunk..((c + 1) * chunk).min(hh);
+                        let r1 = (hh + r0.start)..(hh + r0.end);
+                        unsafe {
+                            materialize_prefix_range(words as *const B128, half, &weights, dst_mut, r0.clone());
+                            materialize_prefix_range(words as *const B128, half, &weights, dst_mut, r1);
+                            let part = message_range(eq, src_planes, hh, &ml, &mlp, r0);
+                            m[0] += part[0];
+                            m[1] += part[1];
+                        }
+                    }
+                    m
+                });
+                let mut m = [F162::ZERO; 2];
+                for part in parts {
+                    m[0] += part[0];
+                    m[1] += part[1];
+                }
+                self.pending = Some(m);
+                self.round += 1;
+                return;
+            }
             // Handed out in chunks from a shared counter, like the partials' rows: a runner
             // that starts late or shares its core takes fewer of them.
             let chunk = (half / (16 * self.threads)).clamp(8, 1 << 12) & !7;
             let chunks = half.div_ceil(chunk);
             let next = std::sync::atomic::AtomicUsize::new(0);
-            // Consecutive chunks are a quarter of the output apart, so that the runners write
-            // to different huge pages and a page's first-touch fault holds up one or two of
-            // them, not all.
             let ways = if chunks % 4 == 0 { 4 } else { 1 };
             crate::par::pool().run(self.threads.min(chunks), |_| loop {
                 let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

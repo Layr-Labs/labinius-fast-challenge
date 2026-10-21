@@ -637,36 +637,214 @@ unsafe fn tail27_b(
 #[repr(C, align(64))]
 struct Blk([i16; 162 * 32]);
 
-/// The final butterfly without its row-major scratch stores. The values and register
-/// assignments are exactly those of `bfly!`; the arranged sink consumes them immediately.
-macro_rules! bfly_registers {
-    ($a0:literal, $a1:literal, $a2:literal, $t:literal,
-     $o0:literal, $o1:literal, $o2:literal) => {
-        bfly!($a0, $a1, $a2, $t)
-    };
-}
-
 macro_rules! hybrid_store {
-    (plain, $reg:literal, $off:literal) => {
+    (plain, $reg:literal, $k:literal, $off:literal) => {
         concat!("vmovdqa64 [{acc}+", $off, "], zmm", $reg, "\n")
     };
-    (reduce, $reg:literal, $off:literal) => {
+    (reduce, $reg:literal, $k:literal, $off:literal) => {
         concat!(
-            "vpmaddwd zmm31, zmm", $reg, ", [{fold}]\n",
-            "vptestmd k1, zmm", $reg, ", [{fold}+64]\n",
-            "vpaddd zmm31{{k1}}, zmm31, [{fold}+128]\n",
-            "vmovdqa64 [{acc}+", $off, "], zmm31\n",
+            "vptestmd ", $k, ", zmm", $reg, ", [{fold}+64]\n",
+            "vpmaddwd zmm", $reg, ", zmm", $reg, ", [{fold}]\n",
+            "vpaddd zmm", $reg, "{{", $k, "}}, zmm", $reg, ", [{fold}+128]\n",
+            "vmovdqa64 [{acc}+", $off, "], zmm", $reg, "\n",
         )
     };
 }
 
-/// Three 8x8 qword transposes and one 4x4 128-bit transpose, in the same output order
-/// as hybrid_commit::tr8/tr4. Each two-source pair first writes the free register and
-/// then overwrites its second input, so only zmm28 is needed as extra transpose storage.
-/// zmm29/30 are the base/tail sums; zmm31 and k1 implement the existing centered fold-back.
-macro_rules! hybrid_register_sink {
+macro_rules! mont_omp31 {
+    ($tw:literal, $off:literal, $a1:literal, $a2:literal, $t:literal) => {
+        mont_omp31!($tw, $off, $a1, $a2, $t, "[{c}+64]")
+    };
+    ($tw:literal, $off:literal, $a1:literal, $a2:literal, $t:literal, $om:literal) => {
+        concat!(
+            "vpbroadcastd zmm", $t, ", dword ptr [{", $tw, "}", $off, "+4]\n",
+            "vpmullw zmm", $t, ", zmm", $a1, ", zmm", $t, "\n",
+            "vpbroadcastd zmm30, dword ptr [{", $tw, "}", $off, "]\n",
+            "vpmulhw zmm", $a1, ", zmm", $a1, ", zmm30\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
+            "vpsubw zmm", $a1, ", zmm", $a1, ", zmm", $t, "\n",
+            "vpbroadcastd zmm", $t, ", dword ptr [{", $tw, "}", $off, "+12]\n",
+            "vpmullw zmm", $t, ", zmm", $a2, ", zmm", $t, "\n",
+            "vpbroadcastd zmm30, dword ptr [{", $tw, "}", $off, "+8]\n",
+            "vpmulhw zmm", $a2, ", zmm", $a2, ", zmm30\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
+            "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
+            "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
+            "vpmullw zmm30, zmm", $t, ", zmm31\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", ", $om, "\n",
+            "vpmulhw zmm30, zmm30, zmm27\n",
+            "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
+        )
+    };
+}
+
+macro_rules! level4_h {
+    (plain $a0:literal, $a1:literal, $a2:literal,
+     $o0:literal, $o1:literal, $o2:literal, $t:literal) => {
+        concat!(
+            "vmovdqa64 zmm", $a0, ", [{i}+", $o0, "]\n",
+            "vmovdqa64 zmm", $a1, ", [{i}+", $o1, "]\n",
+            "vmovdqa64 zmm", $a2, ", [{i}+", $o2, "]\n",
+            "vpmullw zmm", $t, ", zmm", $a1, ", zmm8\n",
+            "vpmulhw zmm", $a1, ", zmm", $a1, ", zmm5\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
+            "vpsubw zmm", $a1, ", zmm", $a1, ", zmm", $t, "\n",
+            "vpmullw zmm", $t, ", zmm", $a2, ", zmm26\n",
+            "vpmulhw zmm", $a2, ", zmm", $a2, ", zmm17\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
+            "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
+            "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
+            "vpmullw zmm30, zmm", $t, ", zmm31\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", [{c}+64]\n",
+            "vpmulhw zmm30, zmm30, zmm27\n",
+            "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
+        )
+    };
+    (lut $a0:literal, $a1:literal, $a2:literal,
+     $o0:literal, $o1:literal, $o2:literal, $t:literal) => {
+        concat!(
+            "vmovdqa64 zmm", $a0, ", [{i}+", $o0, "]\n",
+            "vmovdqa64 zmm", $a1, ", [{i}+", $o1, "]\n",
+            "vmovdqa64 zmm", $a2, ", [{i}+", $o2, "]\n",
+            "vpmullw zmm", $t, ", zmm", $a1, ", zmm8\n",
+            "vpsrlw zmm30, zmm", $a0, ", 11\n",
+            "vpermw zmm30, zmm30, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm", $a0, ", zmm", $a0, ", zmm30\n",
+            "vpmulhw zmm", $a1, ", zmm", $a1, ", zmm5\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
+            "vpsubw zmm", $a1, ", zmm", $a1, ", zmm", $t, "\n",
+            "vpmullw zmm", $t, ", zmm", $a2, ", zmm26\n",
+            "vpmulhw zmm", $a2, ", zmm", $a2, ", zmm17\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
+            "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
+            "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
+            "vpmullw zmm30, zmm", $t, ", zmm31\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", [{c}+64]\n",
+            "vpmulhw zmm30, zmm30, zmm27\n",
+            "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
+        )
+    };
+}
+
+macro_rules! level4_h5 {
+    (plain) => {
+        concat!(
+            "vmovdqa64 zmm14, [{i}+896]\n",
+            "vmovdqa64 zmm23, [{i}+1472]\n",
+            "vpmullw zmm29, zmm14, zmm8\n",
+            "vpmulhw zmm14, zmm14, zmm5\n",
+            "vmovdqa64 zmm5, [{i}+320]\n",
+            "vpmulhw zmm29, zmm29, zmm27\n",
+            "vpsubw zmm14, zmm14, zmm29\n",
+            "vpmullw zmm29, zmm23, zmm26\n",
+            "vpmulhw zmm23, zmm23, zmm17\n",
+            "vpmulhw zmm29, zmm29, zmm27\n",
+            "vpsubw zmm23, zmm23, zmm29\n",
+            "vpsubw zmm29, zmm14, zmm23\n",
+            "vpmullw zmm30, zmm29, zmm31\n",
+            "vpmulhw zmm29, zmm29, [{c}+64]\n",
+            "vpmulhw zmm30, zmm30, zmm27\n",
+            "vpsubw zmm29, zmm29, zmm30\n",
+        )
+    };
+    (lut) => {
+        concat!(
+            "vmovdqa64 zmm14, [{i}+896]\n",
+            "vmovdqa64 zmm23, [{i}+1472]\n",
+            "vpmullw zmm29, zmm14, zmm8\n",
+            "vpmulhw zmm14, zmm14, zmm5\n",
+            "vmovdqa64 zmm5, [{i}+320]\n",
+            "vpsrlw zmm30, zmm5, 11\n",
+            "vpermw zmm30, zmm30, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm5, zmm5, zmm30\n",
+            "vpmulhw zmm29, zmm29, zmm27\n",
+            "vpsubw zmm14, zmm14, zmm29\n",
+            "vpmullw zmm29, zmm23, zmm26\n",
+            "vpmulhw zmm23, zmm23, zmm17\n",
+            "vpmulhw zmm29, zmm29, zmm27\n",
+            "vpsubw zmm23, zmm23, zmm29\n",
+            "vpsubw zmm29, zmm14, zmm23\n",
+            "vpmullw zmm30, zmm29, zmm31\n",
+            "vpmulhw zmm29, zmm29, [{c}+64]\n",
+            "vpmulhw zmm30, zmm30, zmm27\n",
+            "vpsubw zmm29, zmm29, zmm30\n",
+        )
+    };
+}
+
+macro_rules! level4_hlast {
+    (plain) => {
+        concat!(
+            "vmovdqa64 zmm8, [{i}+512]\n",
+            "vmovdqa64 zmm17, [{i}+1088]\n",
+            "vmovdqa64 zmm26, [{i}+1664]\n",
+            mont_omp31!("t4", "", 17, 26, 28),
+        )
+    };
+    (lut) => {
+        concat!(
+            "vmovdqa64 zmm8, [{i}+512]\n",
+            "vmovdqa64 zmm17, [{i}+1088]\n",
+            "vmovdqa64 zmm26, [{i}+1664]\n",
+            "vpbroadcastd zmm28, dword ptr [{t4}+4]\n",
+            "vpmullw zmm28, zmm17, zmm28\n",
+            "vpsrlw zmm30, zmm8, 11\n",
+            "vpermw zmm30, zmm30, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm8, zmm8, zmm30\n",
+            "vpbroadcastd zmm30, dword ptr [{t4}]\n",
+            "vpmulhw zmm17, zmm17, zmm30\n",
+            "vpmulhw zmm28, zmm28, zmm27\n",
+            "vpsubw zmm17, zmm17, zmm28\n",
+            "vpbroadcastd zmm28, dword ptr [{t4}+12]\n",
+            "vpmullw zmm28, zmm26, zmm28\n",
+            "vpbroadcastd zmm30, dword ptr [{t4}+8]\n",
+            "vpmulhw zmm26, zmm26, zmm30\n",
+            "vpmulhw zmm28, zmm28, zmm27\n",
+            "vpsubw zmm26, zmm26, zmm28\n",
+            "vpsubw zmm28, zmm17, zmm26\n",
+            "vpmullw zmm30, zmm28, zmm31\n",
+            "vpmulhw zmm28, zmm28, [{c}+64]\n",
+            "vpmulhw zmm30, zmm30, zmm27\n",
+            "vpsubw zmm28, zmm28, zmm30\n",
+        )
+    };
+}
+
+macro_rules! level6_h {
+    (plain $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal, $om:literal, $bv:literal) => {
+        mont_omp31!("t6", $off, $a1, $a2, $t, $om)
+    };
+    (barrett $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal, $om:literal, $bv:literal) => {
+        concat!(
+            "vpbroadcastd zmm", $t, ", dword ptr [{t6}", $off, "+4]\n",
+            "vpmullw zmm", $t, ", zmm", $a1, ", zmm", $t, "\n",
+            "vpmulhrsw zmm30, zmm", $a0, ", ", $bv, "\n",
+            "vpmullw zmm30, zmm30, zmm27\n",
+            "vpsubw zmm", $a0, ", zmm", $a0, ", zmm30\n",
+            "vpbroadcastd zmm30, dword ptr [{t6}", $off, "]\n",
+            "vpmulhw zmm", $a1, ", zmm", $a1, ", zmm30\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
+            "vpsubw zmm", $a1, ", zmm", $a1, ", zmm", $t, "\n",
+            "vpbroadcastd zmm", $t, ", dword ptr [{t6}", $off, "+12]\n",
+            "vpmullw zmm", $t, ", zmm", $a2, ", zmm", $t, "\n",
+            "vpbroadcastd zmm30, dword ptr [{t6}", $off, "+8]\n",
+            "vpmulhw zmm", $a2, ", zmm", $a2, ", zmm30\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
+            "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
+            "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
+            "vpmullw zmm30, zmm", $t, ", zmm31\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", ", $om, "\n",
+            "vpmulhw zmm30, zmm30, zmm27\n",
+            "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
+        )
+    };
+}
+
+macro_rules! hybrid_sink_g1 {
     ($mode:ident) => {
         concat!(
+            "vmovdqa64 zmm29, [{acc}+0]\n",
+            "vmovdqa64 zmm30, [{acc}+64]\n",
             "vpunpcklqdq zmm28, zmm0, zmm2\n",
             "vpunpckhqdq zmm2, zmm0, zmm2\n",
             "vpunpcklqdq zmm0, zmm1, zmm6\n",
@@ -691,8 +869,6 @@ macro_rules! hybrid_register_sink {
             "vshufi64x2 zmm8, zmm0, zmm8, 221\n",
             "vshufi64x2 zmm0, zmm6, zmm5, 136\n",
             "vshufi64x2 zmm5, zmm6, zmm5, 221\n",
-            "vmovdqa64 zmm29, [{acc}+0]\n",
-            "vmovdqa64 zmm30, [{acc}+64]\n",
             "vpdpwssd zmm29, zmm7, zmmword ptr [{key}+0]\n",
             "vpdpwssd zmm30, zmm7, zmmword ptr [{key}+512]\n",
             "vpdpwssd zmm29, zmm3, zmmword ptr [{key}+64]\n",
@@ -709,8 +885,17 @@ macro_rules! hybrid_register_sink {
             "vpdpwssd zmm30, zmm8, zmmword ptr [{key}+896]\n",
             "vpdpwssd zmm29, zmm5, zmmword ptr [{key}+448]\n",
             "vpdpwssd zmm30, zmm5, zmmword ptr [{key}+960]\n",
-            hybrid_store!($mode, 29, 0),
-            hybrid_store!($mode, 30, 64),
+            hybrid_store!($mode, 29, "k1", 0),
+            hybrid_store!($mode, 30, "k2", 64),
+        )
+    };
+}
+
+macro_rules! hybrid_sink_g2 {
+    ($mode:ident) => {
+        concat!(
+            "vmovdqa64 zmm29, [{acc}+128]\n",
+            "vmovdqa64 zmm30, [{acc}+192]\n",
             "vpunpcklqdq zmm28, zmm4, zmm18\n",
             "vpunpckhqdq zmm18, zmm4, zmm18\n",
             "vpunpcklqdq zmm4, zmm20, zmm19\n",
@@ -735,8 +920,6 @@ macro_rules! hybrid_register_sink {
             "vshufi64x2 zmm24, zmm4, zmm24, 221\n",
             "vshufi64x2 zmm4, zmm19, zmm21, 136\n",
             "vshufi64x2 zmm21, zmm19, zmm21, 221\n",
-            "vmovdqa64 zmm29, [{acc}+128]\n",
-            "vmovdqa64 zmm30, [{acc}+192]\n",
             "vpdpwssd zmm29, zmm26, zmmword ptr [{key}+1024]\n",
             "vpdpwssd zmm30, zmm26, zmmword ptr [{key}+1536]\n",
             "vpdpwssd zmm29, zmm25, zmmword ptr [{key}+1088]\n",
@@ -753,8 +936,17 @@ macro_rules! hybrid_register_sink {
             "vpdpwssd zmm30, zmm24, zmmword ptr [{key}+1920]\n",
             "vpdpwssd zmm29, zmm21, zmmword ptr [{key}+1472]\n",
             "vpdpwssd zmm30, zmm21, zmmword ptr [{key}+1984]\n",
-            hybrid_store!($mode, 29, 128),
-            hybrid_store!($mode, 30, 192),
+            hybrid_store!($mode, 29, "k1", 128),
+            hybrid_store!($mode, 30, "k2", 192),
+        )
+    };
+}
+
+macro_rules! hybrid_sink_g3 {
+    ($mode:ident) => {
+        concat!(
+            "vmovdqa64 zmm29, [{acc}+256]\n",
+            "vmovdqa64 zmm30, [{acc}+320]\n",
             "vpunpcklqdq zmm28, zmm23, zmm22\n",
             "vpunpckhqdq zmm22, zmm23, zmm22\n",
             "vpunpcklqdq zmm23, zmm9, zmm11\n",
@@ -779,8 +971,6 @@ macro_rules! hybrid_register_sink {
             "vshufi64x2 zmm10, zmm23, zmm10, 221\n",
             "vshufi64x2 zmm23, zmm11, zmm16, 136\n",
             "vshufi64x2 zmm16, zmm11, zmm16, 221\n",
-            "vmovdqa64 zmm29, [{acc}+256]\n",
-            "vmovdqa64 zmm30, [{acc}+320]\n",
             "vpdpwssd zmm29, zmm15, zmmword ptr [{key}+2048]\n",
             "vpdpwssd zmm30, zmm15, zmmword ptr [{key}+2560]\n",
             "vpdpwssd zmm29, zmm17, zmmword ptr [{key}+2112]\n",
@@ -797,8 +987,17 @@ macro_rules! hybrid_register_sink {
             "vpdpwssd zmm30, zmm10, zmmword ptr [{key}+2944]\n",
             "vpdpwssd zmm29, zmm16, zmmword ptr [{key}+2496]\n",
             "vpdpwssd zmm30, zmm16, zmmword ptr [{key}+3008]\n",
-            hybrid_store!($mode, 29, 256),
-            hybrid_store!($mode, 30, 320),
+            hybrid_store!($mode, 29, "k1", 256),
+            hybrid_store!($mode, 30, "k2", 320),
+        )
+    };
+}
+
+macro_rules! hybrid_sink_g4 {
+    ($mode:ident) => {
+        concat!(
+            "vmovdqa64 zmm29, [{acc}+384]\n",
+            "vmovdqa64 zmm30, [{acc}+448]\n",
             "vshufi64x2 zmm0, zmm12, zmm14, 136\n",
             "vshufi64x2 zmm1, zmm12, zmm14, 221\n",
             "vshufi64x2 zmm2, zmm13, zmm13, 136\n",
@@ -807,8 +1006,6 @@ macro_rules! hybrid_register_sink {
             "vshufi64x2 zmm5, zmm1, zmm3, 136\n",
             "vshufi64x2 zmm6, zmm0, zmm2, 221\n",
             "vshufi64x2 zmm7, zmm1, zmm3, 221\n",
-            "vmovdqa64 zmm29, [{acc}+384]\n",
-            "vmovdqa64 zmm30, [{acc}+448]\n",
             "vpdpwssd zmm29, zmm4, zmmword ptr [{key}+3072]\n",
             "vpdpwssd zmm30, zmm4, zmmword ptr [{key}+3328]\n",
             "vpdpwssd zmm29, zmm5, zmmword ptr [{key}+3136]\n",
@@ -817,8 +1014,81 @@ macro_rules! hybrid_register_sink {
             "vpdpwssd zmm30, zmm6, zmmword ptr [{key}+3456]\n",
             "vpdpwssd zmm29, zmm7, zmmword ptr [{key}+3264]\n",
             "vpdpwssd zmm30, zmm7, zmmword ptr [{key}+3520]\n",
-            hybrid_store!($mode, 29, 384),
-            hybrid_store!($mode, 30, 448),
+            hybrid_store!($mode, 29, "k1", 384),
+            hybrid_store!($mode, 30, "k2", 448),
+        )
+    };
+}
+
+macro_rules! tail27_hybrid_body {
+    ($m4:ident, $m6:ident, $red:ident) => {
+        concat!(
+            "vmovdqa64 zmm27, [{c}]\n",
+            "vmovdqa64 zmm31, [{c}+128]\n",
+            "vpbroadcastd zmm5, dword ptr [{t4}]\n",
+            "vpbroadcastd zmm8, dword ptr [{t4}+4]\n",
+            "vpbroadcastd zmm17, dword ptr [{t4}+8]\n",
+            "vpbroadcastd zmm26, dword ptr [{t4}+12]\n",
+            level4_h!($m4 0, 9, 18, 0, 576, 1152, 28),
+            level4_h!($m4 3, 12, 21, 192, 768, 1344, 29),
+            bfly!(0, 9, 18, 28),
+            level4_h!($m4 6, 15, 24, 384, 960, 1536, 28),
+            bfly!(3, 12, 21, 29),
+            level4_h!($m4 1, 10, 19, 64, 640, 1216, 29),
+            bfly!(6, 15, 24, 28),
+            level4_h!($m4 4, 13, 22, 256, 832, 1408, 28),
+            bfly!(1, 10, 19, 29),
+            level4_h!($m4 7, 16, 25, 448, 1024, 1600, 29),
+            bfly!(4, 13, 22, 28),
+            level4_h!($m4 2, 11, 20, 128, 704, 1280, 28),
+            bfly!(7, 16, 25, 29),
+            level4_h5!($m4),
+            bfly!(2, 11, 20, 28),
+            level4_hlast!($m4),
+            bfly!(5, 14, 23, 29),
+            bfly!(8, 17, 26, 28),
+            mont_omp31!("t5", "", 3, 6, 28),
+            mont_omp31!("t5", "+16", 21, 24, 29),
+            bfly!(0, 3, 6, 28),
+            mont_omp31!("t5", "+32", 12, 15, 28),
+            bfly!(18, 21, 24, 29),
+            mont_omp31!("t5", "", 4, 7, 29),
+            bfly!(9, 12, 15, 28),
+            mont_omp31!("t5", "+16", 22, 25, 28),
+            bfly!(1, 4, 7, 29),
+            mont_omp31!("t5", "+32", 13, 16, 29),
+            bfly!(19, 22, 25, 28),
+            mont_omp31!("t5", "", 5, 8, 28),
+            bfly!(10, 13, 16, 29),
+            mont_omp31!("t5", "+16", 23, 26, 29),
+            bfly!(2, 5, 8, 28),
+            mont_omp31!("t5", "+32", 14, 17, 28),
+            bfly!(20, 23, 26, 29),
+            bfly!(11, 14, 17, 28),
+            level6_h!($m6 "", 0, 1, 2, 28, "[{c}+64]", "[{c}+192]"),
+            level6_h!($m6 "+16", 6, 7, 8, 29, "[{c}+64]", "[{c}+192]"),
+            bfly!(0, 1, 2, 28),
+            level6_h!($m6 "+32", 3, 4, 5, 28, "[{c}+64]", "[{c}+192]"),
+            bfly!(6, 7, 8, 29),
+            bfly!(3, 4, 5, 28),
+            hybrid_sink_g1!($red),
+            "vmovdqa64 zmm0, [{c}+64]\n",
+            "vmovdqa64 zmm1, [{c}+192]\n",
+            level6_h!($m6 "+48", 18, 19, 20, 29, "zmm0", "zmm1"),
+            level6_h!($m6 "+64", 24, 25, 26, 28, "zmm0", "zmm1"),
+            bfly!(18, 19, 20, 29),
+            level6_h!($m6 "+80", 21, 22, 23, 29, "zmm0", "zmm1"),
+            bfly!(24, 25, 26, 28),
+            bfly!(21, 22, 23, 29),
+            hybrid_sink_g2!($red),
+            level6_h!($m6 "+96", 9, 10, 11, 28, "zmm0", "zmm1"),
+            level6_h!($m6 "+112", 15, 16, 17, 29, "zmm0", "zmm1"),
+            bfly!(9, 10, 11, 28),
+            bfly!(15, 16, 17, 29),
+            hybrid_sink_g3!($red),
+            level6_h!($m6 "+128", 12, 13, 14, 28, "zmm0", "zmm1"),
+            bfly!(12, 13, 14, 28),
+            hybrid_sink_g4!($red),
         )
     };
 }
@@ -846,9 +1116,7 @@ unsafe fn tail27_hybrid<const Q: u16, const RED: bool>(
         ($m4:ident, $m6:ident, $red:ident) => {
             core::arch::asm!(
                 concat!(
-                    "vmovdqa64 zmm27, [{c}]\n",
-                    tail27!($m4, $m6, bfly_registers),
-                    hybrid_register_sink!($red),
+                    tail27_hybrid_body!($m4, $m6, $red),
                     "/* {fold} */\n",
                 ),
                 i = in(reg) bp, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,
@@ -887,6 +1155,7 @@ unsafe fn tail27_hybrid<const Q: u16, const RED: bool>(
                 out("zmm30") _,
                 out("zmm31") _,
                 out("k1") _,
+                out("k2") _,
                 options(nostack)
             )
         };

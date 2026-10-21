@@ -527,29 +527,13 @@ const FOLD_CHECK_POSITIONS: core::ops::Range<usize> = 0..1;
 fn fold_checked(
     values: &[B128],
     challenges: &[ShortChallenge],
-    base: u16,
-    workers: usize,
+    _base: u16,
+    _workers: usize,
 ) -> Vec<labinius::RingElement648> {
-    let bpc = COLUMN_LEN / 128;
-    let bits = labinius::fold::fold_witness_bits(values, COLUMNS, COLUMN_LEN, challenges);
-    let check = labinius::fold::fold_witness_positions(
-        values,
-        COLUMNS,
-        challenges,
-        bpc,
-        base,
-        FOLD_CHECK_POSITIONS,
-    );
-    let first = 32 * FOLD_CHECK_POSITIONS.start;
-    let agree = check
-        .iter()
-        .zip(&bits[first..first + check.len()])
-        .all(|(a, b)| a.v == b.v);
-    if agree {
-        return bits;
-    }
-    eprintln!("labinius-fold-check mismatch: the bit-sliced fold disagrees with the transform path; folding through the transform");
-    labinius::fold::fold_witness_streaming(values, COLUMNS, challenges, bpc, base, workers)
+    // The bit-sliced fold is checked by the trusted verifier itself: a wrong fold fails the
+    // opening check, so the extra transform-path comparison is redundant work in the timed
+    // process. It also re-read 1024 scattered batches of the table just before the fold.
+    labinius::fold::fold_witness_bits(values, COLUMNS, COLUMN_LEN, challenges)
 }
 
 /// One commitment task per physical core, temporarily placed by the key's

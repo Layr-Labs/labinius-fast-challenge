@@ -279,6 +279,12 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
     debug_assert!(a.n >= n);
     let (mut acc, blocks) = ([_mm512_setzero_si512(); 12], n / 8);
     for t in 0..blocks {
+        // The words' lines 1 KB ahead, requested explicitly: with eight runners streaming the
+        // table the hardware prefetcher alone leaves the clmul work waiting (6.6 -> 5.9 ms for
+        // the phase; 4 KB and 16 KB ahead are no better). A prefetch past the end is harmless.
+        let ahead = b.wrapping_add(8 * t + 64) as *const i8;
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead);
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead.wrapping_add(64));
         let x = [
             _mm512_loadu_si512(a.w[0].as_ptr().add(8 * t) as *const __m512i),
             _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
@@ -309,11 +315,19 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     let columns = words.len() / wdim;
     let eq = Poly::from_scalars(&eq_table(p0));
     let mut out = vec![F162::ZERO; columns];
-    let runs = crate::par::ranges(columns, workers, 1);
+    // Columns handed out a few at a time from a shared counter: a runner that starts late or
+    // shares its core with another process takes fewer of them instead of holding the phase up.
+    let chunk = columns.div_ceil(32 * workers.max(1)).max(1);
+    let chunks = columns.div_ceil(chunk);
+    let next = std::sync::atomic::AtomicUsize::new(0);
     let out_addr = out.as_mut_ptr() as usize;
-    crate::par::pool().run(runs.len(), |i| {
-        // Run `i` owns `out[runs[i]]`.
-        for j in runs[i].clone() {
+    crate::par::pool().run(workers.clamp(1, chunks), |_| loop {
+        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if k >= chunks {
+            break;
+        }
+        // Chunk `k` owns `out[k * chunk ..]`.
+        for j in k * chunk..((k + 1) * chunk).min(columns) {
             let value = unsafe { dot_words(&eq, words.as_ptr().add(j * wdim), wdim) };
             unsafe { (out_addr as *mut F162).add(j).write(value) };
         }

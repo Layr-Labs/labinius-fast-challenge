@@ -293,6 +293,14 @@ unsafe fn slice_raw(base: *const u8, out: &mut BinaryIndex32) {
         interleave8(cp, 2, w, v.add(64 * w));
     }
 
+    uv_to_rows(wk, out);
+}
+
+/// Phases 3 and 4 of [`slice_raw`]: the plane pairs `u`, `v` of `wk` to the index rows.
+#[inline(always)]
+unsafe fn uv_to_rows(wk: *mut Work, out: &mut BinaryIndex32) {
+    let u = (*wk).u.as_mut_ptr();
+    let v = (*wk).v.as_mut_ptr();
     let (ag, bg) = ((*wk).ag.as_mut_ptr(), (*wk).bg.as_mut_ptr());
     for i in 0..6 {
         let t = 8 * i;
@@ -350,6 +358,86 @@ unsafe fn slice_raw(base: *const u8, out: &mut BinaryIndex32) {
             _mm512_ternarylogic_epi32::<0xEA>(b, lo4, p16),
         );
     }
+}
+
+/// Rows of the network that holds lane `pos`'s element after the byte transpose below: the
+/// 16-row unpack network leaves byte position `pos` of each output lane holding input row
+/// `ORDER[pos]`, so loading lane `7 - pos` (`pos < 8`) or `23 - pos` (`pos >= 8`) into that row
+/// puts lanes 7..0 and 15..8 into the two qwords, which is the order the GFNI transpose wants.
+const ORDER: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+const fn row_lane() -> [usize; 16] {
+    let mut t = [0usize; 16];
+    let mut pos = 0;
+    while pos < 16 {
+        t[ORDER[pos]] = if pos < 8 { 7 - pos } else { 23 - pos };
+        pos += 1;
+    }
+    t
+}
+const ROW_LANE: [usize; 16] = row_lane();
+/// `vpermb` index: byte `8 j + t` of the output is byte `8 t + j` of the input (an 8 x 8 byte
+/// transpose of the eight qwords).
+static QT: A64<[u8; 64]> = A64({
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = (8 * (i % 8) + i / 8) as u8;
+        i += 1;
+    }
+    t
+});
+
+/// The index rows of 32 ring elements given as one pointer per lane to its 4 `B128` words
+/// (coefficient `4m + k` of the element is bit `m` of word `k`), read in place.
+///
+/// A 16 x 16 byte transpose per 128-bit lane (64 unpacks per 16 elements) leaves, for each byte
+/// position `B` of each word, the 32 lanes' bytes in four qwords; one GFNI affine transposes the
+/// 8 x 8 bit blocks into 8-lane mask bytes and one `vpermb` interleaves words 0/1 (2/3) into the
+/// plane pairs `u` (`v`) that [`slice_raw`]'s last two phases consume.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+pub unsafe fn slice_b128_lanes_into(elems: &[*const crate::fields::scalar::B128; 32], out: &mut BinaryIndex32) {
+    let mut work: MaybeUninit<Work> = MaybeUninit::uninit();
+    let wk = work.as_mut_ptr();
+    let u = (*wk).u.as_mut_ptr();
+    let v = (*wk).v.as_mut_ptr();
+    let zero = _mm512_setzero_si512();
+    for i in 0..8 {
+        _mm512_storeu_si512(u.add(128 + 8 * i) as *mut __m512i, zero);
+        _mm512_storeu_si512(v.add(128 + 8 * i) as *mut __m512i, zero);
+    }
+    let mut g = [[zero; 16]; 2];
+    for (h, gh) in g.iter_mut().enumerate() {
+        let mut r: [__m512i; 16] = core::array::from_fn(|row| {
+            _mm512_loadu_si512(elems[16 * h + ROW_LANE[row]] as *const __m512i)
+        });
+        macro_rules! stage {
+            ($lo:ident, $hi:ident) => {{
+                let n: [__m512i; 16] = core::array::from_fn(|j| {
+                    let (x, y) = (r[j / 2], r[j / 2 + 8]);
+                    if j % 2 == 0 { $lo(x, y) } else { $hi(x, y) }
+                });
+                r = n;
+            }};
+        }
+        stage!(_mm512_unpacklo_epi8, _mm512_unpackhi_epi8);
+        stage!(_mm512_unpacklo_epi16, _mm512_unpackhi_epi16);
+        stage!(_mm512_unpacklo_epi32, _mm512_unpackhi_epi32);
+        stage!(_mm512_unpacklo_epi64, _mm512_unpackhi_epi64);
+        *gh = r;
+    }
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    let qt = _mm512_load_si512(QT.0.as_ptr() as *const __m512i);
+    let iu = _mm512_setr_epi64(0, 1, 8, 9, 2, 3, 10, 11);
+    let iv = _mm512_setr_epi64(4, 5, 12, 13, 6, 7, 14, 15);
+    for b in 0..16 {
+        let tu = _mm512_permutex2var_epi64(g[0][b], iu, g[1][b]);
+        let tv = _mm512_permutex2var_epi64(g[0][b], iv, g[1][b]);
+        let mu = _mm512_permutexvar_epi8(qt, _mm512_gf2p8affine_epi64_epi8::<0>(ident, tu));
+        let mv = _mm512_permutexvar_epi8(qt, _mm512_gf2p8affine_epi64_epi8::<0>(ident, tv));
+        _mm512_storeu_si512(u.add(8 * b) as *mut __m512i, mu);
+        _mm512_storeu_si512(v.add(8 * b) as *mut __m512i, mv);
+    }
+    uv_to_rows(wk, out);
 }
 
 /// The `vpermb` index rows of the 32 ring elements formed by `elems` (element 4p + k supplies the

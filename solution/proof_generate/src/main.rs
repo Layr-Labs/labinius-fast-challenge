@@ -362,6 +362,14 @@ mod huge {
 #[global_allocator]
 static ALLOC: huge::Alloc = huge::Alloc;
 
+/// Whether the witness table's mapping asks for huge pages.
+fn table_huge_pages() -> bool {
+    match std::env::var("LABINIUS_TABLE_HUGE") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    }
+}
+
 /// The harness witness table: `(1 << LOG_VARS) / 8` BLAKE3 XOF bytes, each 16 little-endian
 /// bytes one GHASH word. The timed prover does not recompute it, and does not copy it either: on
 /// Linux the file is mapped read-only and the mapping is read as the `B128` words it is (`B128`
@@ -401,6 +409,12 @@ impl Table {
                 )
             };
             if ptr as isize != -1 && !ptr.is_null() && (ptr as usize) % 16 == 0 {
+                // The table is read in 8 KB chunks at a 256 KB stride by the fold and
+                // in 2 KB chunks by the commitment: a page-table walk per chunk
+                // otherwise. Ask for huge pages; the kernel may refuse.
+                if table_huge_pages() {
+                    unsafe { sys::madvise(ptr, Self::BYTES, sys::MADV_HUGEPAGE) };
+                }
                 return Table::Mapped {
                     ptr: ptr as *const B128,
                     bytes: Self::BYTES,
@@ -951,7 +965,15 @@ const COMMIT_WORKERS: usize = 4;
 /// a host of two-thread cores the two threads of a core take the halves of each 32-column group,
 /// so each batch of the arranged keys, 168 KB, is read from L3 once per 32 columns; 32 per
 /// worker measured 1.8 ms slower (L2 pressure).
-const HYBRID_GROUP: usize = 16;
+const HYBRID_GROUP: usize = 32;
+/// The group size the commitment runs with: columns per worker, which sets how much
+/// of the arranged key is reused from L2 and how large the accumulators get.
+fn hybrid_group() -> usize {
+    match std::env::var("LABINIUS_HYBRID_GROUP") {
+        Ok(v) => v.parse::<usize>().unwrap_or(HYBRID_GROUP).max(1),
+        Err(_) => HYBRID_GROUP,
+    }
+}
 
 
 // =============================================================================================
@@ -1364,7 +1386,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
     let rows = if let Some(keys) = arranged {
-        labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,HYBRID_GROUP)
+        labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,hybrid_group())
     } else if modulus==modulus_choice::HYBRID_MODULUS {
         let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
         labinius::simd::commit::hybrid::commit_columns_rows(&key(),&tail,&columns,workers,HYBRID_GROUP)

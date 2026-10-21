@@ -2051,20 +2051,23 @@ mod tests {
     }
     #[test]
     fn hybrid_commitment_matches_schoolbook_under_new_modulus() {
-        let q=modulus_choice::HYBRID_MODULUS;let ring=128usize;let columns=4;
+        let q=modulus_choice::HYBRID_MODULUS;let ring=288usize;let columns=17;
         let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
         let matrix=rq::ajtai_matrix(q,ring);
         let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
         let tail=keygen::build_tail_key_from_matrix(&matrix);
         let mut t=Transcript::new(b"hybrid-commitment-regression");
-        let values=t.sample_b128(b"binary",ring*4*columns);
+        let random=t.sample_b128(b"binary",ring*4*columns);
+        for mode in 0..3 {
+        let values=match mode {0=>random.clone(),1=>vec![B128(0);random.len()],_=>vec![B128(u128::MAX);random.len()]};
         let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
-        let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,4);
+        let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,16);
         let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,3,None);
         let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
         for c in 0..columns {
             let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
             assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);
+        }
         }
     }
 

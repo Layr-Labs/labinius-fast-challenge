@@ -1209,7 +1209,10 @@ pub fn fold_witness_bits(
     let elements = column_words / 4;
     let blocks = elements / fb::BLOCK_ELEMENTS;
     let reach = fb::Reach::of(&cs);
-    let mut out: Vec<[i16; N]> = vec![[0i16; N]; elements];
+    // Every element is written by the block workers before the pool joins, so the eager
+    // zero-fill of the 5.4 MB output would be pure traffic.
+    let mut out: Vec<[i16; N]> = Vec::with_capacity(elements);
+    unsafe { out.set_len(elements) };
     let out_addr = out.as_mut_ptr() as usize;
     let sample = &words[..fb::LANES];
     let gfni = Gfni::validated(unsafe { core::slice::from_raw_parts(sample.as_ptr() as *const u128, fb::LANES) });

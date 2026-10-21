@@ -757,6 +757,100 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
     }
 }
 
+/// Consumer of `H` transforms run in lockstep ([`ntt_bin_batch32_multi_sink`]): block `blk` of
+/// all of them is handed over at once, so an accumulator can take all `H` products in one
+/// read-modify-write.
+pub trait MultiBlockSink<const H: usize> {
+    /// Where block `blk` of each transform is stored (27 vectors each).
+    unsafe fn dsts(&mut self, blk: usize) -> [*mut i16; H];
+    /// Called once all transforms' 27 vectors of block `blk` are stored.
+    unsafe fn blocks(&mut self, blk: usize, w: [*mut i16; H]);
+}
+
+/// The binary transform of `H` independent batches, interleaved per 162-slot quarter: the
+/// lookup stage of each, then each 27-block of each, then the sink. Each transform is exactly
+/// [`ntt_bin_batch32`]'s, operation for operation.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+pub unsafe fn ntt_bin_batch32_multi_sink<const Q: u16, const H: usize, S: MultiBlockSink<H>>(
+    ins: [&BinaryIndex32; H],
+    sink: &mut S,
+) {
+    let t = tables::<Q>();
+    let c = C {
+        q: bc(&t.qd),
+        om: bc(&t.om[0]),
+        omp: bc(&t.om[1]),
+    };
+    let bar = needs_barrett(Q);
+    let ips: [*const u8; H] = core::array::from_fn(|h| ins[h].rows.as_ptr() as *const u8);
+    let mut blks: [core::mem::MaybeUninit<Blk>; H] = [const { core::mem::MaybeUninit::uninit() }; H];
+    let bps: [*mut i16; H] = core::array::from_fn(|h| blks[h].as_mut_ptr() as *mut i16);
+
+    for k in 0..4 {
+        let lut = t.lut.as_ptr().add(12 * k) as *const u8;
+        let l = |s2: usize, r: usize, ab: usize| -> __m512i {
+            _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
+        };
+        let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
+        let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
+        let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
+        for h in 0..H {
+            let (ip, bp) = (ips[h], bps[h]);
+            for i in 0..27 {
+                let n0 = ldb(ip, i);
+                let n0h = ldb(ip, i + 81);
+                let n1 = ldb(ip, i + 27);
+                let n1h = ldb(ip, i + 108);
+                let n2 = ldb(ip, i + 54);
+                let n2h = ldb(ip, i + 135);
+
+                let x = _mm512_permutexvar_epi8(n0, l000);
+                let y = _mm512_permutexvar_epi8(n0h, l001);
+                let a0 = _mm512_add_epi16(x, y);
+                let b0 = _mm512_sub_epi16(x, y);
+
+                let x = _mm512_permutexvar_epi8(n1, l010);
+                let y = _mm512_permutexvar_epi8(n1h, l011);
+                let a1 = _mm512_add_epi16(x, y);
+                let b1 = _mm512_sub_epi16(y, x);
+
+                let x = _mm512_permutexvar_epi8(n2, l020);
+                let y = _mm512_permutexvar_epi8(n2h, l021);
+                let a2 = _mm512_add_epi16(x, y);
+                let b2 = _mm512_sub_epi16(x, y);
+
+                let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
+                let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
+                st(bp, i, u0);
+                st(bp, i + 27, u1);
+                st(bp, i + 54, u2);
+                st(bp, i + 81, v2);
+                st(bp, i + 108, v0);
+                st(bp, i + 135, v1);
+            }
+        }
+        let cv = t.cv.as_ptr() as *const i16;
+        for j in 0..6 {
+            let kk = 6 * k + j;
+            let os = sink.dsts(kk);
+            let (t4, t5, t6) = (
+                t.tw4[kk].as_ptr(),
+                t.tw5[3 * kk].as_ptr(),
+                t.tw6[9 * kk].as_ptr(),
+            );
+            for h in 0..H {
+                let bpj = bps[h].add(32 * 27 * j);
+                if bar {
+                    tail27_b(bpj, os[h], t4, t5, t6, cv);
+                } else {
+                    tail27_p(bpj, os[h], t4, t5, t6, cv);
+                }
+            }
+            sink.blocks(kk, os);
+        }
+    }
+}
+
 /// Forward NTT of 32 binary polynomials: `out.v[j][p] = a_p(psi^SLOT_EXP[j]) mod q`, lazily
 /// reduced (see the bound table above).
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]

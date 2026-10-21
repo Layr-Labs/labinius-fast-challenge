@@ -915,6 +915,10 @@ static EMBEDDED_TAIL:Aligned64<[u8;EMBEDDED_TAIL_LEN]>=Aligned64(*include_bytes!
 /// Both hybrid keys (base and tail, both primes) in the hybrid sink's arrangement, precomputed
 /// by `build.rs` from the same public keys as the two images above (empty when the build host
 /// could not run the kernels); read in place.
+/// The hybrid modulus's keys in the column-pair layout (`hybrid::pair_keys`), little-endian
+/// `u32` words, empty when the build host could not run the kernels.
+const EMBEDDED_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/pair-key.bin")).len();
+static EMBEDDED_PAIRS:Aligned64<[u8;EMBEDDED_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/pair-key.bin")));
 const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")).len();
 static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
 const COMMIT_GROUP: usize = 8;
@@ -1318,7 +1322,14 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let setup_time = clock.elapsed();
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
-    let rows = if let Some(keys) = arranged {
+    let pairs = if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
+        keygen::pair_words(&EMBEDDED_PAIRS.0)
+    } else {
+        None
+    };
+    let rows = if let Some(pairs) = pairs {
+        labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers)
+    } else if let Some(keys) = arranged {
         labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,HYBRID_GROUP)
     } else if modulus==modulus_choice::HYBRID_MODULUS {
         let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
@@ -1953,6 +1964,39 @@ mod tests {
         assert!(EMBEDDED_HYBRID.0[..] == image[..], "the embedded arranged image differs");
         assert!(hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES).is_some());
         assert!(hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES - 1).is_none());
+    }
+    /// The embedded column-pair image is the one built from the key and the 1024-lift key.
+    #[test]
+    fn embedded_pairs_match_the_built_keys() {
+        if MODULUS != modulus_choice::HYBRID_MODULUS || EMBEDDED_PAIRS.0.is_empty() { return; }
+        let key = keygen::build_key(MODULUS);
+        let tail = keygen::build_tail_key(MODULUS);
+        let built = labinius::simd::commit::hybrid::pair_keys(&key, &tail, 1);
+        assert_eq!(keygen::pair_words(&EMBEDDED_PAIRS.0).expect("a valid image"), &built[..]);
+    }
+    /// The column-pair kernel's rows equal the arranged kernel's exactly, across a full and a
+    /// partial certified chunk and a full and a partial 16-column group, and the commitment is
+    /// the schoolbook product.
+    #[test]
+    fn pair_commitment_matches_arranged_kernel_and_schoolbook() {
+        let q=modulus_choice::HYBRID_MODULUS;let ring=288usize;let columns=17;
+        let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
+        let matrix=rq::ajtai_matrix(q,ring);
+        let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
+        let tail=keygen::build_tail_key_from_matrix(&matrix);
+        let mut t=Transcript::new(b"pair-commitment-regression");
+        let values=t.sample_b128(b"binary",ring*4*columns);
+        let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
+        let arranged=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,1,4);
+        let pairs=labinius::simd::commit::hybrid::pair_keys(&key,&tail,1);
+        let rows=labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pairs,&cols,1);
+        assert!(rows==arranged, "the pair kernel's rows differ");
+        let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,1,None);
+        let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
+        for c in [0,16] {
+            let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
+            assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);
+        }
     }
     #[test]
     fn hybrid_commitment_matches_schoolbook_under_new_modulus() {

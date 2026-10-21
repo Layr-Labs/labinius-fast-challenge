@@ -25,7 +25,8 @@ const P0:u16=3889;
 const P1:u16=9721;
 const PRODUCT:i64=P0 as i64*P1 as i64;
 pub const MODULUS:u128=PRODUCT as u128*1024;
-pub const CHUNK_BATCHES:usize=7;
+// The public-key CRT certificate is checked again after the coupled lift.
+pub const CHUNK_BATCHES:usize=8;
 
 /// Arranged key vectors per 27-row block: three 8-row groups of eight qword vectors and one
 /// 4-row group of four chunk vectors, each for A and then T.
@@ -37,8 +38,9 @@ const ABLK:usize=8;
 /// `27 blk + 8 g + s` of A, vector `.. + 8 + q` the same of T. The 4-row group: vector
 /// `KBLK blk + 48 + c` holds in its 128-bit slot `s` the lanes `8c .. 8c + 8` of row
 /// `27 blk + 24 + s` of A (zero for `s = 3`), vector `.. + 4 + c` the same of T. 84 KB.
+/// A certified RED byte follows the vectors; alignment adds 63 serialized zero padding bytes.
 #[repr(C,align(64))]
-pub struct KeyBatch {v:[[i16;32];24*KBLK]}
+pub struct KeyBatch {v:[[i16;32];24*KBLK],reduce:u8}
 /// One column-prime's accumulators: vector `ABLK blk + 2 g` is the base stream of group `g` of
 /// block `blk` (8-row groups: lanes `2s, 2s + 1` sum row `8 g + s`; the 4-row group: lanes
 /// `4s .. 4s + 4` sum row `24 + s`), the next one its tail stream. 12 KB.
@@ -81,6 +83,8 @@ const _:()={
   assert!(acc_after_reduce_c(q)+(period(q) as i64)*per_batch(q)<=i32::MAX as i64);
   // finish_base folds every lane back (to at most acc_after_reduce) and sums at most four
   assert!(4*acc_after_reduce(q)<=i32::MAX as i64);
+  // Fused base output reduces each lane before its at-most-four-lane sum.
+  assert!(4*acc_after_reduce_c(q)<=bias(q));
   // the tail finish sums raw lanes (no i32 overflow) and biases the sums into [0, 2^32)
   assert!(tail_row_bound(q)<=bias(q) && bias(q)<=i32::MAX as i64);
   i+=1;
@@ -209,11 +213,12 @@ impl<const Q:u16,const RED:bool> BlockSink for TSink<Q,RED> {
  }
 }
 /// One column's batch `b` modulo `Q` (`keys[2b]` for 3889, `keys[2b + 1]` for 9721), folded back
-/// when it ends a period.
+/// according to the actual-key certificate stored with that batch.
 #[inline(always)]
 unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,keys:&[KeyBatch],b:usize,acc:*mut i32) {
- let k=keys[2*b+if Q==P0 {0} else {1}].v.as_ptr() as *const i16;
- if (b+1)%period(Q)==0 {
+ let key=&keys[2*b+if Q==P0 {0} else {1}];
+ let k=key.v.as_ptr() as *const i16;
+ if key.reduce!=0 {
   vb::ntt_bin_batch32_hybrid::<Q,true>(idx,k,acc);
  } else {
   vb::ntt_bin_batch32_hybrid::<Q,false>(idx,k,acc);
@@ -480,6 +485,122 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
   }));
  }
 }
+// BEGIN PORTABLE REDUCTION CERTIFICATE: integer arithmetic and slice access only.
+// A batch adds at most W times the sum of its actual absolute key coefficients to
+// each i32 lane. This also bounds every prefix of its dot-product chain. All vectors
+// of a prime share one RED flag; tail lanes restart after every certified chunk.
+const CERT_LANES:usize=24*4*2*16;
+fn cert_lane(blk:usize,g:usize,stream:usize,l:usize)->usize {((blk*4+g)*2+stream)*16+l}
+fn cert_growth_values(q:u16,out:&mut [i64],get:impl Fn(usize,usize)->i16) {
+ assert_eq!(out.len(),CERT_LANES);
+ let w=w_bound(q);let half=(q/2) as i64;
+ for blk in 0..24 {for g in 0..4 {for stream in 0..2 {for l in 0..16 {
+  let (start,n)=if g<3 {(KBLK*blk+16*g+8*stream,8)}else{(KBLK*blk+48+4*stream,4)};
+  let mut sum=0i64;
+  for i in 0..n {for j in 0..2 {
+   let a=(get(start+i,2*l+j) as i64).abs();
+   assert!(a<=half,"uncentered hybrid key");
+   sum+=a;
+  }}
+  if g==3 && l>=12 {assert_eq!(sum,0,"nonzero hybrid padding lane");}
+  out[cert_lane(blk,g,stream,l)]=w*sum;
+ }}}}
+}
+fn cert_growth(key:&KeyBatch,q:u16,out:&mut [i64]) {
+ cert_growth_values(q,out,|row,lane|key.v[row][lane]);
+}
+fn cert_tail_max(bounds:&[i64])->i64 {
+ let mut maximum=0;
+ for blk in 0..24 {for g in 0..4 {
+  let (rows,width)=if g<3 {(8,2)}else{(3,4)};
+  for row in 0..rows {
+   let mut sum=0;
+   for j in 0..width {sum+=bounds[cert_lane(blk,g,1,row*width+j)];}
+   maximum=maximum.max(sum);
+  }
+ }}
+ maximum
+}
+fn certify_reduction_schedule(nb:usize,mut growth:impl FnMut(usize,u16,&mut [i64]))->Vec<u8> {
+ assert!(nb>0,"at least one hybrid key batch");
+ let mut flags=vec![0u8;nb.checked_mul(2).expect("hybrid key count overflow")];
+ // Three reusable buffers, 72 KiB; no full-key growth table or witness data.
+ let mut bounds=vec![0i64;CERT_LANES];
+ let mut current=vec![0i64;CERT_LANES];let mut next=vec![0i64;CERT_LANES];
+ for (prime,q) in [(0usize,P0),(1,P1)] {
+  bounds.fill(0);
+  growth(prime,q,&mut current);
+  for b in 0..nb {
+   for (a,delta) in bounds.iter_mut().zip(&current) {
+    assert!(*a+*delta<=i32::MAX as i64,"hybrid accumulator certificate overflow");
+    *a+=*delta;
+   }
+   let flush=(b+1)%CHUNK_BATCHES==0 || b+1==nb;
+   let mut needs_next=false;
+   if b+1<nb {
+    growth(2*(b+1)+prime,q,&mut next);
+    needs_next=bounds.iter().zip(&next).enumerate().any(|(i,(a,delta))|{
+     let after=if flush && (i/16)%2==1 {0}else{*a};
+     after+*delta>i32::MAX as i64
+    });
+   }
+   // Keep prime 9721's established every-batch reduction. Prime 3889 folds only
+   // to satisfy the current tail flush or protect the next batch's dot products.
+   let red=q==P1 || needs_next || (flush && cert_tail_max(&bounds)>bias(q));
+   flags[2*b+prime]=red as u8;
+   if red {for a in &mut bounds {if *a!=0 {*a=acc_after_reduce_c(q);}}}
+   if flush {
+    assert!(cert_tail_max(&bounds)<=bias(q),"hybrid tail certificate overflow");
+    for (i,a) in bounds.iter_mut().enumerate() {if (i/16)%2==1 {*a=0;}}
+   }
+   core::mem::swap(&mut current,&mut next);
+  }
+ }
+ flags
+}
+fn certify_reductions(keys:&mut [KeyBatch]) {
+ assert!(!keys.is_empty() && keys.len()%2==0,"two nonempty hybrid key limbs");
+ let flags=certify_reduction_schedule(keys.len()/2,|i,q,out|cert_growth(&keys[i],q,out));
+ for (key,flag) in keys.iter_mut().zip(flags) {key.reduce=flag;}
+}
+// Read serialized i16 values explicitly: image generation needs no aligned typed
+// view and no second full arranged-key allocation. Only the flag bytes are changed.
+fn certify_image_reductions(image:&mut [u8],nb:usize) {
+ assert!(nb>0,"at least one hybrid key batch");
+ let bytes=nb.checked_mul(2).and_then(|n|n.checked_mul(KEY_BATCH_BYTES))
+  .expect("hybrid key image size overflow");
+ assert_eq!(image.len(),bytes,"hybrid key image length");
+ let flags=certify_reduction_schedule(nb,|i,q,out|{
+  let record=&image[i*KEY_BATCH_BYTES..(i+1)*KEY_BATCH_BYTES];
+  cert_growth_values(q,out,|row,lane|{
+   let at=2*(32*row+lane);
+   i16::from_le_bytes([record[at],record[at+1]])
+  });
+ });
+ for (record,flag) in image.chunks_exact_mut(KEY_BATCH_BYTES).zip(flags) {
+  record[24*KBLK*64]=flag;
+ }
+}
+// Stream the final image through one reusable record, then certify its LE bytes.
+// Kept with the portable core so native tests can exercise the production serializer.
+// fill must overwrite every v entry (including zero-key padding) for record i:
+// i=2*b is prime 3889, i=2*b+1 is prime 9721. Its reduce byte is ignored.
+fn arranged_image_from(nb:usize,mut fill:impl FnMut(usize,&mut KeyBatch))->Vec<u8> {
+ assert!(nb>0,"at least one hybrid key batch");
+ let count=nb.checked_mul(2).expect("hybrid key count overflow");
+ let mut out=Vec::with_capacity(count.checked_mul(KEY_BATCH_BYTES).expect("hybrid key image size overflow"));
+ let mut kb=Box::new(KeyBatch{v:[[0i16;32];24*KBLK],reduce:0});
+ for i in 0..count {
+  fill(i,&mut kb);
+  for row in &kb.v {for &x in row {out.extend_from_slice(&x.to_le_bytes());}}
+  out.extend_from_slice(&[0u8;64]);
+ }
+ drop(kb);
+ certify_image_reductions(&mut out,nb);
+ out
+}
+// END PORTABLE REDUCTION CERTIFICATE.
+
 /// One batch of one prime's base and tail keys in the sink's arrangement ([`KeyBatch`]).
 fn arrange(a:&Batch32,t:&Batch32,out:&mut KeyBatch) {
  for blk in 0..24 {
@@ -502,32 +623,31 @@ fn check_keys(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey) {
 }
 /// Bytes of one arranged key batch.
 pub const KEY_BATCH_BYTES:usize=core::mem::size_of::<KeyBatch>();
-const _:()=assert!(KEY_BATCH_BYTES==24*KBLK*64 && core::mem::align_of::<KeyBatch>()==64);
+const _:()=assert!(KEY_BATCH_BYTES==24*KBLK*64+64 && core::mem::align_of::<KeyBatch>()==64);
 /// Both keys of every batch in the sink's arrangement as bytes, `keys[2b]` (modulo 3889) and
 /// `keys[2b + 1]` (modulo 9721) in order: the public-parameter image a build script embeds so
 /// that the prover reads the arranged keys in place ([`keys_from_image`]).
 pub fn arranged_image(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey)->Vec<u8> {
  check_keys(base,tail);
  let nb=base.row(0).len();
- let mut out=Vec::with_capacity(2*nb*KEY_BATCH_BYTES);
- let mut kb:Box<[KeyBatch]>=zeroed_slice(1);
- for i in 0..2*nb {
-  arrange(&base.row(i%2)[i/2],&tail.row(i%2)[i/2],&mut kb[0]);
-  for row in kb[0].v.iter() {for &x in row {out.extend_from_slice(&x.to_le_bytes());}}
- }
- out
+ arranged_image_from(nb,|i,kb|arrange(&base.row(i%2)[i/2],&tail.row(i%2)[i/2],kb))
 }
 /// The arranged keys of `nb` batches an [`arranged_image`] holds, read in place (`image` must be
 /// 64-byte aligned; `None` for any other length).
 pub fn keys_from_image(image:&'static [u8],nb:usize)->Option<&'static [KeyBatch]> {
- if !cfg!(target_endian="little") || image.len()!=2*nb*KEY_BATCH_BYTES || image.as_ptr() as usize%64!=0 {return None;}
- Some(unsafe{core::slice::from_raw_parts(image.as_ptr() as *const KeyBatch,2*nb)})
+ let count=nb.checked_mul(2)?;
+ if nb==0 || !cfg!(target_endian="little") || image.len()!=count.checked_mul(KEY_BATCH_BYTES)? || image.as_ptr() as usize%64!=0 {return None;}
+ // Only images produced with the new layout are accepted. The flag is a byte,
+ // so inspect it before constructing the aligned typed view.
+ if image.chunks_exact(KEY_BATCH_BYTES).any(|b|b[24*KBLK*64]>1) {return None;}
+ Some(unsafe{core::slice::from_raw_parts(image.as_ptr() as *const KeyBatch,count)})
 }
 /// Both keys of every batch in the sink's arrangement: `keys[2b]` modulo 3889, `keys[2b + 1]`
 /// modulo 9721.
 pub fn arrange_keys(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey,workers:usize)->Box<[KeyBatch]> {
  check_keys(base,tail);
  let nb=base.row(0).len();
+ assert!(nb>0,"at least one hybrid key batch");
  let mut keys:Box<[KeyBatch]>=zeroed_slice(2*nb);
  let kp=keys.as_mut_ptr() as usize;
  let tasks=workers.clamp(1,2*nb);
@@ -538,6 +658,7 @@ pub fn arrange_keys(base:&crate::key::CommitmentKey,tail:&crate::key::Commitment
    i+=tasks;
   }
  });
+ certify_reductions(&mut keys);
  keys
 }
 pub fn certify(raw:&[[i16;648]],chunk_batches:usize)->i64 {
@@ -684,9 +805,382 @@ fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,place
   mine.store(usize::MAX/2,Ordering::Release);
  });
 }
+#[inline(always)]
+unsafe fn base_words<const Q:u16>(acc:*const i32,blk:usize)->__m512i {
+ let p=acc.add(16*ABLK*blk) as *const __m512i;
+ // Dynamic RED certifies each raw lane, not a final 2/4-lane sum. Fold
+ // every lane first, preserving the old finish_base contract for a final RED=false.
+ let t0=reduce_vec_c::<Q>(_mm512_load_si512(p));let t1=reduce_vec_c::<Q>(_mm512_load_si512(p.add(2)));
+ let t2=reduce_vec_c::<Q>(_mm512_load_si512(p.add(4)));let t3=reduce_vec_c::<Q>(_mm512_load_si512(p.add(6)));
+ let e=_mm512_loadu_si512(EVEN.as_ptr() as *const __m512i);let o=_mm512_loadu_si512(ODD.as_ptr() as *const __m512i);
+ let lo=_mm512_add_epi32(_mm512_permutex2var_epi32(t0,e,t1),_mm512_permutex2var_epi32(t0,o,t1));
+ let t3=_mm512_add_epi32(t3,_mm512_shuffle_epi32::<0x4E>(t3));
+ let e=_mm512_loadu_si512(EVEN4.as_ptr() as *const __m512i);let o=_mm512_loadu_si512(ODD4.as_ptr() as *const __m512i);
+ let hi=_mm512_add_epi32(_mm512_permutex2var_epi32(t2,e,t3),_mm512_permutex2var_epi32(t2,o,t3));
+ _mm512_packs_epi32(red16::<Q>(lo),red16::<Q>(hi))
+}
+
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn finish_bases<const Q:u16>(acc:*const GAcc,k:usize,g:usize,pend:&mut Batch32) {
+ let col=|c:usize| (*acc.add(2*c+k)).v.as_ptr() as *const i32;
+ let pv=pend.v.as_mut_ptr();
+ if g%16==0 {
+  for h in 0..g/16 {
+   for blk in 0..24 {
+    let mut x=[_mm512_setzero_si512();16];
+    for c in 0..16 {x[c]=base_words::<Q>(col(16*h+c),blk);}
+    put16(&x,pv,blk,16*h);
+   }
+  }
+ } else {
+  for c in 0..g {
+   for blk in 0..24 {
+    let mut t=[0i16;32];
+    _mm512_storeu_si512(t.as_mut_ptr() as *mut __m512i,base_words::<Q>(col(c),blk));
+    for r in 0..27 {(*pv.add(27*blk+r))[c]=t[row_word(r)];}
+   }
+  }
+ }
+ if g<32 {clear_lanes(pend,g);}
+ pend.representation=Representation::Ntt;
+ gen_small::intt_gen_batch32::<Q>(pend);
+}
+
+#[inline(always)]
+unsafe fn tr8_i16_lanes(x:&[__m512i;8])->[__m512i;8] {
+ let a0=_mm512_unpacklo_epi16(x[0],x[1]);let a1=_mm512_unpackhi_epi16(x[0],x[1]);
+ let a2=_mm512_unpacklo_epi16(x[2],x[3]);let a3=_mm512_unpackhi_epi16(x[2],x[3]);
+ let a4=_mm512_unpacklo_epi16(x[4],x[5]);let a5=_mm512_unpackhi_epi16(x[4],x[5]);
+ let a6=_mm512_unpacklo_epi16(x[6],x[7]);let a7=_mm512_unpackhi_epi16(x[6],x[7]);
+ let b0=_mm512_unpacklo_epi32(a0,a2);let b1=_mm512_unpackhi_epi32(a0,a2);
+ let b2=_mm512_unpacklo_epi32(a1,a3);let b3=_mm512_unpackhi_epi32(a1,a3);
+ let b4=_mm512_unpacklo_epi32(a4,a6);let b5=_mm512_unpackhi_epi32(a4,a6);
+ let b6=_mm512_unpacklo_epi32(a5,a7);let b7=_mm512_unpackhi_epi32(a5,a7);
+ [_mm512_unpacklo_epi64(b0,b4),_mm512_unpackhi_epi64(b0,b4),
+  _mm512_unpacklo_epi64(b1,b5),_mm512_unpackhi_epi64(b1,b5),
+  _mm512_unpacklo_epi64(b2,b6),_mm512_unpackhi_epi64(b2,b6),
+  _mm512_unpacklo_epi64(b3,b7),_mm512_unpackhi_epi64(b3,b7)]
+}
+
+static LIFT_BYTES:[u8;64]={
+ let mut t=[0u8;64];let mut k=0;
+ while k<40 {t[k]=((k/5)*8+k%5) as u8;k+=1;}
+ t
+};
+
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn emit_group_bytes(r0:&Batch32,r1:&Batch32,total:&mut Batch32,g:usize,slots:usize,out:*mut u8) {
+ const INV:u16=inv_mod(P0 as u64,P1 as u64) as u16;
+ const W:i16=Params::<P1>::to_mont(INV);
+ const WP:i16=Params::<P1>::mont_pre(W);
+ if g!=32 && g!=16 {
+  for j in 0..N {
+   for c in 0..g {
+    let mut s=0u16;
+    for k in 0..slots {s=s.wrapping_add(total.v[j][k*g+c] as u16);}
+    total.v[j][c]=s as i16;
+   }
+  }
+ }
+ let p0v=_mm512_set1_epi16(P0 as i16);
+ let p1v=_mm512_set1_epi16(P1 as i16);
+ let wv=_mm512_set1_epi16(W);
+ let wpv=_mm512_set1_epi16(WP);
+ let k153=_mm512_set1_epi16(153);
+ let m1023=_mm512_set1_epi16(1023);
+ let q0_64=_mm512_set1_epi64(P0 as i64);
+ let prod_64=_mm512_set1_epi64(PRODUCT);
+ let pick=_mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
+ let keep:__mmask64=(1u64<<40)-1;
+ for jb in 0..N/8 {
+  let j0=8*jb;
+  let mut av_rows=[_mm512_setzero_si512();8];
+  let mut u_rows=[_mm512_setzero_si512();8];
+  let mut dig_rows=[_mm512_setzero_si512();8];
+  for r in 0..8 {
+   let j=j0+r;
+   let av=canonical(_mm512_load_si512(r0.v[j].as_ptr() as *const __m512i),P0 as i16);
+   let bv=canonical(_mm512_load_si512(r1.v[j].as_ptr() as *const __m512i),P1 as i16);
+   let tv=_mm512_load_si512(total.v[j].as_ptr() as *const __m512i);
+   let tl=if g==16 {_mm512_add_epi16(tv,_mm512_shuffle_i64x2::<0xEE>(tv,tv))} else {tv};
+   let d=_mm512_sub_epi16(bv,av);
+   let m=_mm512_mullo_epi16(d,wpv);
+   let h=_mm512_mulhi_epi16(d,wv);
+   let u=canonical(_mm512_sub_epi16(h,_mm512_mulhi_epi16(m,p1v)),P1 as i16);
+   let val_lo=_mm512_add_epi16(av,_mm512_mullo_epi16(u,p0v));
+   let dig=_mm512_and_si512(_mm512_mullo_epi16(_mm512_sub_epi16(tl,val_lo),k153),m1023);
+   av_rows[r]=av;
+   u_rows[r]=u;
+   dig_rows[r]=dig;
+  }
+  let av_t=tr8_i16_lanes(&av_rows);
+  let u_t=tr8_i16_lanes(&u_rows);
+  let dig_t=tr8_i16_lanes(&dig_rows);
+  macro_rules! store_lane {
+   ($L:literal) => {
+    for w in 0..8 {
+     let c=8*$L+w;
+     if c<g {
+      let a64=_mm512_cvtepu16_epi64(_mm512_extracti32x4_epi32::<$L>(av_t[w]));
+      let u64=_mm512_cvtepu16_epi64(_mm512_extracti32x4_epi32::<$L>(u_t[w]));
+      let d64=_mm512_cvtepu16_epi64(_mm512_extracti32x4_epi32::<$L>(dig_t[w]));
+      let val=_mm512_add_epi64(a64,_mm512_mul_epu32(u64,q0_64));
+      let lifted=_mm512_add_epi64(val,_mm512_mul_epu32(d64,prod_64));
+      _mm512_mask_storeu_epi8(
+       out.add((c*N+j0)*5) as *mut i8,
+       keep,
+       _mm512_permutexvar_epi8(pick,lifted),
+      );
+     }
+    }
+   };
+  }
+  store_lane!(0);
+  store_lane!(1);
+  store_lane!(2);
+  store_lane!(3);
+ }
+}
+
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn group_bytes<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mut Worker,out:*mut u8,mut sync:F) {
+ let g=cols.len();assert!(g>=1 && 2*g<=ws.acc.len() && keys.len()==2*nb);
+ let slots=32/g;
+ for a in ws.acc[..2*g].iter_mut() {core::ptr::write_bytes(a as *mut GAcc,0,1);}
+ core::ptr::write_bytes(&mut ws.total[0] as *mut Batch32,0,1);
+ let mut filled=0usize;
+ for b in 0..nb {
+  for c in 0..g {
+   if prefetch_witness_on() {
+    prefetch_witness(cols[c].as_ptr().add(128*b),2048);
+    if b+1<nb {prefetch_witness(cols[c].as_ptr().add(128*(b+1)),2048);}
+    if c+1<g {prefetch_witness(cols[c+1].as_ptr().add(128*b),2048);}
+   }
+   cols[c].slice_batch(b,&mut ws.idx[0]);
+   let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;
+   sink_batch::<P0>(&ws.idx[0],keys,b,a0);
+   sink_batch::<P1>(&ws.idx[0],keys,b,a1);
+  }
+  sync(b);
+  if (b+1)%CHUNK_BATCHES==0 || b+1==nb {
+   let (p0,p1)=ws.pend.split_at_mut(1);
+   let acc=ws.acc.as_mut_ptr();
+   finish_tails::<P0>(acc,0,g,&mut p0[0],filled*g);
+   finish_tails::<P1>(acc,1,g,&mut p1[0],filled*g);
+   filled+=1;
+   if filled==slots || b+1==nb {
+    if filled*g<32 {clear_lanes(&mut p0[0],filled*g);clear_lanes(&mut p1[0],filled*g);}
+    p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
+    gen_small::intt_gen_batch32::<P0>(&mut p0[0]);gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
+    crt_accumulate(&p0[0],&p1[0],&mut ws.total[0]);
+    filled=0;
+   }
+  }
+ }
+ let (p0,p1)=ws.pend.split_at_mut(1);
+ let acc=ws.acc.as_ptr();
+ finish_bases::<P0>(acc,0,g,&mut p0[0]);
+ finish_bases::<P1>(acc,1,g,&mut p1[0]);
+ emit_group_bytes(&p0[0],&p1[0],&mut ws.total[0],g,slots,out);
+}
+
+fn commit_paired_bytes(
+ keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,
+ placement:Option<&crate::par::CorePlacement>,dst:usize,
+) {
+ use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
+ let nb=keys.len()/2;
+ let pairs=workers/2;let sg=2*g;
+ let groups=columns.len().div_ceil(sg);
+ let rounds=groups+1;
+ let next=AtomicUsize::new(0);
+ let slots:Vec<std::sync::OnceLock<usize>>=(0..pairs*rounds).map(|_|std::sync::OnceLock::new()).collect();
+ let done:Vec<Progress>=(0..2*pairs).map(|_|Progress(AtomicUsize::new(0))).collect();
+ let coupled:Vec<AtomicBool>=(0..pairs).map(|_|AtomicBool::new(true)).collect();
+ crate::par::pool().run(2*pairs,|worker|{
+  let _guard=placement.and_then(|p|p.pin(worker));
+  let (pair,s)=(worker/2,worker%2);
+  let mine=&done[worker].0;let other=&done[worker^1].0;let coupled=&coupled[pair];
+  let mut ws:Option<Worker>=None;
+  for r in 0..rounds {
+   let gi=*slots[pair*rounds+r].get_or_init(||next.fetch_add(1,Ordering::Relaxed));
+   if gi>=groups {break;}
+   let c0=gi*sg;let gc=sg.min(columns.len()-c0);
+   let h=gc.div_ceil(2);
+   let (lo,n)=if s==0 {(c0,h)} else {(c0+h,gc-h)};
+   let base=r*nb;
+   if n==0 {mine.store(base+nb,Ordering::Release);continue;}
+   let ws=ws.get_or_insert_with(||Worker::new(g));
+   unsafe{group_bytes(&columns[lo..lo+n],keys,nb,ws,(dst as *mut u8).add(5*N*lo),|b|{
+    let d=base+b+1;
+    mine.store(d,Ordering::Release);
+    if !coupled.load(Ordering::Relaxed) {return;}
+    if other.load(Ordering::Acquire)+LEAD>=d {return;}
+    let start=std::time::Instant::now();
+    let mut spins=0u32;
+    while other.load(Ordering::Acquire)+LEAD<d {
+     core::hint::spin_loop();
+     spins+=1;
+     if spins%64==0 && start.elapsed()>SIBLING_WAIT {coupled.store(false,Ordering::Relaxed);return;}
+    }
+   })};
+  }
+  mine.store(usize::MAX/2,Ordering::Release);
+ });
+}
+
+/// Commit `columns` against `keys` and fuse the inverse NTT recombination and CRT lift into each
+/// `group_size`-column group, writing the `5 * N * columns.len()` wire bytes straight into `out`
+/// without allocating the intermediate rows vector. The existing paired schedule is retained.
+pub fn commit_columns_bytes_arranged(
+ keys:&[KeyBatch],columns:&[&[B128]],workers:usize,group_size:usize,out:&mut [u8],
+) {
+ assert!(!columns.is_empty(),"at least one witness column");
+ assert_eq!(out.len(),columns.len()*N*5,"5 bytes per coefficient");
+ let nb=keys.len()/2;
+ assert!(nb>0 && keys.len()==2*nb,"two arranged key batches per batch");
+ for c in columns {assert_eq!(c.len(),128*nb,"128 words per key batch");}
+ let g=group_size.clamp(1,32).min(columns.len());
+ let dst=out.as_mut_ptr() as usize;
+ let paired=if workers>=2 && workers%2==0 && columns.len()>g {crate::par::CorePlacement::for_sibling_pairs(workers)} else {None};
+ if let Some(placement)=paired {
+  commit_paired_bytes(keys,columns,workers,g,Some(&placement),dst);
+ } else {
+  let groups=columns.len().div_ceil(g);let workers=workers.clamp(1,groups);
+  let next=std::sync::atomic::AtomicUsize::new(0);
+  let placement=crate::par::CorePlacement::for_workers(workers);
+  crate::par::pool().run(workers,|worker|{
+   let _guard=placement.as_ref().and_then(|p|p.pin(worker));
+   let mut ws:Option<Worker>=None;
+   loop {
+    let gi=next.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+    if gi>=groups {break;}
+    let c0=gi*g;let gc=g.min(columns.len()-c0);
+    let ws=ws.get_or_insert_with(||Worker::new(g));
+    unsafe{group_bytes(&columns[c0..c0+gc],keys,nb,ws,(dst as *mut u8).add(5*N*c0),|_|{})};
+   }
+  });
+ }
+}
+
+pub fn commit_columns_bytes(
+ base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey,
+ columns:&[&[B128]],workers:usize,group_size:usize,
+)->Vec<u8> {
+ check_keys(base,tail);
+ for c in columns {assert_eq!(c.len(),base.len_f162());}
+ let mut out=vec![0u8;columns.len()*N*5];
+ commit_columns_bytes_arranged(&arrange_keys(base,tail,workers),columns,workers,group_size,&mut out);
+ out
+}
+
+
 #[cfg(test)]
 mod tests {
  use super::*;
+ fn fused_base_words_check<const Q:u16>() {
+  let mut seed=0xcafe8012abcdef97u64;
+  for case in 0..6 {
+   let mut acc=zeroed_slice::<GAcc>(1);
+   for v in &mut acc[0].v {for x in v {
+    seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;
+    *x=match case {0=>0,1=>i32::MAX,2=>i32::MIN,3=>0x7fff8000,4=>-0x7fff8000,_=>seed as i32};
+   }}
+   unsafe {
+    let ptr=acc[0].v.as_mut_ptr() as *mut i32;
+    let expected=finish_base::<Q>(ptr);
+    for blk in 0..24 {
+     let mut got=[0i16;32];
+     _mm512_storeu_si512(got.as_mut_ptr() as *mut __m512i,base_words::<Q>(ptr,blk));
+     for j in 0..27 {assert_eq!((got[row_word(j)] as i32).rem_euclid(Q as i32) as u32,expected[27*blk+j],"q={Q} case={case} block={blk} row={j}");}
+    }
+   }
+  }
+ }
+ #[test]
+ fn fused_base_words_preserve_unreduced_final_lanes() {
+  fused_base_words_check::<P0>();fused_base_words_check::<P1>();
+ }
+
+ // Pure certificate tests are extractable with the portable block above.
+ fn certificate_fixture(nb:usize,case:usize)->Vec<KeyBatch> {
+  let mut state=0x475d91e3a8b2c6f1u64;
+  (0..2*nb).map(|i|{
+   let q=if i%2==0 {P0}else{P1};
+   let mut key=KeyBatch{v:[[0i16;32];24*KBLK],reduce:0};
+   for row in &mut key.v {for x in row {
+    state^=state<<13;state^=state>>7;state^=state<<17;
+    *x=match case {0=>0,1=>q as i16/2,2=>-(q as i16/2),_=>(state%q as u64) as i16-q as i16/2};
+   }}
+   for blk in 0..24 {for stream in 0..2 {for c in 0..4 {
+    key.v[KBLK*blk+48+4*stream+c][24..32].fill(0);
+   }}}
+   key
+  }).collect()
+ }
+ fn certificate_image(keys:&[KeyBatch])->Vec<u8> {
+  let mut image=Vec::with_capacity(keys.len()*KEY_BATCH_BYTES);
+  for key in keys {
+   for row in &key.v {for &x in row {image.extend_from_slice(&x.to_le_bytes());}}
+   image.push(key.reduce);image.extend_from_slice(&[0u8;63]);
+  }
+  image
+ }
+ #[test]
+ fn reduction_image_matches_key_records() {
+  for nb in [1,7,9] {for case in 0..4 {
+   let mut keys=certificate_fixture(nb,case);
+   let image=arranged_image_from(nb,|i,kb|kb.v=keys[i].v);
+   certify_reductions(&mut keys);
+   assert_eq!(image,certificate_image(&keys),"nb={nb} case={case}");
+  }}
+ }
+ #[test]
+ fn streamed_arranged_image_matches_arranged_keys() {
+  use crate::key::CommitmentKey;
+  use crate::ring::Modulus;
+  let base=CommitmentKey::random(128*9,41,Modulus::Q3889_FS_S,&[Modulus::Q9721_FS_S]);
+  let tail=CommitmentKey::random(128*9,42,Modulus::Q3889_FS_S,&[Modulus::Q9721_FS_S]);
+  let expected=certificate_image(&arrange_keys(&base,&tail,2));
+  assert_eq!(arranged_image(&base,&tail),expected);
+ }
+ #[test]
+ #[should_panic(expected="at least one hybrid key batch")]
+ fn reduction_image_rejects_empty() {certify_image_reductions(&mut [],0);}
+ #[test]
+ #[should_panic(expected="hybrid key image length")]
+ fn reduction_image_rejects_partial_record() {
+  let keys=certificate_fixture(1,0);let mut image=certificate_image(&keys);
+  image.pop();certify_image_reductions(&mut image,1);
+ }
+ #[test]
+ #[should_panic(expected="hybrid key image size overflow")]
+ fn reduction_image_rejects_size_overflow() {certify_image_reductions(&mut [],usize::MAX);}
+ #[test]
+ fn actual_key_reduction_certificate_boundaries() {
+  for nb in [1,7,9] {for case in 0..4 {
+   let mut keys=certificate_fixture(nb,case);
+   certify_reductions(&mut keys);
+   for pair in keys.chunks_exact(2) {
+    assert!(pair[0].reduce<=1);assert_eq!(pair[1].reduce,1);
+    if case==0 {assert_eq!(pair[0].reduce,0);}
+   }
+  }}
+  let mut bad=vec![0i64;CERT_LANES];
+  bad[cert_lane(0,0,1,0)]=bias(P0);bad[cert_lane(0,0,1,1)]=1;
+  assert!(cert_tail_max(&bad)>bias(P0));
+  bad[cert_lane(0,0,1,1)]=0;assert_eq!(cert_tail_max(&bad),bias(P0));
+  bad.fill(0);bad[cert_lane(0,3,1,0)]=bias(P0);bad[cert_lane(0,3,1,3)]=1;
+  assert!(cert_tail_max(&bad)>bias(P0));
+ }
+ #[test]
+ #[should_panic(expected="two nonempty hybrid key limbs")]
+ fn reduction_certificate_rejects_empty() {certify_reductions(&mut []);}
+ #[test]
+ #[should_panic(expected="two nonempty hybrid key limbs")]
+ fn reduction_certificate_rejects_odd_key_count() {
+  let mut keys=certificate_fixture(1,0);keys.pop();certify_reductions(&mut keys);
+ }
  /// The fused register consumer equals the original row-major scratch consumer at every
  /// accumulator lane, including centered fold-back. Arbitrary initial accumulators exercise
  /// the exact wrapping SIMD operations; centered keys and all-zero/all-one/random nibbles
@@ -775,7 +1269,7 @@ mod tests {
  }
  /// The transposed-group sink against the folded-lane implementation it replaced, bit for bit,
  /// on random centered keys and random columns: 128 batches (fold-backs at both periods,
- /// 19 tail chunks, several full and partial lane flushes), every group size from 1 to 32
+ /// 16 tail chunks, several full and partial lane flushes), every group size from 1 to 32
  /// that the prover or the flush logic distinguishes, and a ragged last group.
  #[test]
  fn row_sink_matches_folded_reference() {

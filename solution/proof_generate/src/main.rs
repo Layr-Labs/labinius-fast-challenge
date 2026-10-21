@@ -1385,19 +1385,26 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let setup_time = clock.elapsed();
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
-    let rows = if let Some(keys) = arranged {
-        labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,hybrid_group())
-    } else if modulus==modulus_choice::HYBRID_MODULUS {
-        let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
-        labinius::simd::commit::hybrid::commit_columns_rows(&key(),&tail,&columns,workers,HYBRID_GROUP)
-    } else {key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
-    let commit_time = clock.elapsed();
     let buffer = output.and_then(|o| o.commitment_buffer());
-    let commitment = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer);
+    let (commitment, commit_time) = if modulus == modulus_choice::HYBRID_MODULUS {
+        // Emit each group's final wire bytes directly: no 3 * COLUMNS * N u32 rows.
+        let len = COLUMNS * N * 5;
+        let mut bytes = match buffer { Some(b) if b.len() == len => b, _ => vec![0u8; len] };
+        if let Some(keys) = arranged {
+            labinius::simd::commit::hybrid::commit_columns_bytes_arranged(keys, &columns, workers, hybrid_group(), &mut bytes);
+        } else {
+            let tail = keygen::key_from_image(modulus, &EMBEDDED_TAIL.0).unwrap_or_else(|| keygen::build_tail_key(modulus));
+            let keys = labinius::simd::commit::hybrid::arrange_keys(&key(), &tail, workers);
+            labinius::simd::commit::hybrid::commit_columns_bytes_arranged(&keys, &columns, workers, HYBRID_GROUP, &mut bytes);
+        }
+        (bytes, clock.elapsed())
+    } else {
+        let rows = key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP);
+        let commit_time = clock.elapsed();
+        let bytes = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer);
+        (bytes, commit_time)
+    };
     let recombine_time = clock.elapsed();
-    // Huge pages: a few page-table entries to drop. (A thread of its own to free it, as the
-    // baseline did, is a ninth runnable thread beside eight busy ones.)
-    drop(rows);
     if let Some(output) = output {
         // The pages of the switch's binding pass first: they are written ~10 ms from here,
         // and faulting them in there stalls the pass's runners.
@@ -2050,21 +2057,55 @@ mod tests {
         assert!(hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES - 1).is_none());
     }
     #[test]
+    fn fused_commitment_bytes_match_rows_across_partial_groups_and_chunks() {
+        use labinius::simd::commit::hybrid;
+        let q=modulus_choice::HYBRID_MODULUS;let ring=288usize;let columns=37;
+        let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
+        let matrix=rq::ajtai_matrix(q,ring);
+        let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
+        let tail=keygen::build_tail_key_from_matrix(&matrix);
+        let keys=hybrid::arrange_keys(&key,&tail,3);
+        let mut t=Transcript::new(b"fused-wire-regression");
+        let random=t.sample_b128(b"binary",ring*4*columns);
+        for mode in 0..3 {
+            let values=match mode {0=>random.clone(),1=>vec![B128(0);random.len()],_=>vec![B128(u128::MAX);random.len()]};
+            let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
+            let rows=hybrid::commit_columns_rows_arranged(&keys,&cols,3,16);
+            let expected=commitment_bytes_rows(&rows,&primes,q,columns,3,None);
+            for g in [1,4,8,16,32] {for workers in [3,4] {
+                let mut guarded=vec![0xa5u8;expected.len()+128];
+                hybrid::commit_columns_bytes_arranged(&keys,&cols,workers,g,&mut guarded[64..64+expected.len()]);
+                assert_eq!(&guarded[64..64+expected.len()],&expected[..],"mode={mode}, group={g}, workers={workers}");
+                assert!(guarded[..64].iter().chain(guarded[64+expected.len()..].iter()).all(|&b|b==0xa5));
+            }}
+        }
+        assert!(std::panic::catch_unwind(|| {
+            let values=vec![B128(0);ring*4];let cols=vec![values.as_slice()];let mut bad=vec![0u8;N*5-1];
+            hybrid::commit_columns_bytes_arranged(&keys,&cols,1,1,&mut bad);
+        }).is_err());
+    }
+
+    #[test]
     fn hybrid_commitment_matches_schoolbook_under_new_modulus() {
-        let q=modulus_choice::HYBRID_MODULUS;let ring=128usize;let columns=4;
+        let q=modulus_choice::HYBRID_MODULUS;let ring=288usize;let columns=17;
         let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
         let matrix=rq::ajtai_matrix(q,ring);
         let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
         let tail=keygen::build_tail_key_from_matrix(&matrix);
         let mut t=Transcript::new(b"hybrid-commitment-regression");
-        let values=t.sample_b128(b"binary",ring*4*columns);
+        let random=t.sample_b128(b"binary",ring*4*columns);
+        for mode in 0..3 {
+        let values=match mode {0=>random.clone(),1=>vec![B128(0);random.len()],_=>vec![B128(u128::MAX);random.len()]};
         let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
-        let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,4);
+        let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,16);
         let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,3,None);
+        let fused=labinius::simd::commit::hybrid::commit_columns_bytes(&key,&tail,&cols,3,16);
+        assert_eq!(fused,coefficients,"fused bytes differ in schoolbook mode={mode}");
         let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
         for c in 0..columns {
             let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
             assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);
+        }
         }
     }
 

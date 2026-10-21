@@ -629,6 +629,9 @@ struct Progress(std::sync::atomic::AtomicUsize);
 const LEAD:usize=1;
 /// How long a worker waits for its sibling before the pair stops waiting for each other.
 const SIBLING_WAIT:std::time::Duration=std::time::Duration::from_micros(500);
+/// How long a worker waits for every other worker to start before the run stops waiting for
+/// late starters.
+const START_WAIT:std::time::Duration=std::time::Duration::from_millis(5);
 /// The commitment with the two hyperthreads of a core sharing every key batch in their L2:
 /// workers `2k` and `2k + 1` (placed on core `k`'s two CPUs) take the two halves of each group
 /// of `2 g` columns the pair claims, and neither starts a batch more than [`LEAD`] batches
@@ -642,6 +645,10 @@ const SIBLING_WAIT:std::time::Duration=std::time::Duration::from_micros(500);
 /// whichever sibling comes first, so every column is committed whatever the pool's runners do;
 /// a sibling that keeps the other waiting longer than [`SIBLING_WAIT`] (descheduled, or its
 /// task not started) ends the waiting for the rest of the run.
+/// Before its first group a worker waits, yielding its CPU, until every worker has started:
+/// a runner that the scheduler queued on a CPU whose worker kept it (pinned there) otherwise
+/// starts only at the next rebalance, measured 2.3-4.3 ms late in 9 of 15 runs on a c3 host,
+/// and its pair ends that much later (or its sibling stops waiting for it for the whole run).
 fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,placement:Option<&crate::par::CorePlacement>,dst:usize) {
  use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
  let nb=keys.len()/2;
@@ -652,8 +659,15 @@ fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,place
  let slots:Vec<std::sync::OnceLock<usize>>=(0..pairs*rounds).map(|_|std::sync::OnceLock::new()).collect();
  let done:Vec<Progress>=(0..2*pairs).map(|_|Progress(AtomicUsize::new(0))).collect();
  let coupled:Vec<AtomicBool>=(0..pairs).map(|_|AtomicBool::new(true)).collect();
+ let (started,starting)=(AtomicUsize::new(0),AtomicBool::new(true));
  crate::par::pool().run(2*pairs,|worker|{
   let _guard=placement.and_then(|p|p.pin(worker));
+  started.fetch_add(1,Ordering::AcqRel);
+  let start=std::time::Instant::now();
+  while starting.load(Ordering::Relaxed) && started.load(Ordering::Acquire)<2*pairs {
+   if start.elapsed()>START_WAIT {starting.store(false,Ordering::Relaxed);}
+   std::thread::yield_now();
+  }
   let (pair,s)=(worker/2,worker%2);
   let mine=&done[worker].0;let other=&done[worker^1].0;let coupled=&coupled[pair];
   let mut ws:Option<Worker>=None;

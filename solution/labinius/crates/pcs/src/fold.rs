@@ -1600,9 +1600,11 @@ mod bitsliced {
         let zero = _mm512_setzero_si512();
         let mut tiles = [[zero; 16]; 8];
         for t in 0..8 {
-            for i in 0..16 {
-                _mm_prefetch::<{ _MM_HINT_T0 }>((next as *const i8).add(1024 * t + 64 * i));
-            }
+            // The next column's same block is 256 KB away; touching the first line of each
+            // 1 KB tile is enough for the L2 streamer to follow (the every-line form issued
+            // 128 prefetches per 8 KB block and is the pattern the commitment-side
+            // measurements found too expensive).
+            _mm_prefetch::<{ _MM_HINT_T0 }>((next as *const i8).add(1024 * t));
             transpose_tile(words.add(64 * t), &mut tiles[t]);
         }
         let perm = _mm512_load_si512(PERM.0.as_ptr() as *const __m512i);

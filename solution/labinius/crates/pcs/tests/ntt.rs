@@ -345,6 +345,52 @@ mod bin_asm {
         assert_eq!(worst_out, sh.max[4]);
     }
 
+    // ------------------------------------------------------------------ the packed front end
+
+    /// Inputs with coefficients 512..647 zero (lifted `B128` words), as the commitment feeds the
+    /// kernel: the `B128` slicer's packed pair rows equal the scalar definition, and the packed
+    /// kernel's lanes are bit-identical to the plain kernel's.
+    fn check_packed<const Q: u16>() {
+        use labinius::fields::scalar::B128;
+        for mut polys in batches(48, 23 + Q as u64) {
+            for p in polys.iter_mut() {
+                for c in 512..N {
+                    p[c] = 0;
+                }
+            }
+            let e = elems_of(&polys);
+            let want = f162::index_rows_scalar_packed(&e);
+            let words: [B128; 128] =
+                core::array::from_fn(|i| B128(e[i].0[0] as u128 | ((e[i].0[1] as u128) << 64)));
+            let mut got = BinaryIndex32::zero();
+            unsafe { tf::slice_b128_into(&words, &mut got) };
+            for i in 0..162 {
+                assert!(want.rows[i] == got.rows[i], "slice_b128_into row {i}");
+            }
+            for j in 0..54 {
+                assert!(want.comb[j] == got.comb[j], "slice_b128_into comb row {j}");
+            }
+            let mut plain = Batch32::zero(Representation::Coefficients);
+            let mut packed = Batch32::zero(Representation::Coefficients);
+            unsafe {
+                vb::ntt_bin_batch32::<Q>(&got, &mut plain);
+                vb::ntt_bin_batch32_packed::<Q>(&got, &mut packed);
+            }
+            for j in 0..N {
+                assert!(plain.v[j] == packed.v[j], "q={Q} slot {j}: packed kernel differs");
+            }
+        }
+    }
+
+    #[test]
+    fn packed_kernel_3889() {
+        check_packed::<3889>();
+    }
+    #[test]
+    fn packed_kernel_9721() {
+        check_packed::<9721>();
+    }
+
     #[test]
     fn kernel_3889() {
         check_kernel::<3889>();

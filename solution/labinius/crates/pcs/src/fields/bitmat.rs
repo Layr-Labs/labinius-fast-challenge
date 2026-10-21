@@ -128,16 +128,36 @@ unsafe fn apply_round(z: &mut [__m512i], slot_bit: usize, r: &[[u8; 64]; 2]) {
     }
 }
 
+/// [`apply_round`] on a 16-vector tile with the slot known at compile time, so that the pair
+/// loop unrolls and the tile stays in registers: 16 `vpermt2b` and two index loads per round.
+#[inline(always)]
+unsafe fn apply_round16<const SLOT: usize>(z: &mut [__m512i; 16], r: &[[u8; 64]; 2]) {
+    let (i0, i1) = (idx(&r[0]), idx(&r[1]));
+    let mut z0 = 0;
+    while z0 < 16 {
+        if z0 & SLOT == 0 {
+            let z1 = z0 | SLOT;
+            let (a, b) = (z[z0], z[z1]);
+            z[z0] = _mm512_permutex2var_epi8(a, i0, b);
+            z[z1] = _mm512_permutex2var_epi8(a, i1, b);
+        }
+        z0 += 1;
+    }
+}
+
 /// `out[k].byte[p]` = byte `k` of word `word_at(p)` of the 64 words at `src`.
 #[inline(always)]
 pub unsafe fn transpose_tile(src: *const u8, out: &mut [__m512i; 16]) {
     let t = tables();
+    debug_assert_eq!(t.input.len(), 4);
     for (i, o) in out.iter_mut().enumerate() {
         *o = _mm512_loadu_si512(src.add(64 * i) as *const __m512i);
     }
-    for (r, round) in t.input.iter().enumerate() {
-        apply_round(out, 8 >> r, round);
-    }
+    let r = t.input.as_ptr();
+    apply_round16::<8>(out, &*r);
+    apply_round16::<4>(out, &*r.add(1));
+    apply_round16::<2>(out, &*r.add(2));
+    apply_round16::<1>(out, &*r.add(3));
 }
 
 /// `planes[c].byte[p]` = byte `c` of word `word_at(p)` becomes `out[g].qword[i].byte[c]` of word

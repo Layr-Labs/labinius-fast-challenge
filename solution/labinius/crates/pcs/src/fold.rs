@@ -1338,6 +1338,9 @@ pub fn fold_witness_bitsliced(
     if bpc % 4 != 0 || challenges.iter().map(|c| c.weight).sum::<usize>() > 32767 {
         return fold_witness_streaming(words, columns, challenges, bpc, q, workers);
     }
+    // The bit-sliced fold's slicer is the GFNI transpose; the profile flag only said so for
+    // `fold_witness_bits`.
+    FOLD_USED_GFNI.store(true, std::sync::atomic::Ordering::Relaxed);
     bitsliced::fold_words(words, challenges, 128 * bpc, workers)
 }
 
@@ -1383,7 +1386,8 @@ mod bitsliced {
         first: usize,
         columns: usize,
         /// `terms[offsets[q] .. offsets[q + 1]]` is the schedule of slot pair `q`, padded to a
-        /// multiple of 64 with offset 0 (planes 0 and 1 are zero).
+        /// multiple of 16 with offset 0 (planes 0 and 1 are zero): whole 64-input chunks, then a
+        /// tail of 48, 32 or 16 inputs through the matching smaller trees.
         offsets: [usize; PAIRS + 1],
         terms: Vec<u16>,
     }
@@ -1432,7 +1436,7 @@ mod bitsliced {
             for q in 0..PAIRS {
                 count += count_diff[q];
                 debug_assert!(count >= 0);
-                group.offsets[q + 1] = group.offsets[q] + (count as usize).div_ceil(64) * 64;
+                group.offsets[q + 1] = group.offsets[q] + (count as usize).div_ceil(16) * 16;
             }
             // Offset 0 is the padding pair (planes 0 and 1 are zero), not a column's plane.
             group.terms.resize(group.offsets[PAIRS], 0);
@@ -1550,6 +1554,21 @@ mod bitsliced {
     /// transpose uses bitmat's public word permutation. No permutation is needed in the hot loop.
     fn word_of(l: usize) -> usize {
         64 * (l / 64) + bitmat::word_at((l % 64 & !7) + 7 - l % 8)
+    }
+
+    /// The inverse of [`word_of`] within a group of 64 lanes (it permutes each group in the same
+    /// way), as the two `vpermi2w` index vectors that bring a group's 64 counts into word order:
+    /// entry `w` is the lane holding word `w`, for words `0..32` and `32..64`.
+    #[inline(always)]
+    unsafe fn word_lane_indices() -> (__m512i, __m512i) {
+        let mut lanes = [0u16; 64];
+        for l in 0..64 {
+            lanes[word_of(l)] = l as u16;
+        }
+        (
+            _mm512_loadu_si512(lanes.as_ptr() as *const __m512i),
+            _mm512_loadu_si512(lanes.as_ptr().add(32) as *const __m512i),
+        )
     }
 
     /// The 128 direct planes of a block of 512 words to `out`, and their complements to
@@ -1700,44 +1719,81 @@ mod bitsliced {
                 $h = [zero; 2];
             }};
         }
-        for input in terms.chunks_exact(64) {
-            let t = input.as_ptr();
-            macro_rules! two {
-                ($off:expr) => {{
-                    let pa = planes.add(*t.add($off) as usize);
-                    let pb = planes.add(*t.add($off + 1) as usize);
-                    let a0 = _mm512_load_si512(pa as *const __m512i);
-                    let b0 = _mm512_load_si512(pb as *const __m512i);
-                    let a1 = _mm512_load_si512(pa.add(8) as *const __m512i);
-                    let b1 = _mm512_load_si512(pb.add(8) as *const __m512i);
-                    (csa(&mut s0[0], a0, b0), csa(&mut s1[0], a1, b1))
-                }};
-            }
-            macro_rules! level {
-                ($bit:literal, $lower:ident, $off:expr) => {{
-                    let (x0, x1) = $lower!($off);
-                    let (y0, y1) = $lower!($off + (1 << $bit));
-                    (csa(&mut s0[$bit], x0, y0), csa(&mut s1[$bit], x1, y1))
-                }};
-            }
-            macro_rules! four { ($off:expr) => { level!(1, two, $off) }; }
-            macro_rules! eight { ($off:expr) => { level!(2, four, $off) }; }
-            macro_rules! sixteen { ($off:expr) => { level!(3, eight, $off) }; }
-            macro_rules! thirty_two { ($off:expr) => { level!(4, sixteen, $off) }; }
+        let mut t: *const u16 = terms.as_ptr();
+        macro_rules! two {
+            ($off:expr) => {{
+                let pa = planes.add(*t.add($off) as usize);
+                let pb = planes.add(*t.add($off + 1) as usize);
+                let a0 = _mm512_load_si512(pa as *const __m512i);
+                let b0 = _mm512_load_si512(pb as *const __m512i);
+                let a1 = _mm512_load_si512(pa.add(8) as *const __m512i);
+                let b1 = _mm512_load_si512(pb.add(8) as *const __m512i);
+                (csa(&mut s0[0], a0, b0), csa(&mut s1[0], a1, b1))
+            }};
+        }
+        macro_rules! level {
+            ($bit:literal, $lower:ident, $off:expr) => {{
+                let (x0, x1) = $lower!($off);
+                let (y0, y1) = $lower!($off + (1 << $bit));
+                (csa(&mut s0[$bit], x0, y0), csa(&mut s1[$bit], x1, y1))
+            }};
+        }
+        macro_rules! four { ($off:expr) => { level!(1, two, $off) }; }
+        macro_rules! eight { ($off:expr) => { level!(2, four, $off) }; }
+        macro_rules! sixteen { ($off:expr) => { level!(3, eight, $off) }; }
+        macro_rules! thirty_two { ($off:expr) => { level!(4, sixteen, $off) }; }
+        // A weight-64 carry per slot into the two-bit register counters; three fit.
+        macro_rules! count64 {
+            ($c0:ident, $c1:ident) => {{
+                let up = _mm512_and_si512(h0[0], $c0);
+                h0[0] = _mm512_xor_si512(h0[0], $c0);
+                h0[1] = _mm512_xor_si512(h0[1], up);
+                let up = _mm512_and_si512(h1[0], $c1);
+                h1[0] = _mm512_xor_si512(h1[0], $c1);
+                h1[1] = _mm512_xor_si512(h1[1], up);
+                pending += 1;
+                if pending == 3 {
+                    flush!(even, h0);
+                    flush!(odd, h1);
+                    pending = 0;
+                }
+            }};
+        }
+        // A carry of weight `1 << $bit` per slot (a tail tree's output), rippled through the
+        // register bits up to weight 64 and then counted.
+        macro_rules! count_from {
+            ($bit:literal, $c0:ident, $c1:ident) => {{
+                let mut c0 = $c0;
+                let mut c1 = $c1;
+                for b in $bit..6 {
+                    let up0 = _mm512_and_si512(s0[b], c0);
+                    s0[b] = _mm512_xor_si512(s0[b], c0);
+                    c0 = up0;
+                    let up1 = _mm512_and_si512(s1[b], c1);
+                    s1[b] = _mm512_xor_si512(s1[b], c1);
+                    c1 = up1;
+                }
+                count64!(c0, c1);
+            }};
+        }
+        let chunks = terms.chunks_exact(64);
+        let tail = chunks.remainder();
+        for input in chunks {
+            t = input.as_ptr();
             let (c0, c1) = level!(5, thirty_two, 0);
-            // Two-bit register counters of the weight-64 carries: three chunks fit.
-            let up = _mm512_and_si512(h0[0], c0);
-            h0[0] = _mm512_xor_si512(h0[0], c0);
-            h0[1] = _mm512_xor_si512(h0[1], up);
-            let up = _mm512_and_si512(h1[0], c1);
-            h1[0] = _mm512_xor_si512(h1[0], c1);
-            h1[1] = _mm512_xor_si512(h1[1], up);
-            pending += 1;
-            if pending == 3 {
-                flush!(even, h0);
-                flush!(odd, h1);
-                pending = 0;
-            }
+            count64!(c0, c1);
+        }
+        // The schedule is padded to a multiple of 16: the tail is 48, 32 or 16 inputs.
+        debug_assert!(tail.len() % 16 == 0 && tail.len() < 64);
+        t = tail.as_ptr();
+        if tail.len() >= 32 {
+            let (c0, c1) = thirty_two!(0);
+            count_from!(5, c0, c1);
+            t = t.add(32);
+        }
+        if tail.len() % 32 == 16 {
+            let (c0, c1) = sixteen!(0);
+            count_from!(4, c0, c1);
         }
         if pending != 0 {
             flush!(even, h0);
@@ -1800,11 +1856,16 @@ mod bitsliced {
         let blocks = column_words / LANES;
         let per = blocks.div_ceil(workers.clamp(1, blocks));
         let mut out = vec![RingElement::zero(Representation::Coefficients); column_words / 4];
+        // One thread per allowed logical CPU, placed explicitly: the threads do equal work, so
+        // two of them on one core while another core idles would set the phase's end.
+        let placement = crate::par::CorePlacement::for_logical(blocks.div_ceil(per));
         std::thread::scope(|scope| {
             for (worker, target) in out.chunks_mut(per * LANES / 4).enumerate() {
                 let groups = &groups;
                 let bias = &bias;
+                let placement = &placement;
                 scope.spawn(move || unsafe {
+                    let _affinity = placement.as_ref().and_then(|p| p.pin(worker));
                     #[cfg(test)]
                     let mut times = [std::time::Duration::ZERO; 3];
                     let zero = _mm512_setzero_si512();
@@ -1837,22 +1898,59 @@ mod bitsliced {
                         }
                         #[cfg(test)]
                         let start = profile.then(std::time::Instant::now);
-                        let mut a = [0i16; LANES];
-                        let mut b = [0i16; LANES];
-                        let mut c = [0i16; LANES];
+                        let mut a = Aligned([0i16; LANES]);
+                        let mut b = Aligned([0i16; LANES]);
+                        let mut c = Aligned([0i16; LANES]);
+                        let mut xq = Aligned([0u64; LANES / 4]);
+                        let mut yq = Aligned([0u64; LANES / 4]);
+                        let (lo, hi) = word_lane_indices();
+                        let mut overflow = 0u32;
                         for i in 0..81 {
-                            unslice(acc.as_ptr().add(i * BITS), &mut a);
-                            unslice(acc.as_ptr().add((81 + i) * BITS), &mut b);
-                            unslice(acc.as_ptr().add((162 + i) * BITS), &mut c);
-                            for lane in 0..LANES {
-                                let w = word_of(lane);
-                                let x = a[lane] as i32 - bias[i];
-                                let y = b[lane] as i32 - bias[81 + i];
-                                let z = c[lane] as i32 - bias[162 + i];
-                                output[w / 4].v[4 * i + w % 4] = i16::try_from(x - z).expect("integer fold overflow");
-                                output[w / 4].v[4 * (81 + i) + w % 4] = i16::try_from(y + z).expect("integer fold overflow");
+                            unslice(acc.as_ptr().add(i * BITS), &mut a.0);
+                            unslice(acc.as_ptr().add((81 + i) * BITS), &mut b.0);
+                            unslice(acc.as_ptr().add((162 + i) * BITS), &mut c.0);
+                            // x - z = a - c - (bias_i - bias_{162+i}); y + z = b + c - (bias_{81+i} + bias_{162+i}).
+                            // The biases are at most the total weight (below 2^15), as are the counts.
+                            let dx = _mm512_set1_epi16((bias[i] - bias[162 + i]) as i16);
+                            let dy = _mm512_set1_epi16((bias[81 + i] + bias[162 + i]) as i16);
+                            for g in 0..8 {
+                                let at = |arr: &Aligned<[i16; LANES]>, h: usize| {
+                                    _mm512_load_si512(arr.0.as_ptr().add(64 * g + 32 * h) as *const __m512i)
+                                };
+                                let (a0, a1) = (at(&a, 0), at(&a, 1));
+                                let (b0, b1) = (at(&b, 0), at(&b, 1));
+                                let (c0, c1) = (at(&c, 0), at(&c, 1));
+                                let x0 = _mm512_sub_epi16(_mm512_sub_epi16(a0, c0), dx);
+                                let x1 = _mm512_sub_epi16(_mm512_sub_epi16(a1, c1), dx);
+                                let y0 = _mm512_sub_epi16(_mm512_add_epi16(b0, c0), dy);
+                                let y1 = _mm512_sub_epi16(_mm512_add_epi16(b1, c1), dy);
+                                // The scalar version's `i16::try_from` check: wrapping and saturating
+                                // arithmetic agree exactly when nothing overflowed.
+                                let sx0 = _mm512_subs_epi16(_mm512_subs_epi16(a0, c0), dx);
+                                let sx1 = _mm512_subs_epi16(_mm512_subs_epi16(a1, c1), dx);
+                                let sy0 = _mm512_subs_epi16(_mm512_adds_epi16(b0, c0), dy);
+                                let sy1 = _mm512_subs_epi16(_mm512_adds_epi16(b1, c1), dy);
+                                overflow |= _mm512_cmpneq_epi16_mask(x0, sx0)
+                                    | _mm512_cmpneq_epi16_mask(x1, sx1)
+                                    | _mm512_cmpneq_epi16_mask(y0, sy0)
+                                    | _mm512_cmpneq_epi16_mask(y1, sy1);
+                                // Lanes to word order: qword `w / 4` of the group then holds the four
+                                // coefficients of ring element `16 g + w / 4` at `4 i + w % 4`.
+                                let dst = |arr: &mut Aligned<[u64; LANES / 4]>, h: usize| {
+                                    arr.0.as_mut_ptr().add(16 * g + 8 * h) as *mut __m512i
+                                };
+                                _mm512_store_si512(dst(&mut xq, 0), _mm512_permutex2var_epi16(x0, lo, x1));
+                                _mm512_store_si512(dst(&mut xq, 1), _mm512_permutex2var_epi16(x0, hi, x1));
+                                _mm512_store_si512(dst(&mut yq, 0), _mm512_permutex2var_epi16(y0, lo, y1));
+                                _mm512_store_si512(dst(&mut yq, 1), _mm512_permutex2var_epi16(y0, hi, y1));
+                            }
+                            for (e, element) in output.iter_mut().enumerate() {
+                                let v = element.v.as_mut_ptr();
+                                (v.add(4 * i) as *mut u64).write_unaligned(xq.0[e]);
+                                (v.add(4 * (81 + i)) as *mut u64).write_unaligned(yq.0[e]);
                             }
                         }
+                        assert!(overflow == 0, "integer fold overflow");
                         #[cfg(test)]
                         if let Some(start) = start { times[2] += start.elapsed(); }
                     }

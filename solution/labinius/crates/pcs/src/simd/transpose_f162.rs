@@ -42,12 +42,37 @@ use core::mem::MaybeUninit;
 #[derive(Clone)]
 pub struct BinaryIndex32 {
     pub rows: [[u8; 64]; 162],
+    /// The **packed** index rows (`comb[j]` for the row pair `(27 + j, 108 + j)`, j < 54), valid
+    /// only for ring elements whose coefficients 512..647 are zero, i.e. lifted `B128` words:
+    /// then the nibbles of every row from 26 on have a zero top bit, and a pair's two 3-bit
+    /// indices fit one 6-bit index into a 64-entry table. `comb[j][2p] = n(27+j, p) | n(108+j, p) << 3`,
+    /// `comb[j][2p+1] = 64 + the same`, the `vpermi2b` form of a byte-split 64-entry table (low
+    /// halves in the first table operand, high halves in the second). Filled by
+    /// [`slice_b128_into`] and [`fill_comb`](Self::fill_comb) only; the F162 slicer leaves it alone.
+    pub comb: [[u8; 64]; 54],
 }
 
 impl BinaryIndex32 {
     pub fn zero() -> Self {
         BinaryIndex32 {
             rows: [[0u8; 64]; 162],
+            comb: [[0u8; 64]; 54],
+        }
+    }
+
+    /// Scalar definition of `comb` from `rows`, for the reference builder and the tests. The
+    /// caller guarantees the top nibble bit of the rows from 26 on is zero (coefficients 512..647
+    /// zero); with a set bit the packed kernel's result is undefined, so this asserts it in debug.
+    pub fn fill_comb(&mut self) {
+        for j in 0..54 {
+            for p in 0..32 {
+                let n = self.rows[27 + j][2 * p];
+                let m = self.rows[108 + j][2 * p];
+                debug_assert!(n < 8 && m < 8, "packed index rows need coefficients 512..647 zero");
+                let c = (n & 7) | ((m & 7) << 3);
+                self.comb[j][2 * p] = c;
+                self.comb[j][2 * p + 1] = 64 + c;
+            }
         }
     }
 }
@@ -277,9 +302,10 @@ unsafe fn gather8(p0: *const i64, p1: *const i64, p2: *const i64, p3: *const i64
     _mm512_store_si512(o.add(3), _mm512_shuffle_i64x2::<0xDD>(s1, s3));
 }
 
-/// 128 `F162` (32 ring elements, 3072 contiguous bytes at `base`) -> the kernel's index rows.
+/// 128 `F162` (32 ring elements, 3072 contiguous bytes at `base`) -> the kernel's index rows,
+/// plus the packed pair rows when `PACKED` (coefficients 512..647 known zero).
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-unsafe fn slice_raw(base: *const u8, out: &mut BinaryIndex32) {
+unsafe fn slice_raw<const PACKED: bool>(base: *const u8, out: &mut BinaryIndex32) {
     let mut cols: MaybeUninit<Cols> = MaybeUninit::uninit();
     let cp = cols.as_mut_ptr() as *mut __m512i;
     columns(base, cp);
@@ -350,13 +376,26 @@ unsafe fn slice_raw(base: *const u8, out: &mut BinaryIndex32) {
             _mm512_ternarylogic_epi32::<0xEA>(b, lo4, p16),
         );
     }
+    if PACKED {
+        // comb[j] = rows[27+j] + (rows[108+j] << 3) - 0x5000 per 16-bit lane: the low byte is
+        // n + 8m, the high byte (16 + n) + 8 (16 + m) - 80 = 64 + n + 8m. With n, m < 8 nothing
+        // crosses a byte.
+        let fix = _mm512_set1_epi16(0x5000);
+        let cp = out.comb.as_mut_ptr() as *mut __m512i;
+        for j in 0..54 {
+            let lo = _mm512_load_si512(op.add(27 + j) as *const __m512i);
+            let hi = _mm512_load_si512(op.add(108 + j) as *const __m512i);
+            let c = _mm512_sub_epi16(_mm512_add_epi16(lo, _mm512_slli_epi16::<3>(hi)), fix);
+            _mm512_store_si512(cp.add(j), c);
+        }
+    }
 }
 
 /// The `vpermb` index rows of the 32 ring elements formed by `elems` (element 4p + k supplies the
 /// coefficients 4m + k of ring element p).
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
 pub unsafe fn slice_f162_into(elems: &[F162; 128], out: &mut BinaryIndex32) {
-    slice_raw(elems.as_ptr() as *const u8, out)
+    slice_raw::<false>(elems.as_ptr() as *const u8, out)
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
@@ -369,7 +408,8 @@ pub unsafe fn slice_f162(elems: &[F162; 128]) -> BinaryIndex32 {
 /// The same index rows for 128 words of `B128`, the lifted witness read in place: a lifted
 /// `F162` is the word's two limbs and a zero top limb, so the 128 words are staged as 128 `F162`
 /// in an L1-resident buffer (3 KB, written once per batch, a few cycles per ring element against
-/// the transform's hundreds) and sliced exactly as [`slice_f162_into`] slices them.
+/// the transform's hundreds) and sliced exactly as [`slice_f162_into`] slices them; the packed
+/// pair rows (`comb`) are filled as well, since a word's coefficients 512..647 are zero.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
 pub unsafe fn slice_b128_into(words: &[crate::fields::scalar::B128; 128], out: &mut BinaryIndex32) {
     let mut staged: MaybeUninit<A64<[F162; 128]>> = MaybeUninit::uninit();
@@ -377,5 +417,5 @@ pub unsafe fn slice_b128_into(words: &[crate::fields::scalar::B128; 128], out: &
     for (i, w) in words.iter().enumerate() {
         dst.add(i).write(F162::from_b128(*w));
     }
-    slice_raw(dst as *const u8, out)
+    slice_raw::<true>(dst as *const u8, out)
 }

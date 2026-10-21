@@ -97,6 +97,13 @@ pub struct Tables {
     /// `vpermb` (1 uop, port 5 - unlike `vpermw`, which is 2 uops and costs a port-0 slot on this
     /// core) does the lookup: byte n is the low half of entry n, byte 16+n the high half.
     lut: [[u8; 64]; 96],
+    /// The packed-input pair tables, `lut2[4 k + which]`, `which` = a1, b1, a2, b2: entry
+    /// `n + 8 m` (n, m < 8: the 3-bit nibbles of a row pair `(i, i + 81)`, i >= 26, of a ring
+    /// element whose coefficients 512..647 are zero) is the i16 the plain kernel forms from the two
+    /// 16-entry lookups, `L[.., 0][n] + L[.., 1][m]` for a1/a2 and `L[.., 0][n] - L[.., 1][m]` for
+    /// b1/b2 - the same i16, not re-centred, so the lanes stay bit-identical. Byte-split for
+    /// `vpermi2b`: low halves at bytes 0..64 (first table operand), high halves at 64..128.
+    lut2: [[u8; 128]; 16],
     /// Full 512-bit constants used as memory operands / register constants by the asm tail:
     /// `[q, om, omp, bv, ms, corr, and, or]` at byte offsets 0, 64, ... - `bv` is the old
     /// `vpmulhrsw` Barrett constant (unused by the current schedule), `ms` the
@@ -133,6 +140,7 @@ const fn build_tables<const Q: u16>() -> Tables {
     let kappa = [z6, (1 + q - z6) % q];
 
     let mut lut = [[0u8; 64]; 96];
+    let mut lut16 = [[0i16; 16]; 96];
     let mut k = 0;
     while k < 4 {
         let s0 = k / 2;
@@ -164,6 +172,7 @@ const fn build_tables<const Q: u16>() -> Tables {
                         let ti = ((k * 2 + s2) * 3 + r) * 2 + ab;
                         lut[ti][n] = e as u8;
                         lut[ti][16 + n] = (e >> 8) as u8;
+                        lut16[ti][n] = e as i16;
                         n += 1;
                     }
                     ab += 1;
@@ -171,6 +180,33 @@ const fn build_tables<const Q: u16>() -> Tables {
                 r += 1;
             }
             s2 += 1;
+        }
+        k += 1;
+    }
+
+    // the pair tables: (s2, r, sign) = a1: (0, 1, +), b1: (1, 1, -), a2: (0, 2, +), b2: (1, 2, -)
+    let mut lut2 = [[0u8; 128]; 16];
+    let mut k = 0;
+    while k < 4 {
+        let mut which = 0;
+        while which < 4 {
+            let s2 = which & 1;
+            let r = 1 + (which >> 1);
+            let t0 = ((k * 2 + s2) * 3 + r) * 2;
+            let mut n = 0;
+            while n < 8 {
+                let mut m = 0;
+                while m < 8 {
+                    let x = lut16[t0][n];
+                    let y = lut16[t0 + 1][m];
+                    let e = if s2 == 0 { x.wrapping_add(y) } else { x.wrapping_sub(y) } as u16;
+                    lut2[4 * k + which][n + 8 * m] = e as u8;
+                    lut2[4 * k + which][64 + n + 8 * m] = (e >> 8) as u8;
+                    m += 1;
+                }
+                n += 1;
+            }
+            which += 1;
         }
         k += 1;
     }
@@ -201,6 +237,7 @@ const fn build_tables<const Q: u16>() -> Tables {
     }
     Tables {
         lut,
+        lut2,
         cv,
         tw4,
         tw5,
@@ -676,7 +713,10 @@ impl BlockSink for OutSink {
 // ---------------------------------------------------------------------------------------------
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut S) {
+unsafe fn ntt_core<const Q: u16, const PACKED: bool, S: BlockSink>(
+    input: &BinaryIndex32,
+    sink: &mut S,
+) {
     let t = tables::<Q>();
     let c = C {
         q: bc(&t.qd),
@@ -687,6 +727,7 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
 
     // The caller already holds the `vpermb` byte-index rows; the kernel reads them straight.
     let ip: *const u8 = input.rows.as_ptr() as *const u8;
+    let cp: *const u8 = input.comb.as_ptr() as *const u8;
     let mut blk: core::mem::MaybeUninit<Blk> = core::mem::MaybeUninit::uninit();
     let bp = blk.as_mut_ptr() as *mut i16;
 
@@ -700,34 +741,56 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
         let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
         let (l110, l111) = (l(1, 1, 0), l(1, 1, 1));
         let (l120, l121) = (l(1, 2, 0), l(1, 2, 1));
+        // the packed pair tables: each a 128-byte byte-split table in two vectors
+        let lut2 = t.lut2.as_ptr().add(4 * k) as *const u8;
+        let l2 = |which: usize, half: usize| -> __m512i {
+            _mm512_load_si512(lut2.add(128 * which + 64 * half) as *const __m512i)
+        };
+        let (pa1, qa1) = (l2(0, 0), l2(0, 1));
+        let (pb1, qb1) = (l2(1, 0), l2(1, 1));
+        let (pa2, qa2) = (l2(2, 0), l2(2, 1));
+        let (pb2, qb2) = (l2(3, 0), l2(3, 1));
 
         // levels 0+1+2 (table lookups) fused with level 3 (omega multiply only).
         for i in 0..27 {
             let n0 = ldb(ip, i);
             let n0h = ldb(ip, i + 81);
-            let n1 = ldb(ip, i + 27);
-            let n1h = ldb(ip, i + 108);
-            let n2 = ldb(ip, i + 54);
-            let n2h = ldb(ip, i + 135);
 
             let x = _mm512_permutexvar_epi8(n0, l000);
             let y = _mm512_permutexvar_epi8(n0h, l001);
             let a0 = _mm512_add_epi16(x, y);
             let b0 = _mm512_sub_epi16(x, y);
 
-            let x = _mm512_permutexvar_epi8(n1, l010);
-            let y = _mm512_permutexvar_epi8(n1h, l011);
-            let a1 = _mm512_add_epi16(x, y);
-            let x = _mm512_permutexvar_epi8(n1, l110);
-            let y = _mm512_permutexvar_epi8(n1h, l111);
-            let b1 = _mm512_sub_epi16(x, y);
+            let (a1, b1, a2, b2) = if PACKED {
+                // one `vpermi2b` per value: the pair's 6-bit index into the 64-entry table of the
+                // i16 the two lookups below would add or subtract to.
+                (
+                    _mm512_permutex2var_epi8(pa1, ldb(cp, i), qa1),
+                    _mm512_permutex2var_epi8(pb1, ldb(cp, i), qb1),
+                    _mm512_permutex2var_epi8(pa2, ldb(cp, i + 27), qa2),
+                    _mm512_permutex2var_epi8(pb2, ldb(cp, i + 27), qb2),
+                )
+            } else {
+                let n1 = ldb(ip, i + 27);
+                let n1h = ldb(ip, i + 108);
+                let n2 = ldb(ip, i + 54);
+                let n2h = ldb(ip, i + 135);
 
-            let x = _mm512_permutexvar_epi8(n2, l020);
-            let y = _mm512_permutexvar_epi8(n2h, l021);
-            let a2 = _mm512_add_epi16(x, y);
-            let x = _mm512_permutexvar_epi8(n2, l120);
-            let y = _mm512_permutexvar_epi8(n2h, l121);
-            let b2 = _mm512_sub_epi16(x, y);
+                let x = _mm512_permutexvar_epi8(n1, l010);
+                let y = _mm512_permutexvar_epi8(n1h, l011);
+                let a1 = _mm512_add_epi16(x, y);
+                let x = _mm512_permutexvar_epi8(n1, l110);
+                let y = _mm512_permutexvar_epi8(n1h, l111);
+                let b1 = _mm512_sub_epi16(x, y);
+
+                let x = _mm512_permutexvar_epi8(n2, l020);
+                let y = _mm512_permutexvar_epi8(n2h, l021);
+                let a2 = _mm512_add_epi16(x, y);
+                let x = _mm512_permutexvar_epi8(n2, l120);
+                let y = _mm512_permutexvar_epi8(n2h, l121);
+                let b2 = _mm512_sub_epi16(x, y);
+                (a1, b1, a2, b2)
+            };
 
             let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
             let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
@@ -763,7 +826,18 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
 /// reduced (see the bound table above).
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 pub unsafe fn ntt_bin_batch32<const Q: u16>(input: &BinaryIndex32, out: &mut Batch32) {
-    ntt_core::<Q, _>(input, &mut OutSink(out.v.as_mut_ptr() as *mut i16));
+    ntt_core::<Q, false, _>(input, &mut OutSink(out.v.as_mut_ptr() as *mut i16));
+    out.representation = Representation::Ntt;
+}
+
+/// [`ntt_bin_batch32`] for **packed** inputs (coefficients 512..647 zero, `input.comb` filled by
+/// [`crate::simd::transpose_f162::slice_b128_into`] or [`BinaryIndex32::fill_comb`]): the row
+/// pairs from 27 on are looked up with one `vpermi2b` each instead of two `vpermb` and an add,
+/// eight port-5/port-05 uops fewer per 27-iteration of the front end. Lane-for-lane identical to
+/// the plain kernel on such inputs.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+pub unsafe fn ntt_bin_batch32_packed<const Q: u16>(input: &BinaryIndex32, out: &mut Batch32) {
+    ntt_core::<Q, true, _>(input, &mut OutSink(out.v.as_mut_ptr() as *mut i16));
     out.representation = Representation::Ntt;
 }
 
@@ -778,5 +852,18 @@ pub unsafe fn ntt_bin_batch32_sink<const Q: u16, S: BlockSink>(
     input: &BinaryIndex32,
     sink: &mut S,
 ) {
-    ntt_core::<Q, S>(input, sink);
+    ntt_core::<Q, false, S>(input, sink);
+}
+
+/// [`ntt_bin_batch32_sink`] for packed inputs (see [`ntt_bin_batch32_packed`]).
+///
+/// # Safety
+/// See [`BlockSink`]; `input.comb` must be the packed pair rows of an element with zero
+/// coefficients 512..647.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+pub unsafe fn ntt_bin_batch32_sink_packed<const Q: u16, S: BlockSink>(
+    input: &BinaryIndex32,
+    sink: &mut S,
+) {
+    ntt_core::<Q, true, S>(input, sink);
 }

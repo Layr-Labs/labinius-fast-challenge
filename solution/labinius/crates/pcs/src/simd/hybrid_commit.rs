@@ -73,9 +73,9 @@ unsafe fn group(cols:&[&[B128]],basekeys:&[&[Batch32]],tailkeys:&[&[Batch32]],nb
    col.slice_batch(b,&mut idx);
    let p0=accs[2*c].v.as_mut_ptr() as *mut i32;let t0=tails[2*c].v.as_mut_ptr() as *mut i32;
    let p1=accs[2*c+1].v.as_mut_ptr() as *mut i32;let t1=tails[2*c+1].v.as_mut_ptr() as *mut i32;
-   vb::ntt_bin_batch32_sink::<P0,_>(&idx,&mut TwinSink{buf:bp,a:basekeys[0][b].v.as_ptr() as *const i16,
+   vb::ntt_bin_batch32_sink_packed::<P0,_>(&idx,&mut TwinSink{buf:bp,a:basekeys[0][b].v.as_ptr() as *const i16,
     t:tailkeys[0][b].v.as_ptr() as *const i16,base:p0,tail:t0});
-   vb::ntt_bin_batch32_sink::<P1,_>(&idx,&mut TwinSink{buf:bp,a:basekeys[1][b].v.as_ptr() as *const i16,
+   vb::ntt_bin_batch32_sink_packed::<P1,_>(&idx,&mut TwinSink{buf:bp,a:basekeys[1][b].v.as_ptr() as *const i16,
     t:tailkeys[1][b].v.as_ptr() as *const i16,base:p1,tail:t1});
    if (b+1)%red_period(P0)==0 {reduce_acc::<P0>(p0);reduce_acc::<P0>(t0);}
    if (b+1)%red_period(P1)==0 {reduce_acc::<P1>(p1);reduce_acc::<P1>(t1);}

@@ -104,3 +104,11 @@ pub fn index_rows_scalar(elems: &[F162; 128]) -> BinaryIndex32 {
     }
     r
 }
+
+/// [`index_rows_scalar`] plus the packed pair rows, for elements whose coefficients 512..647 are
+/// zero (lifted `B128` words).
+pub fn index_rows_scalar_packed(elems: &[F162; 128]) -> BinaryIndex32 {
+    let mut r = index_rows_scalar(elems);
+    r.fill_comb();
+    r
+}

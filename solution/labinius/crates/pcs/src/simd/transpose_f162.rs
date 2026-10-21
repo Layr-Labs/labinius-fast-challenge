@@ -110,7 +110,23 @@ const fn plus16() -> [u8; 64] {
     t
 }
 
+/// `vpermb` pattern of the 8x8 byte transpose: Y.byte[8b + q] = Z.byte[8q + b].
+const fn byte_tr() -> [u8; 64] {
+    let mut t = [0u8; 64];
+    let mut b = 0;
+    while b < 8 {
+        let mut q = 0;
+        while q < 8 {
+            t[8 * b + q] = (8 * q + b) as u8;
+            q += 1;
+        }
+        b += 1;
+    }
+    t
+}
+
 static BYTE_PERM: A64<[u8; 64]> = A64(byte_perm());
+static BYTE_TR: A64<[u8; 64]> = A64(byte_tr());
 static AFFINE_BOTH: A64<[u8; 64]> = A64(affine_both());
 static DUP_A: A64<[u8; 64]> = A64(dup_idx(0));
 static DUP_B: A64<[u8; 64]> = A64(dup_idx(32));
@@ -315,6 +331,12 @@ unsafe fn slice_raw(base: *const u8, out: &mut BinaryIndex32) {
         );
     }
 
+    index_rows(ag, bg, out);
+}
+
+/// Phase 4: the 81 row-pair groups -> the 162 index rows.
+#[inline(always)]
+unsafe fn index_rows(ag: *const u64, bg: *const u64, out: &mut BinaryIndex32) {
     let ident = _mm512_set1_epi64(GF_IDENT);
     let am = _mm512_load_si512(AFFINE_BOTH.0.as_ptr() as *const __m512i);
     let da = _mm512_load_si512(DUP_A.0.as_ptr() as *const __m512i);
@@ -366,12 +388,155 @@ pub unsafe fn slice_f162(elems: &[F162; 128]) -> BinaryIndex32 {
     out
 }
 
-/// The same index rows for 128 words of `B128`, the lifted witness read in place: a lifted
-/// `F162` is the word's two limbs and a zero top limb, so the 128 words are staged as 128 `F162`
-/// in an L1-resident buffer (3 KB, written once per batch, a few cycles per ring element against
-/// the transform's hundreds) and sliced exactly as [`slice_f162_into`] slices them.
+// ---------------------------------------------------------------------------------------------
+// the B128 front end: the same rows for 128 words whose lift has a zero top limb
+// ---------------------------------------------------------------------------------------------
+//
+// A word lifts to the `F162` (lo, hi, 0), so every plane m >= 128 is zero. Read in place, ring
+// element p is the 64 bytes of its four words, qword (k, w) at 2k + w: one 8x8 qword transpose
+// per group of eight ring elements gives that group's eight non-zero columns (4 transposes per
+// batch where the `F162` layout needs 6, no masked or staged loads). Phase 2 only exists for
+// w = 0, 1, and phase 3 replaces the all-zero fourth stream by zero-masked loads. Phase 4 is
+// shared, so the rows are byte-identical to `slice_f162_into` of the lifted words.
+
+/// Phase 1 (B128): the 32 non-zero columns `(k, w < 2, g)`, at the `F162` positions
+/// `cols[(3k + w) * 4 + g]` (the w = 2 slots are left unwritten and never read).
+#[inline(always)]
+unsafe fn columns_b128(base: *const u8, cp: *mut __m512i) {
+    let perm = _mm512_load_si512(BYTE_PERM.0.as_ptr() as *const __m512i);
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    for g in 0..4 {
+        // ring elements 8g .. 8g + 8, one zmm each
+        let b = base.add(512 * g);
+        let mut r = [_mm512_setzero_si512(); 8];
+        for j in 0..8 {
+            r[j] = _mm512_loadu_si512(b.add(64 * j) as *const __m512i);
+        }
+        let c = transpose8x8_q(r);
+        for k in 0..4 {
+            for w in 0..2 {
+                _mm512_store_si512(
+                    cp.add(4 * (3 * k + w) + g),
+                    bitslice(perm, ident, c[2 * k + w]),
+                );
+            }
+        }
+    }
+}
+
+/// Phase 2 (B128): the 64 u64 `(M_k0[m], M_k0+1[m])`, m = 64w..64w+64, exactly as
+/// [`interleave8`] writes them, as one 8x8 qword transpose (qword `4 kh + g` of output `B` is
+/// bytes `8B..8B+8` of column `(k0 + kh, w, g)`) and one in-register 8x8 byte transpose per
+/// output: 32 shuffles where the unpack tree takes 40.
+#[inline(always)]
+unsafe fn interleave8_tr(cp: *const __m512i, k0: usize, w: usize, tr: __m512i, dst: *mut u64) {
+    let mut r = [_mm512_setzero_si512(); 8];
+    for kh in 0..2 {
+        for g in 0..4 {
+            r[4 * kh + g] = _mm512_load_si512(cp.add(4 * (3 * (k0 + kh) + w) + g));
+        }
+    }
+    let c = transpose8x8_q(r);
+    let d = dst as *mut __m512i;
+    for bb in 0..8 {
+        _mm512_store_si512(d.add(bb), _mm512_permutexvar_epi8(tr, c[bb]));
+    }
+}
+
+/// [`gather8`] with an all-zero fourth stream: `unpack{lo,hi}(c, 0)` are zero-masked loads.
+#[inline(always)]
+unsafe fn gather8_z(p0: *const i64, p1: *const i64, p2: *const i64, dst: *mut u64) {
+    let a = _mm512_loadu_si512(p0 as *const __m512i);
+    let b = _mm512_loadu_si512(p1 as *const __m512i);
+    let l01 = _mm512_unpacklo_epi64(a, b);
+    let h01 = _mm512_unpackhi_epi64(a, b);
+    let l23 = _mm512_maskz_loadu_epi64(0x55, p2);
+    let h23 = _mm512_maskz_loadu_epi64(0x55, p2.add(1));
+    let s0 = _mm512_shuffle_i64x2::<0x44>(l01, l23);
+    let s1 = _mm512_shuffle_i64x2::<0xEE>(l01, l23);
+    let s2 = _mm512_shuffle_i64x2::<0x44>(h01, h23);
+    let s3 = _mm512_shuffle_i64x2::<0xEE>(h01, h23);
+    let o = dst as *mut __m512i;
+    _mm512_store_si512(o, _mm512_shuffle_i64x2::<0x88>(s0, s2));
+    _mm512_store_si512(o.add(1), _mm512_shuffle_i64x2::<0xDD>(s0, s2));
+    _mm512_store_si512(o.add(2), _mm512_shuffle_i64x2::<0x88>(s1, s3));
+    _mm512_store_si512(o.add(3), _mm512_shuffle_i64x2::<0xDD>(s1, s3));
+}
+
+/// 128 `B128` words (2048 contiguous bytes at `base`) -> the kernel's index rows.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+unsafe fn slice_b128_raw(base: *const u8, out: &mut BinaryIndex32) {
+    let mut cols: MaybeUninit<Cols> = MaybeUninit::uninit();
+    let cp = cols.as_mut_ptr() as *mut __m512i;
+    columns_b128(base, cp);
+
+    let mut work: MaybeUninit<Work> = MaybeUninit::uninit();
+    let wk = work.as_mut_ptr();
+    let u = (*wk).u.as_mut_ptr();
+    let v = (*wk).v.as_mut_ptr();
+    let tr = _mm512_load_si512(BYTE_TR.0.as_ptr() as *const __m512i);
+    for w in 0..2 {
+        interleave8_tr(cp, 0, w, tr, u.add(64 * w));
+        interleave8_tr(cp, 2, w, tr, v.add(64 * w));
+    }
+    // planes 128.. are zero; phase 3 reads u[128..130] and v[128] through its partial loads
+    _mm512_store_si512(u.add(128) as *mut __m512i, _mm512_setzero_si512());
+    _mm512_store_si512(v.add(128) as *mut __m512i, _mm512_setzero_si512());
+
+    // phase 3 as in `slice_raw`; the fourth stream (v[t+121..], u[t+122..]) is all zero from
+    // t = 8 on
+    let (ag, bg) = ((*wk).ag.as_mut_ptr(), (*wk).bg.as_mut_ptr());
+    gather8(
+        u as *const i64,
+        v.add(40) as *const i64,
+        u.add(81) as *const i64,
+        v.add(121) as *const i64,
+        ag,
+    );
+    for i in 1..6 {
+        let t = 8 * i;
+        gather8_z(
+            u.add(t) as *const i64,
+            v.add(t + 40) as *const i64,
+            u.add(t + 81) as *const i64,
+            ag.add(4 * t),
+        );
+    }
+    gather8(
+        v as *const i64,
+        u.add(41) as *const i64,
+        v.add(81) as *const i64,
+        u.add(122) as *const i64,
+        bg,
+    );
+    for i in 1..5 {
+        let t = 8 * i;
+        gather8_z(
+            v.add(t) as *const i64,
+            u.add(t + 41) as *const i64,
+            v.add(t + 81) as *const i64,
+            bg.add(4 * t),
+        );
+    }
+
+    index_rows(ag, bg, out);
+}
+
+/// The same index rows for 128 words of `B128`, the lifted witness read in place (a lifted
+/// `F162` is the word's two limbs and a zero top limb): byte-identical to [`slice_f162_into`] of
+/// the 128 lifted words, without staging them and without the zero limb's share of the work.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
 pub unsafe fn slice_b128_into(words: &[crate::fields::scalar::B128; 128], out: &mut BinaryIndex32) {
+    slice_b128_raw(words.as_ptr() as *const u8, out)
+}
+
+/// The previous form of [`slice_b128_into`]: the words staged as 128 lifted `F162` and sliced by
+/// the `F162` front end. Kept as the reference of the B128 path's tests.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+pub unsafe fn slice_b128_staged_into(
+    words: &[crate::fields::scalar::B128; 128],
+    out: &mut BinaryIndex32,
+) {
     let mut staged: MaybeUninit<A64<[F162; 128]>> = MaybeUninit::uninit();
     let dst = (*staged.as_mut_ptr()).0.as_mut_ptr();
     for (i, w) in words.iter().enumerate() {

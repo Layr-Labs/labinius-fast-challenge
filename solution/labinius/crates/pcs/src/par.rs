@@ -215,8 +215,15 @@ impl Pool {
         }));
         // Started by the caller: workers started by the first worker (the caller's setup then
         // runs while they come up) measured the commitment 10 ms slower.
+        // Each worker is told the epoch the pool starts at, not left to read it when it first
+        // runs: a worker whose start-up is delayed past the first dispatches (its stack mapping
+        // waits for the mmap lock behind the table's population) would otherwise take an epoch
+        // published meanwhile for one it has already served, skip that dispatch and park
+        // through it — measured as a commitment run by seven runners, 12-26 ms slower, in about
+        // a third of the runs.
+        let start = epoch_of(shared.claim.load(Ordering::Acquire));
         let handles = (1..width)
-            .map(|_| std::thread::spawn(move || worker(shared)))
+            .map(|_| std::thread::spawn(move || worker(shared, start)))
             .collect();
         Pool {
             shared,
@@ -347,8 +354,9 @@ impl Pool {
     }
 }
 
-fn worker(s: &'static Shared) {
-    let mut seen = epoch_of(s.claim.load(Ordering::Acquire));
+/// A worker's loop. `seen` is the epoch the pool had when the worker was spawned: every later
+/// dispatch is one it has not served, however late the thread itself starts.
+fn worker(s: &'static Shared, mut seen: u64) {
     loop {
         // Wait for a dispatch with a task left to take: spin (doing idle work if there is any),
         // then park.

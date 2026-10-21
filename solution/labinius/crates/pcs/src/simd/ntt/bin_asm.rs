@@ -46,18 +46,20 @@
 //! 2^15 / q = 8.42 (3889) and 3.37 (9721), so **q = 3889 needs no Barrett at all**. For q = 9721
 //! the un-twiddled `a0` input of level 4 gets the **lookup Barrett** ([`barrett_lut_i16`]) and
 //! the one of level 6 the two-multiply `vpmulhrsw` Barrett ([`params::barrett_i16`]); level 5
-//! is left unreduced. The lookup Barrett spends no multiply-port slot at all:
+//! is left unreduced. The lookup Barrett spends no multiply slot at all:
 //!
 //! ```text
-//! vpmultishiftqb s, ctrl, a    p5   both bytes of every lane <- bits 11..18 of that lane
-//! vpandd         s, s, 1f1f    p05  drop the 3 junk bits (the neighbour lane's low bits)
-//! vpord          s, s, 2000    p05  +32 on the high byte: it indexes the other table half
-//! vpermb         s, s, tab     p5   byte-split 64-entry table: -k(s) q, lo at u, hi at 32 + u
-//! vpaddw         a, a, s       p05
+//! vpsrlw  s, a, 11        p0    s = bits 11..15 of the lane = (a >> 11) & 31
+//! vpermw  s, s, [wcorr]   p5    32-entry i16 table -k(s) q (vpermw reads index bits 0..4 only)
+//! vpaddw  a, a, s         p05
 //! ```
 //!
-//! i.e. 2 port-5 + 3 flexible uops against the two-multiply Barrett's 2 port-0 + 1 flexible, on
-//! a kernel whose port 0 is the bottleneck. The quotient window `(a >> 11) & 31` determines `a`
+//! (Sapphire Rapids: `vpermw` zmm is a single port-5 uop. The Tiger Lake schedule this kernel was
+//! first tuned on used a 5-uop byte-split form, `vpmultishiftqb` + `vpandd` + `vpord` + `vpermb`
+//! + `vpaddw`, because `vpermw` cost a port-0 slot there; it gives bit-identical results.)
+//!
+//! i.e. 3 uops against the two-multiply Barrett's 2 multiplies + 1 flexible. The quotient
+//! window `(a >> 11) & 31` determines `a`
 //! to within 2^11, so the nearest multiple of q leaves |r| <= q/2 + 2^10 = 0.579 q -- tighter
 //! than the `vpmulhrsw` estimate's 0.809 q (both exhaustive over all i16), and that is exactly
 //! what lets level 5 run unreduced: 3.323 q there is still inside the 3.371 q budget, while
@@ -98,11 +100,12 @@ pub struct Tables {
     /// core) does the lookup: byte n is the low half of entry n, byte 16+n the high half.
     lut: [[u8; 64]; 96],
     /// Full 512-bit constants used as memory operands / register constants by the asm tail:
-    /// `[q, om, omp, bv, ms, corr, and, or]` at byte offsets 0, 64, ... - `bv` is the old
-    /// `vpmulhrsw` Barrett constant (unused by the current schedule), `ms` the
-    /// `vpmultishiftqb` control, `corr` the byte-split `-k q` table and `and`/`or` the
-    /// index fix-up masks of the lookup Barrett (see `barrett_lut_i16`).
-    cv: [[i16; 32]; 8],
+    /// `[q, om, omp, bv, ms, corr, and, or, wcorr]` at byte offsets 0, 64, ... - `bv` is the
+    /// `vpmulhrsw` Barrett constant of level 6, `wcorr` the 32-entry i16 `-k q` table of the
+    /// level-4 lookup Barrett (`vpsrlw` + `vpermw`, see `barrett_lut_i16`); `ms`, `corr`, `and`
+    /// and `or` belong to the older byte-split `vpmultishiftqb`/`vpermb` form of that lookup and
+    /// are no longer read by the kernel.
+    cv: [[i16; 32]; 9],
     /// `[w, w', w2, w2']` (Montgomery twiddle and companion for zeta and zeta^2), each i16
     /// duplicated into a u32 so `vpbroadcastd` is a pure load.
     tw4: [[u32; 4]; 24],
@@ -179,9 +182,12 @@ const fn build_tables<const Q: u16>() -> Tables {
     let tw5 = r3_twiddles!(72, r3_pair::<Q>, Params::<Q>::ZETA_L5);
     let tw6 = r3_twiddles!(216, r3_pair::<Q>, Params::<Q>::ZETA_L6);
     let (oa, ob) = mont_pair::<Q>(Params::<Q>::OMEGA);
-    let mut cv = [[0i16; 32]; 8];
+    let mut cv = [[0i16; 32]; 9];
     let mut i = 0;
     while i < 32 {
+        // the level-4 lookup Barrett's `vpermw` table: word s is -k(s) q for the window
+        // s = a >> 11 (logical) = (a >> 11) & 31 (arithmetic) of the lane a.
+        cv[8][i] = barrett_lut_corr(i, Q);
         cv[0][i] = Q as i16;
         cv[1][i] = Params::<Q>::to_mont(Params::<Q>::OMEGA);
         cv[2][i] = Params::<Q>::mont_pre(Params::<Q>::to_mont(Params::<Q>::OMEGA));
@@ -253,10 +259,9 @@ const fn lut_byte(u: usize, q: u16) -> u8 {
     }
 }
 
-/// The kernel's level-4 reduction, lane-wise: `vpmultishiftqb` (the 5-bit window
-/// `(a >> 11) & 31` into both bytes of the lane), `vpandd` + `vpord` (drop the junk bits, +32 on
-/// the high byte), `vpermb` on the 64-byte byte-split table of `-k q`, `vpaddw` - **2 port-5 and
-/// 3 flexible uops, not one multiply-port slot**, against the two-multiply Barrett's 2 port-0
+/// The kernel's level-4 reduction, lane-wise: `vpsrlw 11` (the 5-bit window `(a >> 11) & 31`,
+/// as a logical shift of the lane), `vpermw` on the 32-entry i16 table of `-k q`, `vpaddw` -
+/// **3 uops, not one multiply slot**, against the two-multiply Barrett's 2 multiplies
 /// + 1 flexible. Exhaustively over all i16, `max |r| = 5625 = 0.579 q` for q = 9721, where
 /// [`params::barrett_i16`] only reaches 0.809 q - which is what makes the level-5 reduction
 /// droppable.
@@ -419,10 +424,10 @@ macro_rules! level4 {
      $o0:literal, $o1:literal, $o2:literal, $t:literal) => {
         concat!(
             level4!(plain $a0, $a1, $a2, $o0, $o1, $o2, $t),
-            "vpmultishiftqb zmm30, zmm31, zmm", $a0, "\n",
-            "vpandd zmm30, zmm30, dword ptr [{c}+384]{{1to16}}\n",
-            "vpord zmm30, zmm30, dword ptr [{c}+448]{{1to16}}\n",
-            "vpermb zmm30, zmm30, [{c}+320]\n",
+            // logical a >> 11 is the window (a >> 11) & 31 (bits 11..15 of the lane), and
+            // vpermw only reads the low 5 bits of each word index anyway.
+            "vpsrlw zmm30, zmm", $a0, ", 11\n",
+            "vpermw zmm30, zmm30, zmmword ptr [{c}+512]\n",
             "vpaddw zmm", $a0, ", zmm", $a0, ", zmm30\n",
         )
     };
@@ -567,7 +572,6 @@ unsafe fn tail27_p(
         out("zmm28") _,
         out("zmm29") _,
         out("zmm30") _,
-        out("zmm31") _,
         options(nostack)
     );
 }
@@ -584,7 +588,6 @@ unsafe fn tail27_b(
     core::arch::asm!(
         concat!(
             "vmovdqa64 zmm27, [{c}]\n",
-            "vmovdqa64 zmm31, [{c}+256]\n",
             tail27!(lut, barrett),
         ),
         i = in(reg) bp,
@@ -624,7 +627,6 @@ unsafe fn tail27_b(
         out("zmm28") _,
         out("zmm29") _,
         out("zmm30") _,
-        out("zmm31") _,
         options(nostack)
     );
 }

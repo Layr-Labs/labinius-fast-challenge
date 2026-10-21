@@ -66,14 +66,23 @@ const _:()={
  assert!(period(P0)==2 && period(P1)==1);
 };
 
-/// `acc + x . [k]` pairwise (`vpdpwssd` with a memory operand), as one instruction: written as
-/// `asm!` because LLVM otherwise splits chains of them into `vpmaddwd` + `vpaddd`.
+/// `acc + x . [k + OFF]` pairwise: one `vpdpwssd` with a memory operand. Written as `asm!`
+/// because LLVM splits `vpdpwssd` into `vpmaddwd` + `vpaddd` (twice the uops) whenever the
+/// accumulator is on a dependency chain, which here it always is; the displacement is a `const`
+/// operand so that the key address needs no `lea` of its own.
 #[inline(always)]
-unsafe fn dp(acc:__m512i,x:__m512i,k:*const i16)->__m512i {
+unsafe fn dp<const OFF:usize>(acc:__m512i,x:__m512i,k:*const i16)->__m512i {
  let mut r=acc;
- core::arch::asm!("vpdpwssd {r}, {x}, zmmword ptr [{k}]",r=inout(zmm_reg) r,x=in(zmm_reg) x,k=in(reg) k,
+ core::arch::asm!("vpdpwssd {r}, {x}, zmmword ptr [{k} + {o}]",r=inout(zmm_reg) r,x=in(zmm_reg) x,k=in(reg) k,o=const OFF,
   options(pure,readonly,nostack,preserves_flags));
  r
+}
+/// The base and tail accumulations of a transposed group: vector `q` of `x` against arranged
+/// key vectors `q` (base) and `T + q` (tail) of the group at `k`.
+macro_rules! dp_group {
+ ($sb:ident,$st:ident,$x:ident,$k:ident,$t:literal; $($q:literal),*) => {
+  $( $sb=dp::<{64*$q}>($sb,$x[$q],$k); $st=dp::<{64*($t+$q)}>($st,$x[$q],$k); )*
+ };
 }
 /// 8 x 8 qword transpose: qword slot `s` of output `q` is qword `q` of `r[s]` (24 shuffles).
 #[inline(always)]
@@ -101,11 +110,20 @@ unsafe fn tr4(r0:__m512i,r1:__m512i,r2:__m512i,r3:__m512i)->[__m512i;4] {
   _mm512_shuffle_i64x2::<0xDD>(t0,t2),_mm512_shuffle_i64x2::<0xDD>(t1,t3)]
 }
 
-/// The multiply-accumulate sink. With `PF` it also prefetches, into L2, the same block of the
-/// next batch's arranged keys (issued by the last column of a group, one column-pass before the
-/// first column of the next batch reads them).
-struct TSink<const PF:bool> {buf:*mut i16,k:*const i16,acc:*mut i32,nk:*const i8}
-impl<const PF:bool> BlockSink for TSink<PF> {
+/// The multiply-accumulate sink. With `RED` (the batch that ends a fold-back period) every
+/// accumulator vector is folded back ([`reduce_vec`]) on its way back to memory: the same values
+/// a separate pass over the column's accumulators after the batch would leave, without that
+/// pass's 192 loads and stores. (Software prefetching of the keys, of the next batch into L2 or
+/// of the next block into L1, only measured slower: the hardware streamers already follow the
+/// sequential key reads, and the extra requests compete for the fill buffers.)
+struct TSink<const Q:u16,const RED:bool> {buf:*mut i16,k:*const i16,acc:*mut i32}
+impl<const Q:u16,const RED:bool> TSink<Q,RED> {
+ #[inline(always)]
+ unsafe fn put(p:*mut __m512i,v:__m512i) {
+  _mm512_store_si512(p,if RED {reduce_vec::<Q>(v)} else {v});
+ }
+}
+impl<const Q:u16,const RED:bool> BlockSink for TSink<Q,RED> {
  #[inline(always)]unsafe fn dst(&mut self,_:usize)->*mut i16 {self.buf}
  #[target_feature(enable="avx512f,avx512bw")]
  unsafe fn block(&mut self,blk:usize,w:*const i16) {
@@ -117,8 +135,8 @@ impl<const PF:bool> BlockSink for TSink<PF> {
    let kg=k.add(32*16*g);
    let pb=acc.add(32*g) as *mut __m512i;let pt=acc.add(32*g+16) as *mut __m512i;
    let mut sb=_mm512_load_si512(pb);let mut st=_mm512_load_si512(pt);
-   for q in 0..8 {sb=dp(sb,x[q],kg.add(32*q));st=dp(st,x[q],kg.add(32*(8+q)));}
-   _mm512_store_si512(pb,sb);_mm512_store_si512(pt,st);
+   dp_group!(sb,st,x,kg,8; 0,1,2,3,4,5,6,7);
+   Self::put(pb,sb);Self::put(pt,st);
   }
   let r24=_mm512_load_si512(w.add(32*24) as *const __m512i);
   let r25=_mm512_load_si512(w.add(32*25) as *const __m512i);
@@ -127,29 +145,19 @@ impl<const PF:bool> BlockSink for TSink<PF> {
   let kg=k.add(32*48);
   let pb=acc.add(32*3) as *mut __m512i;let pt=acc.add(32*3+16) as *mut __m512i;
   let mut sb=_mm512_load_si512(pb);let mut st=_mm512_load_si512(pt);
-  for c in 0..4 {sb=dp(sb,x[c],kg.add(32*c));st=dp(st,x[c],kg.add(32*(4+c)));}
-  _mm512_store_si512(pb,sb);_mm512_store_si512(pt,st);
-  if PF {for i in 0..KBLK {_mm_prefetch(self.nk.add(64*(KBLK*blk+i)),_MM_HINT_T1);}}
+  dp_group!(sb,st,x,kg,4; 0,1,2,3);
+  Self::put(pb,sb);Self::put(pt,st);
  }
 }
-/// One column's batch modulo `Q` (`keys[2b]` for 3889, `keys[2b + 1]` for 9721).
+/// One column's batch `b` modulo `Q` (`keys[2b]` for 3889, `keys[2b + 1]` for 9721), folded back
+/// when it ends a period.
 #[inline(always)]
-unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,bp:*mut i16,keys:&[KeyBatch],b:usize,acc:*mut i32,pf:bool) {
- let p=if Q==P0 {0} else {1};
- let k=keys[2*b+p].v.as_ptr() as *const i16;
- if pf {
-  let nk=keys[2*b+2+p].v.as_ptr() as *const i8;
-  vb::ntt_bin_batch32_sink::<Q,_>(idx,&mut TSink::<true>{buf:bp,k,acc,nk});
+unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,bp:*mut i16,keys:&[KeyBatch],b:usize,acc:*mut i32) {
+ let k=keys[2*b+if Q==P0 {0} else {1}].v.as_ptr() as *const i16;
+ if (b+1)%period(Q)==0 {
+  vb::ntt_bin_batch32_sink::<Q,_>(idx,&mut TSink::<Q,true>{buf:bp,k,acc});
  } else {
-  vb::ntt_bin_batch32_sink::<Q,_>(idx,&mut TSink::<false>{buf:bp,k,acc,nk:core::ptr::null()});
- }
-}
-/// The periodic fold-back of both streams.
-#[target_feature(enable="avx512f,avx512bw")]
-unsafe fn reduce_group<const Q:u16>(acc:*mut i32) {
- for i in 0..24*ABLK {
-  let p=acc.add(16*i) as *mut __m512i;
-  _mm512_store_si512(p,reduce_vec::<Q>(_mm512_load_si512(p)));
+  vb::ntt_bin_batch32_sink::<Q,_>(idx,&mut TSink::<Q,false>{buf:bp,k,acc});
  }
 }
 const EVEN:[i32;16]=[0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30];
@@ -271,11 +279,8 @@ unsafe fn group(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mut Worker,out:*mu
   for c in 0..g {
    cols[c].slice_batch(b,&mut ws.idx[0]);
    let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;
-   let pf=c+1==g && b+1<nb;
-   sink_batch::<P0>(&ws.idx[0],bp,keys,b,a0,pf);
-   sink_batch::<P1>(&ws.idx[0],bp,keys,b,a1,pf);
-   if (b+1)%period(P0)==0 {reduce_group::<P0>(a0);}
-   if (b+1)%period(P1)==0 {reduce_group::<P1>(a1);}
+   sink_batch::<P0>(&ws.idx[0],bp,keys,b,a0);
+   sink_batch::<P1>(&ws.idx[0],bp,keys,b,a1);
   }
   if (b+1)%CHUNK_BATCHES==0 || b+1==nb {
    let (p0,p1)=ws.pend.split_at_mut(1);

@@ -1364,10 +1364,29 @@ mod bitsliced {
     const LANES: usize = 512;
     const SLOTS: usize = 243;
     const BITS: usize = 15;
-    /// Columns per group: 16 * 129 planes, 132 KB per worker (measured on the full instance:
-    /// 19.8 ms at 16 columns, 19.9 at 12 and 20, 20.0 at 24, 20.6 at 31, 21.6 at 63). The
-    /// planes of a group (`GUARD + COL_GROUP * STRIDE`) must keep the qword offsets in u16.
-    const COL_GROUP: usize = 16;
+    /// Columns per group: the unit the fold's schedule is built and its counters accumulated
+    /// over, so the group size trades fewer schedules (less padding) and fewer
+    /// `accumulate_pair` calls against a bigger plane buffer (`group * 129 * 64 B` per worker).
+    /// The previous value, 16, was tuned on an i7-11850H (19.8 ms at 16 columns, 19.9 at 12
+    /// and 20, 20.0 at 24, 20.6 at 31, 21.6 at 63); on the class of machine the challenge
+    /// runs on, 48 columns per group is 3.9 % faster than 16 (interleaved rounds, medians:
+    /// 32.88 ms at 16, 32.36 at 32, 31.88 at 40, 31.59 at 48, 32.09 at 56). The planes of a
+    /// group (`GUARD + COL_GROUP * STRIDE`) must keep the qword offsets in u16, which caps the
+    /// group at 63 columns.
+    const COL_GROUP: usize = 48;
+    /// The group size the fold runs with: columns per group, i.e. the unit the
+    /// schedule is built and the counters are accumulated over. A bigger group means
+    /// fewer schedules (less padding) and fewer `accumulate_pair` calls, against a
+    /// bigger plane buffer; measured on the target's class of machine, 48 columns
+    /// per group is the optimum, and 16 (the value the previous solver tuned on an
+    /// i7) is 4 % slower. The plane offsets are u16, which caps the group at 63.
+    fn group_size() -> usize {
+        static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *SIZE.get_or_init(|| match std::env::var("LABINIUS_FOLD_GROUP") {
+            Ok(v) => v.parse::<usize>().unwrap_or(COL_GROUP),
+            Err(_) => COL_GROUP,
+        })
+    }
     /// Planes per column: the 128 direct planes and a zero guard, which is also the next
     /// column's leading guard. Every term's 128-plane run is flanked by zero planes, so a window
     /// of two consecutive slots reads a zero wherever the term does not reach, with no edge
@@ -1388,7 +1407,7 @@ mod bitsliced {
     /// challenge term and the padding of every group.
     pub(super) fn fits(challenges: &[ShortChallenge]) -> bool {
         let weight: usize = challenges.iter().map(|c| c.weight).sum();
-        weight + PAD_PER_GROUP * challenges.len().div_ceil(COL_GROUP) <= i16::MAX as usize
+        weight + PAD_PER_GROUP * challenges.len().div_ceil(group_size()) <= i16::MAX as usize
     }
 
     struct Group {
@@ -1405,7 +1424,7 @@ mod bitsliced {
 
     /// The schedule of column group `g` (columns `cs`), and per slot pair the number of its
     /// negative entries (padding included): each adds one to the bias of both slots.
-    fn plan_group<const GROUP: usize>(g: usize, cs: &[ShortChallenge]) -> (Group, [i32; PAIRS]) {
+    fn plan_group(group: usize, g: usize, cs: &[ShortChallenge]) -> (Group, [i32; PAIRS]) {
         // A term's run `[m, end)` of slots meets slot pair `q` when `2q <= end - 1` and
         // `2q + 1 >= m`, i.e. `q` in `[m / 2, (end - 1) / 2]`; the wrapped run `[0, wrap)`
         // meets pairs `[0, (wrap - 1) / 2]`, with the opposite sign (`Y^243 = -1`).
@@ -1430,7 +1449,7 @@ mod bitsliced {
             }
         }
         let mut group = Group {
-            first: g * GROUP,
+            first: g * group,
             columns: cs.len(),
             offsets: [0; PAIRS + 1],
             mid: [0; PAIRS],
@@ -1484,12 +1503,12 @@ mod bitsliced {
         (group, negatives)
     }
 
-    fn plan<const GROUP: usize>(challenges: &[ShortChallenge], workers: usize) -> (Vec<Group>, [i32; SLOTS]) {
-        let jobs = challenges.len().div_ceil(GROUP);
+    fn plan(group_size: usize, challenges: &[ShortChallenge], workers: usize) -> (Vec<Group>, [i32; SLOTS]) {
+        let jobs = challenges.len().div_ceil(group_size);
         let group = |g: usize| {
-            let first = g * GROUP;
-            let last = (first + GROUP).min(challenges.len());
-            plan_group::<GROUP>(g, &challenges[first..last])
+            let first = g * group_size;
+            let last = (first + group_size).min(challenges.len());
+            plan_group(group_size, g, &challenges[first..last])
         };
         // The schedule is independent for each public column group; the pool's parked
         // workers take the groups, and the merge keeps column order.
@@ -1974,21 +1993,22 @@ mod bitsliced {
         column_words: usize,
         workers: usize,
     ) -> Vec<RingElement> {
-        fold_config::<COL_GROUP>(words, challenges, column_words, workers)
+        fold_config(group_size(), words, challenges, column_words, workers)
     }
 
-    fn fold_config<const GROUP: usize>(
+    fn fold_config(
+        group_size: usize,
         words: &[B128],
         challenges: &[ShortChallenge],
         column_words: usize,
         workers: usize,
     ) -> Vec<RingElement> {
-        assert!(GROUP > 0 && (GUARD + GROUP * STRIDE) * 8 <= u16::MAX as usize);
+        assert!(group_size > 0 && (GUARD + group_size * STRIDE) * 8 <= u16::MAX as usize);
         #[cfg(test)]
         let profile = std::env::var_os("LABINIUS_BITFOLD_PROFILE").is_some();
         #[cfg(test)]
         let plan_start = std::time::Instant::now();
-        let (groups, bias) = plan::<GROUP>(challenges, workers);
+        let (groups, bias) = plan(group_size, challenges, workers);
         #[cfg(test)]
         if profile {
             eprintln!("bitfold plan_us={}", plan_start.elapsed().as_micros());
@@ -2001,8 +2021,10 @@ mod bitsliced {
         // Tasks are (block, part of the column groups), handed out dynamically so a busy or
         // shared core does fewer of them; the second part of a block to finish adds its counts
         // to the first's (counts are additive and stay within the total weight) and writes.
-        // Parts of the column groups a block is split over. One part keeps the whole
-        // block in one task: no second thread to hand the counts to, and no merge.
+        // Parts of the column groups a block is split over. A part is one task's
+        // sweep over the table. Two parts balance the sweep against the merge
+        // of the parts' counters: one part leaves a task touching 2048 distinct
+        // 4 KB pages at once, and four parts pay for their merge.
         const PARTS: usize = 2;
         let parts = match std::env::var("LABINIUS_FOLD_PARTS") {
             Ok(v) => v.parse::<usize>().unwrap_or(PARTS),
@@ -2021,7 +2043,7 @@ mod bitsliced {
         crate::par::pool().run(workers.clamp(1, tasks), |_| unsafe {
             let zero = _mm512_setzero_si512();
             // Zero everywhere the columns do not write: the guards and the padding pair.
-            let mut planes = vec![zero; GUARD + GROUP * STRIDE];
+            let mut planes = vec![zero; GUARD + group_size * STRIDE];
             let mut acc = vec![zero; 2 * PAIRS * BITS];
             // One counts buffer per worker, for the case where a task owns a whole
             // block: `unslice` writes every lane, so the buffer never has to be

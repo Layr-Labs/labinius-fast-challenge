@@ -1842,6 +1842,23 @@ mod bitsliced {
         }
     }
 
+    /// Add nonnegative 15-bit counters without converting their 512 lanes to integers.
+    /// The total schedule bound checked by fits() also bounds every partial sum; test
+    /// the carry out of every slot, including the final pair's dummy slot, explicitly.
+    #[inline(always)]
+    unsafe fn merge_bit_counts(acc: &mut [__m512i], other: &[__m512i]) {
+        assert_eq!(acc.len(), other.len());
+        assert_eq!(acc.len() % BITS, 0);
+        let zero = _mm512_setzero_si512();
+        for (dst, src) in acc.chunks_exact_mut(BITS).zip(other.chunks_exact(BITS)) {
+            let mut carry = zero;
+            for bit in 0..BITS {
+                carry = csa(&mut dst[bit], src[bit], carry);
+            }
+            assert_eq!(_mm512_test_epi64_mask(carry, carry), 0, "bitfold counter merge overflow");
+        }
+    }
+
     /// Inverse bit transpose to 512 ordinary 16-bit lane counts.
     #[inline(always)]
     unsafe fn unslice(acc: *const __m512i, out: &mut [i16; LANES]) {
@@ -1983,6 +2000,21 @@ mod bitsliced {
         column_words: usize,
         workers: usize,
     ) -> Vec<RingElement> {
+        const PARTS: usize = 2;
+        let parts = match std::env::var("LABINIUS_FOLD_PARTS") {
+            Ok(v) => v.parse::<usize>().unwrap_or(PARTS),
+            Err(_) => PARTS,
+        };
+        fold_parts::<GROUP>(words, challenges, column_words, workers, parts)
+    }
+
+    fn fold_parts<const GROUP: usize>(
+        words: &[B128],
+        challenges: &[ShortChallenge],
+        column_words: usize,
+        workers: usize,
+        requested_parts: usize,
+    ) -> Vec<RingElement> {
         assert!(GROUP > 0 && (GUARD + GROUP * STRIDE) * 8 <= u16::MAX as usize);
         #[cfg(test)]
         let profile = std::env::var_os("LABINIUS_BITFOLD_PROFILE").is_some();
@@ -1998,21 +2030,14 @@ mod bitsliced {
         // Counters and bias are at most the total weight (checked by the caller), which is
         // what lets the output stage subtract them in i16 lanes.
         assert!(bias.iter().all(|&b| (0..=i16::MAX as i32).contains(&b)));
-        // Tasks are (block, part of the column groups), handed out dynamically so a busy or
-        // shared core does fewer of them; the second part of a block to finish adds its counts
-        // to the first's (counts are additive and stay within the total weight) and writes.
+        // Tasks are (block, part of the column groups). The last part to finish adds
+        // the other parts' bit counters, then unslices and writes the block once.
         // Parts of the column groups a block is split over. One part keeps the whole
         // block in one task: no second thread to hand the counts to, and no merge.
-        const PARTS: usize = 2;
-        let parts = match std::env::var("LABINIUS_FOLD_PARTS") {
-            Ok(v) => v.parse::<usize>().unwrap_or(PARTS),
-            Err(_) => PARTS,
-        }
-        .max(1)
-        .min(groups.len().max(1));
+        let parts = requested_parts.max(1).min(groups.len().max(1));
         let cuts: Vec<usize> = (0..=parts).map(|i| groups.len() * i / parts).collect();
         let tasks = blocks * parts;
-        let pending: Vec<std::sync::Mutex<Vec<Vec<[i16; LANES]>>>> =
+        let pending: Vec<std::sync::Mutex<Vec<Vec<__m512i>>>> =
             (0..blocks).map(|_| std::sync::Mutex::new(Vec::new())).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let mut out: Vec<RingElement> = Vec::with_capacity(len);
@@ -2023,9 +2048,8 @@ mod bitsliced {
             // Zero everywhere the columns do not write: the guards and the padding pair.
             let mut planes = vec![zero; GUARD + GROUP * STRIDE];
             let mut acc = vec![zero; 2 * PAIRS * BITS];
-            // One counts buffer per worker, for the case where a task owns a whole
-            // block: `unslice` writes every lane, so the buffer never has to be
-            // cleared, and the task writes straight out of it.
+            // Reuse one counts buffer per worker. With multiple parts it is allocated
+            // only when this worker first completes a block; unslice overwrites every lane.
             let mut counts = if parts == 1 { vec![[0i16; LANES]; SLOTS] } else { Vec::new() };
             loop {
                 let task = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2069,28 +2093,24 @@ mod bitsliced {
                     write_counts(&counts, bias, output);
                     continue;
                 }
-                let mut own = vec![[0i16; LANES]; SLOTS];
-                for s in 0..SLOTS {
-                    unslice(acc.as_ptr().add(s * BITS), &mut own[s]);
-                }
-                let mut done = {
+                let done = {
                     let mut v = pending[block].lock().unwrap();
-                    v.push(own);
-                    if v.len() < parts {
+                    if v.len() + 1 < parts {
+                        v.push(core::mem::replace(&mut acc, vec![zero; 2 * PAIRS * BITS]));
                         continue;
                     }
                     core::mem::take(&mut *v)
                 };
-                let mut total = done.pop().unwrap();
+                // The mutex is released before the merge. This last task retains its own
+                // accumulator and the sole right to write this block's output.
                 for other in &done {
-                    for (t, o) in total.iter_mut().zip(other) {
-                        for (a, b) in t.iter_mut().zip(o) {
-                            *a += *b;
-                        }
-                    }
+                    merge_bit_counts(&mut acc, other);
+                }
+                if counts.is_empty() {
+                    counts.resize(SLOTS, [0i16; LANES]);
                 }
                 let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
-                write_counts(&total, bias, output);
+                write_block(acc.as_ptr(), &mut counts, bias, output);
             }
         });
         // Every task wrote its whole range.
@@ -2115,6 +2135,54 @@ mod bitsliced {
         fn challenges(n: usize) -> Vec<ShortChallenge> {
             let mut t = Transcript::new(b"labinius/test/bitfold");
             (0..n).map(|_| sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0).collect()
+        }
+
+        #[test]
+        fn bitfold_merge_counters_matches_scalar() {
+            let cases = [(0u16, 0u16, 0u16), (1, 0, 0), (0, 1, 0),
+                (16383, 0, 0), (16383, 1, 0), (16384, 0, 0),
+                (16383, 16384, 0), (10922, 10922, 10923), (1, 1, 32765)];
+            unsafe {
+                let zero = _mm512_setzero_si512();
+                let mut parts: Vec<Vec<__m512i>> = (0..3)
+                    .map(|_| vec![zero; 2 * PAIRS * BITS]).collect();
+                for slot in 0..2 * PAIRS {
+                    for bit in 0..BITS {
+                        let mut planes = [[0u64; 8]; 3];
+                        for lane in 0..LANES {
+                            let (a, b, c) = cases[(slot + lane) % cases.len()];
+                            for (part, value) in [a, b, c].into_iter().enumerate() {
+                                planes[part][lane / 64] |= ((value >> bit & 1) as u64) << (lane % 64);
+                            }
+                        }
+                        for part in 0..3 {
+                            parts[part][slot * BITS + bit] = core::mem::transmute(planes[part]);
+                        }
+                    }
+                }
+                let mut total = parts.remove(0);
+                for other in &parts { merge_bit_counts(&mut total, other); }
+                let mut counts = [0i16; LANES];
+                for slot in 0..2 * PAIRS {
+                    unslice(total.as_ptr().add(slot * BITS), &mut counts);
+                    for lane in 0..LANES {
+                        let (a, b, c) = cases[(slot + lane) % cases.len()];
+                        assert_eq!(counts[lane] as u16, a + b + c, "slot {slot}, lane {lane}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn bitfold_parts_and_ragged_groups_match_scalar() {
+            let columns = 2 * COL_GROUP + 3;
+            let words = table(columns * LANES);
+            let cs = challenges(columns);
+            let expected = scalar(&words, &cs, LANES);
+            for parts in [1, 2, 3] {
+                assert_eq!(fold_parts::<COL_GROUP>(&words, &cs, LANES, 3, parts), expected,
+                    "parts {parts}");
+            }
         }
 
         #[test]

@@ -428,7 +428,8 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
     // lanes of unfilled slots still hold the previous flush's coefficients
     if filled*g<32 {clear_lanes(&mut p0[0],filled*g);clear_lanes(&mut p1[0],filled*g);}
     p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
-    gen_small::intt_gen_batch32::<P0>(&mut p0[0]);gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
+    // finish_tails uses red16: every live lane has |r| < 2q; unused lanes are zero.
+    gen_small::intt_hybrid_batch32_3889(&mut p0[0]);gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
     crt_accumulate(&p0[0],&p1[0],&mut ws.total[0]);
     filled=0;
    }

@@ -359,6 +359,15 @@ static PHASE: LazyLock<(Vec<f64>, Vec<f64>)> = LazyLock::new(|| {
     (re, im)
 });
 
+/// Build the sampler's lazily computed tables (the phase table, the sign key) now, on this
+/// thread. Left to the first sample, the 26k-entry phase table is built by one thread of the
+/// parallel sampler while the others block on it.
+pub fn warm() {
+    LazyLock::force(&UNITS);
+    LazyLock::force(&PHASE);
+    LazyLock::force(&SIGN_KEY);
+}
+
 #[inline(always)]
 unsafe fn accumulate<const V: usize>(
     c: &ShortChallenge,

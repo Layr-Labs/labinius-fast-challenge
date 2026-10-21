@@ -21,16 +21,16 @@ mod parameters;
 mod rq;
 
 fn main() {
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("key.bin");
+    let dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed=src/keygen.rs");
     println!("cargo:rerun-if-changed=src/modulus_choice.rs");
     println!("cargo:rerun-if-changed=src/parameters.rs");
     println!("cargo:rerun-if-changed=src/rq.rs");
     println!("cargo:rerun-if-changed=build.rs");
-    let image = key_image();
-    std::fs::write(&out, image).expect("write the key image");
-    let tail=PathBuf::from(env::var("OUT_DIR").unwrap()).join("tail-key.bin");
-    std::fs::write(tail,tail_image()).expect("write the auxiliary key image");
+    let (image, tail, hybrid) = images();
+    std::fs::write(dir.join("key.bin"), image).expect("write the key image");
+    std::fs::write(dir.join("tail-key.bin"), tail).expect("write the auxiliary key image");
+    std::fs::write(dir.join("hybrid-key.bin"), hybrid).expect("write the arranged hybrid key image");
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -44,30 +44,28 @@ fn host_can_run() -> bool {
         && is_x86_feature_detected!("gfni")
 }
 
+/// The key image, and for the hybrid modulus the tail key's image and both keys arranged for
+/// the hybrid commitment's sink (`labinius::simd::commit::hybrid::arranged_image`), each key
+/// built once.
 #[cfg(target_arch = "x86_64")]
-fn key_image() -> Vec<u8> {
+fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     // The library's kernels need these features at run time. A build host without them (for
-    // instance a cross-build for the scored CPU) writes an empty image and the prover builds the
-    // key when it runs; the scored runner has every one of them.
+    // instance a cross-build for the scored CPU) writes empty images and the prover builds the
+    // keys when it runs; the scored runner has every one of them.
     if !host_can_run() {
-        return Vec::new();
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let key = keygen::build_key(parameters::MODULUS);
-    keygen::key_image(&key)
+    let image = keygen::key_image(&key);
+    if parameters::MODULUS != modulus_choice::HYBRID_MODULUS {
+        return (image, Vec::new(), Vec::new());
+    }
+    let tail = keygen::build_tail_key(parameters::MODULUS);
+    let hybrid = labinius::simd::commit::hybrid::arranged_image(&key, &tail);
+    (image, keygen::key_image(&tail), hybrid)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn key_image() -> Vec<u8> {
-    Vec::new()
+fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    (Vec::new(), Vec::new(), Vec::new())
 }
-
-#[cfg(target_arch="x86_64")]
-fn tail_image()->Vec<u8> {
- // Same host guard as `key_image`: an empty image makes the prover build the tail key at run time.
- if !host_can_run() { return Vec::new(); }
- if parameters::MODULUS==modulus_choice::HYBRID_MODULUS {
-  keygen::key_image(&keygen::build_tail_key(parameters::MODULUS))
- } else {Vec::new()}
-}
-#[cfg(not(target_arch="x86_64"))]
-fn tail_image()->Vec<u8> {Vec::new()}

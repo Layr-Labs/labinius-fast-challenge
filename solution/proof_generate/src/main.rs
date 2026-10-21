@@ -283,6 +283,7 @@ fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
 
 /// `rq::pack_ring_elements`, byte for byte, into a sized buffer in parallel: `coefficient_bytes`
 /// little-endian bytes per coefficient, no header.
+#[cfg(test)]
 fn pack_coefficients(coefficients: &[u128], modulus: u128) -> Vec<u8> {
     let width = rq::coefficient_bytes(modulus);
     let mut out = vec![0u8; width * coefficients.len()];
@@ -394,20 +395,23 @@ impl Garner {
 /// modulo limb `k`. Each limb's rows go through that limb's inverse transform
 /// ([`labinius::bd::coefficients_from_rows`]) 32 columns at a time, and Garner's algorithm
 /// lifts the residues to the single integer modulo their product; the lift is exact because
-/// `modulus` is that product. The column blocks are independent and run on `workers` threads.
-fn commitment_coefficients_rows(
+/// `modulus` is that product. The column blocks are independent and run on `workers` threads,
+/// and each block packs directly into its own range of proof bytes.
+fn commitment_bytes_rows(
     rows: &[[u32; N]],
     primes: &[u16],
     modulus: u128,
     columns: usize,
     workers: usize,
-) -> Vec<u128> {
+) -> Vec<u8> {
     let limbs = primes.len();
     let hybrid=modulus==modulus_choice::HYBRID_MODULUS;
     let stride=if hybrid {3}else{limbs};
     assert_eq!(rows.len(), columns * stride);
     let garner = Garner::of(primes);
-    let mut out = vec![0u128; columns * N];
+    let width = rq::coefficient_bytes(modulus);
+    assert!(!hybrid || width == 5);
+    let mut out = vec![0u8; columns * N * width];
     let blocks = columns.div_ceil(32);
     let runs = labinius::par::ranges(blocks, workers, 1);
     let out_addr = out.as_mut_ptr() as usize;
@@ -427,28 +431,44 @@ fn commitment_coefficients_rows(
                 let refs: Vec<&[u32; N]> = (0..cols).map(|c| &rows[(c0 + c) * stride + k]).collect();
                 labinius::bd::coefficients_from_rows(primes[k], &refs, &mut residues[k][..cols * N]);
             }
-            // Block `blk` owns coefficients `c0 * N .. (c0 + cols) * N` of `out`.
-            let dst = unsafe { (out_addr as *mut u128).add(c0 * N) };
-            for i in 0..cols * N {
-                for k in 0..limbs {
-                    at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+            // Block `blk` owns these disjoint, fixed-width wire coefficients.
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut u8).add(c0 * N * width), cols * N * width)
+            };
+            if hybrid {
+                for (i, word) in dst.chunks_exact_mut(5).enumerate() {
+                    let value = lift_hybrid(residues[0][i], residues[1][i], rows[(c0 + i / N) * 3 + 2][i % N]);
+                    debug_assert!((value as u128) < modulus);
+                    word.copy_from_slice(&value.to_le_bytes()[..5]);
                 }
-                let mut value = garner.lift(&at, &mut mixed);
-                if hybrid {
-                    let tail=rows[(c0+i/N)*3+2][i%N] as u64;
-                    let digit=tail.wrapping_sub(value as u64).wrapping_mul(153)&1023;
-                    value+=(3889u128*9721)*(digit as u128);
+            } else {
+                for (i, word) in dst.chunks_exact_mut(width).enumerate() {
+                    for k in 0..limbs {
+                        at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+                    }
+                    let value = garner.lift(&at, &mut mixed);
+                    debug_assert!(value < modulus);
+                    word.copy_from_slice(&value.to_le_bytes()[..width]);
                 }
-                debug_assert!(value < modulus);
-                unsafe { dst.add(i).write(value) };
             }
         }
     });
     out
 }
 
+/// The hybrid modulus's lift with constant reductions: centered residues modulo 3889 and 9721
+/// (3889^-1 mod 9721 = 3242), then the 1024 digit from the tail row's residue.
+#[inline(always)]
+fn lift_hybrid(r0: i16, r1: i16, tail: u32) -> u64 {
+    let a = (if r0 < 0 { r0 as i32 + 3889 } else { r0 as i32 }) as u64;
+    let b = (if r1 < 0 { r1 as i32 + 9721 } else { r1 as i32 }) as u64;
+    let value = a + 3889 * (((b + 9721 - a) * 3242) % 9721);
+    let digit = (tail as u64).wrapping_sub(value).wrapping_mul(153) & 1023;
+    value + 3889 * 9721 * digit
+}
+
 /// The baseline's recombination through the library's commitment matrix, kept as the reference
-/// the tests check [`commitment_coefficients_rows`] against.
+/// the tests check [`commitment_bytes_rows`] against.
 #[cfg(test)]
 fn commitment_coefficients(commitment: &Commitment, primes: &[u16], modulus: u128) -> Vec<u128> {
     let residues = labinius::bd::column_coefficients(commitment.matrix(), primes);
@@ -575,8 +595,8 @@ fn prove_with_storage(seed: &[u8; 32], modulus: u128, table_path: &str) -> (Proo
     // The switch's buffers: huge pages requested, faulted in by their first writers on every
     // core. (A thread touching them during the commitment ran on a hyperthread sibling of a
     // commitment worker and cost the commitment more than it saved the expansion.)
-    // The first eighth of the expansion is all the switch reads.
-    let mut eq = cf::HugeBuf::<B128>::new(1 << (LOG_PACKED - 3));
+    // The first sixteenth of the expansion is all the switch reads.
+    let mut eq = cf::HugeBuf::<B128>::new(1 << (LOG_PACKED - 4));
     let planes = cf::LeanSwitch::planes(1 << LOG_PACKED);
     let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
     let p = params(&primes);
@@ -593,26 +613,23 @@ fn prove_with_storage(seed: &[u8; 32], modulus: u128, table_path: &str) -> (Proo
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
     let rows = if modulus==modulus_choice::HYBRID_MODULUS {
         let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
-        labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&columns,workers,8)
+        labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&columns,workers,16)
     } else {key.commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
     let commit_time = clock.elapsed();
-    let commitment = pack_coefficients(
-        &commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, workers),
-        modulus,
-    );
+    let commitment = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers);
     let recombine_time = clock.elapsed();
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
     // A coordinate equal to one (probability 2^-128 per coordinate) has no half ratio: the
     // baseline's prover over its own full workspace takes over for the whole switch.
     let degenerate = hi.iter().any(|&r| r == B128::ONE);
-    let eighths = if degenerate {
+    let prefix_sets = if degenerate {
         None
     } else {
-        Some(unsafe { cf::eq_expand_and_partials_eighths(&hi, values, eq.as_mut_ptr(), workers) })
+        Some(unsafe { cf::eq_expand_and_partials_sixteenths(&hi, values, eq.as_mut_ptr(), workers) })
     };
-    let partials = match &eighths {
-        Some(sets) => cf::partials_from_eighths(sets, &hi),
+    let partials = match &prefix_sets {
+        Some(sets) => cf::partials_from_sixteenths(sets, &hi),
         None => {
             let mut ws = cf::Workspace::new(LOG_PACKED, 1);
             ws.partial_evals(0, values, &hi)
@@ -623,10 +640,10 @@ fn prove_with_storage(seed: &[u8; 32], modulus: u128, table_path: &str) -> (Proo
     t.absorb_b128(&partials);
     let partials_time = clock.elapsed();
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let lean = eighths.and_then(|sets| {
+    let lean = prefix_sets.and_then(|sets| {
         // Only the nondegenerate path initialized this prefix.
         let eq_words: &[B128] = unsafe { eq.as_slice() };
-        cf::LeanSwitch::with_eighths(values, eq_words, &hi, &batch, workers, planes, sets)
+        cf::LeanSwitch::with_sixteenths(values, eq_words, &hi, &batch, workers, planes, sets)
     });
     let (rounds, coords, opened) = match lean {
         Some(mut sw) => switch_rounds(&mut sw, &mut t),
@@ -1041,7 +1058,8 @@ mod tests {
         let coefficients = commitment_coefficients(&commitment, &primes, modulus);
         let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
         let rows = pp.key().commit_columns_rows(&columns, 3, 4);
-        let direct = commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, 3);
+        let direct = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, 3);
+        let direct = rq::unpack_ring_elements(&direct, COLUMNS * N, modulus).unwrap();
         assert_eq!(coefficients, direct, "the two recombinations differ");
         for j in [0usize, COLUMNS - 1] {
             let column = &w.elements()[j * COLUMN_LEN..(j + 1) * COLUMN_LEN];
@@ -1114,7 +1132,8 @@ mod tests {
         let values=t.sample_b128(b"binary",ring*4*columns);
         let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
         let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,4);
-        let coefficients=commitment_coefficients_rows(&rows,&primes,q,columns,3);
+        let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,3);
+        let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
         for c in 0..columns {
             let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
             assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);

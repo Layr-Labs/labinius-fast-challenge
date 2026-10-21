@@ -1,9 +1,9 @@
 //! Forward NTT for **binary** inputs in the vertical batch-of-32 layout, with levels 4, 5 and 6
 //! hand-scheduled in one `asm!` block per 27-block (27 zmm data registers resident).
 //! Generated; see the report for the schedule variants tried.
-//! For q = 3889 bit-identical to `ntt::bin_small` (same operation order per butterfly); for
-//! q = 9721 it reduces at different levels and with a different Barrett (see Bounds below), so
-//! the two agree modulo q and this one's lanes are the smaller representatives.
+//! Agrees with `ntt::bin_small` modulo q: the s2 = 1 half of every 162-block reuses the s2 = 0
+//! lookups (see the kernel), and for q = 9721 it also reduces at different levels and with a
+//! different Barrett (see Bounds below).
 //!
 //! Levels 0, 1, 2 and the level-3 twiddles are all folded into 16-entry lookup tables indexed by
 //! the 4-bit nibble (b_i, b_{i+162}, b_{i+324}, b_{i+486}) of each polynomial; levels 3..6 are radix-3
@@ -44,9 +44,12 @@
 //! | level 6 (output) |   7.50 q |   2.30 q |
 //!
 //! 2^15 / q = 8.42 (3889) and 3.37 (9721), so **q = 3889 needs no Barrett at all**. For q = 9721
-//! the un-twiddled `a0` input of level 4 gets the **lookup Barrett** ([`barrett_lut_i16`]) and
-//! the one of level 6 the two-multiply `vpmulhrsw` Barrett ([`params::barrett_i16`]); level 5
-//! is left unreduced. The lookup Barrett spends no multiply-port slot at all:
+//! the un-twiddled `a0` input of levels 4 and 6 gets the **lookup Barrett** ([`barrett_lut_i16`]);
+//! level 5 is left unreduced. (Level 6 used the two-multiply `vpmulhrsw` Barrett
+//! ([`params::barrett_i16`]) until the scored machine turned out not to be bound by the uop
+//! count the way the development core was: the lookup form there trades two multiply-port uops
+//! for two port-5 uops per reduction, 432 and 864 per batch, as a probe of which port binds.)
+//! The lookup Barrett spends no multiply-port slot at all:
 //!
 //! ```text
 //! vpmultishiftqb s, ctrl, a    p5   both bytes of every lane <- bits 11..18 of that lane
@@ -268,8 +271,8 @@ pub fn barrett_lut_i16(a: i16, q: u16) -> i16 {
 /// Which of levels 4, 5 and 6 reduce their un-twiddled `a0` input with the lookup Barrett
 /// ([`barrett_lut_i16`]) and which with the two-multiply one ([`params::barrett_i16`]),
 /// for q = 9721; q = 3889 reduces nothing.
-pub const LUT_BARRETT_LEVELS: [bool; 3] = [true, false, false];
-pub const MUL_BARRETT_LEVELS: [bool; 3] = [false, false, true];
+pub const LUT_BARRETT_LEVELS: [bool; 3] = [true, false, true];
+pub const MUL_BARRETT_LEVELS: [bool; 3] = [false, false, false];
 
 /// Does the 7.5 q growth of the un-Barretted schedule still fit in i16?
 pub const fn needs_barrett(q: u16) -> bool {
@@ -432,6 +435,17 @@ macro_rules! level6 {
     (plain $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal) => {
         mont!("t6", $off, $a1, $a2, $t)
     };
+    // the lookup Barrett on a0 (as at level 4): no multiply-port uop, 2 port-5 + 3 flexible
+    (lut $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal) => {
+        concat!(
+            mont!("t6", $off, $a1, $a2, $t),
+            "vpmultishiftqb zmm30, zmm31, zmm", $a0, "\n",
+            "vpandd zmm30, zmm30, dword ptr [{c}+384]{{1to16}}\n",
+            "vpord zmm30, zmm30, dword ptr [{c}+448]{{1to16}}\n",
+            "vpermb zmm30, zmm30, [{c}+320]\n",
+            "vpaddw zmm", $a0, ", zmm", $a0, ", zmm30\n",
+        )
+    };
     (barrett $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal) => {
         concat!(
             "vpbroadcastd zmm", $t, ", dword ptr [{t6}", $off, "+4]\n",
@@ -585,7 +599,7 @@ unsafe fn tail27_b(
         concat!(
             "vmovdqa64 zmm27, [{c}]\n",
             "vmovdqa64 zmm31, [{c}+256]\n",
-            tail27!(lut, barrett),
+            tail27!(lut, lut),
         ),
         i = in(reg) bp,
         o = in(reg) op,
@@ -698,10 +712,12 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
         let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
         let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
         let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
-        let (l110, l111) = (l(1, 1, 0), l(1, 1, 1));
-        let (l120, l121) = (l(1, 2, 0), l(1, 2, 1));
 
         // levels 0+1+2 (table lookups) fused with level 3 (omega multiply only).
+        // The s2 = 1 sibling's level-3 root is zeta6 times the s2 = 0 one (zeta6 = -omega^2), so
+        // its twiddled inputs are zeta6^r (x_r - y_r) on the s2 = 0 lookups: negating r = 1 and
+        // rotating the butterfly outputs by two absorbs the zeta6^r, and the sibling needs no
+        // lookups of its own (6 `vpermb` per row instead of 10). Same residues, same bounds.
         for i in 0..27 {
             let n0 = ldb(ip, i);
             let n0h = ldb(ip, i + 81);
@@ -718,15 +734,11 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
             let x = _mm512_permutexvar_epi8(n1, l010);
             let y = _mm512_permutexvar_epi8(n1h, l011);
             let a1 = _mm512_add_epi16(x, y);
-            let x = _mm512_permutexvar_epi8(n1, l110);
-            let y = _mm512_permutexvar_epi8(n1h, l111);
-            let b1 = _mm512_sub_epi16(x, y);
+            let b1 = _mm512_sub_epi16(y, x);
 
             let x = _mm512_permutexvar_epi8(n2, l020);
             let y = _mm512_permutexvar_epi8(n2h, l021);
             let a2 = _mm512_add_epi16(x, y);
-            let x = _mm512_permutexvar_epi8(n2, l120);
-            let y = _mm512_permutexvar_epi8(n2h, l121);
             let b2 = _mm512_sub_epi16(x, y);
 
             let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
@@ -734,9 +746,9 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
             st(bp, i, u0);
             st(bp, i + 27, u1);
             st(bp, i + 54, u2);
-            st(bp, i + 81, v0);
-            st(bp, i + 108, v1);
-            st(bp, i + 135, v2);
+            st(bp, i + 81, v2);
+            st(bp, i + 108, v0);
+            st(bp, i + 135, v1);
         }
 
         // levels 4, 5 and 6: one register-resident asm block per 27-block, handed to the sink.

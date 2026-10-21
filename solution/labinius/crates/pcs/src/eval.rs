@@ -284,7 +284,7 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
             _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
             _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
         ];
-        bf::mac_soa8(&mut acc, x, load_soa8_words(b.add(8 * t)));
+        bf::mac_soa8_word(&mut acc, x, load_soa8_words(b.add(8 * t)));
     }
     let mut out = if blocks > 0 {
         horizontal(acc)
@@ -297,6 +297,36 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
     out
 }
 
+/// `Poly::from_scalars(&eq_table(ps))` built on the pool, word-sliced as it is written: the top
+/// three variables split the table into eight stretches, each the table of the low variables
+/// times that stretch's factor. The products are the same field elements (associativity), so
+/// the table is identical to the serial one; the serial build of 2^14 entries was a
+/// millisecond on the critical path before the row evaluation.
+fn eq_poly_parallel(ps: &[F162], workers: usize) -> Poly {
+    let n = 1usize << ps.len();
+    if ps.len() < 6 || workers <= 1 {
+        return Poly::from_scalars(&eq_table(ps));
+    }
+    let s = 3;
+    let (lo_vars, hi_vars) = ps.split_at(ps.len() - s);
+    let hi = eq_table(hi_vars);
+    let mut poly = Poly::zero(n);
+    let stretch = n >> s;
+    let addrs = [poly.w[0].as_mut_ptr() as usize, poly.w[1].as_mut_ptr() as usize, poly.w[2].as_mut_ptr() as usize];
+    crate::par::pool().run(1 << s, |i| {
+        // Stretch `i` owns entries `i * stretch ..` of every plane.
+        let lo = eq_table(lo_vars);
+        let f = hi[i];
+        for (j, &x) in lo.iter().enumerate() {
+            let y = x * f;
+            for k in 0..3 {
+                unsafe { (addrs[k] as *mut u64).add(i * stretch + j).write(y.0[k]) };
+            }
+        }
+    });
+    poly
+}
+
 /// [`row_evaluate`] of the witness `Witness::lifted` would build from `words`, read in place
 /// and one column per task over `workers` threads: `u_j = sum_i eq(p0, i) lift(words[i + wdim j])`.
 pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Vec<F162> {
@@ -307,7 +337,7 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
         "the words are not a whole number of columns of {wdim}"
     );
     let columns = words.len() / wdim;
-    let eq = Poly::from_scalars(&eq_table(p0));
+    let eq = eq_poly_parallel(p0, workers);
     let mut out = vec![F162::ZERO; columns];
     let runs = crate::par::ranges(columns, workers, 1);
     let out_addr = out.as_mut_ptr() as usize;
@@ -319,4 +349,54 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
         }
     });
     out
+}
+
+#[cfg(test)]
+mod eq_poly_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_eq_poly_is_the_serial_table() {
+        let mut x = 0x0123_4567_89AB_CDEF_1122_3344_5566_7788u128;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for vars in [6usize, 9, 14] {
+            let ps: Vec<F162> = (0..vars)
+                .map(|_| F162([next() as u64, next() as u64, next() as u64 & ((1 << 34) - 1)]))
+                .collect();
+            let serial = Poly::from_scalars(&eq_table(&ps));
+            let parallel = eq_poly_parallel(&ps, 8);
+            assert_eq!(parallel.n, serial.n);
+            for k in 0..3 {
+                assert_eq!(parallel.w[k], serial.w[k], "plane {k}, {vars} variables");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+
+    #[test]
+    fn word_rows_match_scalar_products() {
+        let mut state = 0x123456789abcdefu64;
+        let mut next = || {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17; state
+        };
+        for log in [0usize, 1, 3, 6, 10] {
+            let p: Vec<_> = (0..log).map(|_| F162([next(), next(), next() & ((1 << 34) - 1)])).collect();
+            let words: Vec<_> = (0..(5 << log)).map(|_| crate::fields::scalar::B128((next() as u128) | ((next() as u128) << 64))).collect();
+            let eq = eq_table(&p);
+            let expected: Vec<_> = words.chunks_exact(1 << log).map(|column|
+                eq.iter().zip(column).fold(F162::ZERO, |a, (&e, &w)| a + e * F162::from_b128(w))).collect();
+            for workers in [1usize, 3, 8] {
+                assert_eq!(row_evaluate_words(&words, &p, workers), expected, "log {log}, workers {workers}");
+            }
+        }
+    }
 }

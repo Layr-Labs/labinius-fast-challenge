@@ -211,12 +211,12 @@ impl<const Q:u16,const RED:bool> BlockSink for TSink<Q,RED> {
 /// One column's batch `b` modulo `Q` (`keys[2b]` for 3889, `keys[2b + 1]` for 9721), folded back
 /// when it ends a period.
 #[inline(always)]
-unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,keys:&[KeyBatch],b:usize,acc:*mut i32) {
+unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,bp:*mut i16,keys:&[KeyBatch],b:usize,acc:*mut i32) {
  let k=keys[2*b+if Q==P0 {0} else {1}].v.as_ptr() as *const i16;
  if (b+1)%period(Q)==0 {
-  vb::ntt_bin_batch32_hybrid::<Q,true>(idx,k,acc);
+  vb::ntt_bin_batch32_sink::<Q,_>(idx,&mut TSink::<Q,true>{buf:bp,k,acc});
  } else {
-  vb::ntt_bin_batch32_hybrid::<Q,false>(idx,k,acc);
+  vb::ntt_bin_batch32_sink::<Q,_>(idx,&mut TSink::<Q,false>{buf:bp,k,acc});
  }
 }
 const EVEN:[i32;16]=[0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30];
@@ -383,12 +383,12 @@ fn zeroed_slice<T>(n:usize)->Box<[T]> {
 }
 /// A worker's scratch, allocated once and reused by every group it takes: the accumulators of up
 /// to `gmax` columns (`acc[2c + k]`, column `c`, prime `k`), the two batches the finished tail
-/// chunks are packed into for the inverse transform, the lane-wise CRT total and index rows.
-/// The fused consumer needs no row-major transform-output block buffer.
-struct Worker {acc:Box<[GAcc]>,pend:Box<[Batch32]>,total:Box<[Batch32]>,idx:Box<[BinaryIndex32]>}
+/// chunks are packed into for the inverse transform, the lane-wise CRT total, the index rows and
+/// the kernel's block buffer.
+struct Worker {acc:Box<[GAcc]>,pend:Box<[Batch32]>,total:Box<[Batch32]>,idx:Box<[BinaryIndex32]>,buf:Box<[Blk27]>}
 impl Worker {
  fn new(gmax:usize)->Self {
-  Worker{acc:zeroed_slice(2*gmax),pend:zeroed_slice(2),total:zeroed_slice(1),idx:zeroed_slice(1)}
+  Worker{acc:zeroed_slice(2*gmax),pend:zeroed_slice(2),total:zeroed_slice(1),idx:zeroed_slice(1),buf:zeroed_slice(1)}
  }
 }
 /// Zero lanes `from..32` of every row of `b`.
@@ -409,13 +409,14 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
  let slots=32/g;
  for a in ws.acc[..2*g].iter_mut() {core::ptr::write_bytes(a as *mut GAcc,0,1);}
  core::ptr::write_bytes(&mut ws.total[0] as *mut Batch32,0,1);
+ let bp=ws.buf[0].0.as_mut_ptr();
  let mut filled=0usize;
  for b in 0..nb {
   for c in 0..g {
    cols[c].slice_batch(b,&mut ws.idx[0]);
    let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;
-   sink_batch::<P0>(&ws.idx[0],keys,b,a0);
-   sink_batch::<P1>(&ws.idx[0],keys,b,a1);
+   sink_batch::<P0>(&ws.idx[0],bp,keys,b,a0);
+   sink_batch::<P1>(&ws.idx[0],bp,keys,b,a1);
   }
    sync(b);
    if (b+1)%CHUNK_BATCHES==0 || b+1==nb {
@@ -649,45 +650,241 @@ fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,place
   mine.store(usize::MAX/2,Ordering::Release);
  });
 }
+// =============================================================================================
+// column-pair layout: lanes are 16 columns x 2 consecutive ring elements
+// =============================================================================================
+//
+// Lane 2l+e of a transform batch is ring element 2b+e of column l of a 16-column group, so the
+// two lanes `vpmaddwd` pairs belong to the same column and multiply the two key elements
+// (A_{2b}, A_{2b+1}), which are the same for every column: one `vpdpwssd` with a broadcast dword
+// per slot and key accumulates 16 columns at once, with no lane folding at all.
+
+/// The keys of both primes and both streams in the pair layout, one flat buffer of four
+/// streams: stream `s = 2*prime + (0 for A, 1 for the 1024 lift)` holds, for pair batch `b` and
+/// slot `j`, the dword `(A_{2b}[j], A_{2b+1}[j])` at `s * np * 648 + 648 b + j`, where `np` is
+/// the number of pair batches of a column.
+pub fn pair_keys(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey,workers:usize)->Vec<u32> {
+ let rows=[base.row(0),tail.row(0),base.row(1),tail.row(1)];
+ let nb=rows[0].len();let np=16*nb;
+ let mut k:Vec<u32>=Vec::with_capacity(4*np*648);
+ unsafe{k.set_len(4*np*648);}
+ let addr=k.as_mut_ptr() as usize;
+ let runs=crate::par::ranges(4*nb,workers.max(1),1);
+ crate::par::pool().run(runs.len(),|r|{
+  for t in runs[r].clone() {
+   let (s,b)=(t/nb,t%nb);let src=&rows[s][b];
+   let dst=(addr as *mut u32).wrapping_add(s*np*648);
+   for h in 0..16 {
+    for j in 0..648 {
+     let lo=src.v[j][2*h] as u16 as u32;let hi=src.v[j][2*h+1] as u16 as u32;
+     unsafe{dst.add((16*b+h)*648+j).write(lo|(hi<<16));}
+    }
+   }
+  }
+ });
+ k
+}
+
+/// One dword-product step bound: two products of a lazily reduced transform lane and a centered
+/// key lane.
+const fn pair_per_batch(q:u16)->i64 {2*w_bound(q)*a_bound(q)}
+/// Pair batches between two fold-backs: the largest power of two P with
+/// `acc_after_reduce + P * pair_per_batch <= i32::MAX`.
+const fn pair_period(q:u16)->usize {
+ let mut p=1usize;
+ while acc_after_reduce(q)+2*(p as i64)*pair_per_batch(q)<=i32::MAX as i64 {p*=2;}
+ p
+}
+const PP0:usize=pair_period(P0);const PP1:usize=pair_period(P1);
+const _:()=assert!(acc_after_reduce(P0)+(PP0 as i64)*pair_per_batch(P0)<=i32::MAX as i64);
+const _:()=assert!(acc_after_reduce(P1)+(PP1 as i64)*pair_per_batch(P1)<=i32::MAX as i64);
+/// Pair batches per certified chunk (the chunk is `CHUNK_BATCHES * 32` ring elements).
+const CHUNK_PAIRS:usize=CHUNK_BATCHES*16;
+/// Tasks per 16-column group (contiguous runs of whole certified chunks).
+const PARTS:usize=4;
+/// Pair batches transformed in lockstep per accumulator read-modify-write.
+const LOCK:usize=2;
+const _:()=assert!(CHUNK_PAIRS%PP0==0 && CHUNK_PAIRS%PP1==0 && PP0%LOCK==0 && PP1%LOCK==0 && CHUNK_PAIRS%LOCK==0);
+
+#[repr(C,align(64))]
+pub struct PAcc { pub v:[[i32;16];648] }
+impl PAcc {
+ fn zero()->Box<PAcc> {
+  unsafe{let mut b=Box::<PAcc>::new_uninit();core::ptr::write_bytes(b.as_mut_ptr() as *mut u8,0,core::mem::size_of::<PAcc>());b.assume_init()}
+ }
+}
+
+/// The pair sink for `H` consecutive pair batches at once: all `H` products enter each
+/// accumulator in one read-modify-write (`red` when the last of them closes a fold-back period).
+struct MultiSink<const Q:u16,const H:usize> {bufs:[*mut i16;H],ka:*const u32,kt:*const u32,aa:*mut i32,at:*mut i32,red:bool}
+/// `acc += vpdpwssd(x, broadcast(k[J]))` as the one instruction with an embedded broadcast at a
+/// constant displacement. Written as `asm!` because LLVM splits a chain of `vpdpwssd` on one
+/// accumulator into `vpmaddwd` + `vpaddd` (two uops on the multiply ports instead of one) to
+/// shorten the dependency chain, and on this kernel the ports, not the chain, are the limit; the
+/// constant displacement keeps the unrolled slot loop free of address arithmetic.
+#[inline(always)]
+unsafe fn dpwssd_bcast<const J:usize>(acc:__m512i,x:__m512i,k:*const u32)->__m512i {
+ let mut a=acc;
+ core::arch::asm!("vpdpwssd {a}, {x}, dword ptr [{k} + {off}]{{1to16}}",a=inout(zmm_reg) a,x=in(zmm_reg) x,k=in(reg) k,
+  off=const 4*J,options(pure,readonly,nostack,preserves_flags));
+ a
+}
+impl<const Q:u16,const H:usize> vb::MultiBlockSink<H> for MultiSink<Q,H> {
+ #[inline(always)]unsafe fn dsts(&mut self,_:usize)->[*mut i16;H] {self.bufs}
+ #[target_feature(enable="avx512f,avx512bw,avx512vnni")]
+ unsafe fn blocks(&mut self,blk:usize,w:[*mut i16;H]) {
+  let s0=27*blk;
+  let (ka,kt):([*const u32;H],[*const u32;H])=(core::array::from_fn(|h|self.ka.add(648*h+s0)),core::array::from_fn(|h|self.kt.add(648*h+s0)));
+  macro_rules! slot {($($j:literal)*) => {$({
+   let pa=self.aa.add(16*(s0+$j)) as *mut __m512i;
+   let pt=self.at.add(16*(s0+$j)) as *mut __m512i;
+   let mut a=_mm512_load_si512(pa);
+   let mut t=_mm512_load_si512(pt);
+   for h in 0..H {
+    let x=_mm512_load_si512(w[h].add(32*$j) as *const __m512i);
+    a=dpwssd_bcast::<$j>(a,x,ka[h]);
+    t=dpwssd_bcast::<$j>(t,x,kt[h]);
+   }
+   if self.red {a=reduce_vec::<Q>(a);t=reduce_vec::<Q>(t);}
+   _mm512_store_si512(pa,a);
+   _mm512_store_si512(pt,t);
+  })*}}
+  slot!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26);
+ }
+}
+/// Slot sums in [0, q) as i16 into lanes 0..16 of `out` (lanes 16..32 are left as they are).
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn pacc_to_batch<const Q:u16>(a:&PAcc,out:&mut Batch32) {
+ let p=a.v.as_ptr() as *const __m512i;
+ for j in 0..648 {
+  let r=mod_q::<Q>(_mm512_load_si512(p.add(j)));
+  _mm256_store_si256(out.v[j].as_mut_ptr() as *mut __m256i,_mm512_cvtepi32_epi16(r));
+ }
+}
+/// [`pacc_to_batch`] into lanes `16 half .. 16 half + 16`.
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn pacc_to_batch_half<const Q:u16>(a:&PAcc,out:&mut Batch32,half:usize) {
+ let p=a.v.as_ptr() as *const __m512i;
+ for j in 0..648 {
+  let r=mod_q::<Q>(_mm512_load_si512(p.add(j)));
+  _mm256_storeu_si256(out.v[j].as_mut_ptr().add(16*half) as *mut __m256i,_mm512_cvtepi32_epi16(r));
+ }
+}
+/// Zero lanes 16..32 of every slot.
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn clear_upper(out:&mut Batch32) {
+ for j in 0..648 {_mm256_storeu_si256(out.v[j].as_mut_ptr().add(16) as *mut __m256i,_mm256_setzero_si256());}
+}
+struct PairOut {base:Vec<[[u32;N];2]>,tail:Vec<[u16;N]>}
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+/// The pair batches `range` (its start a multiple of the certified chunk) of a group of up to 16
+/// columns: base sums in [0, q) and the 1024 residue of the tail, both additive over ranges.
+unsafe fn group_pairs(cols:&[&[B128]],keys:&[u32],np:usize,range:core::ops::Range<usize>)->PairOut {
+ let g=cols.len();assert!(g<=16);
+ let mut acc:[Box<PAcc>;4]=core::array::from_fn(|_|PAcc::zero());
+ let mut partial0=Batch32::zero(Representation::Ntt);let mut partial1=Batch32::zero(Representation::Ntt);
+ let mut total=Batch32::zero(Representation::Coefficients);
+ let mut idx:[BinaryIndex32;LOCK]=core::array::from_fn(|_|BinaryIndex32::zero());
+ let mut bufs:[Blk27;LOCK]=core::array::from_fn(|_|Blk27([0;27*32]));
+ let bps:[*mut i16;LOCK]=core::array::from_fn(|h|bufs[h].0.as_mut_ptr());
+ // Lanes of columns past the group's end read a zero element.
+ static ZERO4:[B128;4]=[B128::ZERO;4];
+ let ka:[*const u32;4]=core::array::from_fn(|s|keys.as_ptr().add(s*np*648));
+ assert!(range.start%CHUNK_PAIRS==0 && (range.end-range.start)%LOCK==0 && range.end<=np);
+ // LOCK pair batches per step: their transforms run in lockstep and their products enter each
+ // accumulator in one read-modify-write.
+ let mut half=0usize;
+ for b in range.clone().step_by(LOCK) {
+  for h in 0..LOCK {
+   // Lane 2l + e is element 2(b + h) + e of column l, read in place.
+   let lanes:[*const B128;32]=core::array::from_fn(|p|{
+    let l=p/2;if l<g {cols[l].as_ptr().add(8*(b+h)+4*(p%2))} else {ZERO4.as_ptr()}
+   });
+   crate::simd::transpose_f162::slice_b128_lanes_into(&lanes,&mut idx[h]);
+  }
+  let (a0,t0,a1,t1)={let [x,y,z,w]=&mut acc;(x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32,z.v.as_mut_ptr() as *mut i32,w.v.as_mut_ptr() as *mut i32)};
+  let ins:[&BinaryIndex32;LOCK]=core::array::from_fn(|h|&idx[h]);
+  vb::ntt_bin_batch32_multi_sink::<P0,LOCK,_>(ins,&mut MultiSink::<P0,LOCK>{bufs:bps,ka:ka[0].add(648*b),kt:ka[1].add(648*b),aa:a0,at:t0,red:(b+LOCK)%PP0==0});
+  vb::ntt_bin_batch32_multi_sink::<P1,LOCK,_>(ins,&mut MultiSink::<P1,LOCK>{bufs:bps,ka:ka[2].add(648*b),kt:ka[3].add(648*b),aa:a1,at:t1,red:(b+LOCK)%PP1==0});
+  if (b+LOCK)%CHUNK_PAIRS==0 || b+LOCK==range.end {
+   // Two finished chunks share one pair of inverse transforms: the first in lanes 0..16, the
+   // second in lanes 16..32 (each chunk's CRT stays exact on its own lanes).
+   pacc_to_batch_half::<P0>(&acc[1],&mut partial0,half);pacc_to_batch_half::<P1>(&acc[3],&mut partial1,half);
+   acc[1].v.fill([0;16]);acc[3].v.fill([0;16]);
+   if half==1 || b+LOCK==range.end {
+    if half==0 {clear_upper(&mut partial0);clear_upper(&mut partial1);}
+    partial0.representation=Representation::Ntt;partial1.representation=Representation::Ntt;
+    gen_small::intt_gen_batch32::<P0>(&mut partial0);gen_small::intt_gen_batch32::<P1>(&mut partial1);
+    crt_accumulate(&partial0,&partial1,&mut total);
+    half=0;
+   } else {half=1;}
+  }
+ }
+ let mut base=vec![[[0u32;N];2];g];
+ let mut tmp=Batch32::zero(Representation::Ntt);
+ for (k,a) in [(0usize,&acc[0]),(1,&acc[2])] {
+  if k==0 {pacc_to_batch::<P0>(a,&mut tmp);} else {pacc_to_batch::<P1>(a,&mut tmp);}
+  for j in 0..N {for l in 0..g {base[l][k][j]=tmp.v[j][l] as u32;}}
+ }
+ PairOut{base,tail:(0..g).map(|l|core::array::from_fn(|j|(total.v[j][l] as u16).wrapping_add(total.v[j][l+16] as u16)&1023)).collect()}
+}
+
+/// [`commit_columns_rows`] in the column-pair layout: groups of 16 columns, one pass over the
+/// pair keys per group.
+pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+ assert!(!columns.is_empty(),"at least one witness column");
+ let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
+ assert_eq!(len%8,0);let np=len/8;
+ assert_eq!(keys.len(),4*np*648);
+ let g=16;let groups=columns.len().div_ceil(g);let workers=workers.clamp(1,groups);
+ // Uninitialised: the groups partition the columns and each writes all three rows of its own.
+ let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;
+ // Each group's pair batches are cut at certified-chunk boundaries into PARTS tasks, so the
+ // dynamic hand-out ends with short tasks; the last part of a group to finish adds the parts.
+ let cut:Vec<usize>=(0..=PARTS).map(|i|if i==PARTS {np} else {(np*i/PARTS)/CHUNK_PAIRS*CHUNK_PAIRS}).collect();
+ let tasks=groups*PARTS;
+ let slots:Vec<std::sync::Mutex<Vec<PairOut>>>=(0..groups).map(|_|std::sync::Mutex::new(Vec::new())).collect();
+ let next=std::sync::atomic::AtomicUsize::new(0);
+ let placement=crate::par::CorePlacement::for_workers(workers);
+ crate::par::pool().run(workers,|worker|{
+  let _guard=placement.as_ref().and_then(|p|p.pin(worker));
+  loop {
+   let t=next.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+   if t>=tasks {break;}
+   let (gi,part)=(t/PARTS,t%PARTS);
+   let c0=gi*g;let gc=g.min(columns.len()-c0);
+   let out=unsafe{group_pairs(&columns[c0..c0+gc],keys,np,cut[part]..cut[part+1])};
+   let parts={let mut v=slots[gi].lock().unwrap();v.push(out);if v.len()<PARTS {continue;} core::mem::take(&mut *v)};
+   for c in 0..gc {
+    let base0:[u32;N]=core::array::from_fn(|j|parts.iter().map(|o|o.base[c][0][j]).sum::<u32>()%P0 as u32);
+    let base1:[u32;N]=core::array::from_fn(|j|parts.iter().map(|o|o.base[c][1][j]).sum::<u32>()%P1 as u32);
+    let tail:[u32;N]=core::array::from_fn(|j|parts.iter().map(|o|o.tail[c][j] as u32).sum::<u32>()&1023);
+    unsafe{
+     let p=(dst as *mut [u32;N]).add((c0+c)*3);
+     p.write(base0);p.add(1).write(base1);p.add(2).write(tail);
+    }
+   }
+  }
+ });
+ unsafe{rows.set_len(columns.len()*3);}
+ rows
+}
+
 #[cfg(test)]
 mod tests {
  use super::*;
- /// The fused register consumer equals the original row-major scratch consumer at every
- /// accumulator lane, including centered fold-back. Arbitrary initial accumulators exercise
- /// the exact wrapping SIMD operations; centered keys and all-zero/all-one/random nibbles
- /// cover the production transform inputs and both primes.
- fn fused_register_sink_check<const Q:u16,const RED:bool>() {
-  let mut state=0xa3e41d7b92c650f1u64 ^ Q as u64;
-  let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
-  let mut key=zeroed_slice::<KeyBatch>(1);
-  let mut got=zeroed_slice::<GAcc>(1);
-  let mut want=zeroed_slice::<GAcc>(1);
-  let mut scratch=Blk27([0;27*32]);
-  let mut idx=BinaryIndex32::zero();
-  for case in 0..24 {
-   for row in &mut idx.rows {for lane in 0..32 {
-    let n=match case {0=>0,1=>15,2=>(lane%16) as u8,_=>(next()&15) as u8};
-    row[2*lane]=n;row[2*lane+1]=16+n;
-   }}
-   for v in &mut key[0].v {for x in v {
-    *x=match case {0=>0,1=>Q as i16/2,2=>-(Q as i16/2),_=>(next()%Q as u64) as i16-Q as i16/2};
-   }}
-   for (a,b) in got[0].v.iter_mut().zip(&mut want[0].v) {for (a,b) in a.iter_mut().zip(b) {
-    *a=match case {0=>0,1=>i32::MAX,2=>i32::MIN,_=>next() as i32};*b=*a;
-   }}
-   unsafe {
-    let kp=key[0].v.as_ptr() as *const i16;
-    vb::ntt_bin_batch32_sink::<Q,_>(&idx,&mut TSink::<Q,RED>{
-     buf:scratch.0.as_mut_ptr(),k:kp,acc:want[0].v.as_mut_ptr() as *mut i32});
-    vb::ntt_bin_batch32_hybrid::<Q,RED>(&idx,kp,got[0].v.as_mut_ptr() as *mut i32);
-   }
-   assert_eq!(got[0].v,want[0].v,"q={Q}, RED={RED}, case={case}");
-  }
- }
+ /// The lane slicer equals the staged one on random words.
  #[test]
- fn fused_register_sink_matches_staged_sink() {
-  fused_register_sink_check::<P0,false>();fused_register_sink_check::<P0,true>();
-  fused_register_sink_check::<P1,false>();fused_register_sink_check::<P1,true>();
+ fn lane_slicer_matches_staged() {
+  let mut x=0x243f6a8885a308d3u64;
+  let words:Vec<B128>=(0..128).map(|_|{x^=x<<13;x^=x>>7;x^=x<<17;let a=x;x^=x<<13;x^=x>>7;x^=x<<17;B128((a as u128)<<64|x as u128)}).collect();
+  unsafe {
+   let arr:&[B128;128]=&*(words.as_ptr() as *const [B128;128]);
+   let mut a=BinaryIndex32::zero();crate::simd::transpose_f162::slice_b128_into(arr,&mut a);
+   let ptrs:[*const B128;32]=core::array::from_fn(|p|words.as_ptr().add(4*p));
+   let mut b=BinaryIndex32::zero();crate::simd::transpose_f162::slice_b128_lanes_into(&ptrs,&mut b);
+   for i in 0..162 {assert_eq!(a.rows[i],b.rows[i],"row {i}");}
+  }
  }
  #[test]
  fn centered_crt_boundaries() {

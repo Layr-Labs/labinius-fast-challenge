@@ -397,31 +397,6 @@ unsafe fn clear_lanes(b:&mut Batch32,from:usize) {
  let m=!((1u64<<from)-1) as u32;
  for j in 0..N {_mm512_mask_storeu_epi16(b.v[j].as_mut_ptr(),m,_mm512_setzero_si512());}
 }
-/// Whether the commitment prefetches the witness: the knob is read once per group.
-fn prefetch_witness_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("LABINIUS_PREFETCH_WITNESS") {
-        Ok(v) => v != "0",
-        Err(_) => true,
-    })
-}
-
-/// Bring the first line of every page of `bytes` of the witness table into the cache: the
-/// commitment reads it in 2 KB chunks whose neighbours are 256 KB away, a pattern the
-/// hardware prefetchers do not follow across pages. Only the page starts are touched: the
-/// L2 streamer picks up the rest of a page after the first miss, and prefetching every line
-/// of every chunk costs more instructions than the misses it saves.
-#[inline(always)]
-fn prefetch_witness(ptr:*const crate::fields::scalar::B128,bytes:usize){
- #[cfg(target_arch="x86_64")]
- unsafe{
-  use core::arch::x86_64::*;
-  let base=ptr as *const i8;
-  let mut off=0usize;
-  while off<bytes{_mm_prefetch::<{_MM_HINT_T0}>(base.add(off));off+=4096;}
- }
-}
-
 /// One group of `g` columns: the batch is the outer loop, so each key batch is read from L3 once
 /// per group and `g` times from L2. A finished tail chunk of column `c` goes to lane `s g + c`
 /// of the pending pair, `s` the chunk's slot; the pair is inverse transformed and CRT-combined
@@ -437,16 +412,6 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
  let mut filled=0usize;
  for b in 0..nb {
   for c in 0..g {
-   // The witness is the commitment's only DRAM traffic, and the hardware
-   // prefetchers do not follow it: a batch's 2 KB chunk of a column sits 256 KB
-   // from the same chunk of the neighbouring column, and advances by 2 KB only
-   // after a whole group of columns has been transformed. Touch the chunks that
-   // come next while this one is read and transformed.
-   if prefetch_witness_on() {
-    prefetch_witness(cols[c].as_ptr().add(128*b),2048);
-    if b+1<nb {prefetch_witness(cols[c].as_ptr().add(128*(b+1)),2048);}
-    if c+1<g {prefetch_witness(cols[c+1].as_ptr().add(128*b),2048);}
-   }
    cols[c].slice_batch(b,&mut ws.idx[0]);
    let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;
    sink_batch::<P0>(&ws.idx[0],keys,b,a0);
@@ -627,6 +592,11 @@ pub fn commit_columns_rows_arranged(keys:&[KeyBatch],columns:&[&[B128]],workers:
 struct Progress(std::sync::atomic::AtomicUsize);
 /// How far (in batches) a worker may run ahead of its sibling before it waits.
 const LEAD:usize=1;
+/// Siblings share each group's columns item by item ([`group_shared`]) instead of taking fixed
+/// halves of it.
+const SHARED_PAIRS:bool=true;
+/// Threads out of groups help the other pairs finish theirs ([`help_pairs`]).
+const HELP_PAIRS:bool=true;
 /// How long a worker waits for its sibling before the pair stops waiting for each other.
 const SIBLING_WAIT:std::time::Duration=std::time::Duration::from_micros(500);
 /// The commitment with the two hyperthreads of a core sharing every key batch in their L2:
@@ -642,6 +612,162 @@ const SIBLING_WAIT:std::time::Duration=std::time::Duration::from_micros(500);
 /// whichever sibling comes first, so every column is committed whatever the pool's runners do;
 /// a sibling that keeps the other waiting longer than [`SIBLING_WAIT`] (descheduled, or its
 /// task not started) ends the waiting for the rest of the run.
+/// What the two hyperthreads of a core share while they work on one group of columns: the
+/// columns' accumulators (`acc[2c + k]`), the chunk buffers and the CRT total, and the counters
+/// that hand out `(batch, column)` work items in batch-major order. Both threads therefore read
+/// the same key batch (shared in L2), and neither can fall behind the other by more than one
+/// item: with fixed halves a sibling that runs a few percent slower (the core that also takes the
+/// interrupts and runs the dispatcher) used to finish 10-17 ms after the other seven threads.
+struct PairState {
+ acc:Box<[GAcc]>,pend:Box<[Batch32]>,total:Box<[Batch32]>,
+ /// A finished tail chunk per column and prime, `stage[2c + k][blk]` = [`tail_words`] of block
+ /// `blk`: written contiguously by whoever finishes the column, packed into `pend` lanes by
+ /// [`put16`] when the chunk is complete.
+ stage:Box<[Stage]>,
+ /// Work items handed out so far, over all rounds: the round's items are `base .. limit`,
+ /// item `base + b * gc + c` being batch `b` of the group's column `c`. Taken by
+ /// compare-and-swap against the round's limit, so a thread still holding an earlier round's
+ /// limit can never take an item of a later one.
+ claim:std::sync::atomic::AtomicUsize,
+ base:std::sync::atomic::AtomicUsize,limit:std::sync::atomic::AtomicUsize,
+ /// The round's first column and column count.
+ c0:std::sync::atomic::AtomicUsize,gc:std::sync::atomic::AtomicUsize,
+ /// Batches of column `c` whose transforms have been accumulated.
+ progress:Box<[std::sync::atomic::AtomicUsize]>,
+ /// Columns whose tail chunk `chunks_flushed` has been written into `pend`.
+ chunk_done:std::sync::atomic::AtomicUsize,
+ /// Chunks inverse-transformed and added to `total` this round.
+ chunks_flushed:std::sync::atomic::AtomicUsize,
+ /// `round + 1` once the leader has initialised the round.
+ ready:std::sync::atomic::AtomicUsize,
+ /// Siblings that have written their outputs, over all rounds.
+ finished:std::sync::atomic::AtomicUsize,
+}
+unsafe impl Sync for PairState {}
+#[repr(C,align(64))]
+struct Stage([[i16;32];24]);
+impl PairState {
+ fn new()->Self {
+  PairState{acc:zeroed_slice(64),pend:zeroed_slice(2),total:zeroed_slice(1),stage:zeroed_slice(64),
+   claim:Default::default(),base:Default::default(),limit:Default::default(),c0:Default::default(),gc:Default::default(),
+   progress:(0..32).map(|_|Default::default()).collect(),
+   chunk_done:Default::default(),chunks_flushed:Default::default(),ready:Default::default(),finished:Default::default()}
+ }
+}
+#[inline(always)]
+fn spin_until(f:impl Fn()->bool) {while !f() {core::hint::spin_loop();}}
+/// Take and run work items of `st`'s current round (`base .. limit`, columns `c0 .. c0 + gc`)
+/// until none is left: the pair's own siblings, and threads of other pairs that have run out of
+/// groups of their own ([`help_pairs`]). The arithmetic per item is [`group`]'s: the same
+/// transforms, fold-back periods, tail chunks, inverse transforms and CRT.
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn work_items(columns:&[&[B128]],keys:&[KeyBatch],nb:usize,st:&PairState,idx:&mut BinaryIndex32,base:usize,limit:usize,c0:usize,gc:usize) {
+ use std::sync::atomic::Ordering::{Acquire,Release,Relaxed,AcqRel};
+ let acc=st.acc.as_ptr() as *mut GAcc;
+ let pend=st.pend.as_ptr() as *mut Batch32;
+ let total=st.total.as_ptr() as *mut Batch32;
+ loop {
+  let k=st.claim.load(Relaxed);
+  if k>=limit {break;}
+  if st.claim.compare_exchange_weak(k,k+1,AcqRel,Relaxed).is_err() {continue;}
+  let item=k-base;
+  let (b,c)=(item/gc,item%gc);
+  spin_until(||st.progress[c].load(Acquire)==b);
+  columns[c0+c].slice_batch(b,idx);
+  let a=acc.add(2*c);
+  sink_batch::<P0>(idx,keys,b,(*a).v.as_mut_ptr() as *mut i32);
+  sink_batch::<P1>(idx,keys,b,(*a.add(1)).v.as_mut_ptr() as *mut i32);
+  if (b+1)%CHUNK_BATCHES==0 || b+1==nb {
+   let m=b/CHUNK_BATCHES;
+   // chunk m - 1's lanes have been inverse transformed before chunk m's are written
+   spin_until(||st.chunks_flushed.load(Acquire)>=m);
+   let stage=st.stage.as_ptr() as *mut Stage;
+   for blk in 0..24 {
+    _mm512_store_si512((*stage.add(2*c)).0[blk].as_mut_ptr() as *mut __m512i,tail_words::<P0>((*a).v.as_mut_ptr() as *mut i32,blk));
+    _mm512_store_si512((*stage.add(2*c+1)).0[blk].as_mut_ptr() as *mut __m512i,tail_words::<P1>((*a.add(1)).v.as_mut_ptr() as *mut i32,blk));
+   }
+   // the column may go on with its next batch once its tail is staged and cleared
+   st.progress[c].store(b+1,Release);
+   if st.chunk_done.fetch_add(1,AcqRel)+1==gc {
+    let (p0,p1)=(&mut *pend,&mut *pend.add(1));
+    for (k,pk) in [(0usize,p0.v.as_mut_ptr()),(1,p1.v.as_mut_ptr())] {
+     for h in 0..gc.div_ceil(16) {
+      for blk in 0..24 {
+       let x:[__m512i;16]=core::array::from_fn(|i|{let c=16*h+i;
+        if c<gc {_mm512_load_si512((*stage.add(2*c+k)).0[blk].as_ptr() as *const __m512i)} else {_mm512_setzero_si512()}});
+       put16(&x,pk,blk,16*h);
+      }
+     }
+    }
+    if gc<32 && gc%16!=0 {clear_lanes(p0,gc);clear_lanes(p1,gc);}
+    p0.representation=Representation::Ntt;p1.representation=Representation::Ntt;
+    gen_small::intt_gen_batch32::<P0>(p0);gen_small::intt_gen_batch32::<P1>(p1);
+    crt_accumulate(p0,p1,&mut *total);
+    st.chunk_done.store(0,Relaxed);
+    st.chunks_flushed.store(m+1,Release);
+   }
+  } else {
+   st.progress[c].store(b+1,Release);
+  }
+ }
+}
+/// Round `r` of a sibling pair on the columns `c0 .. c0 + gc` (at most 32): sibling `s`'s share
+/// of the work items, then its half of the outputs (`out[3c ..]` for the columns `c` with
+/// `c % 2 == s`, `out` at column `c0`).
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn group_shared(columns:&[&[B128]],c0:usize,gc:usize,keys:&[KeyBatch],nb:usize,st:&PairState,idx:&mut BinaryIndex32,out:*mut [u32;N],s:usize,r:usize) {
+ use std::sync::atomic::Ordering::{Acquire,Release,Relaxed};
+ assert!(gc>=1 && gc<=32);
+ let acc=st.acc.as_ptr() as *mut GAcc;
+ let total=st.total.as_ptr() as *mut Batch32;
+ if s==0 {
+  // the previous round's outputs have been read out by both siblings
+  spin_until(||st.finished.load(Acquire)>=2*r);
+  core::ptr::write_bytes(acc,0,2*gc);
+  core::ptr::write_bytes(total,0,1);
+  for c in 0..gc {st.progress[c].store(0,Relaxed);}
+  st.chunk_done.store(0,Relaxed);st.chunks_flushed.store(0,Relaxed);
+  // every earlier claim is below the earlier limit, so the new items start above them all
+  let base=st.claim.load(Acquire);
+  st.base.store(base,Relaxed);st.limit.store(base+nb*gc,Relaxed);
+  st.c0.store(c0,Relaxed);st.gc.store(gc,Relaxed);
+  st.ready.store(r+1,Release);
+ } else {
+  spin_until(||st.ready.load(Acquire)>=r+1);
+ }
+ let (base,limit)=(st.base.load(Relaxed),st.limit.load(Relaxed));
+ work_items(columns,keys,nb,st,idx,base,limit,c0,gc);
+ let chunks=nb.div_ceil(CHUNK_BATCHES);
+ spin_until(||st.chunks_flushed.load(Acquire)>=chunks);
+ let tot=&*total;
+ for c in (s..gc).step_by(2) {
+  let a=acc.add(2*c);
+  out.add(3*c).write(finish_base::<P0>((*a).v.as_mut_ptr() as *mut i32));
+  out.add(3*c+1).write(finish_base::<P1>((*a.add(1)).v.as_mut_ptr() as *mut i32));
+  out.add(3*c+2).write(core::array::from_fn(|j|(tot.v[j][c] as u16 as u32)&1023));
+ }
+ st.finished.fetch_add(1,Release);
+}
+/// A thread whose pair has no group left takes items of the other pairs' current rounds until
+/// none is left anywhere, so the commitment ends when the work does rather than when the slowest
+/// pair's last group does (measured: one pair 4-8 ms behind the other three).
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn help_pairs(columns:&[&[B128]],keys:&[KeyBatch],nb:usize,states:&[PairState],idx:&mut BinaryIndex32) {
+ use std::sync::atomic::Ordering::{Acquire,Relaxed};
+ loop {
+  let mut helped=false;
+  for st in states {
+   let r1=st.ready.load(Acquire);
+   if r1==0 {continue;}
+   let (base,limit,c0,gc)=(st.base.load(Relaxed),st.limit.load(Relaxed),st.c0.load(Relaxed),st.gc.load(Relaxed));
+   if st.ready.load(Acquire)!=r1 || gc==0 {continue;}
+   if st.claim.load(Relaxed)>=limit {continue;}
+   work_items(columns,keys,nb,st,idx,base,limit,c0,gc);
+   helped=true;
+  }
+  if !helped {break;}
+ }
+}
 fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,placement:Option<&crate::par::CorePlacement>,dst:usize) {
  use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
  let nb=keys.len()/2;
@@ -652,11 +778,25 @@ fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,place
  let slots:Vec<std::sync::OnceLock<usize>>=(0..pairs*rounds).map(|_|std::sync::OnceLock::new()).collect();
  let done:Vec<Progress>=(0..2*pairs).map(|_|Progress(AtomicUsize::new(0))).collect();
  let coupled:Vec<AtomicBool>=(0..pairs).map(|_|AtomicBool::new(true)).collect();
+ let states:Vec<PairState>=if SHARED_PAIRS && sg<=32 {(0..pairs).map(|_|PairState::new()).collect()} else {Vec::new()};
  crate::par::pool().run(2*pairs,|worker|{
   let _guard=placement.and_then(|p|p.pin(worker));
   let (pair,s)=(worker/2,worker%2);
   let mine=&done[worker].0;let other=&done[worker^1].0;let coupled=&coupled[pair];
   let mut ws:Option<Worker>=None;
+  if !states.is_empty() {
+   let st=&states[pair];
+   let mut idx=zeroed_slice::<BinaryIndex32>(1);
+   for r in 0..rounds {
+    let gi=*slots[pair*rounds+r].get_or_init(||next.fetch_add(1,Ordering::Relaxed));
+    if gi>=groups {break;}
+    let c0=gi*sg;let gc=sg.min(columns.len()-c0);
+    unsafe{group_shared(columns,c0,gc,keys,nb,st,&mut idx[0],(dst as *mut [u32;N]).add(3*c0),s,r)};
+   }
+   if HELP_PAIRS {unsafe{help_pairs(columns,keys,nb,&states,&mut idx[0])};}
+   let _=(mine,other,coupled,&mut ws);
+   return;
+  }
   for r in 0..rounds {
    let gi=*slots[pair*rounds+r].get_or_init(||next.fetch_add(1,Ordering::Relaxed));
    if gi>=groups {break;}

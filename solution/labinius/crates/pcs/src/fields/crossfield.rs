@@ -2052,13 +2052,18 @@ impl<'a> LeanSwitch<'a> {
         }).collect();
         let rs = self.prefix_r;
         let tables = [psi_table(&self.l), psi_table(&self.lp)];
-        let mut msg = [F162::ZERO; 2];
-        for z in 0..1usize << k {
+        // One task per (z, chunk of 16 bits): the sums are independent, and the main thread
+        // alone took ~1.2 ms over the rounds that come from the sets while the pool waited.
+        const CHUNK: usize = 16;
+        let chunks = PACK / CHUNK;
+        let tasks = (1usize << k) * chunks;
+        let parts: Vec<[F162; 2]> = crate::par::pool().map(tasks, |task| {
+            let (z, ch) = (task / chunks, task % chunks);
             let weight = (0..k).fold(F162::ONE, |a, i| {
                 a * if z & (1 << (k - 1 - i)) != 0 { rs[i] } else { F162::ONE + rs[i] }
             });
             let mut terms = [F162::ZERO; 2];
-            for b in 0..PACK {
+            for b in CHUNK * ch..CHUNK * (ch + 1) {
                 let mut sums = [B128::ZERO; 2];
                 for (s, &scale) in scales.iter().enumerate() {
                     let group = (z << (prefix - k)) | s;
@@ -2069,8 +2074,10 @@ impl<'a> LeanSwitch<'a> {
                 monomial.0[b / 64] = 1 << (b % 64);
                 for t in 0..2 { terms[t] += psi(&tables[t], sums[t]) * monomial; }
             }
-            for t in 0..2 { msg[t] += weight * terms[t]; }
-        }
+            [weight * terms[0], weight * terms[1]]
+        });
+        let mut msg = [F162::ZERO; 2];
+        for part in parts { msg[0] += part[0]; msg[1] += part[1]; }
         msg
     }
 

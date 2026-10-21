@@ -38,9 +38,9 @@ mod rq;
 use parameters::RING_ELEMENTS;
 use parameters::{COLUMNS, COLUMN_LEN, COLUMN_LOG, LOG_PACKED, LOG_VARS, MODULUS};
 
-/// The key of the default modulus, precomputed by `build.rs` and embedded as the bytes of its
-/// batches (empty when the build host could not run the kernels). 64-byte aligned so the
-/// batches are read in place.
+/// The commitment key of the default modulus in the column-pair layout
+/// (`hybrid::pair_keys`), precomputed by `build.rs` and embedded as little-endian `u32` words
+/// (empty when the build host could not run the kernels). 64-byte aligned so it is read in place.
 #[repr(C, align(64))]
 struct Aligned64<T>(T);
 const EMBEDDED_KEY_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")).len();
@@ -552,10 +552,8 @@ fn fold_checked(
     labinius::fold::fold_witness_streaming(values, COLUMNS, challenges, bpc, base, workers)
 }
 
-/// One commitment task per physical core, temporarily placed by the key's
-/// worker entry point; eight columns share each pass over the public key.
-const EMBEDDED_TAIL_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/tail-key.bin")).len();
-static EMBEDDED_TAIL:Aligned64<[u8;EMBEDDED_TAIL_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/tail-key.bin")));
+/// The generic (non-hybrid) commitment: one task per physical core, temporarily placed by the
+/// key's worker entry point; eight columns share each pass over the public key.
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 
@@ -584,17 +582,31 @@ fn prove_with_storage(seed: &[u8; 32], modulus: u128, table_path: &str) -> (Proo
     // is the default and the build host could compute it, and is built otherwise.
     populate_words(values, workers);
     let matrix_time = clock.elapsed();
-    let key = match keygen::key_from_image(modulus, &EMBEDDED_KEY.0) {
-        Some(key) => key,
-        None => keygen::build_key(modulus),
+    let hybrid = modulus == modulus_choice::HYBRID_MODULUS;
+    // The default modulus commits through the embedded column-pair image, read in place; any
+    // other modulus (or a build host that could not compute the image) builds its key here.
+    let embedded = (hybrid && modulus == MODULUS)
+        .then(|| keygen::pair_words(&EMBEDDED_KEY.0))
+        .flatten();
+    let (key, owned_pairs) = match embedded {
+        Some(_) => (None, None),
+        None if hybrid => {
+            let key = keygen::build_key(modulus);
+            let tail = keygen::build_tail_key(modulus);
+            let pairs = labinius::simd::commit::hybrid::pair_keys(&key, &tail, workers);
+            (None, Some(pairs))
+        }
+        None => (Some(keygen::build_key(modulus)), None),
     };
     let setup_time = clock.elapsed();
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
-    let rows = if modulus==modulus_choice::HYBRID_MODULUS {
-        let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
-        labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&columns,workers,8)
-    } else {key.commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
+    let rows = match (embedded, &owned_pairs, &key) {
+        (Some(pairs), _, _) => labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs, &columns, workers),
+        (None, Some(pairs), _) => labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs, &columns, workers),
+        (None, None, Some(key)) => key.commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP),
+        _ => unreachable!("a key or a pair image"),
+    };
     let commit_time = clock.elapsed();
     let commitment = pack_coefficients(
         &commitment_coefficients_rows(&rows, &primes, modulus, COLUMNS, workers),
@@ -977,29 +989,19 @@ mod tests {
         assert_eq!(decoded.folded, proof.folded);
     }
 
-    /// The embedded key is the key the prover would build, batch for batch, and the image
-    /// round-trips through the in-place reader.
+    /// The embedded column-pair image is the one the prover would build from the key and the
+    /// 1024-lift key, word for word.
     #[test]
-    fn embedded_key_matches_the_built_key() {
-        let built = keygen::build_key(MODULUS);
-        let image = keygen::key_image(&built);
+    fn embedded_pairs_match_the_built_keys() {
         if EMBEDDED_KEY.0.is_empty() {
-            // Built on a host without the kernels: only the image format is checked.
-            assert_eq!(image.len(), built.limbs() * keygen::BATCHES * keygen::BATCH_BYTES);
+            // Built on a host without the kernels: the prover builds the pairs at run time.
             return;
         }
-        assert_eq!(&EMBEDDED_KEY.0[..], &image[..], "the embedded image differs");
-        assert!(keygen::key_from_image(55_144_219_393, &EMBEDDED_KEY.0).is_none(),
-            "a different three-limb modulus must rebuild its matrix");
-        let read = keygen::key_from_image(MODULUS, &EMBEDDED_KEY.0).expect("a valid image");
-        for k in 0..built.limbs() {
-            assert_eq!(read.prime(k), built.prime(k));
-            for (a, b) in read.row(k).iter().zip(built.row(k)) {
-                assert_eq!(a.v, b.v, "limb {k} differs");
-                assert_eq!(a.representation, b.representation);
-            }
-        }
-        assert!(keygen::key_from_image(9721u128 * 2917 * 4861, &EMBEDDED_KEY.0).is_none());
+        let key = keygen::build_key(MODULUS);
+        let tail = keygen::build_tail_key(MODULUS);
+        let built = labinius::simd::commit::hybrid::pair_keys(&key, &tail, threads());
+        let read = keygen::pair_words(&EMBEDDED_KEY.0).expect("a valid image");
+        assert_eq!(read, &built[..], "the embedded image differs");
     }
 
     #[test]
@@ -1116,6 +1118,29 @@ mod tests {
         let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,4);
         let coefficients=commitment_coefficients_rows(&rows,&primes,q,columns,3);
         for c in 0..columns {
+            let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
+            assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);
+        }
+    }
+    /// The column-pair kernel produces the grouped kernel's rows exactly, across a full and a
+    /// partial certified chunk and a full and a partial 16-column group, and its coefficients
+    /// are the schoolbook commitment.
+    #[test]
+    fn pair_commitment_matches_grouped_kernel_and_schoolbook() {
+        let q=modulus_choice::HYBRID_MODULUS;let ring=288usize;let columns=17;
+        let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
+        let matrix=rq::ajtai_matrix(q,ring);
+        let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
+        let tail=keygen::build_tail_key_from_matrix(&matrix);
+        let mut t=Transcript::new(b"pair-commitment-regression");
+        let values=t.sample_b128(b"binary",ring*4*columns);
+        let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
+        let grouped=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,4);
+        let pairs=labinius::simd::commit::hybrid::pair_keys(&key,&tail,3);
+        let rows=labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pairs,&cols,3);
+        assert_eq!(rows,grouped);
+        let coefficients=commitment_coefficients_rows(&rows,&primes,q,columns,3);
+        for c in [0,16] {
             let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
             assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);
         }

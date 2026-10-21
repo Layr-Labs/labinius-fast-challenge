@@ -27,10 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/parameters.rs");
     println!("cargo:rerun-if-changed=src/rq.rs");
     println!("cargo:rerun-if-changed=build.rs");
-    let image = key_image();
-    std::fs::write(&out, image).expect("write the key image");
-    let tail=PathBuf::from(env::var("OUT_DIR").unwrap()).join("tail-key.bin");
-    std::fs::write(tail,tail_image()).expect("write the auxiliary key image");
+    std::fs::write(&out, pair_image()).expect("write the key image");
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -42,6 +39,23 @@ fn host_can_run() -> bool {
         && is_x86_feature_detected!("avx512vbmi2")
         && is_x86_feature_detected!("avx512vnni")
         && is_x86_feature_detected!("gfni")
+}
+
+/// The column-pair image of the default (hybrid) modulus: both primes' ordinary and 1024-lift
+/// keys, as the flat `u32` buffer `hybrid::pair_keys` builds, little-endian.
+#[cfg(target_arch = "x86_64")]
+fn pair_image() -> Vec<u8> {
+    if !host_can_run() || parameters::MODULUS != modulus_choice::HYBRID_MODULUS {
+        return Vec::new();
+    }
+    let key = keygen::build_key(parameters::MODULUS);
+    let tail = keygen::build_tail_key(parameters::MODULUS);
+    let words = labinius::simd::commit::hybrid::pair_keys(&key, &tail, labinius::par::threads());
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn pair_image() -> Vec<u8> {
+    Vec::new()
 }
 
 #[cfg(target_arch = "x86_64")]

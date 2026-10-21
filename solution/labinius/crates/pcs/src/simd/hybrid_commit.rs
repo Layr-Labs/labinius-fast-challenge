@@ -219,6 +219,17 @@ unsafe fn sink_batch<const Q:u16>(idx:&BinaryIndex32,keys:&[KeyBatch],b:usize,ac
   vb::ntt_bin_batch32_hybrid::<Q,false>(idx,k,acc);
  }
 }
+/// Both primes share the binary-index loads; their certified fold-back periods stay separate.
+#[inline(always)]
+unsafe fn sink_pair_batch(idx:&BinaryIndex32,keys:&[KeyBatch],b:usize,acc0:*mut i32,acc1:*mut i32) {
+ let k0=keys[2*b].v.as_ptr() as *const i16;let k1=keys[2*b+1].v.as_ptr() as *const i16;
+ // period(P0)==2 and period(P1)==1 are asserted above.
+ if (b+1)%period(P0)==0 {
+  vb::ntt_bin_batch32_hybrid_pair::<true,true>(idx,k0,k1,acc0,acc1);
+ } else {
+  vb::ntt_bin_batch32_hybrid_pair::<false,true>(idx,k0,k1,acc0,acc1);
+ }
+}
 const EVEN:[i32;16]=[0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30];
 const ODD:[i32;16]=[1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31];
 /// Lane `8v + i` is the sum of lanes `2i, 2i + 1` of `[a, b][v]`.
@@ -449,8 +460,7 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
    }
    cols[c].slice_batch(b,&mut ws.idx[0]);
    let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;
-   sink_batch::<P0>(&ws.idx[0],keys,b,a0);
-   sink_batch::<P1>(&ws.idx[0],keys,b,a1);
+   sink_pair_batch(&ws.idx[0],keys,b,a0,a1);
   }
    sync(b);
    if (b+1)%CHUNK_BATCHES==0 || b+1==nb {
@@ -723,6 +733,43 @@ mod tests {
  fn fused_register_sink_matches_staged_sink() {
   fused_register_sink_check::<P0,false>();fused_register_sink_check::<P0,true>();
   fused_register_sink_check::<P1,false>();fused_register_sink_check::<P1,true>();
+ }
+ /// The paired frontend is exactly equal to two independent transforms, including
+ /// i32 wrapping and P0's alternating / P1's every-batch fold-back. Each case starts
+ /// from fresh arbitrary accumulators and compares every lane after every batch.
+ #[test]
+ fn paired_frontend_matches_individual_accumulators() {
+  let mut state=0x8ba91d723c65e40fu64;
+  let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
+  let mut keys=zeroed_slice::<KeyBatch>(8);
+  let mut got=zeroed_slice::<GAcc>(2);let mut want=zeroed_slice::<GAcc>(2);
+  let mut idx=BinaryIndex32::zero();
+  for case in 0..16 {
+   for (ki,key) in keys.iter_mut().enumerate() {
+    let q=if ki%2==0 {P0} else {P1};
+    for v in &mut key.v {for x in v {
+     *x=match case {0=>0,1=>q as i16/2,2=>-(q as i16/2),_=>(next()%q as u64) as i16-q as i16/2};
+    }}
+   }
+   for qi in 0..2 {for (a,b) in got[qi].v.iter_mut().zip(&mut want[qi].v) {
+    for (a,b) in a.iter_mut().zip(b) {
+     *a=match case {0=>0,1=>i32::MAX,2=>i32::MIN,_=>next() as i32};*b=*a;
+    }
+   }}
+   for batch in 0..4 {
+    for (ri,row) in idx.rows.iter_mut().enumerate() {for lane in 0..32 {
+     let n=match case {0=>0,1=>15,2=>((ri+lane+batch)%16) as u8,_=>(next()&15) as u8};
+     row[2*lane]=n;row[2*lane+1]=16+n;
+    }}
+    unsafe {
+     sink_batch::<P0>(&idx,&keys,batch,want[0].v.as_mut_ptr() as *mut i32);
+     sink_batch::<P1>(&idx,&keys,batch,want[1].v.as_mut_ptr() as *mut i32);
+     let a0=got[0].v.as_mut_ptr() as *mut i32;let a1=got[1].v.as_mut_ptr() as *mut i32;
+     sink_pair_batch(&idx,&keys,batch,a0,a1);
+    }
+    for qi in 0..2 {assert_eq!(got[qi].v,want[qi].v,"prime={qi}, case={case}, batch={batch}");}
+   }
+  }
  }
  #[test]
  fn centered_crt_boundaries() {

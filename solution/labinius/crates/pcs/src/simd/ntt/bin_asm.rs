@@ -1090,3 +1090,137 @@ pub unsafe fn ntt_bin_batch32_hybrid<const Q: u16, const RED: bool>(
     assert!(Q == 3889 || Q == 9721, "the hybrid commitment's primes");
     ntt_core::<Q, _>(input, &mut HybridSink::<Q, RED> { key, acc });
 }
+
+
+/// Read one pair of index rows once for both primes. The two input-index registers
+/// become outputs after all four lookups, so no index survives this helper. Together
+/// with twelve LUTs, six arithmetic constants and the previous two pairs of results,
+/// the last lookup needs exactly 32 zmm registers, without an intermediate array.
+#[inline(always)]
+unsafe fn paired_lookup<const NEG: bool>(
+    p: *const u8, l00: __m512i, l01: __m512i, l10: __m512i, l11: __m512i,
+) -> (__m512i, __m512i, __m512i, __m512i) {
+    let (a0, b0, a1, b1);
+    let (_t0, _t1): (__m512i, __m512i);
+    macro_rules! run {
+        ($sub0:literal, $sub1:literal) => {
+            core::arch::asm!(
+                "vmovdqa64 {a0}, [{p}]",
+                "vmovdqa64 {b0}, [{p}+5184]",
+                "vpermb {a1}, {a0}, {l00}",
+                "vpermb {b1}, {b0}, {l01}",
+                "vpermb {t0}, {a0}, {l10}",
+                "vpermb {t1}, {b0}, {l11}",
+                "vpaddw {a0}, {a1}, {b1}",
+                $sub0,
+                "vpaddw {a1}, {t0}, {t1}",
+                $sub1,
+                p = in(reg) p,
+                l00 = in(zmm_reg) l00, l01 = in(zmm_reg) l01,
+                l10 = in(zmm_reg) l10, l11 = in(zmm_reg) l11,
+                a0 = out(zmm_reg) a0, b0 = out(zmm_reg) b0,
+                a1 = out(zmm_reg) a1, b1 = out(zmm_reg) b1,
+                t0 = out(zmm_reg) _t0, t1 = out(zmm_reg) _t1,
+                options(pure, readonly, nostack, preserves_flags)
+            )
+        };
+    }
+    if NEG {
+        run!("vpsubw {b0}, {b1}, {a1}", "vpsubw {b1}, {t1}, {t0}");
+    } else {
+        run!("vpsubw {b0}, {a1}, {b1}", "vpsubw {b1}, {t0}, {t1}");
+    }
+    (a0, b0, a1, b1)
+}
+
+/// The same eleven arithmetic instructions as r3_folded, with each output stored
+/// immediately. Explicit destructive temporaries keep the paired frontend within
+/// 32 zmm registers even while the other prime's six inputs remain live.
+#[inline(always)]
+unsafe fn r3_folded_store<const ROTATE: bool>(
+    c: &C, a0: __m512i, a1: __m512i, a2: __m512i, p: *mut i16,
+) {
+    let (_u, _t): (__m512i, __m512i);
+    core::arch::asm!(
+        "vpsubw {u}, {a1}, {a2}",
+        "vpmullw {t}, {u}, {omp}",
+        "vpmulhw {u}, {u}, {om}",
+        "vpmulhw {t}, {t}, {q}",
+        "vpsubw {u}, {u}, {t}",
+        "vpaddw {t}, {a1}, {a2}",
+        "vpaddw {t}, {t}, {a0}",
+        "vmovdqa64 [{p}+{o0}], {t}",
+        "vpsubw {a2}, {a0}, {a2}",
+        "vpaddw {a2}, {a2}, {u}",
+        "vmovdqa64 [{p}+{o1}], {a2}",
+        "vpsubw {a1}, {a0}, {a1}",
+        "vpsubw {a1}, {a1}, {u}",
+        "vmovdqa64 [{p}+{o2}], {a1}",
+        p = in(reg) p,
+        o0 = const if ROTATE { 1728 } else { 0 },
+        o1 = const if ROTATE { 3456 } else { 1728 },
+        o2 = const if ROTATE { 0 } else { 3456 },
+        q = in(zmm_reg) c.q, om = in(zmm_reg) c.om, omp = in(zmm_reg) c.omp,
+        a0 = in(zmm_reg) a0, a1 = inout(zmm_reg) a1 => _, a2 = inout(zmm_reg) a2 => _,
+        u = out(zmm_reg) _u, t = out(zmm_reg) _t,
+        options(nostack, preserves_flags)
+    );
+}
+
+#[inline(always)]
+unsafe fn hybrid_tails<const Q: u16, const RED: bool>(
+    k: usize, bp: *const i16, t: &Tables, key: *const i16, acc: *mut i32,
+) {
+    let mut sink = HybridSink::<Q, RED> { key, acc };
+    for j in 0..core::hint::black_box(6usize) {
+        let kk = 6 * k + j;
+        sink.tail(kk, bp.add(32 * 27 * j),
+            t.tw4.as_ptr().add(kk).cast::<u32>(),
+            t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
+            t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
+            t.cv.as_ptr().cast::<i16>(), needs_barrett(Q));
+    }
+}
+
+/// Both hybrid primes with shared index loads and unchanged per-prime tails.
+/// Each index row is read once per 162-slot block instead of once per prime.
+/// The second 10,368-byte block preserves the other prime across the tail's full
+/// register clobber; all 162 vectors are written before either tail reads them.
+///
+/// # Safety
+/// The feature, key and accumulator requirements of ntt_bin_batch32_hybrid apply
+/// independently to both primes. The two writable accumulator regions must not
+/// overlap each other, the keys or input. RED0 and RED1 retain their own schedules.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+pub unsafe fn ntt_bin_batch32_hybrid_pair<const RED0: bool, const RED1: bool>(
+    input: &BinaryIndex32, key0: *const i16, key1: *const i16,
+    acc0: *mut i32, acc1: *mut i32,
+) {
+    let (t0, t1) = (tables::<3889>(), tables::<9721>());
+    let c0 = C { q: bc(&t0.qd), om: bc(&t0.om[0]), omp: bc(&t0.om[1]) };
+    let c1 = C { q: bc(&t1.qd), om: bc(&t1.om[0]), omp: bc(&t1.om[1]) };
+    let ip = input.rows.as_ptr().cast::<u8>();
+    let mut blk0 = core::mem::MaybeUninit::<Blk>::uninit();
+    let mut blk1 = core::mem::MaybeUninit::<Blk>::uninit();
+    let bp0 = blk0.as_mut_ptr().cast::<i16>();
+    let bp1 = blk1.as_mut_ptr().cast::<i16>();
+    for k in 0..4 {
+        let l0 = t0.lut.as_ptr().add(12 * k).cast::<u8>();
+        let l1 = t1.lut.as_ptr().add(12 * k).cast::<u8>();
+        let (l000, l001, l010, l011, l020, l021) =
+            (ldb(l0, 0), ldb(l0, 1), ldb(l0, 2), ldb(l0, 3), ldb(l0, 4), ldb(l0, 5));
+        let (l100, l101, l110, l111, l120, l121) =
+            (ldb(l1, 0), ldb(l1, 1), ldb(l1, 2), ldb(l1, 3), ldb(l1, 4), ldb(l1, 5));
+        for i in 0..27 {
+            let (a00, b00, a10, b10) = paired_lookup::<false>(ip.add(64*i), l000, l001, l100, l101);
+            let (a01, b01, a11, b11) = paired_lookup::<true>(ip.add(64*(i+27)), l010, l011, l110, l111);
+            let (a02, b02, a12, b12) = paired_lookup::<false>(ip.add(64*(i+54)), l020, l021, l120, l121);
+            r3_folded_store::<false>(&c0, a00, a01, a02, bp0.add(32*i));
+            r3_folded_store::<true>(&c0, b00, b01, b02, bp0.add(32*(i+81)));
+            r3_folded_store::<false>(&c1, a10, a11, a12, bp1.add(32*i));
+            r3_folded_store::<true>(&c1, b10, b11, b12, bp1.add(32*(i+81)));
+        }
+        hybrid_tails::<3889, RED0>(k, bp0, t0, key0, acc0);
+        hybrid_tails::<9721, RED1>(k, bp1, t1, key1, acc1);
+    }
+}

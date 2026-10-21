@@ -1,6 +1,6 @@
 //! Commitment modulo 3889 * 9721 * 2^10 using only two witness NTTs.
 //!
-//! Both transforms feed two public-key streams: the ordinary residue and the centered
+//! Both transforms feed two public-key streams: the ordinary residue and a coupled
 //! coefficient lift of A mod 1024. The latter is reconstructed exactly in certified
 //! chunks, inverse transformed across columns, and accumulated mod 1024. Only public
 //! parameters are precomputed. Every invocation consumes its complete fresh table.
@@ -25,7 +25,9 @@ const P0:u16=3889;
 const P1:u16=9721;
 const PRODUCT:i64=P0 as i64*P1 as i64;
 pub const MODULUS:u128=PRODUCT as u128*1024;
-pub const CHUNK_BATCHES:usize=7;
+/// The coupled public-key lift certifies all eight-batch chunks: maximum absolute
+/// coefficient 17,639,740 < PRODUCT/2. Key construction checks the bound again.
+pub const CHUNK_BATCHES:usize=8;
 
 /// Arranged key vectors per 27-row block: three 8-row groups of eight qword vectors and one
 /// 4-row group of four chunk vectors, each for A and then T.
@@ -541,7 +543,7 @@ pub fn certify(raw:&[[i16;648]],chunk_batches:usize)->i64 {
 
 
 /// Commit B128 columns under two ordinary limbs and an auxiliary 1024 residue.
-/// The tail key is the NTT of the centered coefficient lift of A mod 1024.
+/// The tail key is the NTT of a certified coefficient lift of A mod 1024.
 /// The public-key certificate establishes exact reconstruction for CHUNK_BATCHES.
 /// Arranges the keys first; [`commit_columns_rows_arranged`] takes them arranged.
 pub fn commit_columns_rows(
@@ -740,7 +742,7 @@ mod tests {
  }
  /// The transposed-group sink against the folded-lane implementation it replaced, bit for bit,
  /// on random centered keys and random columns: 128 batches (fold-backs at both periods,
- /// 19 tail chunks, several full and partial lane flushes), every group size from 1 to 32
+ /// 16 tail chunks, several full and partial lane flushes), every group size from 1 to 32
  /// that the prover or the flush logic distinguishes, and a ragged last group.
  #[test]
  fn row_sink_matches_folded_reference() {

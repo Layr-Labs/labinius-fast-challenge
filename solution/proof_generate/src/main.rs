@@ -433,17 +433,27 @@ impl Table {
 /// kernel has it (older kernels refuse it, harmlessly), one read per page otherwise (the
 /// fault-around maps a run of pages per fault). A read-only touch, so it runs on another thread
 /// while the key is built.
-fn populate_words(words: &[B128], threads: usize) {
+fn populate_words(words: &[B128], keys: &[u8], threads: usize) {
     let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
-    labinius::par::pool().run(runs.len(), |i| populate_part(&words[runs[i].clone()]));
+    let kruns = labinius::par::ranges(keys.len(), threads, 4096);
+    labinius::par::pool().run(runs.len().max(kruns.len()), |i| {
+        if let Some(r) = kruns.get(i) {
+            populate_part(keys[r.clone()].as_ptr() as usize, r.len());
+        }
+        if let Some(r) = runs.get(i) {
+            populate_part(words[r.clone()].as_ptr() as usize, r.len() * 16);
+        }
+    });
 }
 
-fn populate_part(words: &[B128]) {
-    let (addr, bytes) = (words.as_ptr() as usize, words.len() * 16);
+fn populate_part(addr: usize, bytes: usize) {
     #[cfg(target_os = "linux")]
     {
-        let done =
-            unsafe { sys::madvise(addr as *mut core::ffi::c_void, bytes, sys::MADV_POPULATE_READ) };
+        // whole pages: the range need not start on one
+        let start = addr & !4095;
+        let done = unsafe {
+            sys::madvise(start as *mut core::ffi::c_void, bytes + (addr - start), sys::MADV_POPULATE_READ)
+        };
         if done == 0 {
             return;
         }
@@ -486,7 +496,8 @@ fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
     t.absorb_u64(LOG_VARS as u64);
     t.absorb_u64(COLUMN_LOG as u64);
     t.absorb_bytes(&modulus.to_le_bytes());
-    t.absorb_bytes(commitment);
+    // The 3.3 MB commitment hashed as blake3's subtrees on every core: the same transcript.
+    t.absorb_bytes_parallel(commitment, threads());
     t
 }
 fn point(t: &mut Transcript) -> (Vec<B128>, Vec<B128>) {
@@ -674,9 +685,6 @@ fn commitment_bytes_rows(
     };
     let blocks = columns.div_ceil(32);
     let runs = labinius::par::ranges(blocks, workers, 1);
-    // The blocks are handed out from a shared counter rather than as fixed runs, so a runner
-    // that shares its CPU with another process takes fewer of them.
-    let next = std::sync::atomic::AtomicUsize::new(0);
     let out_addr = out.as_mut_ptr() as usize;
     // One run per logical CPU, placed explicitly for this dispatch and released at its end:
     // this is the first dispatch after the commitment's per-core placement, and the runner
@@ -688,11 +696,7 @@ fn commitment_bytes_rows(
         let mut residues: Vec<Vec<i16>> = (0..limbs).map(|_| vec![0i16; 32 * N]).collect();
         let mut mixed = vec![0u64; limbs];
         let mut at = vec![0u64; limbs];
-        loop {
-            let blk = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if blk >= blocks {
-                break;
-            }
+        for blk in runs[r].clone() {
             let c0 = blk * 32;
             let cols = (columns - c0).min(32);
             for k in 0..limbs {
@@ -904,15 +908,29 @@ const FOLD_CHECK_POSITIONS: core::ops::Range<usize> = 0..1;
 fn fold_checked(
     values: &[B128],
     challenges: &[ShortChallenge],
-    _base: u16,
-    _workers: usize,
+    base: u16,
+    workers: usize,
 ) -> Vec<labinius::RingElement648> {
-    // The trusted verifier checks the folded witness itself (the `A v = sum_j c_j C_j`
-    // identity, the norm bounds and the binary shadow), so a wrong fold cannot verify. The
-    // transform-path comparison this replaces was redundant work: it recomputed one batch
-    // position across all 1024 columns (1024 transforms) and touched 32 KB of every column,
-    // scattered over the 268 MB table, just before the fold's own pass over it.
-    labinius::fold::fold_witness_bits(values, COLUMNS, COLUMN_LEN, challenges)
+    let bpc = COLUMN_LEN / 128;
+    let bits = labinius::fold::fold_witness_bits(values, COLUMNS, COLUMN_LEN, challenges);
+    let check = labinius::fold::fold_witness_positions(
+        values,
+        COLUMNS,
+        challenges,
+        bpc,
+        base,
+        FOLD_CHECK_POSITIONS,
+    );
+    let first = 32 * FOLD_CHECK_POSITIONS.start;
+    let agree = check
+        .iter()
+        .zip(&bits[first..first + check.len()])
+        .all(|(a, b)| a.v == b.v);
+    if agree {
+        return bits;
+    }
+    eprintln!("labinius-fold-check mismatch: the bit-sliced fold disagrees with the transform path; folding through the transform");
+    labinius::fold::fold_witness_streaming(values, COLUMNS, challenges, bpc, base, workers)
 }
 
 /// One commitment task per physical core, temporarily placed by the key's
@@ -922,16 +940,17 @@ static EMBEDDED_TAIL:Aligned64<[u8;EMBEDDED_TAIL_LEN]>=Aligned64(*include_bytes!
 /// Both hybrid keys (base and tail, both primes) in the hybrid sink's arrangement, precomputed
 /// by `build.rs` from the same public keys as the two images above (empty when the build host
 /// could not run the kernels); read in place.
-/// The hybrid modulus's keys in the column-pair layout (`hybrid::pair_keys`), little-endian
-/// `u32` words, empty when the build host could not run the kernels.
-const EMBEDDED_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/pair-key.bin")).len();
-static EMBEDDED_PAIRS:Aligned64<[u8;EMBEDDED_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/pair-key.bin")));
 const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")).len();
 static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
+/// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
+/// and the switch's binding pass then binds that many coordinates at once.
+const PREFIX_SETS: usize = 32;
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
-/// Columns per group of the hybrid commitment (12 KB of accumulators per column and prime; each
-/// batch of the arranged keys, 168 KB, is read from L3 once per group).
+/// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
+/// a host of two-thread cores the two threads of a core take the halves of each 32-column group,
+/// so each batch of the arranged keys, 168 KB, is read from L3 once per 32 columns; 32 per
+/// worker measured 1.8 ms slower (L2 pressure).
 const HYBRID_GROUP: usize = 16;
 
 
@@ -1260,10 +1279,21 @@ impl Output {
     /// thread is about to work alone (the transcript absorbing the commitment): a worker still
     /// in a chunk when a dispatch arrives delays it, and the commitment's coarse work units
     /// turn any delay at its start into a delay of its end.
-    fn populate(&self) {
+    ///
+    /// `first` are anonymous regions to fault in before the file, one chunk each (writable,
+    /// and only ever populated: `MADV_POPULATE_WRITE` leaves what they hold as it is).
+    fn populate(&self, first: Vec<(usize, usize)>) {
         let chunks = self.state.layout.len().div_ceil(POPULATE_CHUNK);
         let worker_state = self.state.clone();
-        let job = labinius::par::pool().idle(chunks, move |i| worker_state.chunk(i + 1));
+        let job = labinius::par::pool().idle(first.len() + chunks, move |i| match first.get(i) {
+            #[cfg(target_os = "linux")]
+            Some(&(addr, len)) => unsafe {
+                sys::madvise(addr as *mut _, len, sys::MADV_POPULATE_WRITE);
+            },
+            #[cfg(not(target_os = "linux"))]
+            Some(_) => {}
+            None => worker_state.chunk(i - first.len() + 1),
+        });
         let _ = self.populate.set(job);
     }
 
@@ -1313,7 +1343,11 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let p = params(&primes);
     // The table's pages come in on every core; the key is the embedded one when the modulus
     // is the default and the build host could compute it, and is built otherwise.
-    populate_words(values, workers);
+    // ... and so do the embedded arranged keys' (otherwise a page-cache fault per 64 KB inside
+    // the commitment, taken by all its workers at once as they reach the same batches: measured
+    // 2 ms of commitment for 0.3-0.5 ms here).
+    let image: &[u8] = if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS { &EMBEDDED_HYBRID.0 } else { &[] };
+    populate_words(values, image, workers);
     let matrix_time = clock.elapsed();
     // The hybrid modulus commits against the embedded arranged keys when the build host made
     // them; otherwise the key (and the tail key) come from their images or are built.
@@ -1329,14 +1363,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let setup_time = clock.elapsed();
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
-    let pairs = if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
-        keygen::pair_words(&EMBEDDED_PAIRS.0)
-    } else {
-        None
-    };
-    let rows = if let Some(pairs) = pairs {
-        labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers)
-    } else if let Some(keys) = arranged {
+    let rows = if let Some(keys) = arranged {
         labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,HYBRID_GROUP)
     } else if modulus==modulus_choice::HYBRID_MODULUS {
         let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
@@ -1350,7 +1377,14 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // baseline did, is a ninth runnable thread beside eight busy ones.)
     drop(rows);
     if let Some(output) = output {
-        output.populate();
+        // The pages of the switch's binding pass first: they are written ~10 ms from here,
+        // and faulting them in there stalls the pass's runners.
+        let bound = ((1usize << LOG_PACKED) / PREFIX_SETS * 8).min(planes[0].len() * 8);
+        let first = planes.iter().flat_map(|p| {
+            let (addr, _) = p.region();
+            (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
+        });
+        output.populate(first.collect());
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
@@ -1360,10 +1394,10 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let prefix_sets = if degenerate {
         None
     } else {
-        Some(cf::eq_expand_and_partials_factored(&hi, values, workers))
+        Some(cf::eq_expand_and_partials_factored_blocks::<PREFIX_SETS>(&hi, values, workers))
     };
     let partials = match &prefix_sets {
-        Some((sets, _)) => cf::partials_from_sixteenths(sets, &hi),
+        Some((sets, _)) => cf::partials_from_sets(sets, &hi),
         None => {
             let mut ws = cf::Workspace::new(LOG_PACKED, 1);
             ws.partial_evals(0, values, &hi)
@@ -1376,7 +1410,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
     let lean = prefix_sets.and_then(|(sets, eq)| {
         // The first block of the expansion, as factors: the switch recomputes its tiles.
-        cf::LeanSwitch::with_sixteenths_factored(values, eq, &hi, &batch, workers, planes, sets)
+        cf::LeanSwitch::with_sets_factored(values, eq, &hi, &batch, workers, planes, sets.into())
     });
     let (rounds, coords, opened) = match lean {
         Some(mut sw) => switch_rounds(&mut sw, &mut t),
@@ -1971,39 +2005,6 @@ mod tests {
         assert!(EMBEDDED_HYBRID.0[..] == image[..], "the embedded arranged image differs");
         assert!(hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES).is_some());
         assert!(hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES - 1).is_none());
-    }
-    /// The embedded column-pair image is the one built from the key and the 1024-lift key.
-    #[test]
-    fn embedded_pairs_match_the_built_keys() {
-        if MODULUS != modulus_choice::HYBRID_MODULUS || EMBEDDED_PAIRS.0.is_empty() { return; }
-        let key = keygen::build_key(MODULUS);
-        let tail = keygen::build_tail_key(MODULUS);
-        let built = labinius::simd::commit::hybrid::pair_keys(&key, &tail, 1);
-        assert_eq!(keygen::pair_words(&EMBEDDED_PAIRS.0).expect("a valid image"), &built[..]);
-    }
-    /// The column-pair kernel's rows equal the arranged kernel's exactly, across a full and a
-    /// partial certified chunk and a full and a partial 16-column group, and the commitment is
-    /// the schoolbook product.
-    #[test]
-    fn pair_commitment_matches_arranged_kernel_and_schoolbook() {
-        let q=modulus_choice::HYBRID_MODULUS;let ring=288usize;let columns=17;
-        let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
-        let matrix=rq::ajtai_matrix(q,ring);
-        let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
-        let tail=keygen::build_tail_key_from_matrix(&matrix);
-        let mut t=Transcript::new(b"pair-commitment-regression");
-        let values=t.sample_b128(b"binary",ring*4*columns);
-        let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
-        let arranged=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,1,4);
-        let pairs=labinius::simd::commit::hybrid::pair_keys(&key,&tail,1);
-        let rows=labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pairs,&cols,1);
-        assert!(rows==arranged, "the pair kernel's rows differ");
-        let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,1,None);
-        let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
-        for c in [0,16] {
-            let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
-            assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);
-        }
     }
     #[test]
     fn hybrid_commitment_matches_schoolbook_under_new_modulus() {

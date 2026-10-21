@@ -54,9 +54,11 @@ pub fn eq_table(ps: &[F162]) -> Vec<F162> {
         let n = t.len();
         t.resize(2 * n, F162::ZERO);
         for b in 0..n {
+            // x (1 + p) = x + x p: one product per entry.
             let x = t[b];
-            t[b + n] = x * p;
-            t[b] = x * (F162::ONE + p);
+            let y = x * p;
+            t[b + n] = y;
+            t[b] = x + y;
         }
     }
     t
@@ -279,12 +281,6 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
     debug_assert!(a.n >= n);
     let (mut acc, blocks) = ([_mm512_setzero_si512(); 12], n / 8);
     for t in 0..blocks {
-        // The words' lines 1 KB ahead, requested explicitly: with eight runners streaming the
-        // table the hardware prefetcher alone leaves the clmul work waiting (6.6 -> 5.9 ms for
-        // the phase; 4 KB and 16 KB ahead are no better). A prefetch past the end is harmless.
-        let ahead = b.wrapping_add(8 * t + 64) as *const i8;
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead);
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead.wrapping_add(64));
         let x = [
             _mm512_loadu_si512(a.w[0].as_ptr().add(8 * t) as *const __m512i),
             _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
@@ -305,6 +301,44 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
 
 /// [`row_evaluate`] of the witness `Witness::lifted` would build from `words`, read in place
 /// and one column per task over `workers` threads: `u_j = sum_i eq(p0, i) lift(words[i + wdim j])`.
+/// `eq(p0, .)` straight into the word-sliced layout [`dot_words`] reads: entry `i` is
+/// `eq(p0[..3], i & 7) eq(p0[3..], i >> 3)`, eight entries per [`bf::mul_soa8`] against the
+/// eight low ones, cut over the pool. The field is exact, so the entries are [`eq_table`]'s.
+fn eq_poly(p0: &[F162], workers: usize) -> Poly {
+    const LO: usize = 3;
+    let n = 1usize << p0.len();
+    if p0.len() < 2 * LO {
+        return Poly::from_scalars(&eq_table(p0));
+    }
+    let lo = eq_table(&p0[..LO]);
+    let hi = eq_table(&p0[LO..]);
+    let mut w: [Vec<u64>; 3] = core::array::from_fn(|_| Vec::with_capacity(n));
+    let addrs = w.each_mut().map(|v| v.as_mut_ptr() as usize);
+    let runs = crate::par::ranges(hi.len(), workers, 8);
+    crate::par::pool().run(runs.len(), |r| unsafe {
+        let lo_v: [__m512i; 3] = core::array::from_fn(|k| {
+            let limbs: [u64; 8] = core::array::from_fn(|i| lo[i].0[k]);
+            _mm512_loadu_si512(limbs.as_ptr() as *const __m512i)
+        });
+        for ih in runs[r].clone() {
+            let h = hi[ih].0;
+            let v = bf::mul_soa8(lo_v, [
+                _mm512_set1_epi64(h[0] as i64),
+                _mm512_set1_epi64(h[1] as i64),
+                _mm512_set1_epi64(h[2] as i64),
+            ]);
+            for (k, &a) in addrs.iter().enumerate() {
+                _mm512_storeu_si512((a as *mut u64).add(8 * ih) as *mut __m512i, v[k]);
+            }
+        }
+    });
+    // Every entry was written above.
+    for v in &mut w {
+        unsafe { v.set_len(n) };
+    }
+    Poly { w, n }
+}
+
 pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Vec<F162> {
     let wdim = 1usize << p0.len();
     assert_eq!(
@@ -313,21 +347,13 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
         "the words are not a whole number of columns of {wdim}"
     );
     let columns = words.len() / wdim;
-    let eq = Poly::from_scalars(&eq_table(p0));
+    let eq = eq_poly(p0, workers);
     let mut out = vec![F162::ZERO; columns];
-    // Columns handed out a few at a time from a shared counter: a runner that starts late or
-    // shares its core with another process takes fewer of them instead of holding the phase up.
-    let chunk = columns.div_ceil(32 * workers.max(1)).max(1);
-    let chunks = columns.div_ceil(chunk);
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    let runs = crate::par::ranges(columns, workers, 1);
     let out_addr = out.as_mut_ptr() as usize;
-    crate::par::pool().run(workers.clamp(1, chunks), |_| loop {
-        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if k >= chunks {
-            break;
-        }
-        // Chunk `k` owns `out[k * chunk ..]`.
-        for j in k * chunk..((k + 1) * chunk).min(columns) {
+    crate::par::pool().run(runs.len(), |i| {
+        // Run `i` owns `out[runs[i]]`.
+        for j in runs[i].clone() {
             let value = unsafe { dot_words(&eq, words.as_ptr().add(j * wdim), wdim) };
             unsafe { (out_addr as *mut F162).add(j).write(value) };
         }
@@ -345,7 +371,7 @@ mod word_tests {
         let mut next = || {
             state ^= state << 13; state ^= state >> 7; state ^= state << 17; state
         };
-        for log in [0usize, 1, 3, 6, 10] {
+        for log in [0usize, 1, 3, 6, 7, 10, 14] {
             let p: Vec<_> = (0..log).map(|_| F162([next(), next(), next() & ((1 << 34) - 1)])).collect();
             let words: Vec<_> = (0..(5 << log)).map(|_| crate::fields::scalar::B128((next() as u128) | ((next() as u128) << 64))).collect();
             let eq = eq_table(&p);
@@ -353,6 +379,8 @@ mod word_tests {
                 eq.iter().zip(column).fold(F162::ZERO, |a, (&e, &w)| a + e * F162::from_b128(w))).collect();
             for workers in [1usize, 3, 8] {
                 assert_eq!(row_evaluate_words(&words, &p, workers), expected, "log {log}, workers {workers}");
+                let poly = eq_poly(&p, workers);
+                assert_eq!((0..eq.len()).map(|i| poly.get(i)).collect::<Vec<_>>(), eq, "log {log}");
             }
         }
     }

@@ -154,6 +154,45 @@ mod bin_asm {
         }
     }
 
+    /// The in-place `B128` slicer against the staged one (`F162` front end on the lifted words)
+    /// and against the scalar definition, on random words and on words with single bits / all
+    /// ones (every plane, including the edges 127/128 of the zero top limb).
+    #[test]
+    fn transpose_b128_matches() {
+        use labinius::rng::Rng;
+        use labinius::{B128, F162};
+        let mut rng = Rng::new(0xB128);
+        let mut cases: Vec<[B128; 128]> = Vec::new();
+        for _ in 0..64 {
+            cases.push(core::array::from_fn(|_| {
+                B128(rng.next_u64() as u128 | ((rng.next_u64() as u128) << 64))
+            }));
+        }
+        cases.push([B128(u128::MAX); 128]);
+        cases.push([B128(0); 128]);
+        for bit in [0usize, 1, 63, 64, 65, 80, 81, 120, 121, 126, 127] {
+            for p in [0usize, 7, 8, 31, 77, 127] {
+                let mut c = [B128(0); 128];
+                c[p] = B128(1u128 << bit);
+                cases.push(c);
+            }
+        }
+        for words in &cases {
+            let lifted: [F162; 128] = core::array::from_fn(|i| F162::from_b128(words[i]));
+            let want = f162::index_rows_scalar(&lifted);
+            let mut got = BinaryIndex32::zero();
+            let mut staged = BinaryIndex32::zero();
+            unsafe {
+                tf::slice_b128_into(words, &mut got);
+                tf::slice_b128_staged_into(words, &mut staged);
+            }
+            for i in 0..162 {
+                assert!(want.rows[i] == got.rows[i], "slice_b128_into row {i}");
+                assert!(staged.rows[i] == got.rows[i], "slice_b128_into vs staged row {i}");
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ i32 shadow model
     //
     // Mirrors the kernel's exact schedule lane-wise in i32 so that every intermediate can be checked

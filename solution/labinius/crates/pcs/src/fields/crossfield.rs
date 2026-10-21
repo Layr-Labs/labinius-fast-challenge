@@ -1126,6 +1126,15 @@ pub fn eq_expand_and_partials_factored(
     unsafe { partials_blocks::<16>(r, pi0, threads) }
 }
 
+/// [`eq_expand_and_partials_factored`] with `G` prefix blocks (a power of two, at most 256):
+/// `G` partial sets, and the first `1 / G` of the expansion as factors.
+pub fn eq_expand_and_partials_factored_blocks<const G: usize>(
+    r: &[B128], pi0: &[B128], threads: usize,
+) -> ([Vec<B128>; G], EqFactors) {
+    assert!(G.is_power_of_two() && G <= 256);
+    unsafe { partials_blocks::<G>(r, pi0, threads) }
+}
+
 unsafe fn eq_expand_and_partials_blocks<const G: usize>(
     r: &[B128], pi0: &[B128], out: *mut B128, threads: usize,
 ) -> [Vec<B128>; G] {
@@ -1366,6 +1375,12 @@ pub fn partials_from_eighths(v: &[Vec<B128>; 8], r_hi: &[B128]) -> Vec<B128> {
 }
 
 pub fn partials_from_sixteenths(v: &[Vec<B128>; 16], r_hi: &[B128]) -> Vec<B128> {
+    partials_from_blocks(v, r_hi)
+}
+
+/// The 128 partials of the whole table from any power-of-two number of prefix-block sets.
+pub fn partials_from_sets(v: &[Vec<B128>], r_hi: &[B128]) -> Vec<B128> {
+    assert!(v.len().is_power_of_two());
     partials_from_blocks(v, r_hi)
 }
 
@@ -1725,68 +1740,53 @@ unsafe fn message_range(
 
 /// Bind all prefix coordinates directly. Polynomial products are XOR-accumulated
 /// before one field reduction per output, instead of reducing each tree node.
-/// Plane elements ahead of the current tile that [`fold_message_range`] prefetches in each of
-/// its twelve read streams (1 KB; measured 2.57 -> 2.32 ms for rounds 4 on, 4 KB ahead 2.42).
-const FOLD_AHEAD: usize = 128;
-
-/// Words ahead of the current eight that [`materialize_prefix_range`] prefetches in each stream.
-const MATERIALIZE_AHEAD: usize = 64;
-
+///
+/// The blocks are `len` words apart, a multiple of the L2's set span, so the words of every
+/// block at one position share a cache set: more than [`BIND_WAYS`] streams at once evict each
+/// other's prefetched lines. More blocks are taken [`BIND_WAYS`] at a time over a stretch of
+/// [`BIND_STRETCH`] outputs, the later sweeps adding their reduced sums to the stored ones
+/// (reduction is linear, so the values are the same).
 unsafe fn materialize_prefix_range(
     words: *const B128, len: usize, weights: &[[__m512i; 3]],
     dst: [*mut u64; 3], range: core::ops::Range<usize>,
 ) {
-    for j in range.step_by(8) {
-        let mut acc = [_mm512_setzero_si512(); 12];
-        for (q, &weight) in weights.iter().enumerate() {
-            // Sixteen read streams per runner: the hardware prefetcher does not run far enough
-            // ahead of the clmul work on all of them, so each stream's lines 1 KB ahead are
-            // requested here (measured 9.4 -> 8.1 ms for the round;
-            // 0.5 KB and 1.5 KB ahead are both slower, 32 KB much slower). A prefetch past the end
-            // of the table is harmless.
-            let a = words.wrapping_add(j + MATERIALIZE_AHEAD + q * len) as *const i8;
-            _mm_prefetch::<_MM_HINT_T0>(a);
-            _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64));
-            super::f162::mac_soa8_word(&mut acc, weight, load_words(words.add(j + q * len)));
-        }
-        store_p(dst, j, super::f162::reduce_soa8(acc));
-    }
-}
-
-/// Rounds over fewer elements than this run on the calling thread: below it, waking the pool's
-/// parked workers costs more than the round's work. (Lower under test, so that the small
-/// instances there take the split path too.)
-const PAR_FROM: usize = if cfg!(test) { 1 << 8 } else { 1 << 15 };
-
-/// `f` over `0 .. n` in TILE-aligned chunks handed out from a shared counter, the parts summed
-/// (F162 addition is exact and order-free, so the result does not depend on who took which
-/// chunk). Eight chunks per thread: a runner that starts late or shares its core with another
-/// process takes fewer of them instead of holding the round up. Whole on the calling thread
-/// below [`PAR_FROM`].
-fn dynamic_sum2(n: usize, threads: usize, f: impl Fn(core::ops::Range<usize>) -> [F162; 2] + Sync) -> [F162; 2] {
-    if n < PAR_FROM {
-        return f(0..n);
-    }
-    let chunk = n.div_ceil(8 * threads.max(1)).div_ceil(TILE) * TILE;
-    let chunks = n.div_ceil(chunk);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let parts: Vec<[F162; 2]> = crate::par::pool().map(threads.min(chunks), |_| {
-        let mut m = [F162::ZERO; 2];
-        loop {
-            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if k >= chunks {
-                break m;
+    let mut j0 = range.start;
+    while j0 < range.end {
+        let j1 = (j0 + BIND_STRETCH).min(range.end);
+        for (s, ws) in weights.chunks(BIND_WAYS).enumerate() {
+            let q0 = s * BIND_WAYS;
+            for j in (j0..j1).step_by(8) {
+                let mut acc = [_mm512_setzero_si512(); 12];
+                for (i, &weight) in ws.iter().enumerate() {
+                    super::f162::mac_soa8_word(&mut acc, weight, load_words(words.add(j + (q0 + i) * len)));
+                }
+                let mut v = super::f162::reduce_soa8(acc);
+                if s > 0 {
+                    v = xor3p(v, load_p(Src::Planes(dst.map(|p| p as *const u64)), j));
+                }
+                store_p(dst, j, v);
             }
-            let r = f(k * chunk..((k + 1) * chunk).min(n));
-            m[0] += r[0];
-            m[1] += r[1];
         }
-    });
-    parts.into_iter().fold([F162::ZERO; 2], |a, p| [a[0] + p[0], a[1] + p[1]])
+        j0 = j1;
+    }
 }
+
+/// Blocks one sweep of the binding pass reads at once (see [`materialize_prefix_range`]). Few
+/// streams with long runs each (64 KB per block and sweep) suit the memory best, which pays for
+/// the extra reductions: 32 blocks over 2^19 outputs measured 5.0 ms at 2 x 4096, 5.1 ms at
+/// 4 x 4096, 6.3 ms at 16 x 512 and 16.5 ms in one sweep (pages faulted in beforehand).
+const BIND_WAYS: usize = 2;
+/// Outputs per sweep of the binding pass.
+const BIND_STRETCH: usize = 4096;
+
+/// Rounds over fewer elements than this run on the calling thread: below it, a dispatch costs
+/// more than the round's work. The switch's rounds follow each other within microseconds, so
+/// the pool's workers are still spinning, not parked: splitting the rounds from 2^10 elements
+/// on measured the switch ~0.4 ms faster than from 2^15. (Lower under test, so that the small
+/// instances there take the split path too.)
+const PAR_FROM: usize = if cfg!(test) { 1 << 8 } else { 1 << 10 };
 
 /// `0 .. n` cut for the pool, or whole when `n` is below [`PAR_FROM`].
-#[allow(dead_code)]
 fn round_ranges(n: usize, threads: usize) -> Vec<core::ops::Range<usize>> {
     if n < PAR_FROM {
         vec![0..n]
@@ -1817,18 +1817,6 @@ unsafe fn fold_message_range(
     let mut buf = EqTile([B128::ZERO; TILE]);
     let stream = hh >= STREAM_FROM;
     for j0 in range.step_by(TILE) {
-        // The four source rows of the next tiles, all three planes, a tile ahead of the hardware
-        // prefetcher; a prefetch past a plane's end is harmless.
-        if let Src::Planes(p) = src {
-            for k in 0..3 {
-                for o in [j0, j0 + half, j0 + hh, j0 + hh + half] {
-                    let a = p[k].wrapping_add(o + FOLD_AHEAD) as *const i8;
-                    for l in 0..(TILE * 8 / 64) {
-                        _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64 * l));
-                    }
-                }
-            }
-        }
         map_tile2(eq.tile(j0, &mut buf), ml, mlp, &mut av, &mut apv);
         for g in 0..8 {
             let j = j0 + 8 * g;
@@ -1873,6 +1861,9 @@ impl EqView<'_> {
     }
 }
 
+/// The most prefix coordinates the partial sets of a [`LeanSwitch`] may cover.
+pub const MAX_PREFIX: usize = 8;
+
 /// The switch prover that keeps `a` as a linear map and `p` in one half-size buffer (see the
 /// section comment). Drives the same transcript as [`SwitchProver`]: `msg`, `fold`, `msg`, ...
 /// `final_eval`.
@@ -1887,7 +1878,7 @@ pub struct LeanSwitch<'a> {
     /// Materialized p after the prefix rounds, word-sliced.
     p: [HugeBuf<u64>; 3],
     /// Challenges defining the virtual prefix folds.
-    prefix_r: [F162; 4],
+    prefix_r: [F162; MAX_PREFIX],
     /// Prefix-block partial sets: four, eight or sixteen blocks supply the first
     /// two, three or four messages, respectively; eq holds the first block only.
     blocks: Option<Vec<Vec<B128>>>,
@@ -1964,6 +1955,20 @@ impl<'a> LeanSwitch<'a> {
         Self::build(pi0, EqView::Factored(eq), r_hi, batch, threads, planes, Some(sets.into()))
     }
 
+    /// [`with_sixteenths_factored`](Self::with_sixteenths_factored) for any power-of-two
+    /// number of prefix sets from 2 to [`MAX_PREFIX`] coordinates' worth: the first
+    /// `log2(sets.len())` messages come from the sets.
+    pub fn with_sets_factored(
+        pi0: &'a [B128], eq: EqFactors, r_hi: &'a [B128], batch: &[F162],
+        threads: usize, planes: [HugeBuf<u64>; 3], sets: Vec<Vec<B128>>,
+    ) -> Option<Self> {
+        let prefix = sets.len().trailing_zeros() as usize;
+        assert!(sets.len().is_power_of_two() && (1..=MAX_PREFIX).contains(&prefix));
+        assert!(r_hi.len() > prefix);
+        assert!(eq.low.len() % TILE == 0, "a tile is within one row of the factors");
+        Self::build(pi0, EqView::Factored(eq), r_hi, batch, threads, planes, Some(sets))
+    }
+
     fn build(
         pi0: &'a [B128],
         eq: EqView<'a>,
@@ -1998,7 +2003,7 @@ impl<'a> LeanSwitch<'a> {
             l,
             lp,
             p: planes,
-            prefix_r: [F162::ZERO; 4],
+            prefix_r: [F162::ZERO; MAX_PREFIX],
             blocks,
             half: n,
             round: 0,
@@ -2079,8 +2084,17 @@ impl<'a> LeanSwitch<'a> {
         }
         let ml = eq_matrices(&self.l);
         let mlp = eq_matrices(&self.lp);
+        let runs = round_ranges(half, self.threads);
         let eq = self.eq.src();
-        dynamic_sum2(half, self.threads, |r| unsafe { message_range(eq, src, half, &ml, &mlp, r) })
+        let parts: Vec<[F162; 2]> = crate::par::pool().map(runs.len(), |i| unsafe {
+            message_range(eq, src, half, &ml, &mlp, runs[i].clone())
+        });
+        let mut m = [F162::ZERO; 2];
+        for part in parts {
+            m[0] += part[0];
+            m[1] += part[1];
+        }
+        m
     }
 
     fn dst(&mut self) -> [*mut u64; 3] {
@@ -2159,7 +2173,7 @@ impl<'a> LeanSwitch<'a> {
             let dst = dst.map(|p| p as usize);
             // Handed out in chunks from a shared counter, like the partials' rows: a runner
             // that starts late or shares its core takes fewer of them.
-            let chunk = (half / (32 * self.threads)).clamp(8, 1 << 12) & !7;
+            let chunk = (half / (16 * self.threads)).clamp(8, 1 << 12) & !7;
             let chunks = half.div_ceil(chunk);
             let next = std::sync::atomic::AtomicUsize::new(0);
             // Consecutive chunks are a quarter of the output apart, so that the runners write
@@ -2204,11 +2218,27 @@ impl<'a> LeanSwitch<'a> {
         }
         let ml = eq_matrices(&self.l);
         let mlp = eq_matrices(&self.lp);
+        let runs = round_ranges(hh, self.threads);
         let eq = self.eq.src();
         let dst = dst.map(|p| p as usize);
-        let m = dynamic_sum2(hh, self.threads, |range| unsafe {
-            fold_message_range(eq, src, dst.map(|p| p as *mut u64), half, hh, r, &ml, &mlp, range)
+        let parts: Vec<[F162; 2]> = crate::par::pool().map(runs.len(), |i| unsafe {
+            fold_message_range(
+                eq,
+                src,
+                dst.map(|p| p as *mut u64),
+                half,
+                hh,
+                r,
+                &ml,
+                &mlp,
+                runs[i].clone(),
+            )
         });
+        let mut m = [F162::ZERO; 2];
+        for part in parts {
+            m[0] += part[0];
+            m[1] += part[1];
+        }
         self.pending = Some(m);
         self.round += 1;
     }
@@ -2421,6 +2451,42 @@ mod lean_tests {
                 }
                 assert_eq!(reference.final_eval(), lean.final_eval(), "l {l}");
             }
+        }
+    }
+
+    /// More prefix sets than one sweep of the binding pass reads (32 and 64 blocks), and fewer.
+    #[test]
+    fn factored_sets_path_matches_switch_prover() {
+        let mut x = 0x5151_2626_3737_4848_9A9A_0B0B_1C1C_2D2Du128;
+        fn run<const G: usize>(x: &mut u128, l: usize, threads: usize) {
+            let n = 1 << l;
+            let pi0: Vec<B128> = (0..n).map(|_| B128(next(x))).collect();
+            let r_hi: Vec<B128> = (0..l).map(|_| B128(next(x))).collect();
+            let batch: Vec<F162> = (0..PACK)
+                .map(|_| F162([next(x) as u64, next(x) as u64, (next(x) as u64) & ((1 << 34) - 1)]))
+                .collect();
+            let r: Vec<F162> = (0..l)
+                .map(|_| F162([next(x) as u64, next(x) as u64, (next(x) as u64) & ((1 << 34) - 1)]))
+                .collect();
+            let eq = eq_expand_b128(&r_hi);
+            let (sets, factors) = eq_expand_and_partials_factored_blocks::<G>(&r_hi, &pi0, threads);
+            assert_eq!(factors.len(), n / G);
+            assert_eq!(factors.to_vec()[..], eq[..n / G], "the first block, l {l} G {G}");
+            assert_eq!(partials_from_sets(&sets, &r_hi), partial_evals(&pi0, &eq), "partials, l {l} G {G}");
+            let mut reference = SwitchProver::new(&pi0, &eq, &batch);
+            let mut lean = LeanSwitch::with_sets_factored(&pi0, factors, &r_hi, &batch, threads,
+                LeanSwitch::planes(n), sets.into()).unwrap();
+            for (round, &ri) in r.iter().enumerate() {
+                assert_eq!(reference.msg(), lean.msg(), "l {l} G {G} threads {threads} round {round}");
+                reference.fold(ri);
+                lean.fold(ri);
+            }
+            assert_eq!(reference.final_eval(), lean.final_eval(), "l {l} G {G}");
+        }
+        for threads in [1usize, 3, 8] {
+            run::<32>(&mut x, 18, threads);
+            run::<64>(&mut x, 19, threads);
+            run::<8>(&mut x, 18, threads);
         }
     }
 

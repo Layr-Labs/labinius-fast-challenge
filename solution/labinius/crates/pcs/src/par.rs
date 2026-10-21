@@ -215,8 +215,15 @@ impl Pool {
         }));
         // Started by the caller: workers started by the first worker (the caller's setup then
         // runs while they come up) measured the commitment 10 ms slower.
+        // Each worker is told the epoch the pool starts at, not left to read it when it first
+        // runs: a worker whose start-up is delayed past the first dispatches (its stack mapping
+        // waits for the mmap lock behind the table's population) would otherwise take an epoch
+        // published meanwhile for one it has already served, skip that dispatch and park
+        // through it — measured as a commitment run by seven runners, 12-26 ms slower, in about
+        // a third of the runs.
+        let start = epoch_of(shared.claim.load(Ordering::Acquire));
         let handles = (1..width)
-            .map(|_| std::thread::spawn(move || worker(shared)))
+            .map(|_| std::thread::spawn(move || worker(shared, start)))
             .collect();
         Pool {
             shared,
@@ -347,8 +354,9 @@ impl Pool {
     }
 }
 
-fn worker(s: &'static Shared) {
-    let mut seen = epoch_of(s.claim.load(Ordering::Acquire));
+/// A worker's loop. `seen` is the epoch the pool had when the worker was spawned: every later
+/// dispatch is one it has not served, however late the thread itself starts.
+fn worker(s: &'static Shared, mut seen: u64) {
     loop {
         // Wait for a dispatch with a task left to take: spin (doing idle work if there is any),
         // then park.
@@ -480,8 +488,15 @@ unsafe extern "C" {
 /// path when the caller arranges it.
 #[cfg(target_os="linux")]
 fn physical_cores()->Option<&'static [usize]> {
-    static CORES:std::sync::OnceLock<Option<Vec<usize>>>=std::sync::OnceLock::new();
-    CORES.get_or_init(read_physical_cores).as_deref()
+    static FIRST:std::sync::OnceLock<Option<Vec<usize>>>=std::sync::OnceLock::new();
+    FIRST.get_or_init(||core_cpus().map(|c|c.iter().map(|l|l[0]).collect())).as_deref()
+}
+/// The allowed logical CPUs of each physical core (cores in the order of their first CPU in
+/// `/proc/cpuinfo`, each core's CPUs in that order): read once, like [`physical_cores`].
+#[cfg(target_os="linux")]
+fn core_cpus()->Option<&'static [Vec<usize>]> {
+    static CORES:std::sync::OnceLock<Option<Vec<Vec<usize>>>>=std::sync::OnceLock::new();
+    CORES.get_or_init(read_core_cpus).as_deref()
 }
 /// Read the CPU topology [`CorePlacement::for_workers`] needs now.
 pub fn warm_topology() {
@@ -489,12 +504,12 @@ pub fn warm_topology() {
     let _=physical_cores();
 }
 #[cfg(target_os="linux")]
-fn read_physical_cores()->Option<Vec<usize>> {
+fn read_core_cpus()->Option<Vec<Vec<usize>>> {
         let mut allowed=[0usize;16];
         if unsafe {sched_getaffinity(0,std::mem::size_of_val(&allowed),allowed.as_mut_ptr())} !=0 {return None;}
         let info=std::fs::read_to_string("/proc/cpuinfo").ok()?;
-        let mut seen=std::collections::BTreeSet::new();
-        let mut cpus=Vec::new();
+        let mut seen=std::collections::BTreeMap::new();
+        let mut cores:Vec<Vec<usize>>=Vec::new();
         for record in info.split("\n\n") {
             let mut cpu=None;let mut package=None;let mut core=None;
             for line in record.lines() {
@@ -509,9 +524,12 @@ fn read_physical_cores()->Option<Vec<usize>> {
             let (Some(cpu),Some(package),Some(core))=(cpu,package,core) else {continue};
             let bits=usize::BITS as usize;
             if cpu>=allowed.len()*bits || allowed[cpu/bits]&(1usize<<(cpu%bits))==0 {continue;}
-            if seen.insert((package,core)) {cpus.push(cpu);}
+            let next=cores.len();
+            let i=*seen.entry((package,core)).or_insert(next);
+            if i==next {cores.push(Vec::new());}
+            cores[i].push(cpu);
         }
-        Some(cpus)
+        Some(cores)
 }
 #[cfg(target_os="linux")]
 impl CorePlacement {
@@ -519,6 +537,13 @@ impl CorePlacement {
         let cpus=physical_cores()?;
         if workers==0 || cpus.len()<workers {return None;}
         Some(Self{cpus:cpus.to_vec()})
+    }
+    /// Tasks `2k` and `2k + 1` on the two hyperthreads of physical core `k`: for a dispatch of
+    /// exactly twice as many tasks as there are cores, each core having exactly two allowed CPUs.
+    pub fn for_sibling_pairs(tasks:usize)->Option<Self> {
+        let cores=core_cpus()?;
+        if cores.is_empty() || tasks!=2*cores.len() || cores.iter().any(|c|c.len()!=2) {return None;}
+        Some(Self{cpus:cores.iter().flatten().copied().collect()})
     }
     /// One task per allowed logical CPU, in CPU order: for a dispatch of exactly `tasks` equal
     /// tasks on a pool as wide as the CPU set, so that no two of them share a CPU while another
@@ -552,6 +577,7 @@ pub struct CorePlacement;
 impl CorePlacement {
     pub fn for_workers(_:usize)->Option<Self>{None}
     pub fn for_logical(_:usize)->Option<Self>{None}
+    pub fn for_sibling_pairs(_:usize)->Option<Self>{None}
     pub fn pin(&self,_:usize)->Option<()>{None}
 }
 

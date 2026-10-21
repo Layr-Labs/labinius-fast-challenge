@@ -27,8 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/parameters.rs");
     println!("cargo:rerun-if-changed=src/rq.rs");
     println!("cargo:rerun-if-changed=build.rs");
-    let (image, tail, hybrid, pairs) = images();
-    std::fs::write(dir.join("pair-key.bin"), pairs).expect("write the column-pair key image");
+    let (image, tail, hybrid) = images();
     std::fs::write(dir.join("key.bin"), image).expect("write the key image");
     std::fs::write(dir.join("tail-key.bin"), tail).expect("write the auxiliary key image");
     std::fs::write(dir.join("hybrid-key.bin"), hybrid).expect("write the arranged hybrid key image");
@@ -49,26 +48,24 @@ fn host_can_run() -> bool {
 /// the hybrid commitment's sink (`labinius::simd::commit::hybrid::arranged_image`), each key
 /// built once.
 #[cfg(target_arch = "x86_64")]
-fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     // The library's kernels need these features at run time. A build host without them (for
     // instance a cross-build for the scored CPU) writes empty images and the prover builds the
     // keys when it runs; the scored runner has every one of them.
     if !host_can_run() {
-        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let key = keygen::build_key(parameters::MODULUS);
     let image = keygen::key_image(&key);
     if parameters::MODULUS != modulus_choice::HYBRID_MODULUS {
-        return (image, Vec::new(), Vec::new(), Vec::new());
+        return (image, Vec::new(), Vec::new());
     }
     let tail = keygen::build_tail_key(parameters::MODULUS);
     let hybrid = labinius::simd::commit::hybrid::arranged_image(&key, &tail);
-    let pairs = labinius::simd::commit::hybrid::pair_keys(&key, &tail, labinius::par::threads());
-    let pairs: Vec<u8> = pairs.iter().flat_map(|w| w.to_le_bytes()).collect();
-    (image, keygen::key_image(&tail), hybrid, pairs)
+    (image, keygen::key_image(&tail), hybrid)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
-    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    (Vec::new(), Vec::new(), Vec::new())
 }

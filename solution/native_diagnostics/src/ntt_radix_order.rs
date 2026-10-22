@@ -1,95 +1,13 @@
-//! Forward NTT for **binary** inputs in the vertical batch-of-32 layout, with levels 4, 5 and 6
-//! hand-scheduled in one `asm!` block per 27-block (27 zmm data registers resident).
-//! Generated; see the report for the schedule variants tried.
-//! Agrees with `ntt::bin_small` modulo q: the s2 = 1 half of every 162-block reuses the s2 = 0
-//! lookups (see the kernel), and for q = 9721 it also reduces at different levels and with a
-//! different Barrett (see Bounds below).
-//!
-//! Levels 0, 1, 2 and the level-3 twiddles are all folded into 16-entry lookup tables indexed by
-//! the 4-bit nibble (b_i, b_{i+162}, b_{i+324}, b_{i+486}) of each polynomial; levels 3..6 are radix-3
-//! signed-Montgomery butterflies. The whole batch is done depth-first per 162-block: the table
-//! lookups, level 3 and level 4 write a 10 KB stack block, levels 5 and 6 are fused (a degree-9
-//! sub-ring is exactly three degree-3 sub-rings, so its nine values never leave registers) and go
-//! straight to the output.
-//!
-//! Measured on the i7-11850H, one core, cache-resident input: 280.2 cycles per ring element
-//! for q = 3889 and 303.8 for q = 9721 (697 / 752 instructions, 699 / 760 uops, 268 / 291
-//! port-0, 246 / 277 port-5).
-//!
-//! ## Instruction selection (port facts measured on this core)
-//!
-//! `vpermw` zmm is 2 uops (p0 + p5), so a 16-entry i16 lookup done with `vpermw` would cost one
-//! port-0 slot per lookup (1080 per batch, ~17% of the port-0 budget). The tables are therefore
-//! stored **byte-split** (low halves at byte n, high halves at byte 16+n) and looked up
-//! with `vpermb` (1 uop, p5 only) on the byte-index rows `(n, 16+n)` that
-//! `transpose_f162::slice_f162_into` emits directly (`BinaryIndex32`), so the kernel has no
-//! index-expansion prologue at all.
-//! `vpbroadcastd zmm, m32` really is a free load (0 p0/p5 uops), so every twiddle is stored as a
-//! duplicated u32.
-//!
-//! ## Bounds (|lane| as a multiple of q; `tests/ntt.rs::bin_asm`: `proved_bounds_9721`
-//! propagates the worst case over all i16 lane values, the i32 shadow model replays the exact
-//! schedule on the test inputs)
-//!
-//! Table entries are centered, |T| <= q/2. A twiddle multiplication `mont(a, w, w')` with
-//! |w| <= q/2 satisfies |mont| <= |a| q / 2^17 + q/2 + 1 < 0.75 q for any i16 `a`; the radix-3
-//! butterfly therefore adds at most 1.5 q to the (untwiddled) `a0` input.
-//!
-//! | after            | q = 3889 | q = 9721 |
-//! |------------------|---------:|---------:|
-//! | levels 0+1+2     |   1.00 q |   1.00 q |
-//! | level 3          |   3.00 q |   3.00 q |
-//! | level 4          |   4.50 q |   2.03 q |
-//! | level 5          |   6.00 q |   3.33 q |
-//! | level 6 (output) |   7.50 q |   2.30 q |
-//!
-//! 2^15 / q = 8.42 (3889) and 3.37 (9721), so **q = 3889 needs no Barrett at all**. For q = 9721
-//! the un-twiddled `a0` input of level 4 gets the **lookup Barrett** ([`barrett_lut_i16`]) and
-//! the one of level 6 the two-multiply `vpmulhrsw` Barrett ([`params::barrett_i16`]); level 5
-//! is left unreduced. The lookup Barrett spends no multiply slot at all:
-//!
-//! ```text
-//! vpsrlw  s, a, 11        p0    s = bits 11..15 of the lane = (a >> 11) & 31
-//! vpermw  s, s, [wcorr]   p5    32-entry i16 table -k(s) q (vpermw reads index bits 0..4 only)
-//! vpaddw  a, a, s         p05
-//! ```
-//!
-//! (Sapphire Rapids: `vpermw` zmm is a single port-5 uop. The Tiger Lake schedule this kernel was
-//! first tuned on used a 5-uop byte-split form, `vpmultishiftqb` + `vpandd` + `vpord` + `vpermb`
-//! + `vpaddw`, because `vpermw` cost a port-0 slot there; it gives bit-identical results.)
-//!
-//! i.e. 3 uops against the two-multiply Barrett's 2 multiplies + 1 flexible. The quotient
-//! window `(a >> 11) & 31` determines `a`
-//! to within 2^11, so the nearest multiple of q leaves |r| <= q/2 + 2^10 = 0.579 q -- tighter
-//! than the `vpmulhrsw` estimate's 0.809 q (both exhaustive over all i16), and that is exactly
-//! what lets level 5 run unreduced: 3.323 q there is still inside the 3.371 q budget, while
-//! 0.809 q at level 4 would have grown to 3.588 q and overflowed. Level 6 only has to keep the
-//! output inside i16, so there the two-multiply Barrett is the cheaper of the two (4 uops
-//! against 5, and its two port-0 slots are affordable again now that level 5 costs nothing).
-//! Reductions per batch: 432 (216 at each of levels 4 and 6) instead of 648, of which only 216
-//! touch the multiply port.
-//!
-//! Measured alternatives for q = 9721 (cache-resident cycles per ring element, 316.6 before):
-//! lookup at 4 and 6 304.6, lookup at 4 only + `vpmulhrsw` at 6 **303.8**, lookup at all three
-//! levels 316.3 (the level-5 reduction is what costs, not the reduction itself); folding the
-//! `vpandd`/`vpord` pair into one `vpternlogd` needs a second constant register, and the only
-//! one to free is q -- as a memory operand of the 1944 `vpmulhw m, q` per batch it costs more
-//! than the uop it saves (306.0); splitting the five uops across the block (the `vpermb` and
-//! `vpaddw` deferred to the end of the multiply block) 308.7, all five at the end 303.6.
-//! `vpermw` on a 32-entry table would take the index straight from a `vpmulhrsw` quotient, but
-//! it is 2 uops (p0 + p5) and needs a p0 uop to build the index: 2 port-0 again.
+//! Isolated radix-order prototype. See the frozen model and evidence in this directory.
+//! The LOCK2 buffers, old tail, key order, output slots, and pair periods are unchanged.
 use labinius::params::*;
 macro_rules! r3_twiddles {
     ($n:literal, $pair:path, $zetas:expr) => {{
-        let mut t = [[0u32; 4]; $n];
-        let mut i = 0;
-        while i < $n {
-            t[i] = $pair($zetas[i]);
-            i += 1;
-        }
-        t
+        let mut t = [[0u32; 4]; $n]; let mut i = 0;
+        while i < $n { t[i] = $pair($zetas[i]); i += 1; } t
     }};
 }
+
 pub use labinius::simd::transpose_f162::BinaryIndex32;
 use labinius::ring::element::*;
 use core::arch::x86_64::*;
@@ -1155,41 +1073,6 @@ macro_rules! pair_register_sink {
     };
 }
 
-// Store the first pass after all 27 outputs are in registers.
-macro_rules! pair_stage27 {
-    () => {
-        concat!(
-            "vmovdqa64 [{w0}+64], zmm2\n",
-            "vmovdqa64 [{w0}+128], zmm1\n",
-            "vmovdqa64 [{w0}+0], zmm0\n",
-            "vmovdqa64 [{w0}+256], zmm8\n",
-            "vmovdqa64 [{w0}+320], zmm7\n",
-            "vmovdqa64 [{w0}+192], zmm6\n",
-            "vmovdqa64 [{w0}+448], zmm5\n",
-            "vmovdqa64 [{w0}+512], zmm4\n",
-            "vmovdqa64 [{w0}+384], zmm3\n",
-            "vmovdqa64 [{w0}+640], zmm20\n",
-            "vmovdqa64 [{w0}+704], zmm19\n",
-            "vmovdqa64 [{w0}+576], zmm18\n",
-            "vmovdqa64 [{w0}+832], zmm26\n",
-            "vmovdqa64 [{w0}+896], zmm25\n",
-            "vmovdqa64 [{w0}+768], zmm24\n",
-            "vmovdqa64 [{w0}+1024], zmm23\n",
-            "vmovdqa64 [{w0}+1088], zmm22\n",
-            "vmovdqa64 [{w0}+960], zmm21\n",
-            "vmovdqa64 [{w0}+1216], zmm11\n",
-            "vmovdqa64 [{w0}+1280], zmm10\n",
-            "vmovdqa64 [{w0}+1152], zmm9\n",
-            "vmovdqa64 [{w0}+1408], zmm17\n",
-            "vmovdqa64 [{w0}+1472], zmm16\n",
-            "vmovdqa64 [{w0}+1344], zmm15\n",
-            "vmovdqa64 [{w0}+1600], zmm14\n",
-            "vmovdqa64 [{w0}+1664], zmm13\n",
-            "vmovdqa64 [{w0}+1536], zmm12\n",
-        )
-    };
-}
-
 #[inline(always)]
 unsafe fn tail27_pair<const Q: u16>(
     bp: *const i16, w0: *const i16, t4: *const u32, t5: *const u32, t6: *const u32,
@@ -1199,19 +1082,8 @@ unsafe fn tail27_pair<const Q: u16>(
         ($m4:ident, $m6:ident) => {
             core::arch::asm!(
                 concat!(
-                    // Bit 1 selects the first pass. Both input registers are restored
-                    // before exit. Thus the operand contract needs no extra GPR.
-                    "or {red:r}, 2\n",
-                    "4:\n",
                     "vmovdqa64 zmm27, [{c}]\n",
                     tail27!($m4, $m6, bfly_registers),
-                    "test {red:e}, 2\n",
-                    "jz 5f\n",
-                    pair_stage27!(),
-                    "add {i}, {stride}\n",
-                    "xor {red:r}, 2\n",
-                    "jmp 4b\n",
-                    "5:\n",
                     "test {red:e}, {red:e}\n",
                     "jnz 2f\n",
                     pair_register_sink!(plain),
@@ -1219,14 +1091,12 @@ unsafe fn tail27_pair<const Q: u16>(
                     "2:\n",
                     pair_register_sink!(reduce),
                     "3:\n",
-                    "sub {i}, {stride}\n",
                     "/* {fold} */\n",
                 ),
                 i = in(reg) bp, w0 = in(reg) w0, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,
                 c = in(reg) cv, key = in(reg) key, acc = in(reg) acc,
                 fold = in(reg) &const { hybrid_fold::<Q>() },
                 red = in(reg) red,
-                stride = const core::mem::size_of::<Blk>(),
                 out("zmm0") _,
                 out("zmm1") _,
                 out("zmm2") _,
@@ -1386,11 +1256,7 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
 ) {
     assert!(Q == 3889 || Q == 9721, "the hybrid commitment's primes");
     let t = tables::<Q>();
-    let c = C {
-        q: bc(&t.qd),
-        om: bc(&t.om[0]),
-        omp: bc(&t.om[1]),
-    };
+    let bar = needs_barrett(Q);
     let ips: [*const u8; 2] = [
         ins[0].rows.as_ptr() as *const u8,
         ins[1].rows.as_ptr() as *const u8,
@@ -1409,59 +1275,12 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
 
     // Process fixed adjacent quarter pairs: both prefixes share each six-row index load.
     // Each quarter retains its own two LOCK=2 buffers until its original six tails finish.
-    for kp in 0..2 {
-        let load_luts = |k: usize| {
-            let lut = t.lut.as_ptr().add(12 * k) as *const u8;
-            let l = |r: usize, ab: usize| -> __m512i {
-                _mm512_load_si512(lut.add(64 * (r * 2 + ab)) as *const __m512i)
-            };
-            (l(0, 0), l(0, 1), l(1, 0), l(1, 1), l(2, 0), l(2, 1))
-        };
-        let ls0 = load_luts(2 * kp);
-        let ls1 = load_luts(2 * kp + 1);
-        for h in 0..2 {
-            let ip = ips[h];
-            for i in 0..27 {
-                let n0 = ldb(ip, i);
-                let n0h = ldb(ip, i + 81);
-                let n1 = ldb(ip, i + 27);
-                let n1h = ldb(ip, i + 108);
-                let n2 = ldb(ip, i + 54);
-                let n2h = ldb(ip, i + 135);
-
-                macro_rules! prefix {
-                    ($bp:expr, $ls:expr) => {{
-                        let bp = $bp;
-                        let (l000, l001, l010, l011, l020, l021) = $ls;
-                        let x = _mm512_permutexvar_epi8(n0, l000);
-                        let y = _mm512_permutexvar_epi8(n0h, l001);
-                        let a0 = _mm512_add_epi16(x, y);
-                        let b0 = _mm512_sub_epi16(x, y);
-
-                        let x = _mm512_permutexvar_epi8(n1, l010);
-                        let y = _mm512_permutexvar_epi8(n1h, l011);
-                        let a1 = _mm512_add_epi16(x, y);
-                        let b1 = _mm512_sub_epi16(y, x);
-
-                        let x = _mm512_permutexvar_epi8(n2, l020);
-                        let y = _mm512_permutexvar_epi8(n2h, l021);
-                        let a2 = _mm512_add_epi16(x, y);
-                        let b2 = _mm512_sub_epi16(x, y);
-
-                        let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
-                        let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
-                        st(bp, i, u0);
-                        st(bp, i + 27, u1);
-                        st(bp, i + 54, u2);
-                        st(bp, i + 81, v2);
-                        st(bp, i + 108, v0);
-                        st(bp, i + 135, v1);
-                    }};
-                }
-                prefix!(bps[h], ls0);
-                prefix!(bps[2 + h], ls1);
-            }
-        }
+    for kp in 0..core::hint::black_box(2usize) {
+        let rt = if Q == 3889 { &RADIX_3889 } else { &RADIX_9721 };
+        prefix_radix_root(
+            ips[0], ips[1], bps[0], bps[1], bps[2], bps[3],
+            rt.lut.as_ptr().add(12 * kp).cast::<i16>(), rt.mont.as_ptr(),
+        );
         for qpair in 0..core::hint::black_box(2usize) {
             let k = 2 * kp + qpair;
             let cv = t.cv.as_ptr() as *const i16;
@@ -1474,8 +1293,14 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
                     t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
                 );
                 let bp0 = bps[2 * qpair].add(32 * 27 * j);
+                if bar {
+                    tail27_b(bp0, w0p, t4, t5, t6, cv);
+                } else {
+                    tail27_p(bp0, w0p, t4, t5, t6, cv);
+                }
+                let bp1 = bps[2 * qpair + 1].add(32 * 27 * j);
                 tail27_pair::<Q>(
-                    bp0,
+                    bp1,
                     w0p,
                     t4,
                     t5,
@@ -1488,4 +1313,246 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
             }
         }
     }
+}
+
+include!("radix_tables.rs");
+
+// The 12 current degree-27 blocks stay in their current staging buffers.
+// Each input and output base is unchanged at asm exit. Only off and zmm0..29 change.
+#[inline(always)]
+unsafe fn prefix_radix_root(
+    ip0: *const u8, ip1: *const u8,
+    bp0: *mut i16, bp1: *mut i16, bp2: *mut i16, bp3: *mut i16,
+    lut: *const i16, mont: *const u32,
+) {
+    core::arch::asm!(
+        "vmovdqa64 zmm0, [{lut}+0]",
+        "vmovdqa64 zmm1, [{lut}+64]",
+        "vmovdqa64 zmm2, [{lut}+128]",
+        "vmovdqa64 zmm3, [{lut}+192]",
+        "vmovdqa64 zmm4, [{lut}+256]",
+        "vmovdqa64 zmm5, [{lut}+320]",
+        "vmovdqa64 zmm6, [{lut}+384]",
+        "vmovdqa64 zmm7, [{lut}+448]",
+        "vmovdqa64 zmm8, [{lut}+512]",
+        "vmovdqa64 zmm9, [{lut}+576]",
+        "vmovdqa64 zmm10, [{lut}+640]",
+        "vmovdqa64 zmm11, [{lut}+704]",
+        "vpbroadcastd zmm12, dword ptr [{mont}+0]",
+        "vpbroadcastd zmm13, dword ptr [{mont}+4]",
+        "vpbroadcastd zmm14, dword ptr [{mont}+8]",
+        "vmovdqa64 zmm15, [{index}+0]",
+        "vmovdqa64 zmm16, [{index}+64]",
+        "vmovdqa64 zmm17, [{index}+128]",
+        "vmovdqa64 zmm18, [{index}+192]",
+        "vmovdqa64 zmm19, [{index}+256]",
+        "vmovdqa64 zmm20, [{index}+320]",
+        "xor {off:e}, {off:e}",
+        "2:",
+        "vmovdqa64 zmm21, [{ip0}+{off}+0]",
+        "vmovdqa64 zmm22, [{ip0}+{off}+1728]",
+        "vmovdqa64 zmm23, [{ip0}+{off}+3456]",
+        "vmovdqa64 zmm24, [{ip0}+{off}+5184]",
+        "vmovdqa64 zmm25, [{ip0}+{off}+6912]",
+        "vmovdqa64 zmm26, [{ip0}+{off}+8640]",
+        "vgf2p8affineqb zmm21, zmm21, zmm15, 0",
+        "vpandd zmm21, zmm21, zmm18",
+        "vgf2p8affineqb zmm25, zmm25, zmm16, 0",
+        "vpternlogd zmm21, zmm25, zmm19, 248",
+        "vgf2p8affineqb zmm23, zmm23, zmm17, 0",
+        "vpternlogd zmm21, zmm23, zmm20, 248",
+        "vpsrlw zmm23, zmm21, 8",
+        "vgf2p8affineqb zmm22, zmm22, zmm15, 0",
+        "vpandd zmm22, zmm22, zmm18",
+        "vgf2p8affineqb zmm26, zmm26, zmm16, 0",
+        "vpternlogd zmm22, zmm26, zmm19, 248",
+        "vgf2p8affineqb zmm24, zmm24, zmm17, 0",
+        "vpternlogd zmm22, zmm24, zmm20, 248",
+        "vpsrlw zmm24, zmm22, 8",
+        "vpermw zmm25, zmm21, zmm0",
+        "vpermw zmm26, zmm22, zmm1",
+        "vpermw zmm27, zmm23, zmm2",
+        "vpermw zmm28, zmm24, zmm3",
+        "vpaddw zmm29, zmm25, zmm27",
+        "vpsubw zmm25, zmm25, zmm27",
+        "vpaddw zmm27, zmm26, zmm28",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpmullw zmm28, zmm26, zmm14",
+        "vpmulhw zmm26, zmm26, zmm13",
+        "vpmulhw zmm28, zmm28, zmm12",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpaddw zmm28, zmm29, zmm27",
+        "vmovdqa64 [{bp0}+{off}+0], zmm28",
+        "vpsubw zmm29, zmm29, zmm27",
+        "vmovdqa64 [{bp0}+{off}+6912], zmm29",
+        "vpaddw zmm28, zmm25, zmm26",
+        "vmovdqa64 [{bp2}+{off}+5184], zmm28",
+        "vpsubw zmm25, zmm25, zmm26",
+        "vmovdqa64 [{bp2}+{off}+3456], zmm25",
+        "vpermw zmm25, zmm21, zmm4",
+        "vpermw zmm26, zmm22, zmm5",
+        "vpermw zmm27, zmm23, zmm6",
+        "vpermw zmm28, zmm24, zmm7",
+        "vpaddw zmm29, zmm25, zmm27",
+        "vpsubw zmm25, zmm25, zmm27",
+        "vpaddw zmm27, zmm26, zmm28",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpmullw zmm28, zmm26, zmm14",
+        "vpmulhw zmm26, zmm26, zmm13",
+        "vpmulhw zmm28, zmm28, zmm12",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpaddw zmm28, zmm29, zmm27",
+        "vmovdqa64 [{bp2}+{off}+0], zmm28",
+        "vpsubw zmm29, zmm29, zmm27",
+        "vmovdqa64 [{bp2}+{off}+6912], zmm29",
+        "vpaddw zmm28, zmm25, zmm26",
+        "vmovdqa64 [{bp0}+{off}+1728], zmm28",
+        "vpsubw zmm25, zmm25, zmm26",
+        "vmovdqa64 [{bp0}+{off}+8640], zmm25",
+        "vpermw zmm25, zmm21, zmm8",
+        "vpermw zmm26, zmm22, zmm9",
+        "vpermw zmm27, zmm23, zmm10",
+        "vpermw zmm28, zmm24, zmm11",
+        "vpaddw zmm29, zmm25, zmm27",
+        "vpsubw zmm25, zmm25, zmm27",
+        "vpaddw zmm27, zmm26, zmm28",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpmullw zmm28, zmm26, zmm14",
+        "vpmulhw zmm26, zmm26, zmm13",
+        "vpmulhw zmm28, zmm28, zmm12",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpaddw zmm28, zmm29, zmm27",
+        "vmovdqa64 [{bp0}+{off}+5184], zmm28",
+        "vpsubw zmm29, zmm29, zmm27",
+        "vmovdqa64 [{bp0}+{off}+3456], zmm29",
+        "vpaddw zmm28, zmm25, zmm26",
+        "vmovdqa64 [{bp2}+{off}+1728], zmm28",
+        "vpsubw zmm25, zmm25, zmm26",
+        "vmovdqa64 [{bp2}+{off}+8640], zmm25",
+        "add {off}, 64",
+        "cmp {off}, 1728",
+        "jne 2b",
+        "xor {off:e}, {off:e}",
+        "3:",
+        "vmovdqa64 zmm21, [{ip1}+{off}+0]",
+        "vmovdqa64 zmm22, [{ip1}+{off}+1728]",
+        "vmovdqa64 zmm23, [{ip1}+{off}+3456]",
+        "vmovdqa64 zmm24, [{ip1}+{off}+5184]",
+        "vmovdqa64 zmm25, [{ip1}+{off}+6912]",
+        "vmovdqa64 zmm26, [{ip1}+{off}+8640]",
+        "vgf2p8affineqb zmm21, zmm21, zmm15, 0",
+        "vpandd zmm21, zmm21, zmm18",
+        "vgf2p8affineqb zmm25, zmm25, zmm16, 0",
+        "vpternlogd zmm21, zmm25, zmm19, 248",
+        "vgf2p8affineqb zmm23, zmm23, zmm17, 0",
+        "vpternlogd zmm21, zmm23, zmm20, 248",
+        "vpsrlw zmm23, zmm21, 8",
+        "vgf2p8affineqb zmm22, zmm22, zmm15, 0",
+        "vpandd zmm22, zmm22, zmm18",
+        "vgf2p8affineqb zmm26, zmm26, zmm16, 0",
+        "vpternlogd zmm22, zmm26, zmm19, 248",
+        "vgf2p8affineqb zmm24, zmm24, zmm17, 0",
+        "vpternlogd zmm22, zmm24, zmm20, 248",
+        "vpsrlw zmm24, zmm22, 8",
+        "vpermw zmm25, zmm21, zmm0",
+        "vpermw zmm26, zmm22, zmm1",
+        "vpermw zmm27, zmm23, zmm2",
+        "vpermw zmm28, zmm24, zmm3",
+        "vpaddw zmm29, zmm25, zmm27",
+        "vpsubw zmm25, zmm25, zmm27",
+        "vpaddw zmm27, zmm26, zmm28",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpmullw zmm28, zmm26, zmm14",
+        "vpmulhw zmm26, zmm26, zmm13",
+        "vpmulhw zmm28, zmm28, zmm12",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpaddw zmm28, zmm29, zmm27",
+        "vmovdqa64 [{bp1}+{off}+0], zmm28",
+        "vpsubw zmm29, zmm29, zmm27",
+        "vmovdqa64 [{bp1}+{off}+6912], zmm29",
+        "vpaddw zmm28, zmm25, zmm26",
+        "vmovdqa64 [{bp3}+{off}+5184], zmm28",
+        "vpsubw zmm25, zmm25, zmm26",
+        "vmovdqa64 [{bp3}+{off}+3456], zmm25",
+        "vpermw zmm25, zmm21, zmm4",
+        "vpermw zmm26, zmm22, zmm5",
+        "vpermw zmm27, zmm23, zmm6",
+        "vpermw zmm28, zmm24, zmm7",
+        "vpaddw zmm29, zmm25, zmm27",
+        "vpsubw zmm25, zmm25, zmm27",
+        "vpaddw zmm27, zmm26, zmm28",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpmullw zmm28, zmm26, zmm14",
+        "vpmulhw zmm26, zmm26, zmm13",
+        "vpmulhw zmm28, zmm28, zmm12",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpaddw zmm28, zmm29, zmm27",
+        "vmovdqa64 [{bp3}+{off}+0], zmm28",
+        "vpsubw zmm29, zmm29, zmm27",
+        "vmovdqa64 [{bp3}+{off}+6912], zmm29",
+        "vpaddw zmm28, zmm25, zmm26",
+        "vmovdqa64 [{bp1}+{off}+1728], zmm28",
+        "vpsubw zmm25, zmm25, zmm26",
+        "vmovdqa64 [{bp1}+{off}+8640], zmm25",
+        "vpermw zmm25, zmm21, zmm8",
+        "vpermw zmm26, zmm22, zmm9",
+        "vpermw zmm27, zmm23, zmm10",
+        "vpermw zmm28, zmm24, zmm11",
+        "vpaddw zmm29, zmm25, zmm27",
+        "vpsubw zmm25, zmm25, zmm27",
+        "vpaddw zmm27, zmm26, zmm28",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpmullw zmm28, zmm26, zmm14",
+        "vpmulhw zmm26, zmm26, zmm13",
+        "vpmulhw zmm28, zmm28, zmm12",
+        "vpsubw zmm26, zmm26, zmm28",
+        "vpaddw zmm28, zmm29, zmm27",
+        "vmovdqa64 [{bp1}+{off}+5184], zmm28",
+        "vpsubw zmm29, zmm29, zmm27",
+        "vmovdqa64 [{bp1}+{off}+3456], zmm29",
+        "vpaddw zmm28, zmm25, zmm26",
+        "vmovdqa64 [{bp3}+{off}+1728], zmm28",
+        "vpsubw zmm25, zmm25, zmm26",
+        "vmovdqa64 [{bp3}+{off}+8640], zmm25",
+        "add {off}, 64",
+        "cmp {off}, 1728",
+        "jne 3b",
+        ip0 = in(reg) ip0, ip1 = in(reg) ip1,
+        bp0 = in(reg) bp0, bp1 = in(reg) bp1,
+        bp2 = in(reg) bp2, bp3 = in(reg) bp3,
+        lut = in(reg) lut, mont = in(reg) mont,
+        index = in(reg) &INDEX_CONSTANTS,
+        off = out(reg) _,
+        out("zmm0") _,
+        out("zmm1") _,
+        out("zmm2") _,
+        out("zmm3") _,
+        out("zmm4") _,
+        out("zmm5") _,
+        out("zmm6") _,
+        out("zmm7") _,
+        out("zmm8") _,
+        out("zmm9") _,
+        out("zmm10") _,
+        out("zmm11") _,
+        out("zmm12") _,
+        out("zmm13") _,
+        out("zmm14") _,
+        out("zmm15") _,
+        out("zmm16") _,
+        out("zmm17") _,
+        out("zmm18") _,
+        out("zmm19") _,
+        out("zmm20") _,
+        out("zmm21") _,
+        out("zmm22") _,
+        out("zmm23") _,
+        out("zmm24") _,
+        out("zmm25") _,
+        out("zmm26") _,
+        out("zmm27") _,
+        out("zmm28") _,
+        out("zmm29") _,
+        options(nostack)
+    );
 }

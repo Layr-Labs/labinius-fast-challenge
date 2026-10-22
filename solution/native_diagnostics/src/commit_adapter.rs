@@ -1,4 +1,4 @@
-// Complete current LOCK2 commitment. Only shared-tail and optional wait choices differ.
+// Complete current LOCK2 commitment. RADIX_ORDER selects the isolated prefix. WAIT stays true.
 #![allow(dead_code)]
 use core::arch::x86_64::*;
 use labinius::fields::scalar::B128;
@@ -241,7 +241,7 @@ impl PairWorker {
 
 
 #[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn group_pairs_full<const SHARED_TAIL:bool,F:FnMut(usize)>(
+unsafe fn group_pairs_full<const RADIX_ORDER:bool,F:FnMut(usize)>(
  cols:&[&[B128]],
  keys:&[u32],
  np:usize,
@@ -267,9 +267,9 @@ unsafe fn group_pairs_full<const SHARED_TAIL:bool,F:FnMut(usize)>(
   };
   let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
   let kb=kbase.add(b*648*4);
-  if SHARED_TAIL {
-   crate::ntt_shared_tail::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
-   crate::ntt_shared_tail::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
+  if RADIX_ORDER {
+   crate::ntt_radix_order::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
+   crate::ntt_radix_order::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
   } else {
    vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
    vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
@@ -298,7 +298,7 @@ unsafe fn group_pairs_full<const SHARED_TAIL:bool,F:FnMut(usize)>(
  write_pair_group_rows(acc0,acc1,&mut ws.total[0],g,dst);
 }
 
-fn commit_paired_pairs<const SHARED_TAIL:bool,const WAIT:bool>(
+fn commit_paired_pairs<const RADIX_ORDER:bool,const WAIT:bool>(
  keys:&[u32],
  columns:&[&[B128]],
  np:usize,
@@ -328,7 +328,7 @@ fn commit_paired_pairs<const SHARED_TAIL:bool,const WAIT:bool>(
    let base=r*np;
    if n==0 {mine.store(base+np,Ordering::Release);continue;}
    let ws=ws.get_or_insert_with(PairWorker::new);
-   unsafe{group_pairs_full::<SHARED_TAIL,_>(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),|b_done|{
+   unsafe{group_pairs_full::<RADIX_ORDER,_>(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),|b_done|{
     if !WAIT {return;}
     let d=base+b_done;
     mine.store(d,Ordering::Release);
@@ -347,7 +347,7 @@ fn commit_paired_pairs<const SHARED_TAIL:bool,const WAIT:bool>(
  });
 }
 
-pub fn commit_columns_rows_pairs<const SHARED_TAIL:bool,const WAIT:bool>(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+pub fn commit_columns_rows_pairs<const RADIX_ORDER:bool,const WAIT:bool>(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
  assert!(!columns.is_empty(),"at least one witness column");
  let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
  assert_eq!(len%8,0);let np=len/8;
@@ -357,7 +357,7 @@ pub fn commit_columns_rows_pairs<const SHARED_TAIL:bool,const WAIT:bool>(keys:&[
  let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;
  let paired=if workers>=2 && workers%2==0 && groups>1 {labinius::par::CorePlacement::for_sibling_pairs(workers)} else {None};
  if let Some(placement)=paired {
-  commit_paired_pairs::<SHARED_TAIL,WAIT>(keys,columns,np,workers,Some(&placement),dst);
+  commit_paired_pairs::<RADIX_ORDER,WAIT>(keys,columns,np,workers,Some(&placement),dst);
  } else {
   let workers=workers.clamp(1,groups);
   let next=std::sync::atomic::AtomicUsize::new(0);
@@ -370,7 +370,7 @@ pub fn commit_columns_rows_pairs<const SHARED_TAIL:bool,const WAIT:bool>(keys:&[
     if gi>=groups {break;}
     let c0=gi*g;let gc=g.min(columns.len()-c0);
     let ws=ws.get_or_insert_with(PairWorker::new);
-    unsafe{group_pairs_full::<SHARED_TAIL,_>(&columns[c0..c0+gc],keys,np,ws,(dst as *mut [u32;N]).add(3*c0),|_|{})};
+    unsafe{group_pairs_full::<RADIX_ORDER,_>(&columns[c0..c0+gc],keys,np,ws,(dst as *mut [u32;N]).add(3*c0),|_|{})};
    }
   });
  }

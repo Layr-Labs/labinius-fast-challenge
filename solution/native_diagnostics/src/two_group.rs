@@ -1,4 +1,5 @@
-// Complete current LOCK2 commitment. Only shared-tail and optional wait choices differ.
+// Temporary key-cache experiment. This module has no production caller.
+// COHORTS=1 is the control. COHORTS=2 reuses each key address across two groups.
 #![allow(dead_code)]
 use core::arch::x86_64::*;
 use labinius::fields::scalar::B128;
@@ -6,20 +7,16 @@ use labinius::params::*;
 use labinius::ring::{Batch32,Representation};
 use labinius::simd::commit::{w_bound,a_bound};
 use labinius::simd::transpose_f162::BinaryIndex32;
-use labinius::simd::commit::hybrid::PAcc;
 use labinius::simd::ntt::{bin_asm as vb,gen_small};
-const P0:u16=3889;
-const P1:u16=9721;
-const CHUNK_PAIRS:usize=128;
-const LOCK:usize=2;
-const PP0:usize=pair_period(P0);
-const PP1:usize=pair_period(P1);
+const P0:u16=3889;const P1:u16=9721;
+const LOCK:usize=2;const CHUNK_PAIRS:usize=128;
+const PP0:usize=pair_period(P0);const PP1:usize=pair_period(P1);
 const PAIR_LEAD:usize=2*PP0;
+const _:()=assert!(PP0==16 && PP1==8 && CHUNK_PAIRS%PP0==0 && CHUNK_PAIRS%PP1==0);
 const PAIR_PACK_PERM:[i64;8]=[0,2,4,6,1,3,5,7];
 #[repr(align(128))]
 struct Progress(std::sync::atomic::AtomicUsize);
 const SIBLING_WAIT:std::time::Duration=std::time::Duration::from_micros(500);
-const _:()=assert!(PP0==16&&PP1==8&&CHUNK_PAIRS%PP0==0&&CHUNK_PAIRS%PP1==0);
 
 const fn r16c(q:u16)->i32 {(65536%q as i32)-q as i32}
 
@@ -87,6 +84,9 @@ const fn pair_period(q:u16)->usize {
  while acc_after_reduce_c(q)+2*(p as i64)*pair_per_batch(q)<=i32::MAX as i64 {p*=2;}
  p
 }
+
+#[repr(C,align(128))]
+pub struct PAcc { pub v:[[[i32;16];2];648] }
 
 #[target_feature(enable="avx512f,avx512bw")]
 unsafe fn finish_pair_stream<const Q:u16,const STREAM:usize>(a:&mut PAcc,out:&mut Batch32,half:usize) {
@@ -222,83 +222,80 @@ unsafe fn write_pair_group_rows(
  }
 }
 
-struct PairWorker {
+struct Worker {
  acc:Box<[PAcc]>,
  partial:Box<[Batch32]>,
  total:Box<[Batch32]>,
  idx:Box<[BinaryIndex32]>,
 }
-impl PairWorker {
- fn new()->Self {
-  PairWorker{
-   acc:zeroed_slice(2),
-   partial:zeroed_slice(2),
-   total:zeroed_slice(1),
+impl Worker {
+ fn new<const COHORTS:usize>()->Self {
+  Worker{
+   acc:zeroed_slice(2*COHORTS),
+   partial:zeroed_slice(2*COHORTS),
+   total:zeroed_slice(COHORTS),
    idx:zeroed_slice(LOCK),
   }
  }
 }
 
 
+// Each cohort is one existing group of at most sixteen columns.
+// Each cohort keeps its own state. Only the decoded-index scratch is shared.
 #[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn group_pairs_full<const SHARED_TAIL:bool,F:FnMut(usize)>(
- cols:&[&[B128]],
- keys:&[u32],
- np:usize,
- ws:&mut PairWorker,
- dst:*mut [u32;N],
- mut sync:F,
+unsafe fn group_bundle<const COHORTS:usize,F:FnMut(usize)>(
+ cols:&[&[B128]],keys:&[u32],np:usize,ws:&mut Worker,dst:*mut [u32;N],mut sync:F,
 ) {
- let g=cols.len();assert!(g>=1 && g<=16 && np%LOCK==0);
- // Lanes of columns past the group's end read a zero element.
+ assert!(!cols.is_empty() && cols.len()<=16*COHORTS && np%LOCK==0);
+ let cohorts=cols.len().div_ceil(16);
  static ZERO8:[B128;8]=[B128::ZERO;8];
  let kbase=keys.as_ptr();
  let mut half=0usize;
  for b in (0..np).step_by(LOCK) {
-  for h in 0..LOCK {
-   let cols16:[*const B128;16]=core::array::from_fn(|l|{
-    if l<g {cols[l].as_ptr().add(8*(b+h))} else {ZERO8.as_ptr()}
-   });
-   labinius::simd::transpose_f162::slice_b128_cols16_into(&cols16,&mut ws.idx[h]);
-  }
-  let (acc0,acc1)={
-   let [x,y]=&mut ws.acc[..2] else {unreachable!()};
-   (x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32)
-  };
-  let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
-  let kb=kbase.add(b*648*4);
-  if SHARED_TAIL {
-   crate::ntt_shared_tail::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
-   crate::ntt_shared_tail::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
-  } else {
+  for cohort in 0..cohorts {
+   let c0=16*cohort;let g=(cols.len()-c0).min(16);
+   for h in 0..LOCK {
+    let cols16:[*const B128;16]=core::array::from_fn(|l|{
+     if l<g {cols[c0+l].as_ptr().add(8*(b+h))} else {ZERO8.as_ptr()}
+    });
+    labinius::simd::transpose_f162::slice_b128_cols16_into(&cols16,&mut ws.idx[h]);
+   }
+   let (acc0,acc1)={
+    let [x,y]=&mut ws.acc[2*cohort..2*cohort+2] else {unreachable!()};
+    (x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32)
+   };
+   let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
+   let kb=kbase.add(b*648*4);
    vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
    vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
   }
-  if (b+LOCK)%PP0==0 || b+LOCK==np {
-   sync(b+LOCK);
-  }
+  // The key address advances only after all cohorts use the batch.
+  if (b+LOCK)%PP0==0 || b+LOCK==np {sync(b+LOCK);}
   if (b+LOCK)%CHUNK_PAIRS==0 || b+LOCK==np {
-   // Two finished chunks share one pair of inverse transforms: the first in lanes 0..16, the
-   // second in lanes 16..32 (each chunk's CRT stays exact on its own lanes).
-   let (p0,p1)=ws.partial.split_at_mut(1);
-   finish_pair_stream::<P0,1>(&mut ws.acc[0],&mut p0[0],half);
-   finish_pair_stream::<P1,1>(&mut ws.acc[1],&mut p1[0],half);
-   if half==1 || b+LOCK==np {
-    if half==0 {clear_upper(&mut p0[0]);clear_upper(&mut p1[0]);}
-    p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
-    // finish_pair_stream uses red16: every live lane has |r| < 2*P0; unused lanes are zero.
-    gen_small::intt_hybrid_batch32_3889(&mut p0[0]);
-    gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
-    crt_accumulate(&p0[0],&p1[0],&mut ws.total[0]);
-    half=0;
-   } else {half=1;}
+   for cohort in 0..cohorts {
+    let (p0,p1)=ws.partial[2*cohort..2*cohort+2].split_at_mut(1);
+    finish_pair_stream::<P0,1>(&mut ws.acc[2*cohort],&mut p0[0],half);
+    finish_pair_stream::<P1,1>(&mut ws.acc[2*cohort+1],&mut p1[0],half);
+    if half==1 || b+LOCK==np {
+     if half==0 {clear_upper(&mut p0[0]);clear_upper(&mut p1[0]);}
+     p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
+     gen_small::intt_hybrid_batch32_3889(&mut p0[0]);
+     gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
+     crt_accumulate(&p0[0],&p1[0],&mut ws.total[cohort]);
+    }
+   }
+   if half==1 || b+LOCK==np {half=0;} else {half=1;}
   }
  }
- let [acc0,acc1]=&mut ws.acc[..2] else {unreachable!()};
- write_pair_group_rows(acc0,acc1,&mut ws.total[0],g,dst);
+ for cohort in 0..cohorts {
+  let g=(cols.len()-16*cohort).min(16);
+  let [acc0,acc1]=&mut ws.acc[2*cohort..2*cohort+2] else {unreachable!()};
+  write_pair_group_rows(acc0,acc1,&mut ws.total[cohort],g,dst.add(3*16*cohort));
+ }
 }
 
-fn commit_paired_pairs<const SHARED_TAIL:bool,const WAIT:bool>(
+
+fn commit_paired_bundles<const COHORTS:usize>(
  keys:&[u32],
  columns:&[&[B128]],
  np:usize,
@@ -307,7 +304,7 @@ fn commit_paired_pairs<const SHARED_TAIL:bool,const WAIT:bool>(
  dst:usize,
 ) {
  use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
- let g=16usize;let sg=2*g;
+ let g=16*COHORTS;let sg=2*g;
  let pairs=workers/2;
  let super_groups=columns.len().div_ceil(sg);
  let rounds=super_groups+1;
@@ -319,7 +316,7 @@ fn commit_paired_pairs<const SHARED_TAIL:bool,const WAIT:bool>(
   let _guard=placement.and_then(|p|p.pin(worker));
   let (pair,s)=(worker/2,worker%2);
   let mine=&done[worker].0;let other=&done[worker^1].0;let coupled=&coupled[pair];
-  let mut ws:Option<PairWorker>=None;
+  let mut ws:Option<Worker>=None;
   for r in 0..rounds {
    let gi=*slots[pair*rounds+r].get_or_init(||next.fetch_add(1,Ordering::Relaxed));
    if gi>=super_groups {break;}
@@ -327,9 +324,8 @@ fn commit_paired_pairs<const SHARED_TAIL:bool,const WAIT:bool>(
    let (lo,n)=if s==0 {(c0,gc.min(g))} else {(c0+g,gc.saturating_sub(g))};
    let base=r*np;
    if n==0 {mine.store(base+np,Ordering::Release);continue;}
-   let ws=ws.get_or_insert_with(PairWorker::new);
-   unsafe{group_pairs_full::<SHARED_TAIL,_>(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),|b_done|{
-    if !WAIT {return;}
+   let ws=ws.get_or_insert_with(Worker::new::<COHORTS>);
+   unsafe{group_bundle::<COHORTS,_>(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),|b_done|{
     let d=base+b_done;
     mine.store(d,Ordering::Release);
     if !coupled.load(Ordering::Relaxed) {return;}
@@ -347,30 +343,31 @@ fn commit_paired_pairs<const SHARED_TAIL:bool,const WAIT:bool>(
  });
 }
 
-pub fn commit_columns_rows_pairs<const SHARED_TAIL:bool,const WAIT:bool>(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+pub fn commit_columns_rows_pairs<const COHORTS:usize>(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+ assert!(COHORTS==1 || COHORTS==2,"one or two groups per worker");
  assert!(!columns.is_empty(),"at least one witness column");
  let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
  assert_eq!(len%8,0);let np=len/8;
  assert_eq!(keys.len(),4*np*648);
- let g=16usize;let groups=columns.len().div_ceil(g);
+ let g=16*COHORTS;let groups=columns.len().div_ceil(g);
  // Uninitialised: the groups partition the columns and each writes all three rows of its own.
  let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;
  let paired=if workers>=2 && workers%2==0 && groups>1 {labinius::par::CorePlacement::for_sibling_pairs(workers)} else {None};
  if let Some(placement)=paired {
-  commit_paired_pairs::<SHARED_TAIL,WAIT>(keys,columns,np,workers,Some(&placement),dst);
+  commit_paired_bundles::<COHORTS>(keys,columns,np,workers,Some(&placement),dst);
  } else {
   let workers=workers.clamp(1,groups);
   let next=std::sync::atomic::AtomicUsize::new(0);
   let placement=labinius::par::CorePlacement::for_logical(workers).or_else(||labinius::par::CorePlacement::for_workers(workers));
   labinius::par::pool().run(workers,|worker|{
    let _guard=placement.as_ref().and_then(|p|p.pin(worker));
-   let mut ws:Option<PairWorker>=None;
+   let mut ws:Option<Worker>=None;
    loop {
     let gi=next.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
     if gi>=groups {break;}
     let c0=gi*g;let gc=g.min(columns.len()-c0);
-    let ws=ws.get_or_insert_with(PairWorker::new);
-    unsafe{group_pairs_full::<SHARED_TAIL,_>(&columns[c0..c0+gc],keys,np,ws,(dst as *mut [u32;N]).add(3*c0),|_|{})};
+    let ws=ws.get_or_insert_with(Worker::new::<COHORTS>);
+    unsafe{group_bundle::<COHORTS,_>(&columns[c0..c0+gc],keys,np,ws,(dst as *mut [u32;N]).add(3*c0),|_|{})};
    }
   });
  }

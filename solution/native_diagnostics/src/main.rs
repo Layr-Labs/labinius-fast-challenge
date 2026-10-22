@@ -2,9 +2,7 @@
 mod compare;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-mod commit_adapter;
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-mod ntt_shared_tail;
+mod two_group;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native;
 
@@ -14,12 +12,9 @@ fn main() {
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     {
         println!("native-diag phase=smoke native_kernels=not_run");
-        let mut a = || vec![1u32, 2, 3];
-        let mut b = || vec![1u32, 2, 3];
-        let mut c = || vec![1u32, 2, 3];
-        let mut d = || vec![1u32, 2, 3];
-        compare::run("host-smoke", &mut [
-            ("a", &mut a), ("b", &mut b), ("c", &mut c), ("d", &mut d),
-        ]);
+        let mut baseline = || vec![1u32, 2, 3];
+        let mut control = || vec![1u32, 2, 3];
+        let mut candidate = || vec![1u32, 2, 3];
+        compare::run("host-smoke", &mut baseline, &mut control, &mut candidate);
     }
 }

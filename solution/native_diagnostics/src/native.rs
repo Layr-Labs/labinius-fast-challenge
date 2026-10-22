@@ -67,14 +67,9 @@ pub fn run() {
     assert_eq!(columns.len(), COLUMNS);
     println!("native-diag phase=setup elapsed_ns={} input_address_mod4096={} key_address_mod64={} key_bytes={KEY_LEN}", clock.elapsed().as_nanos(), values.as_ptr() as usize % 4096, KEY.0.as_ptr() as usize % 64);
 
-    let mut baseline = || labinius::simd::commit::hybrid::commit_columns_rows_pairs(keys, &columns, workers);
-    let mut shared = || crate::commit_adapter::commit_columns_rows_pairs::<true, true>(keys, &columns, workers);
-    let mut no_wait = || crate::commit_adapter::commit_columns_rows_pairs::<false, false>(keys, &columns, workers);
-    let mut both = || crate::commit_adapter::commit_columns_rows_pairs::<true, false>(keys, &columns, workers);
-    crate::compare::run("commit", &mut [
-        ("baseline", &mut baseline), ("shared-tail", &mut shared),
-        ("no-wait", &mut no_wait), ("shared-tail-no-wait", &mut both),
-    ]);
+    let mut baseline = || labinius::simd::commit::hybrid::commit_columns_rows_pairs_lock2(keys, &columns, workers);
+    let mut candidate = || labinius::simd::commit::hybrid::commit_columns_rows_pairs(keys, &columns, workers);
+    crate::compare::run("commit", &mut baseline, &mut candidate);
     std::hint::black_box(&planes);
     println!("native-diag phase=complete elapsed_ns={}", clock.elapsed().as_nanos());
 }

@@ -1438,3 +1438,229 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
         }
     }
 }
+
+macro_rules! lock4_slot {
+    ($mode:ident, $reg:literal, $off:literal, $k:literal, $a:literal, $t:literal) => {
+        concat!(
+            "vmovdqa64 zmm29, [{acc}+", $a, "]\n",
+            "vmovdqa64 zmm30, [{acc}+", $t, "]\n",
+            "vmovdqa64 zmm28, [{w0}+", $off, "]\n",
+            "vpdpwssd zmm29, zmm28, dword ptr [{key}+", $k, "]{{1to16}}\n",
+            "vpdpwssd zmm30, zmm28, dword ptr [{key}+", $k, "+4]{{1to16}}\n",
+            "vmovdqa64 zmm28, [{w1}+", $off, "]\n",
+            "vpdpwssd zmm29, zmm28, dword ptr [{key}+", $k, "+8]{{1to16}}\n",
+            "vpdpwssd zmm30, zmm28, dword ptr [{key}+", $k, "+12]{{1to16}}\n",
+            "vmovdqa64 zmm28, [{w2}+", $off, "]\n",
+            "vpdpwssd zmm29, zmm28, dword ptr [{key}+", $k, "+20736]{{1to16}}\n",
+            "vpdpwssd zmm30, zmm28, dword ptr [{key}+", $k, "+20740]{{1to16}}\n",
+            "vpdpwssd zmm29, zmm", $reg, ", dword ptr [{key}+", $k, "+20744]{{1to16}}\n",
+            "vpdpwssd zmm30, zmm", $reg, ", dword ptr [{key}+", $k, "+20748]{{1to16}}\n",
+            hybrid_store!($mode, 29, $a),
+            hybrid_store!($mode, 30, $t),
+        )
+    };
+}
+macro_rules! lock4_register_sink {
+ ($mode:ident) => { concat!(
+  lock4_slot!($mode, 0, 0, 0, 0, 64),
+  lock4_slot!($mode, 2, 64, 16, 128, 192),
+  lock4_slot!($mode, 1, 128, 32, 256, 320),
+  lock4_slot!($mode, 6, 192, 48, 384, 448),
+  lock4_slot!($mode, 8, 256, 64, 512, 576),
+  lock4_slot!($mode, 7, 320, 80, 640, 704),
+  lock4_slot!($mode, 3, 384, 96, 768, 832),
+  lock4_slot!($mode, 5, 448, 112, 896, 960),
+  lock4_slot!($mode, 4, 512, 128, 1024, 1088),
+  lock4_slot!($mode, 18, 576, 144, 1152, 1216),
+  lock4_slot!($mode, 20, 640, 160, 1280, 1344),
+  lock4_slot!($mode, 19, 704, 176, 1408, 1472),
+  lock4_slot!($mode, 24, 768, 192, 1536, 1600),
+  lock4_slot!($mode, 26, 832, 208, 1664, 1728),
+  lock4_slot!($mode, 25, 896, 224, 1792, 1856),
+  lock4_slot!($mode, 21, 960, 240, 1920, 1984),
+  lock4_slot!($mode, 23, 1024, 256, 2048, 2112),
+  lock4_slot!($mode, 22, 1088, 272, 2176, 2240),
+  lock4_slot!($mode, 9, 1152, 288, 2304, 2368),
+  lock4_slot!($mode, 11, 1216, 304, 2432, 2496),
+  lock4_slot!($mode, 10, 1280, 320, 2560, 2624),
+  lock4_slot!($mode, 15, 1344, 336, 2688, 2752),
+  lock4_slot!($mode, 17, 1408, 352, 2816, 2880),
+  lock4_slot!($mode, 16, 1472, 368, 2944, 3008),
+  lock4_slot!($mode, 12, 1536, 384, 3072, 3136),
+  lock4_slot!($mode, 14, 1600, 400, 3200, 3264),
+  lock4_slot!($mode, 13, 1664, 416, 3328, 3392),
+ ) };
+}
+#[inline(always)]
+unsafe fn tail27_lock4<const Q: u16>(
+    bp: *const i16, w0: *const i16, w1: *const i16, w2: *const i16, t4: *const u32, t5: *const u32, t6: *const u32,
+    cv: *const i16, key: *const u32, acc: *mut i32, red: u32,
+) {
+    macro_rules! run {
+        ($m4:ident, $m6:ident) => {
+            core::arch::asm!(
+                concat!(
+                    "vmovdqa64 zmm27, [{c}]\n",
+                    tail27!($m4, $m6, bfly_registers),
+                    "test {red:e}, {red:e}\n",
+                    "jnz 2f\n",
+                    lock4_register_sink!(plain),
+                    "jmp 3f\n",
+                    "2:\n",
+                    lock4_register_sink!(reduce),
+                    "3:\n",
+                    "/* {fold} */\n",
+                ),
+                i = in(reg) bp, w0 = in(reg) w0, w1 = in(reg) w1, w2 = in(reg) w2, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,
+                c = in(reg) cv, key = in(reg) key, acc = in(reg) acc,
+                fold = in(reg) &const { hybrid_fold::<Q>() },
+                red = in(reg) red,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+                out("zmm8") _,
+                out("zmm9") _,
+                out("zmm10") _,
+                out("zmm11") _,
+                out("zmm12") _,
+                out("zmm13") _,
+                out("zmm14") _,
+                out("zmm15") _,
+                out("zmm16") _,
+                out("zmm17") _,
+                out("zmm18") _,
+                out("zmm19") _,
+                out("zmm20") _,
+                out("zmm21") _,
+                out("zmm22") _,
+                out("zmm23") _,
+                out("zmm24") _,
+                out("zmm25") _,
+                out("zmm26") _,
+                out("zmm27") _,
+                out("zmm28") _,
+                out("zmm29") _,
+                out("zmm30") _,
+                out("zmm31") _,
+                out("k1") _,
+                options(nostack)
+            )
+        };
+    }
+    if needs_barrett(Q) {
+        run!(lut, barrett);
+    } else {
+        run!(plain, plain);
+    }
+}
+#[inline(never)]
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+pub unsafe fn ntt_bin_batch32_lock4<const Q: u16>(
+    ins: [&BinaryIndex32; 4],
+    key: *const u32,
+    acc: *mut i32,
+    red: bool,
+) {
+    assert!(Q == 3889 || Q == 9721, "the hybrid commitment's primes");
+    let t = tables::<Q>();
+    let c = C {
+        q: bc(&t.qd),
+        om: bc(&t.om[0]),
+        omp: bc(&t.om[1]),
+    };
+    let bar = needs_barrett(Q);
+    let ips: [*const u8; 4] = core::array::from_fn(|h| ins[h].rows.as_ptr() as *const u8);
+    let mut blks: [core::mem::MaybeUninit<Blk>; 8] =
+        [const { core::mem::MaybeUninit::uninit() }; 8];
+    let bps: [*mut i16; 8] = core::array::from_fn(|h| blks[h].as_mut_ptr() as *mut i16);
+    let mut staged: [core::mem::MaybeUninit<Blk27>; 3] =
+        [const { core::mem::MaybeUninit::uninit() }; 3];
+    let wp: [*mut i16; 3] = core::array::from_fn(|h| staged[h].as_mut_ptr() as *mut i16);
+    let red_u32 = red as u32;
+
+    // Process fixed adjacent quarter pairs: both prefixes share each six-row index load.
+    // Each quarter retains its own two LOCK=2 buffers until its original six tails finish.
+    for kp in 0..2 {
+        let load_luts = |k: usize| {
+            let lut = t.lut.as_ptr().add(12 * k) as *const u8;
+            let l = |r: usize, ab: usize| -> __m512i {
+                _mm512_load_si512(lut.add(64 * (r * 2 + ab)) as *const __m512i)
+            };
+            (l(0, 0), l(0, 1), l(1, 0), l(1, 1), l(2, 0), l(2, 1))
+        };
+        let ls0 = load_luts(2 * kp);
+        let ls1 = load_luts(2 * kp + 1);
+        for h in 0..core::hint::black_box(4usize) {
+            let ip = *ips.as_ptr().add(h);
+            for i in 0..27 {
+                let n0 = ldb(ip, i);
+                let n0h = ldb(ip, i + 81);
+                let n1 = ldb(ip, i + 27);
+                let n1h = ldb(ip, i + 108);
+                let n2 = ldb(ip, i + 54);
+                let n2h = ldb(ip, i + 135);
+
+                macro_rules! prefix {
+                    ($bp:expr, $ls:expr) => {{
+                        let bp = $bp;
+                        let (l000, l001, l010, l011, l020, l021) = $ls;
+                        let x = _mm512_permutexvar_epi8(n0, l000);
+                        let y = _mm512_permutexvar_epi8(n0h, l001);
+                        let a0 = _mm512_add_epi16(x, y);
+                        let b0 = _mm512_sub_epi16(x, y);
+
+                        let x = _mm512_permutexvar_epi8(n1, l010);
+                        let y = _mm512_permutexvar_epi8(n1h, l011);
+                        let a1 = _mm512_add_epi16(x, y);
+                        let b1 = _mm512_sub_epi16(y, x);
+
+                        let x = _mm512_permutexvar_epi8(n2, l020);
+                        let y = _mm512_permutexvar_epi8(n2h, l021);
+                        let a2 = _mm512_add_epi16(x, y);
+                        let b2 = _mm512_sub_epi16(x, y);
+
+                        let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
+                        let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
+                        st(bp, i, u0);
+                        st(bp, i + 27, u1);
+                        st(bp, i + 54, u2);
+                        st(bp, i + 81, v2);
+                        st(bp, i + 108, v0);
+                        st(bp, i + 135, v1);
+                    }};
+                }
+                prefix!(*bps.as_ptr().add(h), ls0);
+                prefix!(*bps.as_ptr().add(4+h), ls1);
+            }
+        }
+        for qpair in 0..core::hint::black_box(2usize) {
+            let k = 2 * kp + qpair;
+            let cv = t.cv.as_ptr() as *const i16;
+            let tail_blocks = core::hint::black_box(6usize);
+            for j in 0..tail_blocks {
+                let kk = 6 * k + j;
+                let (t4, t5, t6) = (
+                    t.tw4.as_ptr().add(kk).cast::<u32>(),
+                    t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
+                    t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
+                );
+                for h in 0..core::hint::black_box(3usize) {
+                    let bp = (*bps.as_ptr().add(4*qpair+h)).add(32 * 27 * j);
+                    let dst = *wp.as_ptr().add(h);
+                    if bar { tail27_b(bp, dst, t4, t5, t6, cv); }
+                    else { tail27_p(bp, dst, t4, t5, t6, cv); }
+                }
+                tail27_lock4::<Q>(
+                    (*bps.as_ptr().add(4*qpair+3)).add(32 * 27 * j),
+                    wp[0], wp[1], wp[2], t4, t5, t6, cv,
+                    key.add(4 * 27 * kk), acc.add(32 * 27 * kk), red_u32,
+                );
+            }
+        }
+    }
+}

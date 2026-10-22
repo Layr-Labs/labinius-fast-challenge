@@ -712,7 +712,7 @@ const _:()=assert!(acc_after_reduce_c(P1)+(PP1 as i64)*pair_per_batch(P1)<=bias(
 /// Pair batches per certified chunk (the chunk is `CHUNK_BATCHES * 32` ring elements).
 const CHUNK_PAIRS:usize=CHUNK_BATCHES*16;
 /// Pair batches transformed in lockstep per accumulator read-modify-write.
-const LOCK:usize=2;
+const LOCK:usize=4;
 const _:()=assert!(CHUNK_PAIRS%PP0==0 && CHUNK_PAIRS%PP1==0 && PP0%LOCK==0 && PP1%LOCK==0 && CHUNK_PAIRS%LOCK==0);
 
 /// Interleaved base (`[j][0]`) and tail (`[j][1]`) 16-column accumulators for one prime:
@@ -741,12 +741,12 @@ unsafe fn dp_bc<const OFF:usize>(acc:__m512i,x:__m512i,k:*const u32)->__m512i {
 /// Staged reference pair sink for `LOCK = 2` consecutive pair batches at once: both products enter
 /// each accumulator in one read-modify-write (`RED` when the second batch closes a fold-back period).
 #[cfg(test)]
-struct MultiSink<const Q:u16,const RED:bool> {bufs:[*mut i16;LOCK],k:*const u32,acc:*mut __m512i}
+struct MultiSink<const Q:u16,const RED:bool> {bufs:[*mut i16;2],k:*const u32,acc:*mut __m512i}
 #[cfg(test)]
-impl<const Q:u16,const RED:bool> vb::MultiBlockSink<LOCK> for MultiSink<Q,RED> {
- #[inline(always)]unsafe fn dsts(&mut self,_:usize)->[*mut i16;LOCK] {self.bufs}
+impl<const Q:u16,const RED:bool> vb::MultiBlockSink<2> for MultiSink<Q,RED> {
+ #[inline(always)]unsafe fn dsts(&mut self,_:usize)->[*mut i16;2] {self.bufs}
  #[inline(always)]
- unsafe fn blocks(&mut self,blk:usize,w:[*mut i16;LOCK]) {
+ unsafe fn blocks(&mut self,blk:usize,w:[*mut i16;2]) {
   let s0=27*blk;
   let k=self.k.add(4*s0);
   let p0=self.acc.add(2*s0);
@@ -920,7 +920,7 @@ struct PairWorker {
  idx:Box<[BinaryIndex32]>,
 }
 impl PairWorker {
- fn new()->Self {
+ fn new<const LOCK:usize>()->Self {
   PairWorker{
    acc:zeroed_slice(2),
    partial:zeroed_slice(2),
@@ -935,7 +935,7 @@ impl PairWorker {
 /// batches = 162 KiB of `pair_keys`) so hyperthread siblings on a physical core share `pair_keys`
 /// in their 2 MiB L2 cache.
 #[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn group_pairs_full<F:FnMut(usize)>(
+unsafe fn group_pairs_full<const LOCK:usize,F:FnMut(usize)>(
  cols:&[&[B128]],
  keys:&[u32],
  np:usize,
@@ -959,10 +959,16 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
    let [x,y]=&mut ws.acc[..2] else {unreachable!()};
    (x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32)
   };
-  let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
   let kb=kbase.add(b*648*4);
-  vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
-  vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
+  if LOCK==2 {
+   let ins=[&ws.idx[0],&ws.idx[1]];
+   vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
+   vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
+  } else {
+   let ins=[&ws.idx[0],&ws.idx[1],&ws.idx[2],&ws.idx[3]];
+   vb::ntt_bin_batch32_lock4::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
+   vb::ntt_bin_batch32_lock4::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
+  }
   if (b+LOCK)%PP0==0 || b+LOCK==np {
    sync(b+LOCK);
   }
@@ -995,7 +1001,7 @@ const PAIR_LEAD:usize=2*PP0;
 /// `k`'s two logical CPUs) claiming 32-column super-groups (two 16-column groups) and advancing
 /// through `pair_keys` within [`PAIR_LEAD`] pair batches of each other so both siblings share
 /// every key line in their core's 2 MiB L2 cache.
-fn commit_paired_pairs(
+fn commit_paired_pairs<const LOCK:usize>(
  keys:&[u32],
  columns:&[&[B128]],
  np:usize,
@@ -1024,8 +1030,8 @@ fn commit_paired_pairs(
    let (lo,n)=if s==0 {(c0,gc.min(g))} else {(c0+g,gc.saturating_sub(g))};
    let base=r*np;
    if n==0 {mine.store(base+np,Ordering::Release);continue;}
-   let ws=ws.get_or_insert_with(PairWorker::new);
-   unsafe{group_pairs_full(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),|b_done|{
+   let ws=ws.get_or_insert_with(PairWorker::new::<LOCK>);
+   unsafe{group_pairs_full::<LOCK,_>(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),|b_done|{
     let d=base+b_done;
     mine.store(d,Ordering::Release);
     if !coupled.load(Ordering::Relaxed) {return;}
@@ -1046,6 +1052,19 @@ fn commit_paired_pairs(
 /// [`commit_columns_rows`] in the column-pair layout: groups of 16 columns, one pass over the
 /// pair keys per group, with SMT sibling-pair L2 key sharing when available.
 pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+ if columns.first().is_some_and(|c|c.len()%(8*LOCK)==0) {
+  commit_columns_rows_pairs_lock::<LOCK>(keys,columns,workers)
+ } else {
+  commit_columns_rows_pairs_lock::<2>(keys,columns,workers)
+ }
+}
+
+/// The original two-batch production path, also used for shapes not divisible by four batches.
+pub fn commit_columns_rows_pairs_lock2(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+ commit_columns_rows_pairs_lock::<2>(keys,columns,workers)
+}
+
+fn commit_columns_rows_pairs_lock<const LOCK:usize>(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
  assert!(!columns.is_empty(),"at least one witness column");
  let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
  assert_eq!(len%8,0);let np=len/8;
@@ -1055,7 +1074,7 @@ pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->
  let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;
  let paired=if workers>=2 && workers%2==0 && groups>1 {crate::par::CorePlacement::for_sibling_pairs(workers)} else {None};
  if let Some(placement)=paired {
-  commit_paired_pairs(keys,columns,np,workers,Some(&placement),dst);
+  commit_paired_pairs::<LOCK>(keys,columns,np,workers,Some(&placement),dst);
  } else {
   let workers=workers.clamp(1,groups);
   let next=std::sync::atomic::AtomicUsize::new(0);
@@ -1067,8 +1086,8 @@ pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->
     let gi=next.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
     if gi>=groups {break;}
     let c0=gi*g;let gc=g.min(columns.len()-c0);
-    let ws=ws.get_or_insert_with(PairWorker::new);
-    unsafe{group_pairs_full(&columns[c0..c0+gc],keys,np,ws,(dst as *mut [u32;N]).add(3*c0),|_|{})};
+    let ws=ws.get_or_insert_with(PairWorker::new::<LOCK>);
+    unsafe{group_pairs_full::<LOCK,_>(&columns[c0..c0+gc],keys,np,ws,(dst as *mut [u32;N]).add(3*c0),|_|{})};
    }
   });
  }
@@ -1151,7 +1170,7 @@ mod tests {
    unsafe {
     let ins=[&idx[0],&idx[1]];
     let bufs=[scratch[0].0.as_mut_ptr(),scratch[1].0.as_mut_ptr()];
-    vb::ntt_bin_batch32_multi_sink::<Q,LOCK,_>(
+    vb::ntt_bin_batch32_multi_sink::<Q,2,_>(
      ins,
      &mut MultiSink::<Q,RED>{bufs,k:key.as_ptr(),acc:want[0].v.as_mut_ptr() as *mut __m512i},
     );
@@ -1291,7 +1310,7 @@ mod tests {
   }
   for workers in [2usize,4,8] {
    let mut rows:Vec<[u32;N]>=Vec::with_capacity(ncols*3);
-   commit_paired_pairs(&pkeys,&cols,len/8,workers,None,rows.as_mut_ptr() as usize);
+   commit_paired_pairs::<2>(&pkeys,&cols,len/8,workers,None,rows.as_mut_ptr() as usize);
    unsafe{rows.set_len(ncols*3);}
    assert!(rows==want,"paired pair commitment ({workers} workers) differs from the reference");
   }

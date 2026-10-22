@@ -1,0 +1,3065 @@
+{
+  "atUtc": "2026-10-22T04:14:43.231844+00:00",
+  "references": {
+    "reference8af": "8af9a7625ba0de0c6a28393a4e5d446a425a1eea",
+    "reference126": "52f946046db3d7ec0816e92951629dc6bdcfae23",
+    "trusted/proof_verify": "8af9a7625ba0de0c6a28393a4e5d446a425a1eea:verifier/proof_verify",
+    "trusted/labinius": "osdnk/labinius@96b57f724fc15c8e40495015c01dc3e6d8dfe595"
+  },
+  "purpose": "Offline contestant-local copied reference verifier and full-process diagnostic references; official verifier/harness unchanged. This copy is not the protected trusted boundary.",
+  "allUpstreamBlobsMatchedPin": true,
+  "files": [
+    {
+      "path": "reference8af/solution/labinius/.cargo/config.toml",
+      "bytes": 50,
+      "sha256": "ba3a61bfac1eae05cf065f9fc9e4cba90e28f1190b1ddb6911ca8d68e2d83a39"
+    },
+    {
+      "path": "reference8af/solution/labinius/.gitignore",
+      "bytes": 112,
+      "sha256": "4fdeca756e1cbad3410f1b76218630b4511d45e738e2f4d275b1a5ed68b2ace3"
+    },
+    {
+      "path": "reference8af/solution/labinius/Cargo.lock",
+      "bytes": 63710,
+      "sha256": "31cce1e3cf16b0c291de1e476506c675327b53f962bb77485c81ca07ab88dfbf"
+    },
+    {
+      "path": "reference8af/solution/labinius/Cargo.toml",
+      "bytes": 4926,
+      "sha256": "d81d673cb78b8c4225c8dbb9f7f827d0b1db283e34fb8097af6eb4ce30a86732"
+    },
+    {
+      "path": "reference8af/solution/labinius/README.md",
+      "bytes": 4811,
+      "sha256": "bde3875d13933f16533d8c0322af44849c8be08ae54e7884b64ca68e3b4f4032"
+    },
+    {
+      "path": "reference8af/solution/labinius/bench.sh",
+      "bytes": 72,
+      "sha256": "39034263d667cfafad27763985a22cb5aa4d6cc190c367a9a2097ccb53c708f8"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/Cargo.toml",
+      "bytes": 297,
+      "sha256": "16c274b3117a2e77cef73236d66300c1d4d8a32c00c17c475b0dd1e3e85de58d"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/bench.sh",
+      "bytes": 3991,
+      "sha256": "be006f9873a48fa6d6511e514cb6e7064fa7da51b62015fb155f909c5c8a2a9d"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/src/bin/calibrate/bdstats.rs",
+      "bytes": 3164,
+      "sha256": "c9bdb0516c79e605d71b466d8a8548d78848893895c48bdc3eb8e9b620dbb931"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/src/bin/calibrate/boundcheck.rs",
+      "bytes": 2218,
+      "sha256": "6df722ff633498a757a05c1e757c8691d731ef593763216ecc06cfce0bf998d4"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/src/bin/calibrate/foldstats.rs",
+      "bytes": 2854,
+      "sha256": "9e09194b5c6a01878dff269a97177baf3c4875e745efcbb997c9d71b8b5b60c8"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/src/bin/calibrate/gadget.rs",
+      "bytes": 2265,
+      "sha256": "ca15703ff9e8665b06c99c6c1cdef613fc6a352c4a515994272116a6a0aeeaf7"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/src/bin/calibrate/main.rs",
+      "bytes": 869,
+      "sha256": "9b645339b9d5f333af866faaf14f2ab63b9ce37b17b53bc06a351bac581439b0"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/src/bin/calibrate/moduli.rs",
+      "bytes": 9594,
+      "sha256": "30c4a76fe2dd94a77df85f1bd1eec599235a04da26a94389e741cc0569d009a8"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/src/bin/calibrate/recursion.rs",
+      "bytes": 6159,
+      "sha256": "5ab9dfe99a2f5fe651ab20efbb2203cd63da1d20d059a6091bb9807377b610ab"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/src/bin/calibrate/wire_bench.rs",
+      "bytes": 3574,
+      "sha256": "089edbe8e4d794de736f3116d1bb347f4ba5dbbafd80394016aef5468c3b4642"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/src/bin/labinius.rs",
+      "bytes": 21264,
+      "sha256": "32d9697e36ef6a7e68430744912184d79500d256455fff1b01b26dd782457754"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/src/lib.rs",
+      "bytes": 4676,
+      "sha256": "e90bb4e4cfaf378b28fe9d688b8c3cafe39c56b7f68c2d73b371a458247be411"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/bench/tables.py",
+      "bytes": 7741,
+      "sha256": "73d803060d5dbe45ba3134f82c364dc9f2a9f674871c70641cfcba18d439e8e9"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/Cargo.toml",
+      "bytes": 736,
+      "sha256": "ce3c64b7efa96f56afc2674dbb69c12cf16bd00f2f925cc9ef07b6d7fd2ee2ad"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/examples/words.rs",
+      "bytes": 875,
+      "sha256": "cfc625be818d05ed18aa2a5769a09de8199b7ab448bfbce3a5f0196aa9dcecc1"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/src/bin/hashes-binius.rs",
+      "bytes": 10955,
+      "sha256": "1e46020b791167f3aa30260bd7ddb1244a80a42b2433cc946a39499824b81c83"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/src/channel.rs",
+      "bytes": 3321,
+      "sha256": "841a92b6a577c2ffd739e74a054f36dd83f898cfa234cad4a7eb5dcbb88d7383"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/src/circuit.rs",
+      "bytes": 7615,
+      "sha256": "4e214a0380c2f2400431694c18e8834ae32b924de4dff1f38e73a17428d84812"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/src/lib.rs",
+      "bytes": 17900,
+      "sha256": "510fe0a37e175185b88e7bad28bf0e6e9e14cceb252615d1381ef935ed5f1b09"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/src/liop.rs",
+      "bytes": 7877,
+      "sha256": "93e844638dd7acce4d0bef5fada026bb13681ee06735627a6449803a6ff449d2"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/src/phases.rs",
+      "bytes": 2505,
+      "sha256": "27d0307af2e01932f9637deb5a05e7be33cb1838eb801e5483b04effc2d13200"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/src/stock.rs",
+      "bytes": 3287,
+      "sha256": "3aea009aa5f3174e83513b571b509032ba1ef4e03e7672022ad804041f8a8d25"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/src/switch.rs",
+      "bytes": 5160,
+      "sha256": "fb6609606e24c2ee595bcecce9139a217b258edcb6f43c49fe772367ecfbdf5b"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/binius/tests/binius.rs",
+      "bytes": 3288,
+      "sha256": "9ae74b607b3b1a6fe6eb48912db8900ed903e6330ac05d40b59b740db3400533"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/Cargo.toml",
+      "bytes": 1091,
+      "sha256": "9eb64c200c4cacd77d14de1f34bce2565b08d68fb88f0bc324ae7058346b9d26"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/examples/sweep.rs",
+      "bytes": 644,
+      "sha256": "4f94ef7cf67b65250634b8406bb49988166ebe41b2833fa1f752a948b4de99fc"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/src/basefold.rs",
+      "bytes": 9207,
+      "sha256": "3cc419a7d14b066c2a2fc6e17c5f2b32a9ea01433f94829bfa17344485228f71"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/src/bin/pcs-competitors.rs",
+      "bytes": 2017,
+      "sha256": "d51e9ad1b86f77e19445e94de25d41c43627ca57e86e63655a604b3a12db8861"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/src/brakedown.rs",
+      "bytes": 3122,
+      "sha256": "254a881b9b512b702a84113c0065428ae5f453fc6122c93ea0eb27b9c1afd486"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/src/codes/brakedown_code.rs",
+      "bytes": 35036,
+      "sha256": "bcf5168a3f0a76254cbdcb6d756d2f4b27bd689346b87437fc819fb955712542"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/src/codes/mod.rs",
+      "bytes": 3785,
+      "sha256": "2316e7da0ecc30ccb427fae6d94f23ca541943dd7d6d071b91495c78019cbc72"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/src/codes/test_util.rs",
+      "bytes": 2752,
+      "sha256": "671623ff57a05d8fb9cb465773ac93651b4b5eb22f9bec8de0bb1fa9a4cca664"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/src/lib.rs",
+      "bytes": 1340,
+      "sha256": "9b8e36e3d9f10ee8947b8ce841c8028bc44d51053d20bddeef20e5325ed1de3b"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/src/ligerito_flock.rs",
+      "bytes": 5074,
+      "sha256": "c528fbd0f1257508e40878306eefae441b959daa4f142fec3e2216a064a8ab0d"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/src/tensor.rs",
+      "bytes": 24519,
+      "sha256": "60e8f8da059eed31ada1fa6c8f867b3a2b6b24e91f49351bbecbe3d835e97218"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/src/whir.rs",
+      "bytes": 6705,
+      "sha256": "292e5413a4af3e3e8ac9ee76359e49e8c97572b567d83bd23e47f48f2430e297"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/competitors/tests/basefold.rs",
+      "bytes": 967,
+      "sha256": "2db69d0533b8d3b0da1c77850cc74cd3a878bb7c53f93770a09dce02ece24bda"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/flock/Cargo.toml",
+      "bytes": 468,
+      "sha256": "48d998c4062dd3486cf5c1a6edc2b01ad23cd97bb37560eac029db2e75629eac"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/flock/src/bin/hashes-flock.rs",
+      "bytes": 12514,
+      "sha256": "22d6b7ced38e804d581ee4c3931cc7626925ba00b54b6a7f3121613596496c18"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/flock/src/circuit.rs",
+      "bytes": 11744,
+      "sha256": "f5c9f6ea1cc9a1417885b52897744fc9845352b34aa33dcf16fa9a134d3aeeea"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/flock/src/lib.rs",
+      "bytes": 13683,
+      "sha256": "1ef0e40e62067b6c1c32bd5bb74001289b08adfb325f95d5e489afa61b0cd094"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/flock/src/piop.rs",
+      "bytes": 3035,
+      "sha256": "4eb554b727ef8f08f56bf3ffa4256b369b3bdceb25fcd5fd6fca955b49846810"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/flock/src/switch.rs",
+      "bytes": 5343,
+      "sha256": "c22f067d590ea945caf83fcb702054e2fbcfefd88229d0431ac434a5453ac630"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/Cargo.toml",
+      "bytes": 361,
+      "sha256": "ea9ced927cecad3582e985343e3bce8cca3734d0d899497ef67414ea825eb3f2"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/build.rs",
+      "bytes": 4032,
+      "sha256": "35c89aa9e29d41c7d3e8d3f7cf9790da1f7b283a228b7edcb42d0443ff00842b"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/csrc/bn_labrador.c",
+      "bytes": 8479,
+      "sha256": "a357e3814977d77b00942eb50c6d0e44bf7dbbb98ea2c364afa107719dbed4df"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/csrc/bn_labrador.h",
+      "bytes": 4427,
+      "sha256": "62985e40bc73b594e7faef0d576158d3eebe5a9e0737fa8f846d460f77fd11e5"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/examples/two_fields.rs",
+      "bytes": 8031,
+      "sha256": "6f427142c6cd26e6ffce66115e92f07cebba8b7c7a465544126cc7d101c0141b"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/.gitignore",
+      "bytes": 172,
+      "sha256": "948abbbc59de7eb5a406aba9a1df10c317f307de6a8f87c759dd4718e16b218e"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/LICENSE",
+      "bytes": 569,
+      "sha256": "f36c8dab794517bbd77fea3c4496dfeb1d958de17afbb9c606e29ef8bac668c1"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/Makefile",
+      "bytes": 3974,
+      "sha256": "ab4525ad29af6e6ecafdd7cdfb856d72516151a10da6291bdca2e294014d44d7"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/README",
+      "bytes": 782,
+      "sha256": "470b07b64d1caab9eb240ace5e271805034b1562df5b2e336fb21c367b9791b3"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/VENDORED.md",
+      "bytes": 333,
+      "sha256": "adc920ff9dfc10172d046b64766b16e7fa19c7b1ade1ec9bd2371533812e67e9"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/aesctr.c",
+      "bytes": 7137,
+      "sha256": "2fe48795a33ea347463537ee2f42b0728c18819d5c567e7cccf7c6747633da64"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/aesctr.h",
+      "bytes": 1248,
+      "sha256": "7ce52d73c94d095a6d249feaa9fb57b14746900406796c1acf7390b29e18dae5"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/chihuahua.c",
+      "bytes": 31473,
+      "sha256": "b5a0fb58021ffe6ed464e237974c9b8354b2d4573fbaa90eebbf7677bd061648"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/chihuahua.h",
+      "bytes": 3214,
+      "sha256": "3a18e16618d1dcce5357adb79831295e54b9dd3b008363f1edcad54b0f7c9429"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/codec.c",
+      "bytes": 2521,
+      "sha256": "0cb3154ca322a215e7175bf0fe393edea2af9b3f54dc9ec8c1696265c576d8ff"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/codec.h",
+      "bytes": 202,
+      "sha256": "024a1b8a7bf97ec0c0da658efafb9a6b14ca7a0ead44a0eb3d955acf7fcc3e68"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/codec2.c",
+      "bytes": 2680,
+      "sha256": "08e081afe513e75543b9ea5c2a1ed9173d7515642dfa57a16452e57f508fd477"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/codec3.c",
+      "bytes": 1506,
+      "sha256": "7703601e6babf5e531915ead80dd4aff1f4b060b10760a03db58595e3e3cd5c1"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/codec4.c",
+      "bytes": 8966,
+      "sha256": "3ca0b930eaef044e97aa5825ade4fb968a6b6f9f0ac3ca79608dae22f4a01733"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/cpucycles.c",
+      "bytes": 328,
+      "sha256": "1832b42fbed2cb433baebc09b1327878783d18fffa77a091f70d5e2d8ea67d2d"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/cpucycles.h",
+      "bytes": 639,
+      "sha256": "077b09a82773fb9ad58d7553f821ac894be5f430a34a8d654cc857aa055962cd"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/dachshund.c",
+      "bytes": 17097,
+      "sha256": "6abf2c57441860dd3789d1328f9809dedfb6c21083c6e098e3f61b4af9e18915"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/dachshund.h",
+      "bytes": 2076,
+      "sha256": "e4a1c1a2095706b1f030a07d6b452969b42d4bce7d17bb20bdcdf8b3dbdc7ef3"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/data.c",
+      "bytes": 300,
+      "sha256": "32e60bfbcc67ed2eb6fcf9afbd53bf64faee496441640eab6652d4c49ad65800"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/data.h",
+      "bytes": 3903,
+      "sha256": "9ecc15c42a4804ea5f3a557ed7d419c9198e31d560f8aa55cc4f5221fc87ed32"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/data.py",
+      "bytes": 8222,
+      "sha256": "1dd8acd2469e0a56e38d1cceb8e31464d4ab8c7e455dd63a31f5acf226572737"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/data24.c",
+      "bytes": 13600,
+      "sha256": "e7d43338442c14c67b42d127511f0cec9c3721b3ba1e7d1e28de20fba34c72a3"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/data32.c",
+      "bytes": 16330,
+      "sha256": "cbd9d3f2a08380a5734e070cddb7d4f70715f1a84e2672a417ba18298c960a62"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/data40.c",
+      "bytes": 18992,
+      "sha256": "f00d9427da3e05cd42c7720de1f20dfdd740efa2c618fce9669ae4dab364e4d7"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/data48.c",
+      "bytes": 21734,
+      "sha256": "03649a5572488f5baf0ecc108e0c411650d662cc221a09227e3352918ec59b6a"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/data50.c",
+      "bytes": 21736,
+      "sha256": "b2d2614663a77002d33955e2a6751a4da8dbe4a9ae498b9c7962e1160120fdac"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/data56.c",
+      "bytes": 24399,
+      "sha256": "c5310700665a9772b39c5e8acf4e1313b5395e3e905d0225d764f2dc242a647c"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/data64.c",
+      "bytes": 27145,
+      "sha256": "bc1c3a0bc879fe9b42f3d0837a3df29628730d76102b89ea2c0d3ca54ef5e0e7"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/fips202.c",
+      "bytes": 26047,
+      "sha256": "6b33b4e5f82f3f95b7fa1a3f6f243cfd68616057fca1200fbaf1f791e522aab8"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/fips202.h",
+      "bytes": 2935,
+      "sha256": "9e711f2861d38cce76ddb7067dd30552c975aaf30e4a0b4a544acd02890b7fab"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/fq.inc",
+      "bytes": 1305,
+      "sha256": "a3107ba4af6734b30ac757a3b931376fbd187556113fcce842a2ae7e06cc4a0b"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/gaussian.c",
+      "bytes": 2563,
+      "sha256": "375dac72e983108d02fefc7d4ad46d0f0c333935a97679ca3ead1ae240ce867d"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/gaussian.h",
+      "bytes": 104,
+      "sha256": "ff787d995b3e98f67a5f374e8b981cb1cb4b8fbc8b66116150ccc85371b7d2fd"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/greyhound.c",
+      "bytes": 15329,
+      "sha256": "d8c6b303bf2f35602c0efb04c730b7068aab39c831bdbce0684b777b24767683"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/greyhound.h",
+      "bytes": 1029,
+      "sha256": "d35728746f3a86ed27919d891053d3659f2198d9723a35527862f7e4ef758495"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/invntt.S",
+      "bytes": 3829,
+      "sha256": "4b370a4923030813435c0fbaa50a4dae07d9bb765e460a3b3281ea674ce7ffd7"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/jlproj.c",
+      "bytes": 27068,
+      "sha256": "f934afd89814c429e5cec36df8a864ed14e5b1b8275de557a7b64a09fb8c9abe"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/jlproj.h",
+      "bytes": 760,
+      "sha256": "ea5a023a6c9b596d31bbea995f58e3d0cca47521c9a2a5967d6c34ccb3951c6c"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/labrador.c",
+      "bytes": 40563,
+      "sha256": "d84ae9ebb7cb538827326c7dd977a456c187b9c063a742be29461c5dc3309856"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/labrador.h",
+      "bytes": 5605,
+      "sha256": "54f7958f53b304f160e3f12795858b912313bc7f517272b059fa84db13270de4"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/malloc.h",
+      "bytes": 501,
+      "sha256": "fe3bb6a8aa6b18cb8e56753d8a3700d663574d84785715265a5dee6ab8825c3a"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/ntt.S",
+      "bytes": 3843,
+      "sha256": "1803177fe79a6746a34a908cd8c8530c03dc28371553a2a9f4468feb21dd5627"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/pack.c",
+      "bytes": 7473,
+      "sha256": "09b0f1c10563a1f23091fb7c0e05f2bdd5c3cd67e6cc06bd18ebef0b4dd99256"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/pack.h",
+      "bytes": 1238,
+      "sha256": "49924f667fae316677671b72d70079e65d09d37d0add5c32b2506f944ded7489"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/polx.c",
+      "bytes": 15834,
+      "sha256": "0de427d7ebe69b2cdf9bcb301a2bd107c9e1e7976e8824b8d43bcc1d2e7f9e92"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/polx.h",
+      "bytes": 4052,
+      "sha256": "e6f3aeb1320462acbdcde7361c996a998d1fcf260c30e97d6553e24cb19d77ff"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/poly.c",
+      "bytes": 42214,
+      "sha256": "faad8a69b9fb059846680d4028b8309163d3252906b9128af7d2851b140064f6"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/poly.h",
+      "bytes": 5845,
+      "sha256": "2dde54198f98eb9bc114ef1cf69de21a0e3b9e9f94903628bb6d6e6283e9f624"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/polz.c",
+      "bytes": 27966,
+      "sha256": "09466eb6f4deea05af0fba417122fa2172874a7192a7086b63ddc75b9ea19358"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/polz.h",
+      "bytes": 2959,
+      "sha256": "41f6099b230d38d2afe74b94063117a517708c6fbd891b19850d6e842a947355"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/randombytes.c",
+      "bytes": 1584,
+      "sha256": "63533d0cda638498614548de6d5b514382e9ed59b2d3cfa2e8c14adb35f0df2a"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/randombytes.h",
+      "bytes": 150,
+      "sha256": "c6841fa68287f9703e107cacfeb52b258e52a23378ca67f9e20fd7300cd26d4c"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/shuffle.inc",
+      "bytes": 1044,
+      "sha256": "0277b224632807eb6b67527ef1554786a54e7cea20a818ad477157ccd23432f1"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/sparsemat.c",
+      "bytes": 1290,
+      "sha256": "702236e420bbef10422f865a9a758545e2c3a47d2c9bc60a8f1cf898bce74408"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/sparsemat.h",
+      "bytes": 443,
+      "sha256": "a3bad3508d9f440a00afa2bb0497c76545e99a8844d59c80087ef506152090dd"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_aesctr.c",
+      "bytes": 1777,
+      "sha256": "2fda098420bef2c0aaeb7758a9d9eb2bab6e9b6e8e169c8232577de78a6c85f5"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_binary.c",
+      "bytes": 7290,
+      "sha256": "87e062646f0e19d1767ab7874a0f82bd93514418e47fc6e6371841e59f3e26ec"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_chihuahua.c",
+      "bytes": 4898,
+      "sha256": "a0ba3756f785d4acd623ae4b5eb46150c76f5bec60dfc5441737eac050cbb894"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_dachshund.c",
+      "bytes": 4585,
+      "sha256": "fa74a58c2676a2e9b140dcf1b521023f2e35994fd3dd54744f046b3f40512aa4"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_greyhound.c",
+      "bytes": 2404,
+      "sha256": "77f4ff514d791d9b22b67bed385ef868fa4de5f44ff47f91a48a6b586cfe4760"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_jlproj.c",
+      "bytes": 1713,
+      "sha256": "86bdd7c27dce70c8a9faeda4d377132a1eb349d3ad0af0bcc3cda3086e488af9"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_mixed.c",
+      "bytes": 6699,
+      "sha256": "a6244f8200f012c0154c9672ff555c669487b334f9c20785677c31a056691567"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_ntt.c",
+      "bytes": 2764,
+      "sha256": "222a25516752038068ba6871a9c6e3e1308bcbfc94d776dc787b353e9230c0a0"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_off.c",
+      "bytes": 7987,
+      "sha256": "dc9394b5c24855ef17b3cb268b4b2c20c09ec4cea05a11482292a9082b95118f"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_poly.c",
+      "bytes": 1980,
+      "sha256": "e1392c1cc7e9168cb2bd8dd59587d3bda0fd5207f6c64961c3b82014883ab9b2"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/labrador/test_polz.c",
+      "bytes": 7063,
+      "sha256": "618b9c8f14b373de3215ab135e9754b4dcc74f70a070146806b77caf859c8805"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/bd/digits.rs",
+      "bytes": 10719,
+      "sha256": "aaa6961dd5b0d8d68d00424b85865e503e02aa5ad1cb383fa452bd695e2740ec"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/bd/mod.rs",
+      "bytes": 2175,
+      "sha256": "92bddfc65cf621685f38482356740e65e9649df7cbffb4307aa116185eb2ee0f"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/bd/residual.rs",
+      "bytes": 4377,
+      "sha256": "c93774106a672b28efa55a300f0b0fe6f078b286179814f2aee16ea9ff22b599"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/challenge.rs",
+      "bytes": 34178,
+      "sha256": "d217190124cf4c42caea493dacc23a8b7b244fc6c9a2f1280e3745cd6fead3db"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/eval.rs",
+      "bytes": 16502,
+      "sha256": "e823e1feb71b4dedfe80703b69eecdc86384413d72842d8f21fd1e07e0d6b068"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/f162.rs",
+      "bytes": 3709,
+      "sha256": "bc28e5f31128a3c022b56847d794b258ba3a9ef1f4fd84b6fcacbd6d6fca94d8"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/fields/bitmat.rs",
+      "bytes": 6275,
+      "sha256": "7257c896625833823a9ff81d4600841c3398be8f7785679850d8c15385ce84c5"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/fields/crossfield.rs",
+      "bytes": 98763,
+      "sha256": "a65d67c8ce7ec669ff9466206920a8aedf44bb47d96cd90aefcd8f8380db0323"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/fields/f162.rs",
+      "bytes": 4784,
+      "sha256": "8eff3175440393463d152f1405b02e80694f4f51a24c8c2f36fcdc72256199a1"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/fields/mod.rs",
+      "bytes": 819,
+      "sha256": "76434b598880ccd44dcd0dbed66683cfc6b5162d9a6149b2edd4ff790afa277f"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/fields/scalar.rs",
+      "bytes": 3343,
+      "sha256": "30834339d0bc1bdb452b51b7e5912a6eac75ee4a9e7d57ff6321a8c3a62db491"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/fields/sumcheck.rs",
+      "bytes": 3999,
+      "sha256": "3d091dc277282d723c478801944e868d3a31f84280ff8f3f4a99b38146306758"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/fold.rs",
+      "bytes": 104816,
+      "sha256": "cc33f06fc0a4f0ecc1dc9992c723acf17b6163538e038cbbdc783729a2190d95"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/fold_bits.rs",
+      "bytes": 35599,
+      "sha256": "e174866397028d0ad81f7c41a76996f65af2fc68e388ed156a37d1181171ef56"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/key.rs",
+      "bytes": 24502,
+      "sha256": "e98d6e1e07810aa31be6fd8264fcf8c301a76ade4c0db8aac72380dd87368a02"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/labrador/ffi.rs",
+      "bytes": 4569,
+      "sha256": "f5849f47f6f6d41f7529343ffe15c2355c7d3c9c14d7b669a935077e81751a46"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/labrador/mod.rs",
+      "bytes": 37675,
+      "sha256": "6d3b31d21fb30994a8f5ab8468caf64732bb3bf1bbaba28f9397d6a5431931b8"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/labrador/polx.rs",
+      "bytes": 12138,
+      "sha256": "bc9592ca1622ab0d6c3537fc112e01e54b61620da0d0b768d909ed36d5ba8d5a"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/lib.rs",
+      "bytes": 2988,
+      "sha256": "38f0513e3c19e9c08b152af1e2d36ec2cb029d867ee48c69795841eaa6bd8666"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/limb.rs",
+      "bytes": 3150,
+      "sha256": "cd6f631226bea62a4f6704eb0265760a9429eae3062af93fb4c3db758f318d66"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/par.rs",
+      "bytes": 25404,
+      "sha256": "48b273e00e983679714026ef766350cc2cd080c70c881f2ee88bf9a1663c9f35"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/params.rs",
+      "bytes": 18757,
+      "sha256": "6789cac72132a1a48c6987a93b39c72b55d411d10752b8a394143653d7684a91"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/recursion/binary.rs",
+      "bytes": 6198,
+      "sha256": "8fdac74ba44c3ef99a011a254981776ee376473e818ba4e6023f5a58497a5c84"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/recursion/bound.rs",
+      "bytes": 5795,
+      "sha256": "56e77b8991562017039ebc5480fdc4dfce7a7df7fbb29e18d5e76e1b655fd01b"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/recursion/chain.rs",
+      "bytes": 20179,
+      "sha256": "cde63f5165a25f44bfc067c5a081a6252770692e0b6e9ccb525693d2939302a5"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/recursion/chunk.rs",
+      "bytes": 5418,
+      "sha256": "191295088d7829c0958f22b63b35079105148479cb1e32ba2b16bf2ffa8e6456"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/recursion/export.rs",
+      "bytes": 7316,
+      "sha256": "829610b660d06b0838a7ef20314b335a1fb148ea5490c21b9574d9174daeaddb"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/recursion/limbs.rs",
+      "bytes": 19426,
+      "sha256": "109e48e1a480270600f278772d5be957ed513c1e81f30064ab00348dd5c96f05"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/recursion/mod.rs",
+      "bytes": 30675,
+      "sha256": "2c0b99baa4baa48d994cc4a01e75d84ff4eb951e6d9e63a242c5a8156f1a6282"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/recursion/setup.rs",
+      "bytes": 11065,
+      "sha256": "85142aae0f5bee41a2636fd55a4b0228f1ee5033779536e66c930ff98662bdbe"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/recursion/statement.rs",
+      "bytes": 9578,
+      "sha256": "316e3080541de9fab208930b7a88fcd365e243fed4ec7c184b38cbacc2c2561f"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/ring/element.rs",
+      "bytes": 6276,
+      "sha256": "eb82fcdf4d1f273801e0d3d2b8af7a468aa55bba45462031f7e7fa66bca46170"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/ring/mod.rs",
+      "bytes": 17896,
+      "sha256": "76b26f1a1f020cd9670b7b010779921fec806a93a9f13c68a27570d72e6922bc"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/rng.rs",
+      "bytes": 572,
+      "sha256": "07e72d603f1464c2344f37266e1bb312a77212c49b05f709f88eebf3ed716b6a"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/scalar.rs",
+      "bytes": 11619,
+      "sha256": "602b1647f99ce442e0e5f4cdbf30cb5fb7f5d8788f9619fb998cb70de0f33928"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/scheme/commitment.rs",
+      "bytes": 15522,
+      "sha256": "784a03ad0939b09110f9c29251b48f1c8d1c6c28147b674455050349d4a3aa26"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/scheme/mod.rs",
+      "bytes": 2734,
+      "sha256": "883e98e7e476c0c7236130543c745d554d395a86f3c883d20271c9ed609a34b5"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/scheme/params.rs",
+      "bytes": 13311,
+      "sha256": "399355c6e34f0c7dc516b943ef27c133efbcdac9cc7b35d6dcca8ef8ca76bb7c"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/scheme/prover.rs",
+      "bytes": 10114,
+      "sha256": "f71330cbaefbc50f6b1f61f8be8b830cd0180985e2755cf2c374b69c14c4d35a"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/scheme/verifier.rs",
+      "bytes": 16821,
+      "sha256": "a59ae3a21c13ea3c367e029307aeeb5ab8e4fad12301f933796bb4200460ed91"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/scheme/witness.rs",
+      "bytes": 3996,
+      "sha256": "f46ebe8b6fb8c134b5a855fc7fab45ed47bc70f143d29f39a9276611b36d9472"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/bd.rs",
+      "bytes": 2924,
+      "sha256": "4348aef29b791c953243a689a86dcc0cee914e498580e63649576c84ed024200"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/commit.rs",
+      "bytes": 56439,
+      "sha256": "aff8033e91ae7b3079282bac509b610b9ddedcb5158d90177923a404c07faeb7"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/hybrid_commit.rs",
+      "bytes": 50194,
+      "sha256": "634c418b5afa759618c961d484b5713dabac0e3094fc6081c793a6790e0bb01c"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/mod.rs",
+      "bytes": 874,
+      "sha256": "ea274625c41cb741fde1bfd350b95b3de138c473ff0e754cc900018d6229d519"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/norm.rs",
+      "bytes": 1653,
+      "sha256": "097460bb28893d8a5fa997f679e5b7471ff50c7230d66b656f725e4b8bb976e1"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/ntt/bin_asm.rs",
+      "bytes": 48029,
+      "sha256": "0a3106325904ab4517e5e4b9ef44383b77d0f6cf3ca0a70be290e1667e5c800e"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/ntt/bin_large.rs",
+      "bytes": 37161,
+      "sha256": "e1b6258723d7c12d59c582a22da5bc3af505e812d1e27ac278a9efd6f923bca2"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/ntt/bin_quad.rs",
+      "bytes": 36230,
+      "sha256": "bce77fd399827b8a0511d373182e0dd37a13123e69e140e58e835b736f3430e8"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/ntt/bin_small.rs",
+      "bytes": 17249,
+      "sha256": "344b5589b1ab2d8756c0f28d7f8b4a5edc17af563c7e93016bfe8bc1b91fa150"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/ntt/gen_large.rs",
+      "bytes": 22680,
+      "sha256": "092d4a4a6c3f2af6dab9e1626b783d9f3d0d1a4f9390138ad37e36693f14bd74"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/ntt/gen_quad.rs",
+      "bytes": 40488,
+      "sha256": "4e13e0752aaf8da376051267823e3b3d5013ca1296b787e4c73519935cbda8be"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/ntt/gen_small.rs",
+      "bytes": 39183,
+      "sha256": "193c3deca222860dd2e4fb379c70d47c80eec11099c6c94d5d4c037d3c23443b"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/ntt/mod.rs",
+      "bytes": 664,
+      "sha256": "83ad50d2c4c6722083b372e7a5aeda7b61395e2b43a0c37d9c235d9ea0ebabd6"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/slots.rs",
+      "bytes": 4812,
+      "sha256": "028fda72b8521224b93d93299e27e5c89eca3b04366c6d8c1823b0c60e3ddb25"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/transpose32.rs",
+      "bytes": 2684,
+      "sha256": "4925d75a2e2518de4c5a67d9b3760353950f86a57fb08e66ac47127f9b355a54"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/simd/transpose_f162.rs",
+      "bytes": 22894,
+      "sha256": "84b1353ad1975bdb3e2e122bc653c2b3fbfbfc06b0cb328bf821d20a4762965e"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/switch.rs",
+      "bytes": 9927,
+      "sha256": "17643aedf0b1745295487fd8bcaa564609ff7f4f27cae49fb6f45ab8852ad0ec"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/wire/mod.rs",
+      "bytes": 22160,
+      "sha256": "7bfc5a302d34356f257ec60831f1b3951dc527a60f5d251551910a4793a6a6ae"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/src/wire/rans.rs",
+      "bytes": 19447,
+      "sha256": "a77ea2f2a338ff38d2944ecd780b4815bfa0ca740fb845a663e1c0223f661d83"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/api.rs",
+      "bytes": 7016,
+      "sha256": "876903079d48ce3d3cf38cd162c0808941d6827452e88463c8c2941331c6a9d4"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/bd.rs",
+      "bytes": 8199,
+      "sha256": "a5e3c31362ec1a370a4e41daafdb1605eff957843bb03aa70e05e3ec925fea37"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/challenge.rs",
+      "bytes": 9956,
+      "sha256": "782721fb04fa6835415537975c0ec1f6132fdb613da46e974eb3f855be9bb421"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/commit.rs",
+      "bytes": 11357,
+      "sha256": "9fa6909df5b90a5d0fdadce672c80a46de43b23ba2618173c09928fc4621f3d7"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/common/mod.rs",
+      "bytes": 3688,
+      "sha256": "f9bf65ea60eb1ef786b4c3e001108b6a51ed2ddfd398711794054b090f2f3d92"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/eval.rs",
+      "bytes": 5039,
+      "sha256": "ac566ff6b3d0c98ac2b927c67cf9b44b96288081b63af6830b351c30ca8942a7"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/fields.rs",
+      "bytes": 10686,
+      "sha256": "d39c5f4736aafe224be5a94d21da4b220a1f3509ca0fd9aadec677dee604e2a6"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/fold.rs",
+      "bytes": 9003,
+      "sha256": "3538802816bcff3978a80d7dce6259eabf72f38fec3e24ed61c92fd5785336ba"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/labrador_ffi.rs",
+      "bytes": 21241,
+      "sha256": "5cb9ae2661a9526a98ef120d45f2e17a572e849a66c4031c2506f2f615836282"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/limbs.rs",
+      "bytes": 4401,
+      "sha256": "511c8d3612e38974b0f307749072317fd96e96d51a49dc457676261b694c118b"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/ntt.rs",
+      "bytes": 101394,
+      "sha256": "d7bbbf06ea4029c0782433cdc6daf53ac55c46eabf752284e50ee51e2e095fae"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/opening.rs",
+      "bytes": 20722,
+      "sha256": "09f33f042b2a9e1a77a0bf84f13d1cb4657bfe6d4c9a65bec4c534046d1b6039"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/recursion.rs",
+      "bytes": 15681,
+      "sha256": "d0c48a1244227426ff43f748ca59466272418f21f5440022d95392bd389c5453"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/scalar_reference.rs",
+      "bytes": 4656,
+      "sha256": "6f40ebd7df33228247fb7c25aa312ab70b26d30422e4fe2d21b5336bac086326"
+    },
+    {
+      "path": "reference8af/solution/labinius/crates/pcs/tests/wire.rs",
+      "bytes": 20365,
+      "sha256": "5d9ae6c6a36a5c7c544cb7f4c52e8c2441ae56a6e24a8a8268c76231cee289d1"
+    },
+    {
+      "path": "reference8af/solution/labinius/params.ipynb",
+      "bytes": 14198,
+      "sha256": "2d91c27c18b268ce8846ffb417861ffff7ec7d9a15b6a158da97133403f698a0"
+    },
+    {
+      "path": "reference8af/solution/proof_generate/.cargo/config.toml",
+      "bytes": 50,
+      "sha256": "ba3a61bfac1eae05cf065f9fc9e4cba90e28f1190b1ddb6911ca8d68e2d83a39"
+    },
+    {
+      "path": "reference8af/solution/proof_generate/Cargo.lock",
+      "bytes": 4220,
+      "sha256": "7a209b3ffc08473cdc44b2aa85a09d69d4354d0ca0bd98b34ea8a93479882b3e"
+    },
+    {
+      "path": "reference8af/solution/proof_generate/Cargo.toml",
+      "bytes": 981,
+      "sha256": "e6913d8938a838df9fe827e84bfcbd67720f9298e3253182010018ed07515455"
+    },
+    {
+      "path": "reference8af/solution/proof_generate/build.rs",
+      "bytes": 3077,
+      "sha256": "23ffe5f6fdcba419210294d0ad415d05a3bcbeb0038686b73da68de28d7e492e"
+    },
+    {
+      "path": "reference8af/solution/proof_generate/src/keygen.rs",
+      "bytes": 4907,
+      "sha256": "b51aed1930b8a77a1f558d8a21590d637dee3571772628d77d4828790c85f086"
+    },
+    {
+      "path": "reference8af/solution/proof_generate/src/main.rs",
+      "bytes": 87767,
+      "sha256": "3608e264ec782c8d01f7a8b45460fdf580585be06f64216ec2827b8e1f0b6760"
+    },
+    {
+      "path": "reference8af/solution/proof_generate/src/modulus_choice.rs",
+      "bytes": 3706,
+      "sha256": "c2d6d40306da9fb318709a1db572c3148b6cf71a9da4c0a011476e0b95bc5f04"
+    },
+    {
+      "path": "reference8af/solution/proof_generate/src/parameters.rs",
+      "bytes": 934,
+      "sha256": "85fdb6d05ba9de0270f711b2a513194ecc86adcb14300967de08b7b08cb83aef"
+    },
+    {
+      "path": "reference8af/solution/proof_generate/src/rq.rs",
+      "bytes": 21774,
+      "sha256": "8d201427e650972d600bfcb6ce2f45bab1d840349f5a4080780cacde3bbd77be"
+    },
+    {
+      "path": "reference126/solution/labinius/.cargo/config.toml",
+      "bytes": 50,
+      "sha256": "ba3a61bfac1eae05cf065f9fc9e4cba90e28f1190b1ddb6911ca8d68e2d83a39"
+    },
+    {
+      "path": "reference126/solution/labinius/.gitignore",
+      "bytes": 112,
+      "sha256": "4fdeca756e1cbad3410f1b76218630b4511d45e738e2f4d275b1a5ed68b2ace3"
+    },
+    {
+      "path": "reference126/solution/labinius/Cargo.lock",
+      "bytes": 63710,
+      "sha256": "31cce1e3cf16b0c291de1e476506c675327b53f962bb77485c81ca07ab88dfbf"
+    },
+    {
+      "path": "reference126/solution/labinius/Cargo.toml",
+      "bytes": 4926,
+      "sha256": "d81d673cb78b8c4225c8dbb9f7f827d0b1db283e34fb8097af6eb4ce30a86732"
+    },
+    {
+      "path": "reference126/solution/labinius/README.md",
+      "bytes": 4811,
+      "sha256": "bde3875d13933f16533d8c0322af44849c8be08ae54e7884b64ca68e3b4f4032"
+    },
+    {
+      "path": "reference126/solution/labinius/bench.sh",
+      "bytes": 72,
+      "sha256": "39034263d667cfafad27763985a22cb5aa4d6cc190c367a9a2097ccb53c708f8"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/Cargo.toml",
+      "bytes": 297,
+      "sha256": "16c274b3117a2e77cef73236d66300c1d4d8a32c00c17c475b0dd1e3e85de58d"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/bench.sh",
+      "bytes": 3991,
+      "sha256": "be006f9873a48fa6d6511e514cb6e7064fa7da51b62015fb155f909c5c8a2a9d"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/src/bin/calibrate/bdstats.rs",
+      "bytes": 3164,
+      "sha256": "c9bdb0516c79e605d71b466d8a8548d78848893895c48bdc3eb8e9b620dbb931"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/src/bin/calibrate/boundcheck.rs",
+      "bytes": 2218,
+      "sha256": "6df722ff633498a757a05c1e757c8691d731ef593763216ecc06cfce0bf998d4"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/src/bin/calibrate/foldstats.rs",
+      "bytes": 2854,
+      "sha256": "9e09194b5c6a01878dff269a97177baf3c4875e745efcbb997c9d71b8b5b60c8"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/src/bin/calibrate/gadget.rs",
+      "bytes": 2265,
+      "sha256": "ca15703ff9e8665b06c99c6c1cdef613fc6a352c4a515994272116a6a0aeeaf7"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/src/bin/calibrate/main.rs",
+      "bytes": 869,
+      "sha256": "9b645339b9d5f333af866faaf14f2ab63b9ce37b17b53bc06a351bac581439b0"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/src/bin/calibrate/moduli.rs",
+      "bytes": 9594,
+      "sha256": "30c4a76fe2dd94a77df85f1bd1eec599235a04da26a94389e741cc0569d009a8"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/src/bin/calibrate/recursion.rs",
+      "bytes": 6159,
+      "sha256": "5ab9dfe99a2f5fe651ab20efbb2203cd63da1d20d059a6091bb9807377b610ab"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/src/bin/calibrate/wire_bench.rs",
+      "bytes": 3574,
+      "sha256": "089edbe8e4d794de736f3116d1bb347f4ba5dbbafd80394016aef5468c3b4642"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/src/bin/labinius.rs",
+      "bytes": 21264,
+      "sha256": "32d9697e36ef6a7e68430744912184d79500d256455fff1b01b26dd782457754"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/src/lib.rs",
+      "bytes": 4676,
+      "sha256": "e90bb4e4cfaf378b28fe9d688b8c3cafe39c56b7f68c2d73b371a458247be411"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/bench/tables.py",
+      "bytes": 7741,
+      "sha256": "73d803060d5dbe45ba3134f82c364dc9f2a9f674871c70641cfcba18d439e8e9"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/Cargo.toml",
+      "bytes": 736,
+      "sha256": "ce3c64b7efa96f56afc2674dbb69c12cf16bd00f2f925cc9ef07b6d7fd2ee2ad"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/examples/words.rs",
+      "bytes": 875,
+      "sha256": "cfc625be818d05ed18aa2a5769a09de8199b7ab448bfbce3a5f0196aa9dcecc1"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/src/bin/hashes-binius.rs",
+      "bytes": 10955,
+      "sha256": "1e46020b791167f3aa30260bd7ddb1244a80a42b2433cc946a39499824b81c83"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/src/channel.rs",
+      "bytes": 3321,
+      "sha256": "841a92b6a577c2ffd739e74a054f36dd83f898cfa234cad4a7eb5dcbb88d7383"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/src/circuit.rs",
+      "bytes": 7615,
+      "sha256": "4e214a0380c2f2400431694c18e8834ae32b924de4dff1f38e73a17428d84812"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/src/lib.rs",
+      "bytes": 17900,
+      "sha256": "510fe0a37e175185b88e7bad28bf0e6e9e14cceb252615d1381ef935ed5f1b09"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/src/liop.rs",
+      "bytes": 7877,
+      "sha256": "93e844638dd7acce4d0bef5fada026bb13681ee06735627a6449803a6ff449d2"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/src/phases.rs",
+      "bytes": 2505,
+      "sha256": "27d0307af2e01932f9637deb5a05e7be33cb1838eb801e5483b04effc2d13200"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/src/stock.rs",
+      "bytes": 3287,
+      "sha256": "3aea009aa5f3174e83513b571b509032ba1ef4e03e7672022ad804041f8a8d25"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/src/switch.rs",
+      "bytes": 5160,
+      "sha256": "fb6609606e24c2ee595bcecce9139a217b258edcb6f43c49fe772367ecfbdf5b"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/binius/tests/binius.rs",
+      "bytes": 3288,
+      "sha256": "9ae74b607b3b1a6fe6eb48912db8900ed903e6330ac05d40b59b740db3400533"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/Cargo.toml",
+      "bytes": 1091,
+      "sha256": "9eb64c200c4cacd77d14de1f34bce2565b08d68fb88f0bc324ae7058346b9d26"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/examples/sweep.rs",
+      "bytes": 644,
+      "sha256": "4f94ef7cf67b65250634b8406bb49988166ebe41b2833fa1f752a948b4de99fc"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/src/basefold.rs",
+      "bytes": 9207,
+      "sha256": "3cc419a7d14b066c2a2fc6e17c5f2b32a9ea01433f94829bfa17344485228f71"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/src/bin/pcs-competitors.rs",
+      "bytes": 2017,
+      "sha256": "d51e9ad1b86f77e19445e94de25d41c43627ca57e86e63655a604b3a12db8861"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/src/brakedown.rs",
+      "bytes": 3122,
+      "sha256": "254a881b9b512b702a84113c0065428ae5f453fc6122c93ea0eb27b9c1afd486"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/src/codes/brakedown_code.rs",
+      "bytes": 35036,
+      "sha256": "bcf5168a3f0a76254cbdcb6d756d2f4b27bd689346b87437fc819fb955712542"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/src/codes/mod.rs",
+      "bytes": 3785,
+      "sha256": "2316e7da0ecc30ccb427fae6d94f23ca541943dd7d6d071b91495c78019cbc72"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/src/codes/test_util.rs",
+      "bytes": 2752,
+      "sha256": "671623ff57a05d8fb9cb465773ac93651b4b5eb22f9bec8de0bb1fa9a4cca664"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/src/lib.rs",
+      "bytes": 1340,
+      "sha256": "9b8e36e3d9f10ee8947b8ce841c8028bc44d51053d20bddeef20e5325ed1de3b"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/src/ligerito_flock.rs",
+      "bytes": 5074,
+      "sha256": "c528fbd0f1257508e40878306eefae441b959daa4f142fec3e2216a064a8ab0d"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/src/tensor.rs",
+      "bytes": 24519,
+      "sha256": "60e8f8da059eed31ada1fa6c8f867b3a2b6b24e91f49351bbecbe3d835e97218"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/src/whir.rs",
+      "bytes": 6705,
+      "sha256": "292e5413a4af3e3e8ac9ee76359e49e8c97572b567d83bd23e47f48f2430e297"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/competitors/tests/basefold.rs",
+      "bytes": 967,
+      "sha256": "2db69d0533b8d3b0da1c77850cc74cd3a878bb7c53f93770a09dce02ece24bda"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/flock/Cargo.toml",
+      "bytes": 468,
+      "sha256": "48d998c4062dd3486cf5c1a6edc2b01ad23cd97bb37560eac029db2e75629eac"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/flock/src/bin/hashes-flock.rs",
+      "bytes": 12514,
+      "sha256": "22d6b7ced38e804d581ee4c3931cc7626925ba00b54b6a7f3121613596496c18"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/flock/src/circuit.rs",
+      "bytes": 11744,
+      "sha256": "f5c9f6ea1cc9a1417885b52897744fc9845352b34aa33dcf16fa9a134d3aeeea"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/flock/src/lib.rs",
+      "bytes": 13683,
+      "sha256": "1ef0e40e62067b6c1c32bd5bb74001289b08adfb325f95d5e489afa61b0cd094"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/flock/src/piop.rs",
+      "bytes": 3035,
+      "sha256": "4eb554b727ef8f08f56bf3ffa4256b369b3bdceb25fcd5fd6fca955b49846810"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/flock/src/switch.rs",
+      "bytes": 5343,
+      "sha256": "c22f067d590ea945caf83fcb702054e2fbcfefd88229d0431ac434a5453ac630"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/Cargo.toml",
+      "bytes": 361,
+      "sha256": "ea9ced927cecad3582e985343e3bce8cca3734d0d899497ef67414ea825eb3f2"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/build.rs",
+      "bytes": 4032,
+      "sha256": "35c89aa9e29d41c7d3e8d3f7cf9790da1f7b283a228b7edcb42d0443ff00842b"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/csrc/bn_labrador.c",
+      "bytes": 8479,
+      "sha256": "a357e3814977d77b00942eb50c6d0e44bf7dbbb98ea2c364afa107719dbed4df"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/csrc/bn_labrador.h",
+      "bytes": 4427,
+      "sha256": "62985e40bc73b594e7faef0d576158d3eebe5a9e0737fa8f846d460f77fd11e5"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/examples/two_fields.rs",
+      "bytes": 8031,
+      "sha256": "6f427142c6cd26e6ffce66115e92f07cebba8b7c7a465544126cc7d101c0141b"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/.gitignore",
+      "bytes": 172,
+      "sha256": "948abbbc59de7eb5a406aba9a1df10c317f307de6a8f87c759dd4718e16b218e"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/LICENSE",
+      "bytes": 569,
+      "sha256": "f36c8dab794517bbd77fea3c4496dfeb1d958de17afbb9c606e29ef8bac668c1"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/Makefile",
+      "bytes": 3974,
+      "sha256": "ab4525ad29af6e6ecafdd7cdfb856d72516151a10da6291bdca2e294014d44d7"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/README",
+      "bytes": 782,
+      "sha256": "470b07b64d1caab9eb240ace5e271805034b1562df5b2e336fb21c367b9791b3"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/VENDORED.md",
+      "bytes": 333,
+      "sha256": "adc920ff9dfc10172d046b64766b16e7fa19c7b1ade1ec9bd2371533812e67e9"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/aesctr.c",
+      "bytes": 7137,
+      "sha256": "2fe48795a33ea347463537ee2f42b0728c18819d5c567e7cccf7c6747633da64"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/aesctr.h",
+      "bytes": 1248,
+      "sha256": "7ce52d73c94d095a6d249feaa9fb57b14746900406796c1acf7390b29e18dae5"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/chihuahua.c",
+      "bytes": 31473,
+      "sha256": "b5a0fb58021ffe6ed464e237974c9b8354b2d4573fbaa90eebbf7677bd061648"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/chihuahua.h",
+      "bytes": 3214,
+      "sha256": "3a18e16618d1dcce5357adb79831295e54b9dd3b008363f1edcad54b0f7c9429"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/codec.c",
+      "bytes": 2521,
+      "sha256": "0cb3154ca322a215e7175bf0fe393edea2af9b3f54dc9ec8c1696265c576d8ff"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/codec.h",
+      "bytes": 202,
+      "sha256": "024a1b8a7bf97ec0c0da658efafb9a6b14ca7a0ead44a0eb3d955acf7fcc3e68"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/codec2.c",
+      "bytes": 2680,
+      "sha256": "08e081afe513e75543b9ea5c2a1ed9173d7515642dfa57a16452e57f508fd477"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/codec3.c",
+      "bytes": 1506,
+      "sha256": "7703601e6babf5e531915ead80dd4aff1f4b060b10760a03db58595e3e3cd5c1"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/codec4.c",
+      "bytes": 8966,
+      "sha256": "3ca0b930eaef044e97aa5825ade4fb968a6b6f9f0ac3ca79608dae22f4a01733"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/cpucycles.c",
+      "bytes": 328,
+      "sha256": "1832b42fbed2cb433baebc09b1327878783d18fffa77a091f70d5e2d8ea67d2d"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/cpucycles.h",
+      "bytes": 639,
+      "sha256": "077b09a82773fb9ad58d7553f821ac894be5f430a34a8d654cc857aa055962cd"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/dachshund.c",
+      "bytes": 17097,
+      "sha256": "6abf2c57441860dd3789d1328f9809dedfb6c21083c6e098e3f61b4af9e18915"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/dachshund.h",
+      "bytes": 2076,
+      "sha256": "e4a1c1a2095706b1f030a07d6b452969b42d4bce7d17bb20bdcdf8b3dbdc7ef3"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/data.c",
+      "bytes": 300,
+      "sha256": "32e60bfbcc67ed2eb6fcf9afbd53bf64faee496441640eab6652d4c49ad65800"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/data.h",
+      "bytes": 3903,
+      "sha256": "9ecc15c42a4804ea5f3a557ed7d419c9198e31d560f8aa55cc4f5221fc87ed32"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/data.py",
+      "bytes": 8222,
+      "sha256": "1dd8acd2469e0a56e38d1cceb8e31464d4ab8c7e455dd63a31f5acf226572737"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/data24.c",
+      "bytes": 13600,
+      "sha256": "e7d43338442c14c67b42d127511f0cec9c3721b3ba1e7d1e28de20fba34c72a3"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/data32.c",
+      "bytes": 16330,
+      "sha256": "cbd9d3f2a08380a5734e070cddb7d4f70715f1a84e2672a417ba18298c960a62"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/data40.c",
+      "bytes": 18992,
+      "sha256": "f00d9427da3e05cd42c7720de1f20dfdd740efa2c618fce9669ae4dab364e4d7"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/data48.c",
+      "bytes": 21734,
+      "sha256": "03649a5572488f5baf0ecc108e0c411650d662cc221a09227e3352918ec59b6a"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/data50.c",
+      "bytes": 21736,
+      "sha256": "b2d2614663a77002d33955e2a6751a4da8dbe4a9ae498b9c7962e1160120fdac"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/data56.c",
+      "bytes": 24399,
+      "sha256": "c5310700665a9772b39c5e8acf4e1313b5395e3e905d0225d764f2dc242a647c"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/data64.c",
+      "bytes": 27145,
+      "sha256": "bc1c3a0bc879fe9b42f3d0837a3df29628730d76102b89ea2c0d3ca54ef5e0e7"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/fips202.c",
+      "bytes": 26047,
+      "sha256": "6b33b4e5f82f3f95b7fa1a3f6f243cfd68616057fca1200fbaf1f791e522aab8"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/fips202.h",
+      "bytes": 2935,
+      "sha256": "9e711f2861d38cce76ddb7067dd30552c975aaf30e4a0b4a544acd02890b7fab"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/fq.inc",
+      "bytes": 1305,
+      "sha256": "a3107ba4af6734b30ac757a3b931376fbd187556113fcce842a2ae7e06cc4a0b"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/gaussian.c",
+      "bytes": 2563,
+      "sha256": "375dac72e983108d02fefc7d4ad46d0f0c333935a97679ca3ead1ae240ce867d"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/gaussian.h",
+      "bytes": 104,
+      "sha256": "ff787d995b3e98f67a5f374e8b981cb1cb4b8fbc8b66116150ccc85371b7d2fd"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/greyhound.c",
+      "bytes": 15329,
+      "sha256": "d8c6b303bf2f35602c0efb04c730b7068aab39c831bdbce0684b777b24767683"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/greyhound.h",
+      "bytes": 1029,
+      "sha256": "d35728746f3a86ed27919d891053d3659f2198d9723a35527862f7e4ef758495"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/invntt.S",
+      "bytes": 3829,
+      "sha256": "4b370a4923030813435c0fbaa50a4dae07d9bb765e460a3b3281ea674ce7ffd7"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/jlproj.c",
+      "bytes": 27068,
+      "sha256": "f934afd89814c429e5cec36df8a864ed14e5b1b8275de557a7b64a09fb8c9abe"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/jlproj.h",
+      "bytes": 760,
+      "sha256": "ea5a023a6c9b596d31bbea995f58e3d0cca47521c9a2a5967d6c34ccb3951c6c"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/labrador.c",
+      "bytes": 40563,
+      "sha256": "d84ae9ebb7cb538827326c7dd977a456c187b9c063a742be29461c5dc3309856"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/labrador.h",
+      "bytes": 5605,
+      "sha256": "54f7958f53b304f160e3f12795858b912313bc7f517272b059fa84db13270de4"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/malloc.h",
+      "bytes": 501,
+      "sha256": "fe3bb6a8aa6b18cb8e56753d8a3700d663574d84785715265a5dee6ab8825c3a"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/ntt.S",
+      "bytes": 3843,
+      "sha256": "1803177fe79a6746a34a908cd8c8530c03dc28371553a2a9f4468feb21dd5627"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/pack.c",
+      "bytes": 7473,
+      "sha256": "09b0f1c10563a1f23091fb7c0e05f2bdd5c3cd67e6cc06bd18ebef0b4dd99256"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/pack.h",
+      "bytes": 1238,
+      "sha256": "49924f667fae316677671b72d70079e65d09d37d0add5c32b2506f944ded7489"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/polx.c",
+      "bytes": 15834,
+      "sha256": "0de427d7ebe69b2cdf9bcb301a2bd107c9e1e7976e8824b8d43bcc1d2e7f9e92"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/polx.h",
+      "bytes": 4052,
+      "sha256": "e6f3aeb1320462acbdcde7361c996a998d1fcf260c30e97d6553e24cb19d77ff"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/poly.c",
+      "bytes": 42214,
+      "sha256": "faad8a69b9fb059846680d4028b8309163d3252906b9128af7d2851b140064f6"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/poly.h",
+      "bytes": 5845,
+      "sha256": "2dde54198f98eb9bc114ef1cf69de21a0e3b9e9f94903628bb6d6e6283e9f624"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/polz.c",
+      "bytes": 27966,
+      "sha256": "09466eb6f4deea05af0fba417122fa2172874a7192a7086b63ddc75b9ea19358"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/polz.h",
+      "bytes": 2959,
+      "sha256": "41f6099b230d38d2afe74b94063117a517708c6fbd891b19850d6e842a947355"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/randombytes.c",
+      "bytes": 1584,
+      "sha256": "63533d0cda638498614548de6d5b514382e9ed59b2d3cfa2e8c14adb35f0df2a"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/randombytes.h",
+      "bytes": 150,
+      "sha256": "c6841fa68287f9703e107cacfeb52b258e52a23378ca67f9e20fd7300cd26d4c"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/shuffle.inc",
+      "bytes": 1044,
+      "sha256": "0277b224632807eb6b67527ef1554786a54e7cea20a818ad477157ccd23432f1"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/sparsemat.c",
+      "bytes": 1290,
+      "sha256": "702236e420bbef10422f865a9a758545e2c3a47d2c9bc60a8f1cf898bce74408"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/sparsemat.h",
+      "bytes": 443,
+      "sha256": "a3bad3508d9f440a00afa2bb0497c76545e99a8844d59c80087ef506152090dd"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_aesctr.c",
+      "bytes": 1777,
+      "sha256": "2fda098420bef2c0aaeb7758a9d9eb2bab6e9b6e8e169c8232577de78a6c85f5"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_binary.c",
+      "bytes": 7290,
+      "sha256": "87e062646f0e19d1767ab7874a0f82bd93514418e47fc6e6371841e59f3e26ec"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_chihuahua.c",
+      "bytes": 4898,
+      "sha256": "a0ba3756f785d4acd623ae4b5eb46150c76f5bec60dfc5441737eac050cbb894"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_dachshund.c",
+      "bytes": 4585,
+      "sha256": "fa74a58c2676a2e9b140dcf1b521023f2e35994fd3dd54744f046b3f40512aa4"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_greyhound.c",
+      "bytes": 2404,
+      "sha256": "77f4ff514d791d9b22b67bed385ef868fa4de5f44ff47f91a48a6b586cfe4760"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_jlproj.c",
+      "bytes": 1713,
+      "sha256": "86bdd7c27dce70c8a9faeda4d377132a1eb349d3ad0af0bcc3cda3086e488af9"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_mixed.c",
+      "bytes": 6699,
+      "sha256": "a6244f8200f012c0154c9672ff555c669487b334f9c20785677c31a056691567"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_ntt.c",
+      "bytes": 2764,
+      "sha256": "222a25516752038068ba6871a9c6e3e1308bcbfc94d776dc787b353e9230c0a0"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_off.c",
+      "bytes": 7987,
+      "sha256": "dc9394b5c24855ef17b3cb268b4b2c20c09ec4cea05a11482292a9082b95118f"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_poly.c",
+      "bytes": 1980,
+      "sha256": "e1392c1cc7e9168cb2bd8dd59587d3bda0fd5207f6c64961c3b82014883ab9b2"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/labrador/test_polz.c",
+      "bytes": 7063,
+      "sha256": "618b9c8f14b373de3215ab135e9754b4dcc74f70a070146806b77caf859c8805"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/bd/digits.rs",
+      "bytes": 15660,
+      "sha256": "fe2903c499fc4de6b0805d6b47ea7e6bc04d7b638a3f929ab5b9d9121c7951a3"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/bd/mod.rs",
+      "bytes": 2175,
+      "sha256": "92bddfc65cf621685f38482356740e65e9649df7cbffb4307aa116185eb2ee0f"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/bd/residual.rs",
+      "bytes": 4377,
+      "sha256": "c93774106a672b28efa55a300f0b0fe6f078b286179814f2aee16ea9ff22b599"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/challenge.rs",
+      "bytes": 34901,
+      "sha256": "da91f31560394d9d17d0957fdf3b8e7dd7a9f4028b8c1649cd32c3f81e944ce3"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/eval.rs",
+      "bytes": 20917,
+      "sha256": "09ae065e388c67c24656c565f0f50193d4f6a2d92c2023c0677127e4c5d5416e"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/f162.rs",
+      "bytes": 3709,
+      "sha256": "bc28e5f31128a3c022b56847d794b258ba3a9ef1f4fd84b6fcacbd6d6fca94d8"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/fields/bitmat.rs",
+      "bytes": 6275,
+      "sha256": "7257c896625833823a9ff81d4600841c3398be8f7785679850d8c15385ce84c5"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/fields/crossfield.rs",
+      "bytes": 105967,
+      "sha256": "aadf3d32b797c2af34c6008e7b38cf410112b75540456f0083a2d88e514e89df"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/fields/f162.rs",
+      "bytes": 4784,
+      "sha256": "8eff3175440393463d152f1405b02e80694f4f51a24c8c2f36fcdc72256199a1"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/fields/mod.rs",
+      "bytes": 819,
+      "sha256": "76434b598880ccd44dcd0dbed66683cfc6b5162d9a6149b2edd4ff790afa277f"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/fields/scalar.rs",
+      "bytes": 3343,
+      "sha256": "30834339d0bc1bdb452b51b7e5912a6eac75ee4a9e7d57ff6321a8c3a62db491"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/fields/sumcheck.rs",
+      "bytes": 3999,
+      "sha256": "3d091dc277282d723c478801944e868d3a31f84280ff8f3f4a99b38146306758"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/fold.rs",
+      "bytes": 112109,
+      "sha256": "667c922fc1564bd168d3e97507021cadfcaba97e1483ec0296b34fa7ae0565ca"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/fold_bits.rs",
+      "bytes": 35599,
+      "sha256": "e174866397028d0ad81f7c41a76996f65af2fc68e388ed156a37d1181171ef56"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/key.rs",
+      "bytes": 24502,
+      "sha256": "e98d6e1e07810aa31be6fd8264fcf8c301a76ade4c0db8aac72380dd87368a02"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/labrador/ffi.rs",
+      "bytes": 4569,
+      "sha256": "f5849f47f6f6d41f7529343ffe15c2355c7d3c9c14d7b669a935077e81751a46"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/labrador/mod.rs",
+      "bytes": 37675,
+      "sha256": "6d3b31d21fb30994a8f5ab8468caf64732bb3bf1bbaba28f9397d6a5431931b8"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/labrador/polx.rs",
+      "bytes": 12138,
+      "sha256": "bc9592ca1622ab0d6c3537fc112e01e54b61620da0d0b768d909ed36d5ba8d5a"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/lib.rs",
+      "bytes": 2988,
+      "sha256": "38f0513e3c19e9c08b152af1e2d36ec2cb029d867ee48c69795841eaa6bd8666"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/limb.rs",
+      "bytes": 3150,
+      "sha256": "cd6f631226bea62a4f6704eb0265760a9429eae3062af93fb4c3db758f318d66"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/par.rs",
+      "bytes": 25404,
+      "sha256": "48b273e00e983679714026ef766350cc2cd080c70c881f2ee88bf9a1663c9f35"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/params.rs",
+      "bytes": 18757,
+      "sha256": "6789cac72132a1a48c6987a93b39c72b55d411d10752b8a394143653d7684a91"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/recursion/binary.rs",
+      "bytes": 6198,
+      "sha256": "8fdac74ba44c3ef99a011a254981776ee376473e818ba4e6023f5a58497a5c84"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/recursion/bound.rs",
+      "bytes": 5795,
+      "sha256": "56e77b8991562017039ebc5480fdc4dfce7a7df7fbb29e18d5e76e1b655fd01b"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/recursion/chain.rs",
+      "bytes": 20179,
+      "sha256": "cde63f5165a25f44bfc067c5a081a6252770692e0b6e9ccb525693d2939302a5"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/recursion/chunk.rs",
+      "bytes": 5418,
+      "sha256": "191295088d7829c0958f22b63b35079105148479cb1e32ba2b16bf2ffa8e6456"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/recursion/export.rs",
+      "bytes": 7316,
+      "sha256": "829610b660d06b0838a7ef20314b335a1fb148ea5490c21b9574d9174daeaddb"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/recursion/limbs.rs",
+      "bytes": 19426,
+      "sha256": "109e48e1a480270600f278772d5be957ed513c1e81f30064ab00348dd5c96f05"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/recursion/mod.rs",
+      "bytes": 30675,
+      "sha256": "2c0b99baa4baa48d994cc4a01e75d84ff4eb951e6d9e63a242c5a8156f1a6282"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/recursion/setup.rs",
+      "bytes": 11065,
+      "sha256": "85142aae0f5bee41a2636fd55a4b0228f1ee5033779536e66c930ff98662bdbe"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/recursion/statement.rs",
+      "bytes": 9578,
+      "sha256": "316e3080541de9fab208930b7a88fcd365e243fed4ec7c184b38cbacc2c2561f"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/ring/element.rs",
+      "bytes": 6276,
+      "sha256": "eb82fcdf4d1f273801e0d3d2b8af7a468aa55bba45462031f7e7fa66bca46170"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/ring/mod.rs",
+      "bytes": 17896,
+      "sha256": "76b26f1a1f020cd9670b7b010779921fec806a93a9f13c68a27570d72e6922bc"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/rng.rs",
+      "bytes": 572,
+      "sha256": "07e72d603f1464c2344f37266e1bb312a77212c49b05f709f88eebf3ed716b6a"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/scalar.rs",
+      "bytes": 11619,
+      "sha256": "602b1647f99ce442e0e5f4cdbf30cb5fb7f5d8788f9619fb998cb70de0f33928"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/scheme/commitment.rs",
+      "bytes": 15522,
+      "sha256": "784a03ad0939b09110f9c29251b48f1c8d1c6c28147b674455050349d4a3aa26"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/scheme/mod.rs",
+      "bytes": 2734,
+      "sha256": "883e98e7e476c0c7236130543c745d554d395a86f3c883d20271c9ed609a34b5"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/scheme/params.rs",
+      "bytes": 13311,
+      "sha256": "399355c6e34f0c7dc516b943ef27c133efbcdac9cc7b35d6dcca8ef8ca76bb7c"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/scheme/prover.rs",
+      "bytes": 10114,
+      "sha256": "f71330cbaefbc50f6b1f61f8be8b830cd0180985e2755cf2c374b69c14c4d35a"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/scheme/verifier.rs",
+      "bytes": 16821,
+      "sha256": "a59ae3a21c13ea3c367e029307aeeb5ab8e4fad12301f933796bb4200460ed91"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/scheme/witness.rs",
+      "bytes": 3996,
+      "sha256": "f46ebe8b6fb8c134b5a855fc7fab45ed47bc70f143d29f39a9276611b36d9472"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/bd.rs",
+      "bytes": 2924,
+      "sha256": "4348aef29b791c953243a689a86dcc0cee914e498580e63649576c84ed024200"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/commit.rs",
+      "bytes": 56439,
+      "sha256": "aff8033e91ae7b3079282bac509b610b9ddedcb5158d90177923a404c07faeb7"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/hybrid_commit.rs",
+      "bytes": 69452,
+      "sha256": "4ac34e9f40372caeeea35f2d62b8da4c03cae17ec2d12e2d74b9867da50a6845"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/mod.rs",
+      "bytes": 874,
+      "sha256": "ea274625c41cb741fde1bfd350b95b3de138c473ff0e754cc900018d6229d519"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/norm.rs",
+      "bytes": 1653,
+      "sha256": "097460bb28893d8a5fa997f679e5b7471ff50c7230d66b656f725e4b8bb976e1"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/ntt/bin_asm.rs",
+      "bytes": 60503,
+      "sha256": "8e51fdd60804f66b754f263acb3008419fcd7eb9ceda07caca2e31f82aa1db1a"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/ntt/bin_large.rs",
+      "bytes": 37161,
+      "sha256": "e1b6258723d7c12d59c582a22da5bc3af505e812d1e27ac278a9efd6f923bca2"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/ntt/bin_quad.rs",
+      "bytes": 36230,
+      "sha256": "bce77fd399827b8a0511d373182e0dd37a13123e69e140e58e835b736f3430e8"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/ntt/bin_small.rs",
+      "bytes": 17249,
+      "sha256": "344b5589b1ab2d8756c0f28d7f8b4a5edc17af563c7e93016bfe8bc1b91fa150"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/ntt/gen_large.rs",
+      "bytes": 22680,
+      "sha256": "092d4a4a6c3f2af6dab9e1626b783d9f3d0d1a4f9390138ad37e36693f14bd74"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/ntt/gen_quad.rs",
+      "bytes": 40488,
+      "sha256": "4e13e0752aaf8da376051267823e3b3d5013ca1296b787e4c73519935cbda8be"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/ntt/gen_small.rs",
+      "bytes": 41587,
+      "sha256": "9438a62cbe3d3c084de519a56124c0a6a112cab4fbefe9b2a0ef62c07fc4262d"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/ntt/mod.rs",
+      "bytes": 664,
+      "sha256": "83ad50d2c4c6722083b372e7a5aeda7b61395e2b43a0c37d9c235d9ea0ebabd6"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/slots.rs",
+      "bytes": 4812,
+      "sha256": "028fda72b8521224b93d93299e27e5c89eca3b04366c6d8c1823b0c60e3ddb25"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/transpose32.rs",
+      "bytes": 2684,
+      "sha256": "4925d75a2e2518de4c5a67d9b3760353950f86a57fb08e66ac47127f9b355a54"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/simd/transpose_f162.rs",
+      "bytes": 28759,
+      "sha256": "c1dec6bc5cb9c0eefbe6cb153d909ec9800d0cce496ac0e03a27e28fa20d6b3a"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/switch.rs",
+      "bytes": 9927,
+      "sha256": "17643aedf0b1745295487fd8bcaa564609ff7f4f27cae49fb6f45ab8852ad0ec"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/wire/mod.rs",
+      "bytes": 22160,
+      "sha256": "7bfc5a302d34356f257ec60831f1b3951dc527a60f5d251551910a4793a6a6ae"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/src/wire/rans.rs",
+      "bytes": 19447,
+      "sha256": "a77ea2f2a338ff38d2944ecd780b4815bfa0ca740fb845a663e1c0223f661d83"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/api.rs",
+      "bytes": 7016,
+      "sha256": "876903079d48ce3d3cf38cd162c0808941d6827452e88463c8c2941331c6a9d4"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/bd.rs",
+      "bytes": 8199,
+      "sha256": "a5e3c31362ec1a370a4e41daafdb1605eff957843bb03aa70e05e3ec925fea37"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/challenge.rs",
+      "bytes": 9956,
+      "sha256": "782721fb04fa6835415537975c0ec1f6132fdb613da46e974eb3f855be9bb421"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/commit.rs",
+      "bytes": 11357,
+      "sha256": "9fa6909df5b90a5d0fdadce672c80a46de43b23ba2618173c09928fc4621f3d7"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/common/mod.rs",
+      "bytes": 3688,
+      "sha256": "f9bf65ea60eb1ef786b4c3e001108b6a51ed2ddfd398711794054b090f2f3d92"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/eval.rs",
+      "bytes": 5039,
+      "sha256": "ac566ff6b3d0c98ac2b927c67cf9b44b96288081b63af6830b351c30ca8942a7"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/fields.rs",
+      "bytes": 10686,
+      "sha256": "d39c5f4736aafe224be5a94d21da4b220a1f3509ca0fd9aadec677dee604e2a6"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/fold.rs",
+      "bytes": 9003,
+      "sha256": "3538802816bcff3978a80d7dce6259eabf72f38fec3e24ed61c92fd5785336ba"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/labrador_ffi.rs",
+      "bytes": 21241,
+      "sha256": "5cb9ae2661a9526a98ef120d45f2e17a572e849a66c4031c2506f2f615836282"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/limbs.rs",
+      "bytes": 4401,
+      "sha256": "511c8d3612e38974b0f307749072317fd96e96d51a49dc457676261b694c118b"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/ntt.rs",
+      "bytes": 101394,
+      "sha256": "d7bbbf06ea4029c0782433cdc6daf53ac55c46eabf752284e50ee51e2e095fae"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/opening.rs",
+      "bytes": 20722,
+      "sha256": "09f33f042b2a9e1a77a0bf84f13d1cb4657bfe6d4c9a65bec4c534046d1b6039"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/recursion.rs",
+      "bytes": 15681,
+      "sha256": "d0c48a1244227426ff43f748ca59466272418f21f5440022d95392bd389c5453"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/scalar_reference.rs",
+      "bytes": 4656,
+      "sha256": "6f40ebd7df33228247fb7c25aa312ab70b26d30422e4fe2d21b5336bac086326"
+    },
+    {
+      "path": "reference126/solution/labinius/crates/pcs/tests/wire.rs",
+      "bytes": 20365,
+      "sha256": "5d9ae6c6a36a5c7c544cb7f4c52e8c2441ae56a6e24a8a8268c76231cee289d1"
+    },
+    {
+      "path": "reference126/solution/labinius/params.ipynb",
+      "bytes": 14198,
+      "sha256": "2d91c27c18b268ce8846ffb417861ffff7ec7d9a15b6a158da97133403f698a0"
+    },
+    {
+      "path": "reference126/solution/proof_generate/.cargo/config.toml",
+      "bytes": 50,
+      "sha256": "ba3a61bfac1eae05cf065f9fc9e4cba90e28f1190b1ddb6911ca8d68e2d83a39"
+    },
+    {
+      "path": "reference126/solution/proof_generate/Cargo.lock",
+      "bytes": 4220,
+      "sha256": "7a209b3ffc08473cdc44b2aa85a09d69d4354d0ca0bd98b34ea8a93479882b3e"
+    },
+    {
+      "path": "reference126/solution/proof_generate/Cargo.toml",
+      "bytes": 981,
+      "sha256": "e6913d8938a838df9fe827e84bfcbd67720f9298e3253182010018ed07515455"
+    },
+    {
+      "path": "reference126/solution/proof_generate/build.rs",
+      "bytes": 3274,
+      "sha256": "ff3c97a4a0e5bbca180b0ccaee7741d4aeb42b55c92e2ad9a0dbdbe4b47f0228"
+    },
+    {
+      "path": "reference126/solution/proof_generate/src/keygen.rs",
+      "bytes": 7014,
+      "sha256": "11fb3a2c5544af6d8ec8f5c82fe661ea03860b8a17c892a30ebc9dd4154c280d"
+    },
+    {
+      "path": "reference126/solution/proof_generate/src/main.rs",
+      "bytes": 89788,
+      "sha256": "24c972b9f6bd46898821c7f64904a67fa8a079b79f9eed29ffe772aeb7d17627"
+    },
+    {
+      "path": "reference126/solution/proof_generate/src/modulus_choice.rs",
+      "bytes": 3706,
+      "sha256": "c2d6d40306da9fb318709a1db572c3148b6cf71a9da4c0a011476e0b95bc5f04"
+    },
+    {
+      "path": "reference126/solution/proof_generate/src/parameters.rs",
+      "bytes": 934,
+      "sha256": "85fdb6d05ba9de0270f711b2a513194ecc86adcb14300967de08b7b08cb83aef"
+    },
+    {
+      "path": "reference126/solution/proof_generate/src/rq.rs",
+      "bytes": 21774,
+      "sha256": "8d201427e650972d600bfcb6ce2f45bab1d840349f5a4080780cacde3bbd77be"
+    },
+    {
+      "path": "trusted/labinius/.cargo/config.toml",
+      "bytes": 48,
+      "sha256": "8ea425180afe0e2fc0cd930d9a5dbd4da07aebe14263eeec4d6df9c7ab996a20"
+    },
+    {
+      "path": "trusted/labinius/.gitignore",
+      "bytes": 103,
+      "sha256": "a5465ff5be6524eb6436883a0d938e9782e43de012e853f07ced1414a94ae8d2"
+    },
+    {
+      "path": "trusted/labinius/Cargo.lock",
+      "bytes": 62053,
+      "sha256": "c87ad2a0812f68e20eb69772854674c85e56ceac98294f9c52341b18a603619d"
+    },
+    {
+      "path": "trusted/labinius/Cargo.toml",
+      "bytes": 4858,
+      "sha256": "2c935ba0563f64e1203084a8f68007337545a3339b5c2ed8bb23b1b01f0dc3f7"
+    },
+    {
+      "path": "trusted/labinius/README.md",
+      "bytes": 4721,
+      "sha256": "82ffc8d0018dc3d11315295296cf030cb58edcac3cd189662d29e78f632ca6ec"
+    },
+    {
+      "path": "trusted/labinius/bench.sh",
+      "bytes": 70,
+      "sha256": "a5ef82d8c9241d13913c4aadd5ae9a74a0bed3a61c1740eeb438bab250c1542d"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/Cargo.toml",
+      "bytes": 285,
+      "sha256": "c95ef78bcc6dd75438f5735e1512355a9675677834633d6f943b1c3454032c74"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/bench.sh",
+      "bytes": 3849,
+      "sha256": "ea7a090c7edbb3f9f2018cd72ca3d40fbb38ce2bd8d831c2102036c80c3ff686"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/src/bin/calibrate/bdstats.rs",
+      "bytes": 3076,
+      "sha256": "83264a61c067b84607262c5f5a0f19311c008761999a46fdac0c4b2d797e1511"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/src/bin/calibrate/boundcheck.rs",
+      "bytes": 2157,
+      "sha256": "6c08c8a6f44dbaaac7350857d33b25354e84a9a3762c048e64d98f6a5b9f21a6"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/src/bin/calibrate/foldstats.rs",
+      "bytes": 2789,
+      "sha256": "185da604f44dc090b63941c4c220e5c68e23ab19a5723ad6542c0c5a37c297f2"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/src/bin/calibrate/gadget.rs",
+      "bytes": 2207,
+      "sha256": "a5c9617bd0019e3902796b733d4f9505ceb5511e42d94d7e8a6789adefd5e3dd"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/src/bin/calibrate/main.rs",
+      "bytes": 841,
+      "sha256": "848ef941f61e891fd83c0993b562d84f753458a18a8e7936e804c71883ade74a"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/src/bin/calibrate/moduli.rs",
+      "bytes": 9335,
+      "sha256": "64f42e11a5c192022588616a39fd55ca5cbdd83f47f878d7d0a7d812df12ada9"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/src/bin/calibrate/recursion.rs",
+      "bytes": 5971,
+      "sha256": "7ccc543f391f6b506f80f9414055868916cdb0e1a9b966c03796f93ef75dbcbe"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/src/bin/calibrate/wire_bench.rs",
+      "bytes": 3472,
+      "sha256": "f2a7715bd811778832f23721e1cfd03182bb55cf7a8e90d9d84833e688a7a749"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/src/bin/labinius.rs",
+      "bytes": 20708,
+      "sha256": "d6c12690abd273bc7ebf9340bda14d573865a09a925b4e92b56d881b03aae899"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/src/lib.rs",
+      "bytes": 4524,
+      "sha256": "68c01cc5bd90b1c594a48ef76043c91866057a5d2fa7c75dfee5cbda306a8396"
+    },
+    {
+      "path": "trusted/labinius/crates/bench/tables.py",
+      "bytes": 7605,
+      "sha256": "44a4707aa3d4328658922a000aee5ae1334d2bb9a897253babcd7178e3aea605"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/Cargo.toml",
+      "bytes": 712,
+      "sha256": "296307c9befae5250916446236075a49d9612cd8edbad58777c095545db09446"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/examples/words.rs",
+      "bytes": 850,
+      "sha256": "73cc331b469b12512a8088cfab309d56d7a9c500fce0360b4eb8a4603344fd60"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/src/bin/hashes-binius.rs",
+      "bytes": 10580,
+      "sha256": "d065c2ab65fab3b13287a1455dd9fa407daab53b9dab9d537764eca54e0c8481"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/src/channel.rs",
+      "bytes": 3221,
+      "sha256": "73d5998c7c41ce65791153c5fa8ba472e92d1fd01e87b3ec51643a1abe9fc8b2"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/src/circuit.rs",
+      "bytes": 7399,
+      "sha256": "2b6b2bc501fc6599e0d354861c3aaa6b0e6fa508e8495d45432285ce01dd561f"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/src/lib.rs",
+      "bytes": 17415,
+      "sha256": "f58643e3b2b3614aee979edc5ba7b3738b8bd9f65f470287450891064765b8cb"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/src/liop.rs",
+      "bytes": 7661,
+      "sha256": "7adf04cb68e8e9ebe614867f8b352e536a3c50fd16040c53f5ebc16375b62a79"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/src/phases.rs",
+      "bytes": 2429,
+      "sha256": "4c311f8b7a8f081dcbf513a4e5bf172350ca1a4c5f68652647f5eef9145d0659"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/src/stock.rs",
+      "bytes": 3214,
+      "sha256": "b5caf2e342550142a42a6a9aa506c6037f205c284f013aafeec4acba0c04ce5f"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/src/switch.rs",
+      "bytes": 5010,
+      "sha256": "033df351f21705f72c45c5fbd729143645ac2f13c7b49150cc62b76e62fbcd11"
+    },
+    {
+      "path": "trusted/labinius/crates/binius/tests/binius.rs",
+      "bytes": 3198,
+      "sha256": "1a5abd259729fe1ff743496145d5cf575626be4b38baf5616ce5fdfa2e1c1dda"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/Cargo.toml",
+      "bytes": 1058,
+      "sha256": "a6a0c0f3fcab0266b47c3996c98b482adbe6d8a8fe4d8c61f2db2812dfbe44d6"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/examples/sweep.rs",
+      "bytes": 632,
+      "sha256": "03a08ad8ce8a875e2f838656fe1df4bcbebe80d8320ee8d9dc544b3128614dc0"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/src/basefold.rs",
+      "bytes": 8982,
+      "sha256": "8005f1b845e9803981db6c166ffa8baff8ae3478111ec20e27144132a2caf1dc"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/src/bin/pcs-competitors.rs",
+      "bytes": 1950,
+      "sha256": "2c5ba2b39d968ba330fdb663fe6e9362965daf8b912cb7223c5df8f5660cd15b"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/src/brakedown.rs",
+      "bytes": 3049,
+      "sha256": "772726cae306fa0cc387f696adf7d563f65812f60a150ddca92648ac4e888b82"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/src/codes/brakedown_code.rs",
+      "bytes": 34206,
+      "sha256": "3503a2fef4087d759db0bed6e4e4104364a5e9df4f31823c23edc8d24e230c6b"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/src/codes/mod.rs",
+      "bytes": 3670,
+      "sha256": "aa0e7d39066ba41e29b045efeb5355169dd2a1c7fff9409a593ef56a6d808a13"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/src/codes/test_util.rs",
+      "bytes": 2682,
+      "sha256": "c6ead5bac0b3847683aa82690f45462c967559dadbc1145809a6b89cbeadb00d"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/src/lib.rs",
+      "bytes": 1294,
+      "sha256": "5983a43105d2e6ed93c646fdfeab76e208ad17eb5626d4bbb84daa10066a1cc4"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/src/ligerito_flock.rs",
+      "bytes": 4920,
+      "sha256": "2cf98bfdfe971854b8cf51b7385d4119a5f250b735b1a135fc7a4779953b172d"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/src/tensor.rs",
+      "bytes": 23935,
+      "sha256": "048cf71aa8a448fad653bcd2890e81984eb5f14256da79228306252aac58d669"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/src/whir.rs",
+      "bytes": 6530,
+      "sha256": "d87ec8894e1590aefcb3ced9d07054b3a7e8d918bb0cb969238b800c72931819"
+    },
+    {
+      "path": "trusted/labinius/crates/competitors/tests/basefold.rs",
+      "bytes": 944,
+      "sha256": "5a3c9c7f0d8479f75a1db9c320b8fd6fda6c31aaf51f55d9d527d74964a969b7"
+    },
+    {
+      "path": "trusted/labinius/crates/flock/Cargo.toml",
+      "bytes": 452,
+      "sha256": "c1e63d0d6239d0176ae8a74177a94b39b63a6bb3eeaf1b45611e6f7cdf651a8d"
+    },
+    {
+      "path": "trusted/labinius/crates/flock/src/bin/hashes-flock.rs",
+      "bytes": 12079,
+      "sha256": "78f9e60550f2e1309995b1e0313cc44c9d7c76c3f2b61faa9a5836ffe491a7b1"
+    },
+    {
+      "path": "trusted/labinius/crates/flock/src/circuit.rs",
+      "bytes": 11420,
+      "sha256": "97da8a25cd303b138f5a050c35f7e8f42de9cee4ca93657604531642b227780e"
+    },
+    {
+      "path": "trusted/labinius/crates/flock/src/lib.rs",
+      "bytes": 13273,
+      "sha256": "30bd4be4200cb41de78485ba016daf454b96de0eeacc42b31c7703dd6deeb83d"
+    },
+    {
+      "path": "trusted/labinius/crates/flock/src/piop.rs",
+      "bytes": 2928,
+      "sha256": "14b7283f4240386ef2b120e72e221b41b947d99411b4da1f055c905a526e2b9f"
+    },
+    {
+      "path": "trusted/labinius/crates/flock/src/switch.rs",
+      "bytes": 5153,
+      "sha256": "d0ce7dac49cab5bfc8050a159d263503d6443d8c84547ccba57a3a794357f2b8"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/Cargo.toml",
+      "bytes": 350,
+      "sha256": "fba48e4a3e060609d503e18805225fe48a30088a8f2c532710df1e90f7d2a153"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/build.rs",
+      "bytes": 3923,
+      "sha256": "108ca27ee9c2bd58a2ba3a3135e6b5742fab055baf521956dd934f4d902e1cd9"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/csrc/bn_labrador.c",
+      "bytes": 8185,
+      "sha256": "91f4beb28035fe8277684f8a9cdaa5acbf558be29db0a44bec214d74839c0a6d"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/csrc/bn_labrador.h",
+      "bytes": 4336,
+      "sha256": "4989f2d1fd8dc8767da582bdbca7ad394e55f01f83a79bbc1a38f15469095a59"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/examples/two_fields.rs",
+      "bytes": 7810,
+      "sha256": "7c80b5e22db5f9c0044d5fdd21c327945676c209e6f83828c0cb3a5ca9f5d2d3"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/.gitignore",
+      "bytes": 157,
+      "sha256": "c87d19a3deac7130f2011ad8d1ed9971ef610a67bc80de065c1605516e16c51b"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/LICENSE",
+      "bytes": 556,
+      "sha256": "c34e9e959837728e535a8b5191a12dac040e2fa7bf5514ce6b218ca4784e26d8"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/Makefile",
+      "bytes": 3875,
+      "sha256": "34057d698c1912674131c06a914ba6b458217d89dc532e39ceb9a40d1f4091db"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/README",
+      "bytes": 775,
+      "sha256": "fe8426e325cf37f182b1dce1381bcd8c2a914a347c2bcf8c0d5bf483c162d7a8"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/VENDORED.md",
+      "bytes": 326,
+      "sha256": "837b4921e80abf1baca6e3d75a8d51777e023c3137faee9f48e61dab0095d8f6"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/aesctr.c",
+      "bytes": 6935,
+      "sha256": "79f3b337e4935d4a2da98cb46fa85d0adf69cdd887467c76722e0c64e724b261"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/aesctr.h",
+      "bytes": 1206,
+      "sha256": "e5d00883af6fb4aadb19f274c27ed774f00b0eed3cfc5d3caa770ca801f410b4"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/chihuahua.c",
+      "bytes": 30396,
+      "sha256": "8f7d22d6bc38188fadb9338638a50f71855b99532f4ca229a75d11c7205ab8d9"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/chihuahua.h",
+      "bytes": 3139,
+      "sha256": "6b8c80fda6deedf6a501436135273fd29aa0c7543ef4f2e3f98d3b970bc9bdb2"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/codec.c",
+      "bytes": 2434,
+      "sha256": "0b5f6c5d9f33d51df134dc8d561c2559b40cf928276a26a2e56e5b449edefd7c"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/codec.h",
+      "bytes": 192,
+      "sha256": "fc8cbb8c02d0ebf2b848601b647be591eab04686f60745b07e2e57209777e16f"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/codec2.c",
+      "bytes": 2583,
+      "sha256": "d9b144dd04b8fa7eae2fec7a47b62c60d5194e5c8b26cf84e06f1819d0714bcd"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/codec3.c",
+      "bytes": 1442,
+      "sha256": "cf5ef59dbe62118a2cf8fb09471c0ef5da418599e85f2fa752c9e48c0aab1794"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/codec4.c",
+      "bytes": 8783,
+      "sha256": "07917ce86c75b3c88fbb0b288b7ceb31d941ec9ef1b91a38b1d439e2f402c262"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/cpucycles.c",
+      "bytes": 311,
+      "sha256": "8a5d449ff6e8899932e33d7a65ade13464bda573b5ddec2d0361b29549c1f0b6"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/cpucycles.h",
+      "bytes": 604,
+      "sha256": "6ea888cadc96c64504ab797760bc659b7bca2934168926f8e7a948611f334517"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/dachshund.c",
+      "bytes": 16481,
+      "sha256": "668a053bd4f5ddad1c9176681adbeb1ded29e3d9e5f7820f84d53c47298a6855"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/dachshund.h",
+      "bytes": 2017,
+      "sha256": "a3fe6660ad4fae360521e3c5e213638dab51387e4a036c031e54923a5e16e631"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/data.c",
+      "bytes": 283,
+      "sha256": "8c2f7bb3f14402e29e02b80bc36db8c702e962a5f536ed3df7ff37e3acdb692a"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/data.h",
+      "bytes": 3710,
+      "sha256": "42a3a07dbaec545cafaf045aa67ada35cf8cd2d1db987e71573dc73ed8c081c8"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/data.py",
+      "bytes": 7931,
+      "sha256": "2a4d662feb57ad5515b4ec31b38fae06b1f274b7fd1a5bd2521df04b6a861e2f"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/data24.c",
+      "bytes": 13191,
+      "sha256": "091a8792e8b6ae395b72903b75533b91172a37dde7d841b2e1fae87c87eb6626"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/data32.c",
+      "bytes": 15844,
+      "sha256": "7ab5773ec914e0ee884a709b75b23c464426d96934de2c5a6a394184883b7177"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/data40.c",
+      "bytes": 18429,
+      "sha256": "d01b897776c50267026353704065171847f941630e396c0867e54c4ea8935aec"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/data48.c",
+      "bytes": 21094,
+      "sha256": "5074a5149ecefe5df28590aa15769cc9b09d1526476828d377d862d4d9c8344a"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/data50.c",
+      "bytes": 21096,
+      "sha256": "f42af91206fac7fa3f4275d2f4ab14e316c412f14bdd6b1f6a4c6b231489018e"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/data56.c",
+      "bytes": 23682,
+      "sha256": "31760cad7b5447c3574df05f100ff9a5de44c91f4fa2e8daa9e4b7ef9082f289"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/data64.c",
+      "bytes": 26351,
+      "sha256": "3be6a4e480ba3d22f99f817c756e7cdda867e2516ab435cce37af9a84eec03ae"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/fips202.c",
+      "bytes": 25273,
+      "sha256": "a4428be14c6ac875b6e43293205adf723d7d2dfddc64793cb13f9483435a2d04"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/fips202.h",
+      "bytes": 2872,
+      "sha256": "72c2b61b30d13fa62a84066940298cc5313d7e08d60422e8ec8068576f4a826c"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/fq.inc",
+      "bytes": 1245,
+      "sha256": "51d2a0917f4c41d1830d140ffa59429a1f67115f625895af885afcf9366a9773"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/gaussian.c",
+      "bytes": 2448,
+      "sha256": "530064f71b25e5be41af6e9758c42db75c46c70de6b5184b826c8f5f935daa7e"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/gaussian.h",
+      "bytes": 98,
+      "sha256": "82350e0c38ab7d4766933787d4aeb054203b5c1352d9e6f5cedcd92d8b334227"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/greyhound.c",
+      "bytes": 14787,
+      "sha256": "3cc49f297a69c4e7d967be7e46e77decca24a4ea26e73958b802071965f0e2d3"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/greyhound.h",
+      "bytes": 981,
+      "sha256": "af5564d1e8ab66455715d1ca1cbb218d014b7df2eacfa270dc97db1abce96088"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/invntt.S",
+      "bytes": 3655,
+      "sha256": "1dfe37bdf2e171c4acb276ba3da7e0b843ef78060d2f17d787c9ec13c642160c"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/jlproj.c",
+      "bytes": 26439,
+      "sha256": "3ee4dd52eff1b0a372c64fcbb4c784ac3a8ec77b1baa5c4976ca46b100b8161d"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/jlproj.h",
+      "bytes": 741,
+      "sha256": "10fc1a071d751bf725da0c37c52ce843985d282c4500113b2b3d57004d989715"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/labrador.c",
+      "bytes": 39169,
+      "sha256": "0bf6a9a91f732ed7c70d38310f9e28cc79fab36bca39ce9b885d7a5c9ebf3b9f"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/labrador.h",
+      "bytes": 5468,
+      "sha256": "a9b1da831dbb765736f399ffefef4405cc62bb13d54dde7f8c68b8b3dd1331d5"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/malloc.h",
+      "bytes": 474,
+      "sha256": "f46e25440db133034dc6e326777be3c57c5f54cd8d6185a527fd85ad074465fa"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/ntt.S",
+      "bytes": 3642,
+      "sha256": "90f07ccdf4fba60674999309c2de07d47fa9dd4b82698c169b7311734eddbfe4"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/pack.c",
+      "bytes": 7150,
+      "sha256": "a8ae2d70e1fe17b4434e08006a625c449aae0ab1dd61a9e54f514eb3273c632c"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/pack.h",
+      "bytes": 1201,
+      "sha256": "87db68252f760aaefa49f1ebe0d2594ceecef1515e822c01ce193a75c2973061"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/polx.c",
+      "bytes": 15233,
+      "sha256": "558aa72a8bc3f2102082549d762454097100ca14942d1cef31459e93a44328fa"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/polx.h",
+      "bytes": 3968,
+      "sha256": "032a6b21ca172754b582371f693dabcbb4a6256f5559d872f550c687bafb0aee"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/poly.c",
+      "bytes": 40758,
+      "sha256": "5629b23157dd3625b4209d60d843cc5921fdb009af6976b6a175741cc2ce11a4"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/poly.h",
+      "bytes": 5738,
+      "sha256": "a4edbc54333b8e0a6a0826d3bdc9050893feb6fb1d6ed08c7f6b618db707f4db"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/polz.c",
+      "bytes": 26921,
+      "sha256": "59bb2297ddfaf86868f081dd56a42869645d0c21cae3ebb8b274fd0a8f8a9b21"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/polz.h",
+      "bytes": 2890,
+      "sha256": "4373b3ea4b8c3ac978c099a86743f96b482247c2a9f6f141e5055358cd8586e1"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/randombytes.c",
+      "bytes": 1503,
+      "sha256": "cdb4474e042fa760b56a9803af4c9e0b99bb53a63ba4b0a34076d2c867d25caf"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/randombytes.h",
+      "bytes": 141,
+      "sha256": "5ece412ed498abfd892ecec23480910b76cb8ea1b605da10adc5584ede79f048"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/shuffle.inc",
+      "bytes": 1004,
+      "sha256": "52d58fd050f41d199c7821bcb4df18d095b010e54b92e3af1dc76733292795a9"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/sparsemat.c",
+      "bytes": 1237,
+      "sha256": "b99b24c32c9f62488fbe0819b6572d63a3f07d4e93e1eafa82f52dd99d4a4424"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/sparsemat.h",
+      "bytes": 424,
+      "sha256": "0bef15e9d650ae146dd5793159d84dbd6c9a98b7fa6fa7d234dd63af3ff144e2"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_aesctr.c",
+      "bytes": 1706,
+      "sha256": "ae9de02e049f0505d68b0a96ff894cd05e2f2e466582828b4415db00ac0b507b"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_binary.c",
+      "bytes": 7045,
+      "sha256": "ee7fb8b1a90d466781ba477be5bed44bdcd529b860c63c13d36b26f24dfa0a03"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_chihuahua.c",
+      "bytes": 4692,
+      "sha256": "93fa5cf8b46fd7b80961b183b60efb014a1331aa21332c825fac43b8254db7e8"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_dachshund.c",
+      "bytes": 4390,
+      "sha256": "582f0d46b5f9cad9a0d4106b2f593f74558c14f9b900fb1daf255cb2bd8acc3a"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_greyhound.c",
+      "bytes": 2290,
+      "sha256": "de79fdaacf9b9bd9c3b1f100662d1960f9e87e443316462bb6f8a70ed2dd5018"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_jlproj.c",
+      "bytes": 1642,
+      "sha256": "e7bbf4eb244eac96a3d27245d70e41daa9700f73ce34d47fb07282507062f8a4"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_mixed.c",
+      "bytes": 6471,
+      "sha256": "1db22376192a959af85e9b0bb4d4d73e0503da7549c42c7b870a208a06addfa2"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_ntt.c",
+      "bytes": 2651,
+      "sha256": "9ae19954e28d38cecb366f2f9a573d677b7789a233835385fa47a0d27db2cb35"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_off.c",
+      "bytes": 7690,
+      "sha256": "55a36b5daebc2ff82a649ea8fa969cff0ae54c0681eb997cd20e6d16675ba1cd"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_poly.c",
+      "bytes": 1903,
+      "sha256": "68b6952fa7671041eaf83c934b9431e1a1b60a9c0253629e0feb1119bbdb0b5a"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/labrador/test_polz.c",
+      "bytes": 6788,
+      "sha256": "470e1d865644f7775db4e51fa701438756773a848cc4a6af7f04ce1cce77b595"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/bd/digits.rs",
+      "bytes": 8379,
+      "sha256": "2c64b1be42b78dff460ee338d292d4623db52ee817482887b02dd035aa877634"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/bd/mod.rs",
+      "bytes": 2087,
+      "sha256": "43a09fc3d9aa16c65f34565b5ead0c2f359305fe84184e564028a03587cae61b"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/bd/residual.rs",
+      "bytes": 4247,
+      "sha256": "6b730e5979bd2fe7860e1603f4704e9331b10a46e367b96f391ea293c9f86935"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/challenge.rs",
+      "bytes": 19878,
+      "sha256": "795563e6026c542d7802c448bf6320fe701c8bb438c6cf186846d4f30787bc38"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/eval.rs",
+      "bytes": 10017,
+      "sha256": "f6f56742e4fd45f6c277d2d344aa982e9eaf59ce7b80481d60eb78aff19fdb5f"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/f162.rs",
+      "bytes": 3603,
+      "sha256": "88ad5c967ed76963c77b38d090a67df82443dcf4375d5666353e3005ca4a7302"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/fields/bitmat.rs",
+      "bytes": 6091,
+      "sha256": "a84528e9f395320386b27fe46879a971afca231b3074504a5147ddd55b27007c"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/fields/crossfield.rs",
+      "bytes": 20300,
+      "sha256": "810515f36d7d6937f36dfb22d21c7a4e888ba0c3f7e6cff7173d7bcd495317da"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/fields/f162.rs",
+      "bytes": 3501,
+      "sha256": "b49b8a62fb0c78cc49dab3d6a85733826504fffdcf1a4cfe09d5a7193386c85c"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/fields/mod.rs",
+      "bytes": 804,
+      "sha256": "0547dde35bf1e9f88ba128e4c79c18a7711b05477c0d17e039bc58356576ce39"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/fields/scalar.rs",
+      "bytes": 2956,
+      "sha256": "025b59b17157661487399d0b85e2c42c5ee4c903bcadee244bfc4cb87f02a349"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/fields/sumcheck.rs",
+      "bytes": 3854,
+      "sha256": "74053b4fe3d3574d7b3ee1e3b4f3219387ed37a2012291a4d68ca47450d9e4c2"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/fold.rs",
+      "bytes": 33657,
+      "sha256": "d158157be7f7f8c96ad42e0bbf43221f5aaa7dce2b2641c17efa2e829319878e"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/key.rs",
+      "bytes": 13264,
+      "sha256": "51edc60c88ea11387008c982757d679a77479f0fc8f2f89440a12bd293a8e754"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/labrador/ffi.rs",
+      "bytes": 4435,
+      "sha256": "7e6f4ca30bbdfc19d9d041c083830524416bb10b421fa3d279c1584b21e22b74"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/labrador/mod.rs",
+      "bytes": 36635,
+      "sha256": "e522995bf9a563f8c517ca7526906c33cf2c5556096473c578487353915698aa"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/labrador/polx.rs",
+      "bytes": 11789,
+      "sha256": "dad80bb5789b21fad979b41c1fe6b25d98d5379f94de35de94bde96ef4e21610"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/lib.rs",
+      "bytes": 2893,
+      "sha256": "1f4c3951bd156673f1a1777b1af09857253dd45b9ff963755d5d5d017c1db688"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/limb.rs",
+      "bytes": 3057,
+      "sha256": "5ee3f7e99097a1d50a05f50267af3dac32a0510bb75ebc5ebfdfdfdc7fb9e86c"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/params.rs",
+      "bytes": 18304,
+      "sha256": "8d618fbacbb861c8432bd2a7e8d18ba32681fa5a2f25896744f5d657e3285042"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/recursion/binary.rs",
+      "bytes": 6008,
+      "sha256": "ecc8e50d7a4937251d1cc143a570768cb648ff42cb93ae69fedeb1503a090f02"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/recursion/bound.rs",
+      "bytes": 5660,
+      "sha256": "f99e38128bf3ab6e99dd52523e848a41b3c8709efefe9b49e0b201bf75d32215"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/recursion/chain.rs",
+      "bytes": 19598,
+      "sha256": "3a00b9d8cf2491144ab3ffe10e63366f30749d7e6e9c654d998283572111aa03"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/recursion/chunk.rs",
+      "bytes": 5275,
+      "sha256": "42acafa71e6d33d75a75f2538a0974f053579e86e20b1eb1c152d5351ef7ce36"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/recursion/export.rs",
+      "bytes": 7095,
+      "sha256": "adb4ce69f060b7aa23db1fb8737635948f6238af99f8591e99341a237767696c"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/recursion/limbs.rs",
+      "bytes": 18921,
+      "sha256": "d13a059c2a83714494a079a8191db69f076ce1df7c2590ed5b2137b697c8ea51"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/recursion/mod.rs",
+      "bytes": 29859,
+      "sha256": "cc7be45b862e59af7a3d70486afc944ab64c5ed609013517ab314d473463de5e"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/recursion/setup.rs",
+      "bytes": 10794,
+      "sha256": "29f392c62ee9cccf68a9d1575351c6867f1a0ec508416dacb808b91fa0727f77"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/recursion/statement.rs",
+      "bytes": 9352,
+      "sha256": "70aa1a660be2ea9643af0b17727d2604a465f23107eb6730efd716d172dd51eb"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/ring/element.rs",
+      "bytes": 5838,
+      "sha256": "dfbad3f52d5d068d19be2f7e9f78aeae136dabd80926cc0a2658b0cf2c6b38e7"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/ring/mod.rs",
+      "bytes": 17467,
+      "sha256": "0ce1474c67aca4c0a1e67ec7b05a94e37acfbaaf1ff988f134205a5e03e85433"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/rng.rs",
+      "bytes": 552,
+      "sha256": "489c84147bcb4ad0c9cfb27a80e2306e3678b37c858ff649bffb641c939f465f"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/scalar.rs",
+      "bytes": 11310,
+      "sha256": "6f4a8334c95e53eb813077fc12173f26ebd1e638e4e49fc4cce0582a376a3031"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/scheme/commitment.rs",
+      "bytes": 15063,
+      "sha256": "1fdb288cffd6d6bf17c8046b01e73b392353bc6ecfc208c666405ccdb927d402"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/scheme/mod.rs",
+      "bytes": 2667,
+      "sha256": "a2362a11cf702371730f03f8d80fa9daf0fa77d4fb4f63eab696fb0b83c65cbc"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/scheme/params.rs",
+      "bytes": 12256,
+      "sha256": "240095617c412125e32b6a01c549697f42641820fd5e23ba7195ffb095d9f180"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/scheme/prover.rs",
+      "bytes": 9055,
+      "sha256": "6940b93d20fbaa707cef17b2d7b2bfee773f12f53d20433512bd9cd35bf7b856"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/scheme/verifier.rs",
+      "bytes": 16380,
+      "sha256": "9491f1adc775246e72be5f06f8986bda9b2f7baef05d5c3298cf3a29d569dae9"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/scheme/witness.rs",
+      "bytes": 3879,
+      "sha256": "e9872fcba6e960af486f97327e295defde50e48df5201ec7c2eb05a696c35f3c"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/bd.rs",
+      "bytes": 2836,
+      "sha256": "62a05476c46d6d6fb8d304594acb13988d7f4de82609e083bd8bc9c49004fd62"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/commit.rs",
+      "bytes": 53611,
+      "sha256": "9cbd084f804c9944abcc151f7932f58f7f4034aa08a6f5814c638e85cc372392"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/mod.rs",
+      "bytes": 858,
+      "sha256": "2862fb18ac58554c7cd0a447d68d45b0d7c6967bc21653ba2a71302498614cb0"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/norm.rs",
+      "bytes": 1609,
+      "sha256": "a34ee6c3bd0c07005da5cab649682c27d0ec999f6ab016ce097a662d69f423bd"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/ntt/bin_asm.rs",
+      "bytes": 31733,
+      "sha256": "4ca811cd876ad4a3b0cb2d5c0929a12408364fed192d54eb437bd2e86a46530a"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/ntt/bin_large.rs",
+      "bytes": 36251,
+      "sha256": "b2e17febe1d14f89cdaac1abd6517cce20b4d592bc296463299e7ca38fd1b2c3"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/ntt/bin_quad.rs",
+      "bytes": 35318,
+      "sha256": "8bf1860fb60bdbed3b99b0ddad65bbeb8dc040fbc280287636e495d0b1360869"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/ntt/bin_small.rs",
+      "bytes": 16819,
+      "sha256": "226bf1bf2ff4655918b4b9e3feae7c72ee43c646b0098aedd76b0737cb51cee6"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/ntt/gen_large.rs",
+      "bytes": 22069,
+      "sha256": "517dc84bd45c042de84fce76d9a9f974e9ace4fdbb256eb0d625a2fb3658b2a5"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/ntt/gen_quad.rs",
+      "bytes": 39404,
+      "sha256": "cb72c237f166bf0254d3cdc1c92aa36db87ea454a330801d0a4969244f42353f"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/ntt/gen_small.rs",
+      "bytes": 38226,
+      "sha256": "978208454d6a8d18fb072599fd630cddc01d782d2d8bc14c990be49b9854331e"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/ntt/mod.rs",
+      "bytes": 633,
+      "sha256": "c1382826fc2f190d8739afee30b40291354582a9253b2eb64f6c721b878c6f17"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/slots.rs",
+      "bytes": 4667,
+      "sha256": "453c83ea49973b63f098d47f498ea047c74e5345d0f71f812bb5372b11135556"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/transpose32.rs",
+      "bytes": 2602,
+      "sha256": "f8305cd5475197ba19bf6d01b812f2b411d8cb1b7a12fd35af8442c870120015"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/simd/transpose_f162.rs",
+      "bytes": 15123,
+      "sha256": "a7d615b7c5d7cbd532397501204022b0e835f621bafeb31e4e24684e2a8c8f57"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/switch.rs",
+      "bytes": 9645,
+      "sha256": "f154f0eb1790c20eee5a9cf30d9de81a8177dd8656eda99cd5a6832323938968"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/wire/mod.rs",
+      "bytes": 21601,
+      "sha256": "6c027e953bd4d736d78a9162d3700e9ad135a60eb4bb0f742c9f4e584e72a135"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/src/wire/rans.rs",
+      "bytes": 18923,
+      "sha256": "bb3a01444ebc6b722f68c4f01f17c409bf1d1589cde9a311ccb6f1c7ae174121"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/api.rs",
+      "bytes": 6818,
+      "sha256": "0ed75128d2ebb4998a0fa38c01b2c4614259d83bec692d91fec4eddc33f8f23a"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/bd.rs",
+      "bytes": 7967,
+      "sha256": "33e91378cc64b396995bfdf739c5779262a573b74dd83a5505a5119b56531fc4"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/challenge.rs",
+      "bytes": 9684,
+      "sha256": "3e8cdcf2b92bd5855c6e2d1638f6dbc3362c6a47e4d5b8114cec1bcc5d2e2595"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/commit.rs",
+      "bytes": 10984,
+      "sha256": "557b9bf11badb24b1ec696aeec5ee6fc70375e293285fc88657821f7e075fc1e"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/common/mod.rs",
+      "bytes": 3556,
+      "sha256": "b1b0e9a1dec1bfe9b295fef4c843fb83e8b1471aa90ac7715d3adb8a0903d842"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/eval.rs",
+      "bytes": 4875,
+      "sha256": "b2bba3e3f869f3bf655f2dacba9eac8030c2fe1f761d8a20101fe07b2beb2011"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/fields.rs",
+      "bytes": 10345,
+      "sha256": "e120ed9bfcf57c6022157074d0024099d33657acffb00e6f5c48b9cc2d3b407d"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/fold.rs",
+      "bytes": 8761,
+      "sha256": "11b6f2a94171a487d09791f2b2735788aa2b4f593803971ccdd1d0cb84d0bebe"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/labrador_ffi.rs",
+      "bytes": 20635,
+      "sha256": "15eba9d594c7b99bc2606f786f1e01c851ba3f03cdcaa3e8cf6cfd2576a762d9"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/limbs.rs",
+      "bytes": 4277,
+      "sha256": "34069a16d1529f182c6a0aeecaf52bf4ef1fd53a6d2ec34166d8fc5187276234"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/ntt.rs",
+      "bytes": 96882,
+      "sha256": "1c33ec0157d8244ca1182359f185986348d9acb853137c123a25de40ed8c40eb"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/opening.rs",
+      "bytes": 20167,
+      "sha256": "f5dd7bea251ff3fd4f931e579bd7ea3797da1165533fdaffc600b1b7507a74f6"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/recursion.rs",
+      "bytes": 15264,
+      "sha256": "6c059b9b0b45319e10dcd5381ad61c54f203e1258c984d77ed7e421aa03ac941"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/scalar_reference.rs",
+      "bytes": 4494,
+      "sha256": "ca9977958c6f9048a126d496dc38e699f29775a586a7ad39a224cbb562420193"
+    },
+    {
+      "path": "trusted/labinius/crates/pcs/tests/wire.rs",
+      "bytes": 19833,
+      "sha256": "4abddfa8acbf89840529ff076a4b5488cb6a7d68be12fd7aac12850e647d74cd"
+    },
+    {
+      "path": "trusted/labinius/params.ipynb",
+      "bytes": 13833,
+      "sha256": "9b1de7ad237353e8e96dcb4fd3b637580396e8d4867735842269d122601fae4c"
+    },
+    {
+      "path": "trusted/proof_verify/.cargo/config.toml",
+      "bytes": 48,
+      "sha256": "8ea425180afe0e2fc0cd930d9a5dbd4da07aebe14263eeec4d6df9c7ab996a20"
+    },
+    {
+      "path": "trusted/proof_verify/Cargo.lock",
+      "bytes": 4058,
+      "sha256": "940aba0f0c1c67d52859f7bbbc4fd43944cd4344437f1e7aa45e6733da3c85e8"
+    },
+    {
+      "path": "trusted/proof_verify/Cargo.toml",
+      "bytes": 465,
+      "sha256": "d6823e3d818cca30c0523fcc78526641741d98ad1cbb292a009424afd37a5b58"
+    },
+    {
+      "path": "trusted/proof_verify/src/main.rs",
+      "bytes": 22790,
+      "sha256": "22386f43fbfa9085560d6d348594413330b8d079a80a93cc32ac3f33be5e00b4"
+    },
+    {
+      "path": "trusted/proof_verify/src/reference.rs",
+      "bytes": 7469,
+      "sha256": "263e3be2e4f926f72c8fcd3d9d1e2df4fe40fe24df65fb64fa9ea09e9fa0a60b"
+    },
+    {
+      "path": "trusted/proof_verify/src/rq.rs",
+      "bytes": 21284,
+      "sha256": "a7493f6340901ad190abee9dd6cd29b20391eee0ba0c0f6f1d78acea46337ab9"
+    },
+    {
+      "path": "build_original.rs",
+      "bytes": 3274,
+      "sha256": "ff3c97a4a0e5bbca180b0ccaee7741d4aeb42b55c92e2ad9a0dbdbe4b47f0228"
+    }
+  ],
+  "fileCount": 610,
+  "bytes": 6861476
+}

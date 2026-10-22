@@ -1,95 +1,13 @@
-//! Forward NTT for **binary** inputs in the vertical batch-of-32 layout, with levels 4, 5 and 6
-//! hand-scheduled in one `asm!` block per 27-block (27 zmm data registers resident).
-//! Generated; see the report for the schedule variants tried.
-//! Agrees with `ntt::bin_small` modulo q: the s2 = 1 half of every 162-block reuses the s2 = 0
-//! lookups (see the kernel), and for q = 9721 it also reduces at different levels and with a
-//! different Barrett (see Bounds below).
-//!
-//! Levels 0, 1, 2 and the level-3 twiddles are all folded into 16-entry lookup tables indexed by
-//! the 4-bit nibble (b_i, b_{i+162}, b_{i+324}, b_{i+486}) of each polynomial; levels 3..6 are radix-3
-//! signed-Montgomery butterflies. The whole batch is done depth-first per 162-block: the table
-//! lookups, level 3 and level 4 write a 10 KB stack block, levels 5 and 6 are fused (a degree-9
-//! sub-ring is exactly three degree-3 sub-rings, so its nine values never leave registers) and go
-//! straight to the output.
-//!
-//! Measured on the i7-11850H, one core, cache-resident input: 280.2 cycles per ring element
-//! for q = 3889 and 303.8 for q = 9721 (697 / 752 instructions, 699 / 760 uops, 268 / 291
-//! port-0, 246 / 277 port-5).
-//!
-//! ## Instruction selection (port facts measured on this core)
-//!
-//! `vpermw` zmm is 2 uops (p0 + p5), so a 16-entry i16 lookup done with `vpermw` would cost one
-//! port-0 slot per lookup (1080 per batch, ~17% of the port-0 budget). The tables are therefore
-//! stored **byte-split** (low halves at byte n, high halves at byte 16+n) and looked up
-//! with `vpermb` (1 uop, p5 only) on the byte-index rows `(n, 16+n)` that
-//! `transpose_f162::slice_f162_into` emits directly (`BinaryIndex32`), so the kernel has no
-//! index-expansion prologue at all.
-//! `vpbroadcastd zmm, m32` really is a free load (0 p0/p5 uops), so every twiddle is stored as a
-//! duplicated u32.
-//!
-//! ## Bounds (|lane| as a multiple of q; `tests/ntt.rs::bin_asm`: `proved_bounds_9721`
-//! propagates the worst case over all i16 lane values, the i32 shadow model replays the exact
-//! schedule on the test inputs)
-//!
-//! Table entries are centered, |T| <= q/2. A twiddle multiplication `mont(a, w, w')` with
-//! |w| <= q/2 satisfies |mont| <= |a| q / 2^17 + q/2 + 1 < 0.75 q for any i16 `a`; the radix-3
-//! butterfly therefore adds at most 1.5 q to the (untwiddled) `a0` input.
-//!
-//! | after            | q = 3889 | q = 9721 |
-//! |------------------|---------:|---------:|
-//! | levels 0+1+2     |   1.00 q |   1.00 q |
-//! | level 3          |   3.00 q |   3.00 q |
-//! | level 4          |   4.50 q |   2.03 q |
-//! | level 5          |   6.00 q |   3.33 q |
-//! | level 6 (output) |   7.50 q |   2.30 q |
-//!
-//! 2^15 / q = 8.42 (3889) and 3.37 (9721), so **q = 3889 needs no Barrett at all**. For q = 9721
-//! the un-twiddled `a0` input of level 4 gets the **lookup Barrett** ([`barrett_lut_i16`]) and
-//! the one of level 6 the two-multiply `vpmulhrsw` Barrett ([`params::barrett_i16`]); level 5
-//! is left unreduced. The lookup Barrett spends no multiply slot at all:
-//!
-//! ```text
-//! vpsrlw  s, a, 11        p0    s = bits 11..15 of the lane = (a >> 11) & 31
-//! vpermw  s, s, [wcorr]   p5    32-entry i16 table -k(s) q (vpermw reads index bits 0..4 only)
-//! vpaddw  a, a, s         p05
-//! ```
-//!
-//! (Sapphire Rapids: `vpermw` zmm is a single port-5 uop. The Tiger Lake schedule this kernel was
-//! first tuned on used a 5-uop byte-split form, `vpmultishiftqb` + `vpandd` + `vpord` + `vpermb`
-//! + `vpaddw`, because `vpermw` cost a port-0 slot there; it gives bit-identical results.)
-//!
-//! i.e. 3 uops against the two-multiply Barrett's 2 multiplies + 1 flexible. The quotient
-//! window `(a >> 11) & 31` determines `a`
-//! to within 2^11, so the nearest multiple of q leaves |r| <= q/2 + 2^10 = 0.579 q -- tighter
-//! than the `vpmulhrsw` estimate's 0.809 q (both exhaustive over all i16), and that is exactly
-//! what lets level 5 run unreduced: 3.323 q there is still inside the 3.371 q budget, while
-//! 0.809 q at level 4 would have grown to 3.588 q and overflowed. Level 6 only has to keep the
-//! output inside i16, so there the two-multiply Barrett is the cheaper of the two (4 uops
-//! against 5, and its two port-0 slots are affordable again now that level 5 costs nothing).
-//! Reductions per batch: 432 (216 at each of levels 4 and 6) instead of 648, of which only 216
-//! touch the multiply port.
-//!
-//! Measured alternatives for q = 9721 (cache-resident cycles per ring element, 316.6 before):
-//! lookup at 4 and 6 304.6, lookup at 4 only + `vpmulhrsw` at 6 **303.8**, lookup at all three
-//! levels 316.3 (the level-5 reduction is what costs, not the reduction itself); folding the
-//! `vpandd`/`vpord` pair into one `vpternlogd` needs a second constant register, and the only
-//! one to free is q -- as a memory operand of the 1944 `vpmulhw m, q` per batch it costs more
-//! than the uop it saves (306.0); splitting the five uops across the block (the `vpermb` and
-//! `vpaddw` deferred to the end of the multiply block) 308.7, all five at the end 303.6.
-//! `vpermw` on a 32-entry table would take the index straight from a `vpmulhrsw` quotient, but
-//! it is 2 uops (p0 + p5) and needs a p0 uop to build the index: 2 port-0 again.
+//! Temporary q3889 radix-9 prototype. The current q9721 body and table are unchanged.
+//! See the frozen scalar, bound and register evidence in the adjacent feasibility record.
 use labinius::params::*;
 macro_rules! r3_twiddles {
     ($n:literal, $pair:path, $zetas:expr) => {{
-        let mut t = [[0u32; 4]; $n];
-        let mut i = 0;
-        while i < $n {
-            t[i] = $pair($zetas[i]);
-            i += 1;
-        }
-        t
+        let mut t = [[0u32; 4]; $n]; let mut i = 0;
+        while i < $n { t[i] = $pair($zetas[i]); i += 1; } t
     }};
 }
+
 pub use labinius::simd::transpose_f162::BinaryIndex32;
 use labinius::ring::element::*;
 use core::arch::x86_64::*;
@@ -1155,41 +1073,6 @@ macro_rules! pair_register_sink {
     };
 }
 
-// Store the first pass after all 27 outputs are in registers.
-macro_rules! pair_stage27 {
-    () => {
-        concat!(
-            "vmovdqa64 [{w0}+64], zmm2\n",
-            "vmovdqa64 [{w0}+128], zmm1\n",
-            "vmovdqa64 [{w0}+0], zmm0\n",
-            "vmovdqa64 [{w0}+256], zmm8\n",
-            "vmovdqa64 [{w0}+320], zmm7\n",
-            "vmovdqa64 [{w0}+192], zmm6\n",
-            "vmovdqa64 [{w0}+448], zmm5\n",
-            "vmovdqa64 [{w0}+512], zmm4\n",
-            "vmovdqa64 [{w0}+384], zmm3\n",
-            "vmovdqa64 [{w0}+640], zmm20\n",
-            "vmovdqa64 [{w0}+704], zmm19\n",
-            "vmovdqa64 [{w0}+576], zmm18\n",
-            "vmovdqa64 [{w0}+832], zmm26\n",
-            "vmovdqa64 [{w0}+896], zmm25\n",
-            "vmovdqa64 [{w0}+768], zmm24\n",
-            "vmovdqa64 [{w0}+1024], zmm23\n",
-            "vmovdqa64 [{w0}+1088], zmm22\n",
-            "vmovdqa64 [{w0}+960], zmm21\n",
-            "vmovdqa64 [{w0}+1216], zmm11\n",
-            "vmovdqa64 [{w0}+1280], zmm10\n",
-            "vmovdqa64 [{w0}+1152], zmm9\n",
-            "vmovdqa64 [{w0}+1408], zmm17\n",
-            "vmovdqa64 [{w0}+1472], zmm16\n",
-            "vmovdqa64 [{w0}+1344], zmm15\n",
-            "vmovdqa64 [{w0}+1600], zmm14\n",
-            "vmovdqa64 [{w0}+1664], zmm13\n",
-            "vmovdqa64 [{w0}+1536], zmm12\n",
-        )
-    };
-}
-
 #[inline(always)]
 unsafe fn tail27_pair<const Q: u16>(
     bp: *const i16, w0: *const i16, t4: *const u32, t5: *const u32, t6: *const u32,
@@ -1199,19 +1082,8 @@ unsafe fn tail27_pair<const Q: u16>(
         ($m4:ident, $m6:ident) => {
             core::arch::asm!(
                 concat!(
-                    // Bit 1 selects the first pass. Both input registers are restored
-                    // before exit. Thus the operand contract needs no extra GPR.
-                    "or {red:r}, 2\n",
-                    "4:\n",
                     "vmovdqa64 zmm27, [{c}]\n",
                     tail27!($m4, $m6, bfly_registers),
-                    "test {red:e}, 2\n",
-                    "jz 5f\n",
-                    pair_stage27!(),
-                    "add {i}, {stride}\n",
-                    "xor {red:r}, 2\n",
-                    "jmp 4b\n",
-                    "5:\n",
                     "test {red:e}, {red:e}\n",
                     "jnz 2f\n",
                     pair_register_sink!(plain),
@@ -1219,14 +1091,12 @@ unsafe fn tail27_pair<const Q: u16>(
                     "2:\n",
                     pair_register_sink!(reduce),
                     "3:\n",
-                    "sub {i}, {stride}\n",
                     "/* {fold} */\n",
                 ),
                 i = in(reg) bp, w0 = in(reg) w0, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,
                 c = in(reg) cv, key = in(reg) key, acc = in(reg) acc,
                 fold = in(reg) &const { hybrid_fold::<Q>() },
                 red = in(reg) red,
-                stride = const core::mem::size_of::<Blk>(),
                 out("zmm0") _,
                 out("zmm1") _,
                 out("zmm2") _,
@@ -1384,6 +1254,7 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
     acc: *mut i32,
     red: bool,
 ) {
+    if Q == 3889 { return ntt_bin_batch32_pair_radix9::<Q>(ins, key, acc, red); }
     assert!(Q == 3889 || Q == 9721, "the hybrid commitment's primes");
     let t = tables::<Q>();
     let c = C {
@@ -1391,6 +1262,7 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
         om: bc(&t.om[0]),
         omp: bc(&t.om[1]),
     };
+    let bar = needs_barrett(Q);
     let ips: [*const u8; 2] = [
         ins[0].rows.as_ptr() as *const u8,
         ins[1].rows.as_ptr() as *const u8,
@@ -1474,12 +1346,705 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
                     t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
                 );
                 let bp0 = bps[2 * qpair].add(32 * 27 * j);
+                if bar {
+                    tail27_b(bp0, w0p, t4, t5, t6, cv);
+                } else {
+                    tail27_p(bp0, w0p, t4, t5, t6, cv);
+                }
+                let bp1 = bps[2 * qpair + 1].add(32 * 27 * j);
                 tail27_pair::<Q>(
-                    bp0,
+                    bp1,
                     w0p,
                     t4,
                     t5,
                     t6,
+                    cv,
+                    key.add(4 * 27 * kk),
+                    acc.add(32 * 27 * kk),
+                    red_u32,
+                );
+            }
+        }
+    }
+}
+
+// q3889-only prototype table. The current q9721 table layout is unchanged.
+#[repr(C, align(64))]
+struct Radix9Tables {
+    lut: [[u8; 64]; 96],
+    cv: [[i16; 32]; 21],
+    tw4: [[u32; 4]; 24],
+    tw5: [[u32; 4]; 72],
+    tw6: [[u32; 4]; 216],
+    tw9: [[u32; 16]; 72],
+    om: [u32; 2], qd: u32, bv: u32,
+}
+const fn radix9_tables() -> Radix9Tables {
+    let t = build_tables::<3889>();
+    let mut cv = [[0i16; 32]; 21];
+    let mut j = 0;
+    while j < 9 { cv[j] = t.cv[j]; j += 1; }
+    let fixed = [2492, 56, 3442, 3767, 2403, 2138];
+    j = 0;
+    while j < 6 {
+        let w = Params::<3889>::to_mont(fixed[j]);
+        cv[9 + 2*j] = [w; 32];
+        cv[10 + 2*j] = [Params::<3889>::mont_pre(w); 32];
+        j += 1;
+    }
+    let mut tw9 = [[0u32; 16]; 72];
+    let mut k = 0;
+    while k < 72 {
+        j = 1;
+        while j < 9 {
+            let z = pow_mod(Params::<3889>::PSI as u64, (SLOT_EXP[9*k] as u64)*(j as u64), 3889) as u16;
+            let (w, wp) = mont_pair::<3889>(z);
+            tw9[k][2*(j-1)] = w;
+            tw9[k][2*(j-1)+1] = wp;
+            j += 1;
+        }
+        k += 1;
+    }
+    Radix9Tables { lut: t.lut, cv, tw4: t.tw4, tw5: t.tw5, tw6: t.tw6,
+                   om: t.om, qd: t.qd, bv: t.bv, tw9 }
+}
+static T3889_RADIX9: Radix9Tables = radix9_tables();
+
+macro_rules! tail27_radix9_math {
+    () => { concat!(
+            level4!(plain 0, 9, 18, 0, 576, 1152, 28),
+            level4!(plain 3, 12, 21, 192, 768, 1344, 29),
+            bfly!(0, 9, 18, 28),
+            level4!(plain 6, 15, 24, 384, 960, 1536, 28),
+            bfly!(3, 12, 21, 29),
+            level4!(plain 1, 10, 19, 64, 640, 1216, 29),
+            bfly!(6, 15, 24, 28),
+            level4!(plain 4, 13, 22, 256, 832, 1408, 28),
+            bfly!(1, 10, 19, 29),
+            level4!(plain 7, 16, 25, 448, 1024, 1600, 29),
+            bfly!(4, 13, 22, 28),
+            level4!(plain 2, 11, 20, 128, 704, 1280, 28),
+            bfly!(7, 16, 25, 29),
+            level4!(plain 5, 14, 23, 320, 896, 1472, 29),
+            bfly!(2, 11, 20, 28),
+            level4!(plain 8, 17, 26, 512, 1088, 1664, 28),
+            bfly!(5, 14, 23, 29),
+            bfly!(8, 17, 26, 28),
+        "vpsrlw zmm29, zmm0, 11\n",
+        "vpermw zmm29, zmm29, zmmword ptr [{c}+512]\n",
+        "vpaddw zmm31, zmm0, zmm29\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+4]\n",
+        "vpmullw zmm29, zmm1, zmm29\n",
+        "vpbroadcastd zmm0, dword ptr [{t9}+0]\n",
+        "vpmulhw zmm28, zmm1, zmm0\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm28, zmm28, zmm29\n",
+        "vpbroadcastd zmm1, dword ptr [{t9}+12]\n",
+        "vpmullw zmm1, zmm2, zmm1\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+8]\n",
+        "vpmulhw zmm30, zmm2, zmm29\n",
+        "vpmulhw zmm1, zmm1, zmm27\n",
+        "vpsubw zmm30, zmm30, zmm1\n",
+        "vpbroadcastd zmm2, dword ptr [{t9}+20]\n",
+        "vpmullw zmm2, zmm3, zmm2\n",
+        "vpbroadcastd zmm1, dword ptr [{t9}+16]\n",
+        "vpmulhw zmm1, zmm3, zmm1\n",
+        "vpmulhw zmm2, zmm2, zmm27\n",
+        "vpsubw zmm1, zmm1, zmm2\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+28]\n",
+        "vpmullw zmm29, zmm4, zmm29\n",
+        "vpbroadcastd zmm3, dword ptr [{t9}+24]\n",
+        "vpmulhw zmm3, zmm4, zmm3\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm3, zmm3, zmm29\n",
+        "vpbroadcastd zmm0, dword ptr [{t9}+36]\n",
+        "vpmullw zmm0, zmm5, zmm0\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+32]\n",
+        "vpmulhw zmm5, zmm5, zmm29\n",
+        "vpmulhw zmm0, zmm0, zmm27\n",
+        "vpsubw zmm5, zmm5, zmm0\n",
+        "vpbroadcastd zmm4, dword ptr [{t9}+44]\n",
+        "vpmullw zmm4, zmm6, zmm4\n",
+        "vpbroadcastd zmm0, dword ptr [{t9}+40]\n",
+        "vpmulhw zmm6, zmm6, zmm0\n",
+        "vpmulhw zmm4, zmm4, zmm27\n",
+        "vpsubw zmm6, zmm6, zmm4\n",
+        "vpbroadcastd zmm2, dword ptr [{t9}+52]\n",
+        "vpmullw zmm2, zmm7, zmm2\n",
+        "vpbroadcastd zmm4, dword ptr [{t9}+48]\n",
+        "vpmulhw zmm7, zmm7, zmm4\n",
+        "vpmulhw zmm2, zmm2, zmm27\n",
+        "vpsubw zmm7, zmm7, zmm2\n",
+        "vpbroadcastd zmm2, dword ptr [{t9}+60]\n",
+        "vpmullw zmm2, zmm8, zmm2\n",
+        "vpbroadcastd zmm0, dword ptr [{t9}+56]\n",
+        "vpmulhw zmm4, zmm8, zmm0\n",
+        "vpmulhw zmm2, zmm2, zmm27\n",
+        "vpsubw zmm4, zmm4, zmm2\n",
+        "vpaddw zmm2, zmm28, zmm7\n",
+        "vpaddw zmm29, zmm2, zmm3\n",
+        "vpaddw zmm2, zmm5, zmm4\n",
+        "vpaddw zmm2, zmm2, zmm30\n",
+        "vpsubw zmm0, zmm1, zmm6\n",
+        "vpmullw zmm8, zmm0, zmmword ptr [{c}+128]\n",
+        "vpmulhw zmm0, zmm0, zmmword ptr [{c}+64]\n",
+        "vpmulhw zmm8, zmm8, zmm27\n",
+        "vpsubw zmm0, zmm0, zmm8\n",
+        "vpaddw zmm8, zmm1, zmm6\n",
+        "vpaddw zmm8, zmm31, zmm8\n",
+        "vpsubw zmm6, zmm31, zmm6\n",
+        "vpaddw zmm6, zmm6, zmm0\n",
+        "vpsubw zmm31, zmm31, zmm1\n",
+        "vpsubw zmm31, zmm31, zmm0\n",
+        "vpsubw zmm1, zmm29, zmm2\n",
+        "vpmullw zmm0, zmm1, zmmword ptr [{c}+128]\n",
+        "vpmulhw zmm1, zmm1, zmmword ptr [{c}+64]\n",
+        "vpmulhw zmm0, zmm0, zmm27\n",
+        "vpsubw zmm1, zmm1, zmm0\n",
+        "vpaddw zmm0, zmm29, zmm2\n",
+        "vpaddw zmm0, zmm8, zmm0\n",
+        "vpsubw zmm2, zmm8, zmm2\n",
+        "vpaddw zmm2, zmm2, zmm1\n",
+        "vpsubw zmm8, zmm8, zmm29\n",
+        "vpsubw zmm1, zmm8, zmm1\n",
+        "vpaddw zmm8, zmm28, zmm4\n",
+        "vpsubw zmm28, zmm28, zmm4\n",
+        "vpaddw zmm4, zmm5, zmm3\n",
+        "vpsubw zmm3, zmm5, zmm3\n",
+        "vpaddw zmm5, zmm7, zmm30\n",
+        "vpsubw zmm30, zmm7, zmm30\n",
+        "vpsubw zmm29, zmm8, zmm5\n",
+        "vpsubw zmm4, zmm4, zmm5\n",
+        "vpaddw zmm5, zmm29, zmm4\n",
+        "vpmullw zmm8, zmm29, zmmword ptr [{c}+640]\n",
+        "vpmulhw zmm7, zmm29, zmmword ptr [{c}+576]\n",
+        "vpmulhw zmm8, zmm8, zmm27\n",
+        "vpsubw zmm7, zmm7, zmm8\n",
+        "vpmullw zmm29, zmm4, zmmword ptr [{c}+768]\n",
+        "vpmulhw zmm4, zmm4, zmmword ptr [{c}+704]\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm4, zmm4, zmm29\n",
+        "vpmullw zmm29, zmm5, zmmword ptr [{c}+896]\n",
+        "vpmulhw zmm8, zmm5, zmmword ptr [{c}+832]\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm8, zmm8, zmm29\n",
+        "vpsubw zmm29, zmm7, zmm8\n",
+        "vpsubw zmm5, zmm8, zmm29\n",
+        "vpsubw zmm5, zmm5, zmm4\n",
+        "vpsubw zmm8, zmm4, zmm8\n",
+        "vpsubw zmm7, zmm28, zmm30\n",
+        "vpaddw zmm3, zmm3, zmm30\n",
+        "vpsubw zmm28, zmm7, zmm3\n",
+        "vpmullw zmm4, zmm7, zmmword ptr [{c}+1024]\n",
+        "vpmulhw zmm7, zmm7, zmmword ptr [{c}+960]\n",
+        "vpmulhw zmm4, zmm4, zmm27\n",
+        "vpsubw zmm7, zmm7, zmm4\n",
+        "vpmullw zmm4, zmm3, zmmword ptr [{c}+1152]\n",
+        "vpmulhw zmm30, zmm3, zmmword ptr [{c}+1088]\n",
+        "vpmulhw zmm4, zmm4, zmm27\n",
+        "vpsubw zmm30, zmm30, zmm4\n",
+        "vpmullw zmm4, zmm28, zmmword ptr [{c}+1280]\n",
+        "vpmulhw zmm28, zmm28, zmmword ptr [{c}+1216]\n",
+        "vpmulhw zmm4, zmm4, zmm27\n",
+        "vpsubw zmm28, zmm28, zmm4\n",
+        "vpaddw zmm4, zmm7, zmm28\n",
+        "vpaddw zmm7, zmm30, zmm28\n",
+        "vpaddw zmm30, zmm4, zmm7\n",
+        "vpaddw zmm28, zmm29, zmm4\n",
+        "vpsubw zmm4, zmm29, zmm4\n",
+        "vpaddw zmm3, zmm5, zmm30\n",
+        "vpsubw zmm29, zmm5, zmm30\n",
+        "vpaddw zmm30, zmm8, zmm7\n",
+        "vpsubw zmm5, zmm8, zmm7\n",
+        "vpaddw zmm7, zmm29, zmm6\n",
+        "vpaddw zmm8, zmm30, zmm6\n",
+        "vpaddw zmm5, zmm5, zmm31\n",
+        "vpaddw zmm4, zmm4, zmm31\n",
+        "vpaddw zmm6, zmm28, zmm6\n",
+        "vpaddw zmm3, zmm3, zmm31\n",
+        "vpsrlw zmm29, zmm18, 11\n",
+        "vpermw zmm29, zmm29, zmmword ptr [{c}+512]\n",
+        "vpaddw zmm31, zmm18, zmm29\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+68]\n",
+        "vpmullw zmm29, zmm19, zmm29\n",
+        "vpbroadcastd zmm18, dword ptr [{t9}+64]\n",
+        "vpmulhw zmm28, zmm19, zmm18\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm28, zmm28, zmm29\n",
+        "vpbroadcastd zmm19, dword ptr [{t9}+76]\n",
+        "vpmullw zmm19, zmm20, zmm19\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+72]\n",
+        "vpmulhw zmm30, zmm20, zmm29\n",
+        "vpmulhw zmm19, zmm19, zmm27\n",
+        "vpsubw zmm30, zmm30, zmm19\n",
+        "vpbroadcastd zmm20, dword ptr [{t9}+84]\n",
+        "vpmullw zmm20, zmm21, zmm20\n",
+        "vpbroadcastd zmm19, dword ptr [{t9}+80]\n",
+        "vpmulhw zmm19, zmm21, zmm19\n",
+        "vpmulhw zmm20, zmm20, zmm27\n",
+        "vpsubw zmm19, zmm19, zmm20\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+92]\n",
+        "vpmullw zmm29, zmm22, zmm29\n",
+        "vpbroadcastd zmm21, dword ptr [{t9}+88]\n",
+        "vpmulhw zmm21, zmm22, zmm21\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm21, zmm21, zmm29\n",
+        "vpbroadcastd zmm18, dword ptr [{t9}+100]\n",
+        "vpmullw zmm18, zmm23, zmm18\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+96]\n",
+        "vpmulhw zmm23, zmm23, zmm29\n",
+        "vpmulhw zmm18, zmm18, zmm27\n",
+        "vpsubw zmm23, zmm23, zmm18\n",
+        "vpbroadcastd zmm22, dword ptr [{t9}+108]\n",
+        "vpmullw zmm22, zmm24, zmm22\n",
+        "vpbroadcastd zmm18, dword ptr [{t9}+104]\n",
+        "vpmulhw zmm24, zmm24, zmm18\n",
+        "vpmulhw zmm22, zmm22, zmm27\n",
+        "vpsubw zmm24, zmm24, zmm22\n",
+        "vpbroadcastd zmm20, dword ptr [{t9}+116]\n",
+        "vpmullw zmm20, zmm25, zmm20\n",
+        "vpbroadcastd zmm22, dword ptr [{t9}+112]\n",
+        "vpmulhw zmm25, zmm25, zmm22\n",
+        "vpmulhw zmm20, zmm20, zmm27\n",
+        "vpsubw zmm25, zmm25, zmm20\n",
+        "vpbroadcastd zmm20, dword ptr [{t9}+124]\n",
+        "vpmullw zmm20, zmm26, zmm20\n",
+        "vpbroadcastd zmm18, dword ptr [{t9}+120]\n",
+        "vpmulhw zmm22, zmm26, zmm18\n",
+        "vpmulhw zmm20, zmm20, zmm27\n",
+        "vpsubw zmm22, zmm22, zmm20\n",
+        "vpaddw zmm20, zmm28, zmm25\n",
+        "vpaddw zmm29, zmm20, zmm21\n",
+        "vpaddw zmm20, zmm23, zmm22\n",
+        "vpaddw zmm20, zmm20, zmm30\n",
+        "vpsubw zmm18, zmm19, zmm24\n",
+        "vpmullw zmm26, zmm18, zmmword ptr [{c}+128]\n",
+        "vpmulhw zmm18, zmm18, zmmword ptr [{c}+64]\n",
+        "vpmulhw zmm26, zmm26, zmm27\n",
+        "vpsubw zmm18, zmm18, zmm26\n",
+        "vpaddw zmm26, zmm19, zmm24\n",
+        "vpaddw zmm26, zmm31, zmm26\n",
+        "vpsubw zmm24, zmm31, zmm24\n",
+        "vpaddw zmm24, zmm24, zmm18\n",
+        "vpsubw zmm31, zmm31, zmm19\n",
+        "vpsubw zmm31, zmm31, zmm18\n",
+        "vpsubw zmm19, zmm29, zmm20\n",
+        "vpmullw zmm18, zmm19, zmmword ptr [{c}+128]\n",
+        "vpmulhw zmm19, zmm19, zmmword ptr [{c}+64]\n",
+        "vpmulhw zmm18, zmm18, zmm27\n",
+        "vpsubw zmm19, zmm19, zmm18\n",
+        "vpaddw zmm18, zmm29, zmm20\n",
+        "vpaddw zmm18, zmm26, zmm18\n",
+        "vpsubw zmm20, zmm26, zmm20\n",
+        "vpaddw zmm20, zmm20, zmm19\n",
+        "vpsubw zmm26, zmm26, zmm29\n",
+        "vpsubw zmm19, zmm26, zmm19\n",
+        "vpaddw zmm26, zmm28, zmm22\n",
+        "vpsubw zmm28, zmm28, zmm22\n",
+        "vpaddw zmm22, zmm23, zmm21\n",
+        "vpsubw zmm21, zmm23, zmm21\n",
+        "vpaddw zmm23, zmm25, zmm30\n",
+        "vpsubw zmm30, zmm25, zmm30\n",
+        "vpsubw zmm29, zmm26, zmm23\n",
+        "vpsubw zmm22, zmm22, zmm23\n",
+        "vpaddw zmm23, zmm29, zmm22\n",
+        "vpmullw zmm26, zmm29, zmmword ptr [{c}+640]\n",
+        "vpmulhw zmm25, zmm29, zmmword ptr [{c}+576]\n",
+        "vpmulhw zmm26, zmm26, zmm27\n",
+        "vpsubw zmm25, zmm25, zmm26\n",
+        "vpmullw zmm29, zmm22, zmmword ptr [{c}+768]\n",
+        "vpmulhw zmm22, zmm22, zmmword ptr [{c}+704]\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm22, zmm22, zmm29\n",
+        "vpmullw zmm29, zmm23, zmmword ptr [{c}+896]\n",
+        "vpmulhw zmm26, zmm23, zmmword ptr [{c}+832]\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm26, zmm26, zmm29\n",
+        "vpsubw zmm29, zmm25, zmm26\n",
+        "vpsubw zmm23, zmm26, zmm29\n",
+        "vpsubw zmm23, zmm23, zmm22\n",
+        "vpsubw zmm26, zmm22, zmm26\n",
+        "vpsubw zmm25, zmm28, zmm30\n",
+        "vpaddw zmm21, zmm21, zmm30\n",
+        "vpsubw zmm28, zmm25, zmm21\n",
+        "vpmullw zmm22, zmm25, zmmword ptr [{c}+1024]\n",
+        "vpmulhw zmm25, zmm25, zmmword ptr [{c}+960]\n",
+        "vpmulhw zmm22, zmm22, zmm27\n",
+        "vpsubw zmm25, zmm25, zmm22\n",
+        "vpmullw zmm22, zmm21, zmmword ptr [{c}+1152]\n",
+        "vpmulhw zmm30, zmm21, zmmword ptr [{c}+1088]\n",
+        "vpmulhw zmm22, zmm22, zmm27\n",
+        "vpsubw zmm30, zmm30, zmm22\n",
+        "vpmullw zmm22, zmm28, zmmword ptr [{c}+1280]\n",
+        "vpmulhw zmm28, zmm28, zmmword ptr [{c}+1216]\n",
+        "vpmulhw zmm22, zmm22, zmm27\n",
+        "vpsubw zmm28, zmm28, zmm22\n",
+        "vpaddw zmm22, zmm25, zmm28\n",
+        "vpaddw zmm25, zmm30, zmm28\n",
+        "vpaddw zmm30, zmm22, zmm25\n",
+        "vpaddw zmm28, zmm29, zmm22\n",
+        "vpsubw zmm22, zmm29, zmm22\n",
+        "vpaddw zmm21, zmm23, zmm30\n",
+        "vpsubw zmm29, zmm23, zmm30\n",
+        "vpaddw zmm30, zmm26, zmm25\n",
+        "vpsubw zmm23, zmm26, zmm25\n",
+        "vpaddw zmm25, zmm29, zmm24\n",
+        "vpaddw zmm26, zmm30, zmm24\n",
+        "vpaddw zmm23, zmm23, zmm31\n",
+        "vpaddw zmm22, zmm22, zmm31\n",
+        "vpaddw zmm24, zmm28, zmm24\n",
+        "vpaddw zmm21, zmm21, zmm31\n",
+        "vpsrlw zmm29, zmm9, 11\n",
+        "vpermw zmm29, zmm29, zmmword ptr [{c}+512]\n",
+        "vpaddw zmm31, zmm9, zmm29\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+132]\n",
+        "vpmullw zmm29, zmm10, zmm29\n",
+        "vpbroadcastd zmm9, dword ptr [{t9}+128]\n",
+        "vpmulhw zmm28, zmm10, zmm9\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm28, zmm28, zmm29\n",
+        "vpbroadcastd zmm10, dword ptr [{t9}+140]\n",
+        "vpmullw zmm10, zmm11, zmm10\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+136]\n",
+        "vpmulhw zmm30, zmm11, zmm29\n",
+        "vpmulhw zmm10, zmm10, zmm27\n",
+        "vpsubw zmm30, zmm30, zmm10\n",
+        "vpbroadcastd zmm11, dword ptr [{t9}+148]\n",
+        "vpmullw zmm11, zmm12, zmm11\n",
+        "vpbroadcastd zmm10, dword ptr [{t9}+144]\n",
+        "vpmulhw zmm10, zmm12, zmm10\n",
+        "vpmulhw zmm11, zmm11, zmm27\n",
+        "vpsubw zmm10, zmm10, zmm11\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+156]\n",
+        "vpmullw zmm29, zmm13, zmm29\n",
+        "vpbroadcastd zmm12, dword ptr [{t9}+152]\n",
+        "vpmulhw zmm12, zmm13, zmm12\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm12, zmm12, zmm29\n",
+        "vpbroadcastd zmm9, dword ptr [{t9}+164]\n",
+        "vpmullw zmm9, zmm14, zmm9\n",
+        "vpbroadcastd zmm29, dword ptr [{t9}+160]\n",
+        "vpmulhw zmm14, zmm14, zmm29\n",
+        "vpmulhw zmm9, zmm9, zmm27\n",
+        "vpsubw zmm14, zmm14, zmm9\n",
+        "vpbroadcastd zmm13, dword ptr [{t9}+172]\n",
+        "vpmullw zmm13, zmm15, zmm13\n",
+        "vpbroadcastd zmm9, dword ptr [{t9}+168]\n",
+        "vpmulhw zmm15, zmm15, zmm9\n",
+        "vpmulhw zmm13, zmm13, zmm27\n",
+        "vpsubw zmm15, zmm15, zmm13\n",
+        "vpbroadcastd zmm11, dword ptr [{t9}+180]\n",
+        "vpmullw zmm11, zmm16, zmm11\n",
+        "vpbroadcastd zmm13, dword ptr [{t9}+176]\n",
+        "vpmulhw zmm16, zmm16, zmm13\n",
+        "vpmulhw zmm11, zmm11, zmm27\n",
+        "vpsubw zmm16, zmm16, zmm11\n",
+        "vpbroadcastd zmm11, dword ptr [{t9}+188]\n",
+        "vpmullw zmm11, zmm17, zmm11\n",
+        "vpbroadcastd zmm9, dword ptr [{t9}+184]\n",
+        "vpmulhw zmm13, zmm17, zmm9\n",
+        "vpmulhw zmm11, zmm11, zmm27\n",
+        "vpsubw zmm13, zmm13, zmm11\n",
+        "vpaddw zmm11, zmm28, zmm16\n",
+        "vpaddw zmm29, zmm11, zmm12\n",
+        "vpaddw zmm11, zmm14, zmm13\n",
+        "vpaddw zmm11, zmm11, zmm30\n",
+        "vpsubw zmm9, zmm10, zmm15\n",
+        "vpmullw zmm17, zmm9, zmmword ptr [{c}+128]\n",
+        "vpmulhw zmm9, zmm9, zmmword ptr [{c}+64]\n",
+        "vpmulhw zmm17, zmm17, zmm27\n",
+        "vpsubw zmm9, zmm9, zmm17\n",
+        "vpaddw zmm17, zmm10, zmm15\n",
+        "vpaddw zmm17, zmm31, zmm17\n",
+        "vpsubw zmm15, zmm31, zmm15\n",
+        "vpaddw zmm15, zmm15, zmm9\n",
+        "vpsubw zmm31, zmm31, zmm10\n",
+        "vpsubw zmm31, zmm31, zmm9\n",
+        "vpsubw zmm10, zmm29, zmm11\n",
+        "vpmullw zmm9, zmm10, zmmword ptr [{c}+128]\n",
+        "vpmulhw zmm10, zmm10, zmmword ptr [{c}+64]\n",
+        "vpmulhw zmm9, zmm9, zmm27\n",
+        "vpsubw zmm10, zmm10, zmm9\n",
+        "vpaddw zmm9, zmm29, zmm11\n",
+        "vpaddw zmm9, zmm17, zmm9\n",
+        "vpsubw zmm11, zmm17, zmm11\n",
+        "vpaddw zmm11, zmm11, zmm10\n",
+        "vpsubw zmm17, zmm17, zmm29\n",
+        "vpsubw zmm10, zmm17, zmm10\n",
+        "vpaddw zmm17, zmm28, zmm13\n",
+        "vpsubw zmm28, zmm28, zmm13\n",
+        "vpaddw zmm13, zmm14, zmm12\n",
+        "vpsubw zmm12, zmm14, zmm12\n",
+        "vpaddw zmm14, zmm16, zmm30\n",
+        "vpsubw zmm30, zmm16, zmm30\n",
+        "vpsubw zmm29, zmm17, zmm14\n",
+        "vpsubw zmm13, zmm13, zmm14\n",
+        "vpaddw zmm14, zmm29, zmm13\n",
+        "vpmullw zmm17, zmm29, zmmword ptr [{c}+640]\n",
+        "vpmulhw zmm16, zmm29, zmmword ptr [{c}+576]\n",
+        "vpmulhw zmm17, zmm17, zmm27\n",
+        "vpsubw zmm16, zmm16, zmm17\n",
+        "vpmullw zmm29, zmm13, zmmword ptr [{c}+768]\n",
+        "vpmulhw zmm13, zmm13, zmmword ptr [{c}+704]\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm13, zmm13, zmm29\n",
+        "vpmullw zmm29, zmm14, zmmword ptr [{c}+896]\n",
+        "vpmulhw zmm17, zmm14, zmmword ptr [{c}+832]\n",
+        "vpmulhw zmm29, zmm29, zmm27\n",
+        "vpsubw zmm17, zmm17, zmm29\n",
+        "vpsubw zmm29, zmm16, zmm17\n",
+        "vpsubw zmm14, zmm17, zmm29\n",
+        "vpsubw zmm14, zmm14, zmm13\n",
+        "vpsubw zmm17, zmm13, zmm17\n",
+        "vpsubw zmm16, zmm28, zmm30\n",
+        "vpaddw zmm12, zmm12, zmm30\n",
+        "vpsubw zmm28, zmm16, zmm12\n",
+        "vpmullw zmm13, zmm16, zmmword ptr [{c}+1024]\n",
+        "vpmulhw zmm16, zmm16, zmmword ptr [{c}+960]\n",
+        "vpmulhw zmm13, zmm13, zmm27\n",
+        "vpsubw zmm16, zmm16, zmm13\n",
+        "vpmullw zmm13, zmm12, zmmword ptr [{c}+1152]\n",
+        "vpmulhw zmm30, zmm12, zmmword ptr [{c}+1088]\n",
+        "vpmulhw zmm13, zmm13, zmm27\n",
+        "vpsubw zmm30, zmm30, zmm13\n",
+        "vpmullw zmm13, zmm28, zmmword ptr [{c}+1280]\n",
+        "vpmulhw zmm28, zmm28, zmmword ptr [{c}+1216]\n",
+        "vpmulhw zmm13, zmm13, zmm27\n",
+        "vpsubw zmm28, zmm28, zmm13\n",
+        "vpaddw zmm13, zmm16, zmm28\n",
+        "vpaddw zmm16, zmm30, zmm28\n",
+        "vpaddw zmm30, zmm13, zmm16\n",
+        "vpaddw zmm28, zmm29, zmm13\n",
+        "vpsubw zmm13, zmm29, zmm13\n",
+        "vpaddw zmm12, zmm14, zmm30\n",
+        "vpsubw zmm29, zmm14, zmm30\n",
+        "vpaddw zmm30, zmm17, zmm16\n",
+        "vpsubw zmm14, zmm17, zmm16\n",
+        "vpaddw zmm16, zmm29, zmm15\n",
+        "vpaddw zmm17, zmm30, zmm15\n",
+        "vpaddw zmm14, zmm14, zmm31\n",
+        "vpaddw zmm13, zmm13, zmm31\n",
+        "vpaddw zmm15, zmm28, zmm15\n",
+        "vpaddw zmm12, zmm12, zmm31\n",
+    ) };
+}
+
+#[inline(always)]
+unsafe fn tail27_radix9_stored(i: *const i16, o: *mut i16, t4: *const u32, t9: *const u32, c: *const i16) {
+    core::arch::asm!(concat!("vmovdqa64 zmm27, [{c}]\n", tail27_radix9_math!(),
+        "vmovdqa64 [{o}+64], zmm2\n",
+        "vmovdqa64 [{o}+128], zmm1\n",
+        "vmovdqa64 [{o}+0], zmm0\n",
+        "vmovdqa64 [{o}+256], zmm8\n",
+        "vmovdqa64 [{o}+320], zmm7\n",
+        "vmovdqa64 [{o}+192], zmm6\n",
+        "vmovdqa64 [{o}+448], zmm5\n",
+        "vmovdqa64 [{o}+512], zmm4\n",
+        "vmovdqa64 [{o}+384], zmm3\n",
+        "vmovdqa64 [{o}+640], zmm20\n",
+        "vmovdqa64 [{o}+704], zmm19\n",
+        "vmovdqa64 [{o}+576], zmm18\n",
+        "vmovdqa64 [{o}+832], zmm26\n",
+        "vmovdqa64 [{o}+896], zmm25\n",
+        "vmovdqa64 [{o}+768], zmm24\n",
+        "vmovdqa64 [{o}+1024], zmm23\n",
+        "vmovdqa64 [{o}+1088], zmm22\n",
+        "vmovdqa64 [{o}+960], zmm21\n",
+        "vmovdqa64 [{o}+1216], zmm11\n",
+        "vmovdqa64 [{o}+1280], zmm10\n",
+        "vmovdqa64 [{o}+1152], zmm9\n",
+        "vmovdqa64 [{o}+1408], zmm17\n",
+        "vmovdqa64 [{o}+1472], zmm16\n",
+        "vmovdqa64 [{o}+1344], zmm15\n",
+        "vmovdqa64 [{o}+1600], zmm14\n",
+        "vmovdqa64 [{o}+1664], zmm13\n",
+        "vmovdqa64 [{o}+1536], zmm12\n",
+    ),
+        i = in(reg) i, o = in(reg) o, t4 = in(reg) t4, t9 = in(reg) t9, c = in(reg) c,
+        out("zmm0") _,
+        out("zmm1") _,
+        out("zmm2") _,
+        out("zmm3") _,
+        out("zmm4") _,
+        out("zmm5") _,
+        out("zmm6") _,
+        out("zmm7") _,
+        out("zmm8") _,
+        out("zmm9") _,
+        out("zmm10") _,
+        out("zmm11") _,
+        out("zmm12") _,
+        out("zmm13") _,
+        out("zmm14") _,
+        out("zmm15") _,
+        out("zmm16") _,
+        out("zmm17") _,
+        out("zmm18") _,
+        out("zmm19") _,
+        out("zmm20") _,
+        out("zmm21") _,
+        out("zmm22") _,
+        out("zmm23") _,
+        out("zmm24") _,
+        out("zmm25") _,
+        out("zmm26") _,
+        out("zmm27") _,
+        out("zmm28") _,
+        out("zmm29") _,
+        out("zmm30") _,
+        out("zmm31") _,
+        options(nostack)
+    );
+}
+#[inline(always)]
+unsafe fn tail27_radix9_pair(i: *const i16, w0: *const i16, t4: *const u32, t9: *const u32,
+                            c: *const i16, key: *const u32, acc: *mut i32, red: u32) {
+    core::arch::asm!(concat!("vmovdqa64 zmm27, [{c}]\n", tail27_radix9_math!(),
+        "test {red:e}, {red:e}\n", "jnz 2f\n", pair_register_sink!(plain),
+        "jmp 3f\n", "2:\n", pair_register_sink!(reduce), "3:\n", "/* {fold} */\n"
+    ),
+        i = in(reg) i, w0 = in(reg) w0, t4 = in(reg) t4, t9 = in(reg) t9, c = in(reg) c,
+        key = in(reg) key, acc = in(reg) acc, fold = in(reg) &const { hybrid_fold::<3889>() },
+        red = in(reg) red,
+        out("zmm0") _,
+        out("zmm1") _,
+        out("zmm2") _,
+        out("zmm3") _,
+        out("zmm4") _,
+        out("zmm5") _,
+        out("zmm6") _,
+        out("zmm7") _,
+        out("zmm8") _,
+        out("zmm9") _,
+        out("zmm10") _,
+        out("zmm11") _,
+        out("zmm12") _,
+        out("zmm13") _,
+        out("zmm14") _,
+        out("zmm15") _,
+        out("zmm16") _,
+        out("zmm17") _,
+        out("zmm18") _,
+        out("zmm19") _,
+        out("zmm20") _,
+        out("zmm21") _,
+        out("zmm22") _,
+        out("zmm23") _,
+        out("zmm24") _,
+        out("zmm25") _,
+        out("zmm26") _,
+        out("zmm27") _,
+        out("zmm28") _,
+        out("zmm29") _,
+        out("zmm30") _,
+        out("zmm31") _,
+        out("k1") _,
+        options(nostack)
+    );
+}
+#[inline(always)]
+unsafe fn ntt_bin_batch32_pair_radix9<const Q: u16>(
+    ins: [&BinaryIndex32; 2],
+    key: *const u32,
+    acc: *mut i32,
+    red: bool,
+) {
+    assert!(Q == 3889 || Q == 9721, "the hybrid commitment's primes");
+    let t = &T3889_RADIX9;
+    let c = C {
+        q: bc(&t.qd),
+        om: bc(&t.om[0]),
+        omp: bc(&t.om[1]),
+    };
+    let ips: [*const u8; 2] = [
+        ins[0].rows.as_ptr() as *const u8,
+        ins[1].rows.as_ptr() as *const u8,
+    ];
+    let mut blks: [core::mem::MaybeUninit<Blk>; 4] =
+        [const { core::mem::MaybeUninit::uninit() }; 4];
+    let bps: [*mut i16; 4] = [
+        blks[0].as_mut_ptr() as *mut i16,
+        blks[1].as_mut_ptr() as *mut i16,
+        blks[2].as_mut_ptr() as *mut i16,
+        blks[3].as_mut_ptr() as *mut i16,
+    ];
+    let mut w0: core::mem::MaybeUninit<Blk27> = core::mem::MaybeUninit::uninit();
+    let w0p = w0.as_mut_ptr() as *mut i16;
+    let red_u32 = red as u32;
+
+    // Process fixed adjacent quarter pairs: both prefixes share each six-row index load.
+    // Each quarter retains its own two LOCK=2 buffers until its original six tails finish.
+    for kp in 0..2 {
+        let load_luts = |k: usize| {
+            let lut = t.lut.as_ptr().add(12 * k) as *const u8;
+            let l = |r: usize, ab: usize| -> __m512i {
+                _mm512_load_si512(lut.add(64 * (r * 2 + ab)) as *const __m512i)
+            };
+            (l(0, 0), l(0, 1), l(1, 0), l(1, 1), l(2, 0), l(2, 1))
+        };
+        let ls0 = load_luts(2 * kp);
+        let ls1 = load_luts(2 * kp + 1);
+        for h in 0..2 {
+            let ip = ips[h];
+            for i in 0..27 {
+                let n0 = ldb(ip, i);
+                let n0h = ldb(ip, i + 81);
+                let n1 = ldb(ip, i + 27);
+                let n1h = ldb(ip, i + 108);
+                let n2 = ldb(ip, i + 54);
+                let n2h = ldb(ip, i + 135);
+
+                macro_rules! prefix {
+                    ($bp:expr, $ls:expr) => {{
+                        let bp = $bp;
+                        let (l000, l001, l010, l011, l020, l021) = $ls;
+                        let x = _mm512_permutexvar_epi8(n0, l000);
+                        let y = _mm512_permutexvar_epi8(n0h, l001);
+                        let a0 = _mm512_add_epi16(x, y);
+                        let b0 = _mm512_sub_epi16(x, y);
+
+                        let x = _mm512_permutexvar_epi8(n1, l010);
+                        let y = _mm512_permutexvar_epi8(n1h, l011);
+                        let a1 = _mm512_add_epi16(x, y);
+                        let b1 = _mm512_sub_epi16(y, x);
+
+                        let x = _mm512_permutexvar_epi8(n2, l020);
+                        let y = _mm512_permutexvar_epi8(n2h, l021);
+                        let a2 = _mm512_add_epi16(x, y);
+                        let b2 = _mm512_sub_epi16(x, y);
+
+                        let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
+                        let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
+                        st(bp, i, u0);
+                        st(bp, i + 27, u1);
+                        st(bp, i + 54, u2);
+                        st(bp, i + 81, v2);
+                        st(bp, i + 108, v0);
+                        st(bp, i + 135, v1);
+                    }};
+                }
+                prefix!(bps[h], ls0);
+                prefix!(bps[2 + h], ls1);
+            }
+        }
+        for qpair in 0..core::hint::black_box(2usize) {
+            let k = 2 * kp + qpair;
+            let cv = t.cv.as_ptr() as *const i16;
+            let tail_blocks = core::hint::black_box(6usize);
+            for j in 0..tail_blocks {
+                let kk = 6 * k + j;
+                let (t4, t9) = (
+                    t.tw4.as_ptr().add(kk).cast::<u32>(),
+                    t.tw9.as_ptr().add(3 * kk).cast::<u32>(),
+                );
+                let bp0 = bps[2 * qpair].add(32 * 27 * j);
+                tail27_radix9_stored(bp0, w0p, t4, t9, cv);
+                let bp1 = bps[2 * qpair + 1].add(32 * 27 * j);
+                tail27_radix9_pair(
+                    bp1,
+                    w0p,
+                    t4,
+                    t9,
                     cv,
                     key.add(4 * 27 * kk),
                     acc.add(32 * 27 * kk),

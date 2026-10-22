@@ -397,7 +397,7 @@ mod bin_asm {
 
     // ------------------------------------------------------------------ the lookup Barrett
 
-    /// The reduction the kernel's `vpmultishiftqb` + `vpermb` + `vpaddw` sequence performs, checked
+    /// The reduction the kernel's `vpsrlw` + `vpermw` + `vpaddw` sequence performs, checked
     /// exhaustively over every i16 input: it subtracts a multiple of q and leaves |r| <= 0.579 q,
     /// where the two-multiply `barrett_i16` only guarantees 0.809 q.
     #[test]
@@ -467,9 +467,10 @@ mod bin_asm {
         let (l5y0a, l5y1a, mi5a) = bf(l4y0, l4y0);
         let (l5y0b, l5y1b, mi5b) = bf(l4y1, l4y1);
         let (l5y0, l5y1) = (l5y0a.max(l5y0b), l5y1a.max(l5y1b));
-        // level 6: two-multiply Barrett on a0 (which is a level-5 y0), a1 / a2 are level-5 y1 / y2
-        let (l6y0, l6y1, mi6) = bf(mul, l5y1);
+        // level 6: lookup Barrett on a0 (which is a level-5 y0), a1 / a2 are level-5 y1 / y2
+        let (l6y0, l6y1, mi6) = bf(lut, l5y1);
         let out = l6y0.max(l6y1);
+        assert_eq!(out, 20059);
         let declared = vb::output_bound_milli_q(9721) as i64 * Q / 1000;
         println!(
             "q=9721 proved: l3 {:.3}q  l4 {:.3}q  l5 {:.3}q  out {:.4}q = {out}  (declared {:.3}q);\

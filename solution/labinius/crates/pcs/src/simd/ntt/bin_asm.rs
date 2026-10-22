@@ -41,35 +41,33 @@
 //! | level 3          |   3.00 q |   3.00 q |
 //! | level 4          |   4.50 q |   2.03 q |
 //! | level 5          |   6.00 q |   3.33 q |
-//! | level 6 (output) |   7.50 q |   2.30 q |
+//! | level 6 (output) |   7.50 q |   2.07 q |
 //!
 //! 2^15 / q = 8.42 (3889) and 3.37 (9721), so **q = 3889 needs no Barrett at all**. For q = 9721
 //! the un-twiddled `a0` input of level 4 gets the **lookup Barrett** ([`barrett_lut_i16`]) and
-//! the one of level 6 the two-multiply `vpmulhrsw` Barrett ([`params::barrett_i16`]); level 5
-//! is left unreduced. The lookup Barrett spends no multiply slot at all:
+//! the one of level 6 uses the same lookup; level 5 is left unreduced. The lookup Barrett
+//! uses a shift and a table permutation instead of multiplication:
 //!
 //! ```text
-//! vpsrlw  s, a, 11        p0    s = bits 11..15 of the lane = (a >> 11) & 31
-//! vpermw  s, s, [wcorr]   p5    32-entry i16 table -k(s) q (vpermw reads index bits 0..4 only)
-//! vpaddw  a, a, s         p05
+//! vpsrlw  s, a, 11        s = bits 11..15 of the lane = (a >> 11) & 31
+//! vpermw  s, s, [wcorr]   32-entry i16 table -k(s) q (vpermw reads index bits 0..4 only)
+//! vpaddw  a, a, s
 //! ```
 //!
-//! (Sapphire Rapids: `vpermw` zmm is a single port-5 uop. The Tiger Lake schedule this kernel was
-//! first tuned on used a 5-uop byte-split form, `vpmultishiftqb` + `vpandd` + `vpord` + `vpermb`
-//! + `vpaddw`, because `vpermw` cost a port-0 slot there; it gives bit-identical results.)
+//! This is a three-instruction chain. `vpermw` can use more than one uop; fewer multiply
+//! instructions do not establish a throughput gain. The older byte-split form used
+//! `vpmultishiftqb` + `vpandd` + `vpord` + `vpermb` + `vpaddw` with identical results.
 //!
-//! i.e. 3 uops against the two-multiply Barrett's 2 multiplies + 1 flexible. The quotient
-//! window `(a >> 11) & 31` determines `a`
+//! The quotient window `(a >> 11) & 31` determines `a`
 //! to within 2^11, so the nearest multiple of q leaves |r| <= q/2 + 2^10 = 0.579 q -- tighter
 //! than the `vpmulhrsw` estimate's 0.809 q (both exhaustive over all i16), and that is exactly
 //! what lets level 5 run unreduced: 3.323 q there is still inside the 3.371 q budget, while
-//! 0.809 q at level 4 would have grown to 3.588 q and overflowed. Level 6 only has to keep the
-//! output inside i16, so there the two-multiply Barrett is the cheaper of the two (4 uops
-//! against 5, and its two port-0 slots are affordable again now that level 5 costs nothing).
-//! Reductions per batch: 432 (216 at each of levels 4 and 6) instead of 648, of which only 216
-//! touch the multiply port.
+//! 0.809 q at level 4 would have grown to 3.588 q and overflowed. Using the lookup at level 6
+//! gives a proved output bound of 20059 = 2.0635 q. The declared 2.294 q bound is retained
+//! so consumers keep their existing accumulation periods. The 432 reductions per batch
+//! (216 at each of levels 4 and 6) use no multiply instructions.
 //!
-//! Measured alternatives for q = 9721 (cache-resident cycles per ring element, 316.6 before):
+//! Historical Tiger Lake alternatives for q = 9721 (cache-resident cycles per ring element, 316.6 before):
 //! lookup at 4 and 6 304.6, lookup at 4 only + `vpmulhrsw` at 6 **303.8**, lookup at all three
 //! levels 316.3 (the level-5 reduction is what costs, not the reduction itself); folding the
 //! `vpandd`/`vpord` pair into one `vpternlogd` needs a second constant register, and the only
@@ -100,11 +98,10 @@ pub struct Tables {
     /// core) does the lookup: byte n is the low half of entry n, byte 16+n the high half.
     lut: [[u8; 64]; 96],
     /// Full 512-bit constants used as memory operands / register constants by the asm tail:
-    /// `[q, om, omp, bv, ms, corr, and, or, wcorr]` at byte offsets 0, 64, ... - `bv` is the
-    /// `vpmulhrsw` Barrett constant of level 6, `wcorr` the 32-entry i16 `-k q` table of the
-    /// level-4 lookup Barrett (`vpsrlw` + `vpermw`, see `barrett_lut_i16`); `ms`, `corr`, `and`
-    /// and `or` belong to the older byte-split `vpmultishiftqb`/`vpermb` form of that lookup and
-    /// are no longer read by the kernel.
+    /// `[q, om, omp, bv, ms, corr, and, or, wcorr]` at byte offsets 0, 64, ... . `wcorr` is the
+    /// 32-entry i16 `-k q` table used by the level-4 and level-6 lookup Barrett. The legacy
+    /// entries `bv`, `ms`, `corr`, `and`, and `or` retain their offsets but are no longer read
+    /// by the kernel.
     cv: [[i16; 32]; 9],
     /// `[w, w', w2, w2']` (Montgomery twiddle and companion for zeta and zeta^2), each i16
     /// duplicated into a u32 so `vpbroadcastd` is a pure load.
@@ -185,7 +182,7 @@ const fn build_tables<const Q: u16>() -> Tables {
     let mut cv = [[0i16; 32]; 9];
     let mut i = 0;
     while i < 32 {
-        // the level-4 lookup Barrett's `vpermw` table: word s is -k(s) q for the window
+        // the lookup Barrett's `vpermw` table: word s is -k(s) q for the window
         // s = a >> 11 (logical) = (a >> 11) & 31 (arithmetic) of the lane a.
         cv[8][i] = barrett_lut_corr(i, Q);
         cv[0][i] = Q as i16;
@@ -259,10 +256,10 @@ const fn lut_byte(u: usize, q: u16) -> u8 {
     }
 }
 
-/// The kernel's level-4 reduction, lane-wise: `vpsrlw 11` (the 5-bit window `(a >> 11) & 31`,
+/// The kernel's level-4 and level-6 reduction, lane-wise: `vpsrlw 11` (the 5-bit window `(a >> 11) & 31`,
 /// as a logical shift of the lane), `vpermw` on the 32-entry i16 table of `-k q`, `vpaddw` -
-/// **3 uops, not one multiply slot**, against the two-multiply Barrett's 2 multiplies
-/// + 1 flexible. Exhaustively over all i16, `max |r| = 5625 = 0.579 q` for q = 9721, where
+/// **three instructions, no multiplication**, against the two-multiply Barrett's two multiplies
+/// and one subtract. Exhaustively over all i16, `max |r| = 5625 = 0.579 q` for q = 9721, where
 /// [`params::barrett_i16`] only reaches 0.809 q - which is what makes the level-5 reduction
 /// droppable.
 #[inline]
@@ -273,8 +270,8 @@ pub fn barrett_lut_i16(a: i16, q: u16) -> i16 {
 /// Which of levels 4, 5 and 6 reduce their un-twiddled `a0` input with the lookup Barrett
 /// ([`barrett_lut_i16`]) and which with the two-multiply one ([`params::barrett_i16`]),
 /// for q = 9721; q = 3889 reduces nothing.
-pub const LUT_BARRETT_LEVELS: [bool; 3] = [true, false, false];
-pub const MUL_BARRETT_LEVELS: [bool; 3] = [false, false, true];
+pub const LUT_BARRETT_LEVELS: [bool; 3] = [true, false, true];
+pub const MUL_BARRETT_LEVELS: [bool; 3] = [false, false, false];
 
 /// Does the 7.5 q growth of the un-Barretted schedule still fit in i16?
 pub const fn needs_barrett(q: u16) -> bool {
@@ -376,7 +373,7 @@ macro_rules! mont {
             "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
             "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
             "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
-            "vpmullw zmm30, zmm", $t, ", [{c}+128]\n",
+            "vpmullw zmm30, zmm", $t, ", zmm31\n",
             "vpmulhw zmm", $t, ", zmm", $t, ", [{c}+64]\n",
             "vpmulhw zmm30, zmm30, zmm27\n",
             "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
@@ -437,13 +434,13 @@ macro_rules! level6 {
     (plain $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal) => {
         mont!("t6", $off, $a1, $a2, $t)
     };
-    (barrett $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal) => {
+    (lut $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal) => {
         concat!(
             "vpbroadcastd zmm", $t, ", dword ptr [{t6}", $off, "+4]\n",
             "vpmullw zmm", $t, ", zmm", $a1, ", zmm", $t, "\n",
-            "vpmulhrsw zmm30, zmm", $a0, ", [{c}+192]\n",
-            "vpmullw zmm30, zmm30, zmm27\n",
-            "vpsubw zmm", $a0, ", zmm", $a0, ", zmm30\n",
+            "vpsrlw zmm30, zmm", $a0, ", 11\n",
+            "vpermw zmm30, zmm30, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm", $a0, ", zmm", $a0, ", zmm30\n",
             "vpbroadcastd zmm30, dword ptr [{t6}", $off, "]\n",
             "vpmulhw zmm", $a1, ", zmm", $a1, ", zmm30\n",
             "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
@@ -455,7 +452,7 @@ macro_rules! level6 {
             "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
             "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
             "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
-            "vpmullw zmm30, zmm", $t, ", [{c}+128]\n",
+            "vpmullw zmm30, zmm", $t, ", zmm31\n",
             "vpmulhw zmm", $t, ", zmm", $t, ", [{c}+64]\n",
             "vpmulhw zmm30, zmm30, zmm27\n",
             "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
@@ -469,6 +466,8 @@ macro_rules! tail27 {
     };
     ($m4:ident, $m6:ident, $finish:ident) => {
         concat!(
+            // zmm31 is free until the sink; keep the shared omega preconstant here.
+            "vmovdqa64 zmm31, [{c}+128]\n",
             level4!($m4 0, 9, 18, 0, 576, 1152, 28),
             level4!($m4 3, 12, 21, 192, 768, 1344, 29),
             bfly!(0, 9, 18, 28),
@@ -575,6 +574,7 @@ unsafe fn tail27_p(
         out("zmm28") _,
         out("zmm29") _,
         out("zmm30") _,
+        out("zmm31") _,
         options(nostack)
     );
 }
@@ -591,7 +591,7 @@ unsafe fn tail27_b(
     core::arch::asm!(
         concat!(
             "vmovdqa64 zmm27, [{c}]\n",
-            tail27!(lut, barrett),
+            tail27!(lut, lut),
         ),
         i = in(reg) bp,
         o = in(reg) op,
@@ -630,6 +630,7 @@ unsafe fn tail27_b(
         out("zmm28") _,
         out("zmm29") _,
         out("zmm30") _,
+        out("zmm31") _,
         options(nostack)
     );
 }
@@ -892,7 +893,7 @@ unsafe fn tail27_hybrid<const Q: u16, const RED: bool>(
         };
     }
     if needs_barrett(Q) {
-        if RED { run!(lut, barrett, reduce); } else { run!(lut, barrett, plain); }
+        if RED { run!(lut, lut, reduce); } else { run!(lut, lut, plain); }
     } else if RED { run!(plain, plain, reduce); } else { run!(plain, plain, plain); }
 }
 
@@ -1089,4 +1090,352 @@ pub unsafe fn ntt_bin_batch32_hybrid<const Q: u16, const RED: bool>(
 ) {
     assert!(Q == 3889 || Q == 9721, "the hybrid commitment's primes");
     ntt_core::<Q, _>(input, &mut HybridSink::<Q, RED> { key, acc });
+}
+
+macro_rules! pair_slot {
+    ($mode:ident, $reg:literal, $w_off:literal, $k0:literal, $k1:literal, $k2:literal, $k3:literal, $a0:literal, $a1:literal) => {
+        concat!(
+            "vmovdqa64 zmm29, [{acc}+", $a0, "]\n",
+            "vmovdqa64 zmm30, [{acc}+", $a1, "]\n",
+            "vmovdqa64 zmm28, [{w0}+", $w_off, "]\n",
+            "vpdpwssd zmm29, zmm28, dword ptr [{key}+", $k0, "]{{1to16}}\n",
+            "vpdpwssd zmm30, zmm28, dword ptr [{key}+", $k1, "]{{1to16}}\n",
+            "vpdpwssd zmm29, zmm", $reg, ", dword ptr [{key}+", $k2, "]{{1to16}}\n",
+            "vpdpwssd zmm30, zmm", $reg, ", dword ptr [{key}+", $k3, "]{{1to16}}\n",
+            hybrid_store!($mode, 29, $a0),
+            hybrid_store!($mode, 30, $a1),
+        )
+    };
+}
+
+/// Register-resident LOCK=2 column-pair sink: consumes the second batch's 27 transformed vectors
+/// directly from `zmm0..zmm26` while reading the first batch's 27 vectors from L1D-resident `w0`,
+/// accumulating both against broadcast dword keys into `PAcc` (`[{acc} + 128*s]`, `[{acc} + 128*s + 64]`)
+/// with zero `tr8`/`tr4` shuffles.
+macro_rules! pair_register_sink {
+    ($mode:ident) => {
+        concat!(
+            pair_slot!($mode, 0,    0,   0,   4,   8,  12,    0,   64),
+            pair_slot!($mode, 2,   64,  16,  20,  24,  28,  128,  192),
+            pair_slot!($mode, 1,  128,  32,  36,  40,  44,  256,  320),
+            pair_slot!($mode, 6,  192,  48,  52,  56,  60,  384,  448),
+            pair_slot!($mode, 8,  256,  64,  68,  72,  76,  512,  576),
+            pair_slot!($mode, 7,  320,  80,  84,  88,  92,  640,  704),
+            pair_slot!($mode, 3,  384,  96, 100, 104, 108,  768,  832),
+            pair_slot!($mode, 5,  448, 112, 116, 120, 124,  896,  960),
+            pair_slot!($mode, 4,  512, 128, 132, 136, 140, 1024, 1088),
+            pair_slot!($mode, 18, 576, 144, 148, 152, 156, 1152, 1216),
+            pair_slot!($mode, 20, 640, 160, 164, 168, 172, 1280, 1344),
+            pair_slot!($mode, 19, 704, 176, 180, 184, 188, 1408, 1472),
+            pair_slot!($mode, 24, 768, 192, 196, 200, 204, 1536, 1600),
+            pair_slot!($mode, 26, 832, 208, 212, 216, 220, 1664, 1728),
+            pair_slot!($mode, 25, 896, 224, 228, 232, 236, 1792, 1856),
+            pair_slot!($mode, 21, 960, 240, 244, 248, 252, 1920, 1984),
+            pair_slot!($mode, 23,1024, 256, 260, 264, 268, 2048, 2112),
+            pair_slot!($mode, 22,1088, 272, 276, 280, 284, 2176, 2240),
+            pair_slot!($mode, 9, 1152, 288, 292, 296, 300, 2304, 2368),
+            pair_slot!($mode, 11,1216, 304, 308, 312, 316, 2432, 2496),
+            pair_slot!($mode, 10,1280, 320, 324, 328, 332, 2560, 2624),
+            pair_slot!($mode, 15,1344, 336, 340, 344, 348, 2688, 2752),
+            pair_slot!($mode, 17,1408, 352, 356, 360, 364, 2816, 2880),
+            pair_slot!($mode, 16,1472, 368, 372, 376, 380, 2944, 3008),
+            pair_slot!($mode, 12,1536, 384, 388, 392, 396, 3072, 3136),
+            pair_slot!($mode, 14,1600, 400, 404, 408, 412, 3200, 3264),
+            pair_slot!($mode, 13,1664, 416, 420, 424, 428, 3328, 3392),
+        )
+    };
+}
+
+#[inline(always)]
+unsafe fn tail27_pair<const Q: u16>(
+    bp: *const i16, w0: *const i16, t4: *const u32, t5: *const u32, t6: *const u32,
+    cv: *const i16, key: *const u32, acc: *mut i32, red: u32,
+) {
+    macro_rules! run {
+        ($m4:ident, $m6:ident) => {
+            core::arch::asm!(
+                concat!(
+                    "vmovdqa64 zmm27, [{c}]\n",
+                    tail27!($m4, $m6, bfly_registers),
+                    "test {red:e}, {red:e}\n",
+                    "jnz 2f\n",
+                    pair_register_sink!(plain),
+                    "jmp 3f\n",
+                    "2:\n",
+                    pair_register_sink!(reduce),
+                    "3:\n",
+                    "/* {fold} */\n",
+                ),
+                i = in(reg) bp, w0 = in(reg) w0, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,
+                c = in(reg) cv, key = in(reg) key, acc = in(reg) acc,
+                fold = in(reg) &const { hybrid_fold::<Q>() },
+                red = in(reg) red,
+                out("zmm0") _,
+                out("zmm1") _,
+                out("zmm2") _,
+                out("zmm3") _,
+                out("zmm4") _,
+                out("zmm5") _,
+                out("zmm6") _,
+                out("zmm7") _,
+                out("zmm8") _,
+                out("zmm9") _,
+                out("zmm10") _,
+                out("zmm11") _,
+                out("zmm12") _,
+                out("zmm13") _,
+                out("zmm14") _,
+                out("zmm15") _,
+                out("zmm16") _,
+                out("zmm17") _,
+                out("zmm18") _,
+                out("zmm19") _,
+                out("zmm20") _,
+                out("zmm21") _,
+                out("zmm22") _,
+                out("zmm23") _,
+                out("zmm24") _,
+                out("zmm25") _,
+                out("zmm26") _,
+                out("zmm27") _,
+                out("zmm28") _,
+                out("zmm29") _,
+                out("zmm30") _,
+                out("zmm31") _,
+                out("k1") _,
+                options(nostack)
+            )
+        };
+    }
+    if needs_barrett(Q) {
+        run!(lut, lut);
+    } else {
+        run!(plain, plain);
+    }
+}
+
+#[repr(C, align(64))]
+struct Blk27([i16; 27 * 32]);
+
+/// Consumer of `H` transforms run in lockstep ([`ntt_bin_batch32_multi_sink`]): block `blk` of
+/// all of them is handed over at once, so an accumulator can take all `H` products in one
+/// read-modify-write.
+pub trait MultiBlockSink<const H: usize> {
+    /// Where block `blk` of each transform is stored (27 vectors each).
+    unsafe fn dsts(&mut self, blk: usize) -> [*mut i16; H];
+    /// Called once all transforms' 27 vectors of block `blk` are stored.
+    unsafe fn blocks(&mut self, blk: usize, w: [*mut i16; H]);
+}
+
+/// The binary transform of `H` independent batches, interleaved per 162-slot quarter: the
+/// lookup stage of each, then each 27-block of each, then the sink. Each transform is exactly
+/// [`ntt_bin_batch32`]'s, operation for operation.
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+pub unsafe fn ntt_bin_batch32_multi_sink<const Q: u16, const H: usize, S: MultiBlockSink<H>>(
+    ins: [&BinaryIndex32; H],
+    sink: &mut S,
+) {
+    let t = tables::<Q>();
+    let c = C {
+        q: bc(&t.qd),
+        om: bc(&t.om[0]),
+        omp: bc(&t.om[1]),
+    };
+    let bar = needs_barrett(Q);
+    let ips: [*const u8; H] = core::array::from_fn(|h| ins[h].rows.as_ptr() as *const u8);
+    let mut blks: [core::mem::MaybeUninit<Blk>; H] = [const { core::mem::MaybeUninit::uninit() }; H];
+    let bps: [*mut i16; H] = core::array::from_fn(|h| blks[h].as_mut_ptr() as *mut i16);
+
+    for k in 0..4 {
+        let lut = t.lut.as_ptr().add(12 * k) as *const u8;
+        let l = |s2: usize, r: usize, ab: usize| -> __m512i {
+            _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
+        };
+        let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
+        let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
+        let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
+        for h in 0..H {
+            let (ip, bp) = (ips[h], bps[h]);
+            for i in 0..27 {
+                let n0 = ldb(ip, i);
+                let n0h = ldb(ip, i + 81);
+                let n1 = ldb(ip, i + 27);
+                let n1h = ldb(ip, i + 108);
+                let n2 = ldb(ip, i + 54);
+                let n2h = ldb(ip, i + 135);
+
+                let x = _mm512_permutexvar_epi8(n0, l000);
+                let y = _mm512_permutexvar_epi8(n0h, l001);
+                let a0 = _mm512_add_epi16(x, y);
+                let b0 = _mm512_sub_epi16(x, y);
+
+                let x = _mm512_permutexvar_epi8(n1, l010);
+                let y = _mm512_permutexvar_epi8(n1h, l011);
+                let a1 = _mm512_add_epi16(x, y);
+                let b1 = _mm512_sub_epi16(y, x);
+
+                let x = _mm512_permutexvar_epi8(n2, l020);
+                let y = _mm512_permutexvar_epi8(n2h, l021);
+                let a2 = _mm512_add_epi16(x, y);
+                let b2 = _mm512_sub_epi16(x, y);
+
+                let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
+                let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
+                st(bp, i, u0);
+                st(bp, i + 27, u1);
+                st(bp, i + 54, u2);
+                st(bp, i + 81, v2);
+                st(bp, i + 108, v0);
+                st(bp, i + 135, v1);
+            }
+        }
+        let cv = t.cv.as_ptr() as *const i16;
+        let tail_blocks = core::hint::black_box(6usize);
+        for j in 0..tail_blocks {
+            let kk = 6 * k + j;
+            let os = sink.dsts(kk);
+            let (t4, t5, t6) = (
+                t.tw4.as_ptr().add(kk).cast::<u32>(),
+                t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
+                t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
+            );
+            for h in 0..H {
+                let bpj = bps[h].add(32 * 27 * j);
+                if bar {
+                    tail27_b(bpj, os[h], t4, t5, t6, cv);
+                } else {
+                    tail27_p(bpj, os[h], t4, t5, t6, cv);
+                }
+            }
+            sink.blocks(kk, os);
+        }
+    }
+}
+
+/// Fused LOCK=2 binary NTT into the column-pair two-stream accumulator (`PAcc`).
+///
+/// The first batch of each 27-slot block is staged into a single L1D-resident 27-vector buffer
+/// `w0`, and the second batch's `tail27` consumes its 27 output registers directly via
+/// [`tail27_pair`], eliminating `tr8`/`tr4` shuffles, eliminating the second batch's L1D
+/// store/reload round-trip, and keeping the 6-block tail loop rolled (`black_box(6)`) so the
+/// kernel stays inside the 32 KiB L1 instruction cache.
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
+    ins: [&BinaryIndex32; 2],
+    key: *const u32,
+    acc: *mut i32,
+    red: bool,
+) {
+    assert!(Q == 3889 || Q == 9721, "the hybrid commitment's primes");
+    let t = tables::<Q>();
+    let c = C {
+        q: bc(&t.qd),
+        om: bc(&t.om[0]),
+        omp: bc(&t.om[1]),
+    };
+    let bar = needs_barrett(Q);
+    let ips: [*const u8; 2] = [
+        ins[0].rows.as_ptr() as *const u8,
+        ins[1].rows.as_ptr() as *const u8,
+    ];
+    let mut blks: [core::mem::MaybeUninit<Blk>; 4] =
+        [const { core::mem::MaybeUninit::uninit() }; 4];
+    let bps: [*mut i16; 4] = [
+        blks[0].as_mut_ptr() as *mut i16,
+        blks[1].as_mut_ptr() as *mut i16,
+        blks[2].as_mut_ptr() as *mut i16,
+        blks[3].as_mut_ptr() as *mut i16,
+    ];
+    let mut w0: core::mem::MaybeUninit<Blk27> = core::mem::MaybeUninit::uninit();
+    let w0p = w0.as_mut_ptr() as *mut i16;
+    let red_u32 = red as u32;
+
+    // Process fixed adjacent quarter pairs: both prefixes share each six-row index load.
+    // Each quarter retains its own two LOCK=2 buffers until its original six tails finish.
+    for kp in 0..2 {
+        let load_luts = |k: usize| {
+            let lut = t.lut.as_ptr().add(12 * k) as *const u8;
+            let l = |r: usize, ab: usize| -> __m512i {
+                _mm512_load_si512(lut.add(64 * (r * 2 + ab)) as *const __m512i)
+            };
+            (l(0, 0), l(0, 1), l(1, 0), l(1, 1), l(2, 0), l(2, 1))
+        };
+        let ls0 = load_luts(2 * kp);
+        let ls1 = load_luts(2 * kp + 1);
+        for h in 0..2 {
+            let ip = ips[h];
+            for i in 0..27 {
+                let n0 = ldb(ip, i);
+                let n0h = ldb(ip, i + 81);
+                let n1 = ldb(ip, i + 27);
+                let n1h = ldb(ip, i + 108);
+                let n2 = ldb(ip, i + 54);
+                let n2h = ldb(ip, i + 135);
+
+                macro_rules! prefix {
+                    ($bp:expr, $ls:expr) => {{
+                        let bp = $bp;
+                        let (l000, l001, l010, l011, l020, l021) = $ls;
+                        let x = _mm512_permutexvar_epi8(n0, l000);
+                        let y = _mm512_permutexvar_epi8(n0h, l001);
+                        let a0 = _mm512_add_epi16(x, y);
+                        let b0 = _mm512_sub_epi16(x, y);
+
+                        let x = _mm512_permutexvar_epi8(n1, l010);
+                        let y = _mm512_permutexvar_epi8(n1h, l011);
+                        let a1 = _mm512_add_epi16(x, y);
+                        let b1 = _mm512_sub_epi16(y, x);
+
+                        let x = _mm512_permutexvar_epi8(n2, l020);
+                        let y = _mm512_permutexvar_epi8(n2h, l021);
+                        let a2 = _mm512_add_epi16(x, y);
+                        let b2 = _mm512_sub_epi16(x, y);
+
+                        let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
+                        let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
+                        st(bp, i, u0);
+                        st(bp, i + 27, u1);
+                        st(bp, i + 54, u2);
+                        st(bp, i + 81, v2);
+                        st(bp, i + 108, v0);
+                        st(bp, i + 135, v1);
+                    }};
+                }
+                prefix!(bps[h], ls0);
+                prefix!(bps[2 + h], ls1);
+            }
+        }
+        for qpair in 0..core::hint::black_box(2usize) {
+            let k = 2 * kp + qpair;
+            let cv = t.cv.as_ptr() as *const i16;
+            let tail_blocks = core::hint::black_box(6usize);
+            for j in 0..tail_blocks {
+                let kk = 6 * k + j;
+                let (t4, t5, t6) = (
+                    t.tw4.as_ptr().add(kk).cast::<u32>(),
+                    t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
+                    t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
+                );
+                let bp0 = bps[2 * qpair].add(32 * 27 * j);
+                if bar {
+                    tail27_b(bp0, w0p, t4, t5, t6, cv);
+                } else {
+                    tail27_p(bp0, w0p, t4, t5, t6, cv);
+                }
+                let bp1 = bps[2 * qpair + 1].add(32 * 27 * j);
+                tail27_pair::<Q>(
+                    bp1,
+                    w0p,
+                    t4,
+                    t5,
+                    t6,
+                    cv,
+                    key.add(4 * 27 * kk),
+                    acc.add(32 * 27 * kk),
+                    red_u32,
+                );
+            }
+        }
+    }
 }

@@ -319,12 +319,9 @@ impl Transcript {
     /// The same derivation as [`fill`](Self::fill), as a stream — for samplers that consume a
     /// number of bytes they do not know in advance.
     fn reader(&mut self, label: &[u8]) -> blake3::OutputReader {
-        let mut state = self.state.clone();
-        state.update(&self.counter.to_le_bytes());
-        state.update(&(label.len() as u64).to_le_bytes());
-        state.update(label);
+        let out = self.reader_at(label, 0);
         self.counter += 1;
-        state.finalize_xof()
+        out
     }
 }
 
@@ -402,8 +399,13 @@ pub struct ShortChallenge {
     pub weight: usize,
 }
 
-static SIGN_KEY: LazyLock<Hasher> =
-    LazyLock::new(|| Hasher::new_derive_key("labinius 2026 challenge signs v1"));
+static SIGN_KEY: LazyLock<([u32; 8], blake3::platform::Platform)> = LazyLock::new(|| {
+    let key = hazmat::hash_derive_key_context("labinius 2026 challenge signs v1");
+    (
+        blake3::platform::words_from_le_bytes_32(&key),
+        blake3::platform::Platform::detect(),
+    )
+});
 
 impl ShortChallenge {
     /// The zero element (weight 0).
@@ -425,13 +427,15 @@ impl ShortChallenge {
     }
 
     pub fn signed(&self) -> Self {
-        let mut h = SIGN_KEY.clone();
-        h.update(&(self.weight as u64).to_le_bytes());
-        h.update(&self.positions[..self.weight]);
-        let bits = u32::from_le_bytes(h.finalize().as_bytes()[..4].try_into().unwrap());
+        let &(mut cv, platform) = &*SIGN_KEY;
+        let mut block = [0u8; 64];
+        block[..8].copy_from_slice(&(self.weight as u64).to_le_bytes());
+        block[8..8 + self.weight].copy_from_slice(&self.positions[..self.weight]);
+        // Single-block derive-key material: CHUNK_START(1) | CHUNK_END(2) | ROOT(8) | DERIVE_KEY_MATERIAL(64) = 75.
+        platform.compress_in_place(&mut cv, &block, (8 + self.weight) as u8, 0, 75);
         let mask = ((1u64 << self.weight) - 1) as u32;
         ShortChallenge {
-            signs: bits & mask,
+            signs: cv[0] & mask,
             ..*self
         }
     }
@@ -514,14 +518,17 @@ pub static UNITS: LazyLock<[u16; N162]> = LazyLock::new(|| {
 /// and the first [`HALF`] units: 162 x 88 f64 each, ~228 KB together.
 static PHASE: LazyLock<(Vec<f64>, Vec<f64>)> = LazyLock::new(|| {
     let units = &*UNITS;
+    let roots: [(f64, f64); CONDUCTOR243] = core::array::from_fn(|m| {
+        let angle = 2.0 * PI * (m as f64) / (CONDUCTOR243 as f64);
+        (angle.cos(), angle.sin())
+    });
     let mut re = vec![0.0f64; N162 * LANES];
     let mut im = vec![0.0f64; N162 * LANES];
     for p in 0..N162 {
         for k in 0..HALF {
-            let m = (p * units[k] as usize) % CONDUCTOR243;
-            let angle = 2.0 * PI * (m as f64) / (CONDUCTOR243 as f64);
-            re[p * LANES + k] = angle.cos();
-            im[p * LANES + k] = angle.sin();
+            let (r, i) = roots[(p * units[k] as usize) % CONDUCTOR243];
+            re[p * LANES + k] = r;
+            im[p * LANES + k] = i;
         }
     }
     (re, im)
@@ -662,13 +669,11 @@ fn attempt(x: &mut Xof, weight: usize, perm: &mut [u8; N162]) -> ShortChallenge 
     }
     let mut out = ShortChallenge::zero();
     out.weight = weight;
+    let mut seen = [0u64; N162.div_ceil(64)];
     for i in 0..weight {
         let j = i + x.below((N162 - i) as u16) as usize;
-        perm.swap(i, j);
-    }
-    let out_positions = &perm[..weight];
-    let mut seen = [0u64; N162.div_ceil(64)];
-    for &p in out_positions {
+        let p = perm[j];
+        perm[j] = perm[i];
         seen[p as usize >> 6] |= 1u64 << (p & 63);
     }
     let mut n = 0;
@@ -717,6 +722,25 @@ impl Transcript {
     /// The derivation [`reader`](Self::reader) would make `offset` samples from now, without
     /// advancing the counter: what lets `n` consecutive samples be taken on several threads.
     fn reader_at(&self, label: &[u8], offset: u64) -> blake3::OutputReader {
+        let mut buf = [0u8; 32];
+        let n = 16 + label.len();
+        if n <= buf.len()
+            && (self.state.depth == 0 || self.state.tail.count() + n as u64 <= self.state.lowest())
+        {
+            buf[..8].copy_from_slice(&(self.counter + offset).to_le_bytes());
+            buf[8..16].copy_from_slice(&(label.len() as u64).to_le_bytes());
+            buf[16..n].copy_from_slice(label);
+            let mut tail = self.state.tail.clone();
+            tail.update(&buf[..n]);
+            if self.state.depth == 0 {
+                return tail.finalize_xof();
+            }
+            let mut right = tail.finalize_non_root();
+            for i in (1..self.state.depth).rev() {
+                right = hazmat::merge_subtrees_non_root(&self.state.left[i], &right, Mode::Hash);
+            }
+            return hazmat::merge_subtrees_root_xof(&self.state.left[0], &right, Mode::Hash);
+        }
         let mut state = self.state.clone();
         state.update(&(self.counter + offset).to_le_bytes());
         state.update(&(label.len() as u64).to_le_bytes());
@@ -847,6 +871,13 @@ mod parallel_tests {
             .collect();
         let parallel = sample_short_challenges_parallel(&mut b, 37, DEFAULT_WEIGHT, DEFAULT_BOUND, 5);
         assert_eq!(sequential, parallel);
+        for c in &parallel {
+            let mut h = Hasher::new_derive_key("labinius 2026 challenge signs v1");
+            h.update(&(c.weight as u64).to_le_bytes());
+            h.update(&c.positions[..c.weight]);
+            let bits = u32::from_le_bytes(h.finalize().as_bytes()[..4].try_into().unwrap());
+            assert_eq!(c.signs, bits & (((1u64 << c.weight) - 1) as u32));
+        }
         let mut x = [0u8; 16];
         let mut y = [0u8; 16];
         a.fill(b"after", &mut x);

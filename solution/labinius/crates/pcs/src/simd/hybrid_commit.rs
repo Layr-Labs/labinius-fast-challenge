@@ -25,7 +25,9 @@ const P0:u16=3889;
 const P1:u16=9721;
 const PRODUCT:i64=P0 as i64*P1 as i64;
 pub const MODULUS:u128=PRODUCT as u128*1024;
-pub const CHUNK_BATCHES:usize=7;
+/// The coupled public-key lift certifies all eight-batch chunks: maximum absolute
+/// coefficient 17,639,740 < PRODUCT/2. Key construction checks the bound again.
+pub const CHUNK_BATCHES:usize=8;
 
 /// Arranged key vectors per 27-row block: three 8-row groups of eight qword vectors and one
 /// 4-row group of four chunk vectors, each for A and then T.
@@ -397,31 +399,6 @@ unsafe fn clear_lanes(b:&mut Batch32,from:usize) {
  let m=!((1u64<<from)-1) as u32;
  for j in 0..N {_mm512_mask_storeu_epi16(b.v[j].as_mut_ptr(),m,_mm512_setzero_si512());}
 }
-/// Whether the commitment prefetches the witness: the knob is read once per group.
-fn prefetch_witness_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("LABINIUS_PREFETCH_WITNESS") {
-        Ok(v) => v != "0",
-        Err(_) => true,
-    })
-}
-
-/// Bring the first line of every page of `bytes` of the witness table into the cache: the
-/// commitment reads it in 2 KB chunks whose neighbours are 256 KB away, a pattern the
-/// hardware prefetchers do not follow across pages. Only the page starts are touched: the
-/// L2 streamer picks up the rest of a page after the first miss, and prefetching every line
-/// of every chunk costs more instructions than the misses it saves.
-#[inline(always)]
-fn prefetch_witness(ptr:*const crate::fields::scalar::B128,bytes:usize){
- #[cfg(target_arch="x86_64")]
- unsafe{
-  use core::arch::x86_64::*;
-  let base=ptr as *const i8;
-  let mut off=0usize;
-  while off<bytes{_mm_prefetch::<{_MM_HINT_T0}>(base.add(off));off+=4096;}
- }
-}
-
 /// One group of `g` columns: the batch is the outer loop, so each key batch is read from L3 once
 /// per group and `g` times from L2. A finished tail chunk of column `c` goes to lane `s g + c`
 /// of the pending pair, `s` the chunk's slot; the pair is inverse transformed and CRT-combined
@@ -437,16 +414,6 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
  let mut filled=0usize;
  for b in 0..nb {
   for c in 0..g {
-   // The witness is the commitment's only DRAM traffic, and the hardware
-   // prefetchers do not follow it: a batch's 2 KB chunk of a column sits 256 KB
-   // from the same chunk of the neighbouring column, and advances by 2 KB only
-   // after a whole group of columns has been transformed. Touch the chunks that
-   // come next while this one is read and transformed.
-   if prefetch_witness_on() {
-    prefetch_witness(cols[c].as_ptr().add(128*b),2048);
-    if b+1<nb {prefetch_witness(cols[c].as_ptr().add(128*(b+1)),2048);}
-    if c+1<g {prefetch_witness(cols[c+1].as_ptr().add(128*b),2048);}
-   }
    cols[c].slice_batch(b,&mut ws.idx[0]);
    let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;
    sink_batch::<P0>(&ws.idx[0],keys,b,a0);
@@ -463,7 +430,8 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
     // lanes of unfilled slots still hold the previous flush's coefficients
     if filled*g<32 {clear_lanes(&mut p0[0],filled*g);clear_lanes(&mut p1[0],filled*g);}
     p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
-    gen_small::intt_gen_batch32::<P0>(&mut p0[0]);gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
+    // finish_tails uses red16: every live lane has |r| < 2q; unused lanes are zero.
+    gen_small::intt_hybrid_batch32_3889(&mut p0[0]);gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
     crt_accumulate(&p0[0],&p1[0],&mut ws.total[0]);
     filled=0;
    }
@@ -684,6 +652,432 @@ fn commit_paired(keys:&[KeyBatch],columns:&[&[B128]],workers:usize,g:usize,place
   mine.store(usize::MAX/2,Ordering::Release);
  });
 }
+// =============================================================================================
+// column-pair layout: lanes are 16 columns x 2 consecutive ring elements
+// =============================================================================================
+//
+// Lane 2l+e of a transform batch is ring element 2b+e of column l of a 16-column group, so the
+// two lanes `vpmaddwd` pairs belong to the same column and multiply the two key elements
+// (A_{2b}, A_{2b+1}), which are the same for every column: one `vpdpwssd` with a broadcast dword
+// per slot and key accumulates 16 columns at once, with no lane folding at all.
+
+/// The keys of both primes and both streams in the lockstep pair layout: for lockstep step
+/// `b_lock = b / 2` (`0 .. np / 2`), prime `p` (`0` for 3889, `1` for 9721), and slot `j`
+/// (`0 .. 648`), holds the four contiguous dwords `[ka_b0[j], kt_b0[j], ka_b1[j], kt_b1[j]]`
+/// (16 bytes) at `((b / 2) * 2 + p) * (648 * 4) + 4 * j`, where `np = 16 * nb` is the number
+/// of pair batches of a column.
+pub fn pair_keys(base:&crate::key::CommitmentKey,tail:&crate::key::CommitmentKey,workers:usize)->Vec<u32> {
+ let rows=[[base.row(0),tail.row(0)],[base.row(1),tail.row(1)]];
+ let nb=rows[0][0].len();let np=16*nb;
+ let mut k:Vec<u32>=Vec::with_capacity(4*np*648);
+ unsafe{k.set_len(4*np*648);}
+ let addr=k.as_mut_ptr() as usize;
+ let runs=crate::par::ranges(nb,workers.max(1),1);
+ crate::par::pool().run(runs.len(),|r|{
+  for b in runs[r].clone() {
+   for p in 0..2 {
+    let sa=&rows[p][0][b];let st=&rows[p][1][b];
+    for h2 in 0..8 {
+     let b_lock=8*b+h2;
+     let dst=unsafe{(addr as *mut u32).add((2*b_lock+p)*648*4)};
+     let (l0,l1)=(4*h2,4*h2+2);
+     for j in 0..648 {
+      let a0=(sa.v[j][l0] as u16 as u32)|((sa.v[j][l0+1] as u16 as u32)<<16);
+      let t0=(st.v[j][l0] as u16 as u32)|((st.v[j][l0+1] as u16 as u32)<<16);
+      let a1=(sa.v[j][l1] as u16 as u32)|((sa.v[j][l1+1] as u16 as u32)<<16);
+      let t1=(st.v[j][l1] as u16 as u32)|((st.v[j][l1+1] as u16 as u32)<<16);
+      unsafe{
+       let p=dst.add(4*j);
+       p.write(a0);p.add(1).write(t0);p.add(2).write(a1);p.add(3).write(t1);
+      }
+     }
+    }
+   }
+  }
+ });
+ k
+}
+
+/// One dword-product step bound: two products of a lazily reduced transform lane and a centered
+/// key lane.
+const fn pair_per_batch(q:u16)->i64 {2*w_bound(q)*a_bound(q)}
+/// Pair batches between two fold-backs: the largest power of two P with
+/// `acc_after_reduce_c + P * pair_per_batch <= i32::MAX`.
+const fn pair_period(q:u16)->usize {
+ let mut p=1usize;
+ while acc_after_reduce_c(q)+2*(p as i64)*pair_per_batch(q)<=i32::MAX as i64 {p*=2;}
+ p
+}
+const PP0:usize=pair_period(P0);const PP1:usize=pair_period(P1);
+const _:()=assert!(acc_after_reduce_c(P0)+(PP0 as i64)*pair_per_batch(P0)<=bias(P0));
+const _:()=assert!(acc_after_reduce_c(P1)+(PP1 as i64)*pair_per_batch(P1)<=bias(P1));
+/// Pair batches per certified chunk (the chunk is `CHUNK_BATCHES * 32` ring elements).
+const CHUNK_PAIRS:usize=CHUNK_BATCHES*16;
+/// Pair batches transformed in lockstep per accumulator read-modify-write.
+const LOCK:usize=2;
+const _:()=assert!(CHUNK_PAIRS%PP0==0 && CHUNK_PAIRS%PP1==0 && PP0%LOCK==0 && PP1%LOCK==0 && CHUNK_PAIRS%LOCK==0);
+
+/// Interleaved base (`[j][0]`) and tail (`[j][1]`) 16-column accumulators for one prime:
+/// 128 bytes per slot `j` so both streams share a single 128-byte L2 spatial-prefetcher sector.
+#[repr(C,align(128))]
+pub struct PAcc { pub v:[[[i32;16];2];648] }
+
+/// `acc + x . broadcast([k + OFF])` pairwise: one `vpdpwssd` with an embedded 32-bit broadcast
+/// memory operand (`dword ptr [k + OFF]{1to16}`), avoiding both LLVM's `vpmaddwd` + `vpaddd`
+/// split and a separate `vpbroadcastd` instruction.
+#[cfg(test)]
+#[inline(always)]
+unsafe fn dp_bc<const OFF:usize>(acc:__m512i,x:__m512i,k:*const u32)->__m512i {
+ let mut r=acc;
+ core::arch::asm!(
+  "vpdpwssd {r}, {x}, dword ptr [{k} + {o}]{{1to16}}",
+  r=inout(zmm_reg) r,
+  x=in(zmm_reg) x,
+  k=in(reg) k,
+  o=const OFF,
+  options(pure,readonly,nostack,preserves_flags)
+ );
+ r
+}
+
+/// Staged reference pair sink for `LOCK = 2` consecutive pair batches at once: both products enter
+/// each accumulator in one read-modify-write (`RED` when the second batch closes a fold-back period).
+#[cfg(test)]
+struct MultiSink<const Q:u16,const RED:bool> {bufs:[*mut i16;LOCK],k:*const u32,acc:*mut __m512i}
+#[cfg(test)]
+impl<const Q:u16,const RED:bool> vb::MultiBlockSink<LOCK> for MultiSink<Q,RED> {
+ #[inline(always)]unsafe fn dsts(&mut self,_:usize)->[*mut i16;LOCK] {self.bufs}
+ #[inline(always)]
+ unsafe fn blocks(&mut self,blk:usize,w:[*mut i16;LOCK]) {
+  let s0=27*blk;
+  let k=self.k.add(4*s0);
+  let p0=self.acc.add(2*s0);
+  let w0=w[0] as *const __m512i;
+  let w1=w[1] as *const __m512i;
+  for j in 0..27 {
+   let p=p0.add(2*j);
+   let kj=k.add(4*j);
+   let mut a=_mm512_load_si512(p);
+   let mut t=_mm512_load_si512(p.add(1));
+   let x0=_mm512_load_si512(w0.add(j));
+   let x1=_mm512_load_si512(w1.add(j));
+   a=dp_bc::<0>(a,x0,kj);
+   t=dp_bc::<4>(t,x0,kj);
+   a=dp_bc::<8>(a,x1,kj);
+   t=dp_bc::<12>(t,x1,kj);
+   if RED {a=reduce_vec_c::<Q>(a);t=reduce_vec_c::<Q>(t);}
+   _mm512_store_si512(p,a);
+   _mm512_store_si512(p.add(1),t);
+  }
+ }
+}
+
+const PAIR_PACK_PERM:[i64;8]=[0,2,4,6,1,3,5,7];
+
+/// Reduces stream `STREAM` (`0` for base, `1` for tail) of the 648 16-column slot accumulators
+/// of `a` modulo `Q` into `i16` representatives (`|r| < 2Q`, see [`red16`]), writes them into
+/// lanes `16 * half .. 16 * half + 16` of `out`, and clears that stream in `a` for the next
+/// chunk/part. Two slots are reduced with [`red16`], packed with `vpackssdw`, and deinterleaved
+/// with `vpermq` at a time (no `f64` or scalar conversions).
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn finish_pair_stream<const Q:u16,const STREAM:usize>(a:&mut PAcc,out:&mut Batch32,half:usize) {
+ let p=(a.v.as_mut_ptr() as *mut __m512i).add(STREAM);
+ let zero=_mm512_setzero_si512();
+ let perm=_mm512_loadu_si512(PAIR_PACK_PERM.as_ptr() as *const __m512i);
+ let l0=16*half;
+ for k in 0..324 {
+  let j=2*k;
+  let x0=_mm512_load_si512(p.add(2*j));
+  let x1=_mm512_load_si512(p.add(2*(j+1)));
+  _mm512_store_si512(p.add(2*j),zero);
+  _mm512_store_si512(p.add(2*(j+1)),zero);
+  let packed=_mm512_packs_epi32(red16::<Q>(x0),red16::<Q>(x1));
+  let u=_mm512_permutexvar_epi64(perm,packed);
+  _mm256_storeu_si256(out.v[j].as_mut_ptr().add(l0) as *mut __m256i,_mm512_castsi512_si256(u));
+  _mm256_storeu_si256(out.v[j+1].as_mut_ptr().add(l0) as *mut __m256i,_mm512_extracti64x4_epi64::<1>(u));
+ }
+}
+
+/// Canonical representative in `[0, Q)` of `x` (`|x| <= bias(Q)`), lane-wise, via [`red16`].
+#[inline(always)]
+unsafe fn canon_red16<const Q:u16>(x:__m512i)->__m512i {
+ let r=red16::<Q>(x);
+ let q=_mm512_set1_epi32(Q as i32);
+ let q2=_mm512_set1_epi32(2*Q as i32);
+ let r=_mm512_mask_add_epi32(r,_mm512_cmp_epi32_mask(r,_mm512_setzero_si512(),_MM_CMPINT_LT),r,q2);
+ _mm512_mask_sub_epi32(r,_mm512_cmp_epi32_mask(r,q,_MM_CMPINT_NLT),r,q)
+}
+
+/// Zero lanes 16..32 of every slot.
+#[target_feature(enable="avx512f,avx512bw")]
+unsafe fn clear_upper(out:&mut Batch32) {
+ let zero=_mm256_setzero_si256();
+ for j in 0..648 {_mm256_storeu_si256(out.v[j].as_mut_ptr().add(16) as *mut __m256i,zero);}
+}
+
+/// 16 x 16 u32 matrix transpose in AVX-512 registers: row `s` (`0..16`) holds columns `0..16`
+/// of slot `j0 + s`; output `c` (`0..16`) holds slots `j0..j0+16` of column `c`.
+#[inline(always)]
+unsafe fn transpose16x16_u32(r:&[__m512i;16])->[__m512i;16] {
+ let mut u=[[_mm512_setzero_si512();4];4];
+ for q in 0..4 {
+  let t0=_mm512_unpacklo_epi32(r[4*q],r[4*q+1]);
+  let t1=_mm512_unpackhi_epi32(r[4*q],r[4*q+1]);
+  let t2=_mm512_unpacklo_epi32(r[4*q+2],r[4*q+3]);
+  let t3=_mm512_unpackhi_epi32(r[4*q+2],r[4*q+3]);
+  u[q]=[
+   _mm512_unpacklo_epi64(t0,t2),
+   _mm512_unpackhi_epi64(t0,t2),
+   _mm512_unpacklo_epi64(t1,t3),
+   _mm512_unpackhi_epi64(t1,t3),
+  ];
+ }
+ let mut out=[_mm512_setzero_si512();16];
+ for m in 0..4 {
+  let v=tr4(u[0][m],u[1][m],u[2][m],u[3][m]);
+  for l in 0..4 {out[4*l+m]=v[l];}
+ }
+ out
+}
+
+/// Reduces the base streams of `acc0` (`P0`) and `acc1` (`P1`) and the CRT tail `total` for a
+/// finished 16-column group, clears the accumulators in place for the next group, and writes the
+/// `gc` columns' three rows into `dst` via 16x16 SIMD transposes (no heap allocations or strided
+/// L1D misses).
+#[inline(never)]
+#[target_feature(enable="avx512f,avx512bw,avx512vl")]
+unsafe fn write_pair_group_rows(
+ acc0:&mut PAcc,
+ acc1:&mut PAcc,
+ total:&mut Batch32,
+ gc:usize,
+ dst:*mut [u32;N],
+) {
+ let mask1023=_mm256_set1_epi16(1023);
+ let zero=_mm512_setzero_si512();
+ let p0=acc0.v.as_mut_ptr() as *mut __m512i;
+ let p1=acc1.v.as_mut_ptr() as *mut __m512i;
+ let pt=total.v.as_mut_ptr() as *mut __m512i;
+ for tile in 0..40 {
+  let j0=16*tile;
+  let mut r0=[zero;16];
+  let mut r1=[zero;16];
+  let mut rt=[zero;16];
+  for s in 0..16 {
+   let j=j0+s;
+   let v0=_mm512_load_si512(p0.add(2*j));
+   let v1=_mm512_load_si512(p1.add(2*j));
+   let vt=_mm512_load_si512(pt.add(j));
+   _mm512_store_si512(p0.add(2*j),zero);
+   _mm512_store_si512(p1.add(2*j),zero);
+   _mm512_store_si512(pt.add(j),zero);
+   r0[s]=canon_red16::<P0>(v0);
+   r1[s]=canon_red16::<P1>(v1);
+   let st=_mm256_add_epi16(_mm512_castsi512_si256(vt),_mm512_extracti64x4_epi64::<1>(vt));
+   rt[s]=_mm512_cvtepu16_epi32(_mm256_and_si256(st,mask1023));
+  }
+  let c0=transpose16x16_u32(&r0);
+  let c1=transpose16x16_u32(&r1);
+  let ct=transpose16x16_u32(&rt);
+  for c in 0..gc {
+   _mm512_storeu_si512((dst.add(3*c) as *mut u32).add(j0) as *mut __m512i,c0[c]);
+   _mm512_storeu_si512((dst.add(3*c+1) as *mut u32).add(j0) as *mut __m512i,c1[c]);
+   _mm512_storeu_si512((dst.add(3*c+2) as *mut u32).add(j0) as *mut __m512i,ct[c]);
+  }
+ }
+ // Remaining 8 slots (j = 640..648).
+ let j0=640;
+ let mut r0=[zero;16];
+ let mut r1=[zero;16];
+ let mut rt=[zero;16];
+ for s in 0..8 {
+  let j=j0+s;
+  let v0=_mm512_load_si512(p0.add(2*j));
+  let v1=_mm512_load_si512(p1.add(2*j));
+  let vt=_mm512_load_si512(pt.add(j));
+  _mm512_store_si512(p0.add(2*j),zero);
+  _mm512_store_si512(p1.add(2*j),zero);
+  _mm512_store_si512(pt.add(j),zero);
+  r0[s]=canon_red16::<P0>(v0);
+  r1[s]=canon_red16::<P1>(v1);
+  let st=_mm256_add_epi16(_mm512_castsi512_si256(vt),_mm512_extracti64x4_epi64::<1>(vt));
+  rt[s]=_mm512_cvtepu16_epi32(_mm256_and_si256(st,mask1023));
+ }
+ let c0=transpose16x16_u32(&r0);
+ let c1=transpose16x16_u32(&r1);
+ let ct=transpose16x16_u32(&rt);
+ for c in 0..gc {
+  _mm256_storeu_si256((dst.add(3*c) as *mut u32).add(j0) as *mut __m256i,_mm512_castsi512_si256(c0[c]));
+  _mm256_storeu_si256((dst.add(3*c+1) as *mut u32).add(j0) as *mut __m256i,_mm512_castsi512_si256(c1[c]));
+  _mm256_storeu_si256((dst.add(3*c+2) as *mut u32).add(j0) as *mut __m256i,_mm512_castsi512_si256(ct[c]));
+ }
+}
+
+/// Per-worker scratch for [`commit_columns_rows_pairs`], allocated once per worker thread and
+/// reused across all groups it executes (every accumulator is cleared in place as it is read).
+struct PairWorker {
+ acc:Box<[PAcc]>,
+ partial:Box<[Batch32]>,
+ total:Box<[Batch32]>,
+ idx:Box<[BinaryIndex32]>,
+}
+impl PairWorker {
+ fn new()->Self {
+  PairWorker{
+   acc:zeroed_slice(2),
+   partial:zeroed_slice(2),
+   total:zeroed_slice(1),
+   idx:zeroed_slice(LOCK),
+  }
+ }
+}
+
+/// Commits a whole group of up to 16 columns across all `np` pair batches and writes its `3 * g`
+/// output rows directly to `dst`. `sync(b_done)` is called at every `PP0` boundary (`16` pair
+/// batches = 162 KiB of `pair_keys`) so hyperthread siblings on a physical core share `pair_keys`
+/// in their 2 MiB L2 cache.
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn group_pairs_full<F:FnMut(usize)>(
+ cols:&[&[B128]],
+ keys:&[u32],
+ np:usize,
+ ws:&mut PairWorker,
+ dst:*mut [u32;N],
+ mut sync:F,
+) {
+ let g=cols.len();assert!(g>=1 && g<=16 && np%LOCK==0);
+ // Lanes of columns past the group's end read a zero element.
+ static ZERO8:[B128;8]=[B128::ZERO;8];
+ let kbase=keys.as_ptr();
+ let mut half=0usize;
+ for b in (0..np).step_by(LOCK) {
+  for h in 0..LOCK {
+   let cols16:[*const B128;16]=core::array::from_fn(|l|{
+    if l<g {cols[l].as_ptr().add(8*(b+h))} else {ZERO8.as_ptr()}
+   });
+   crate::simd::transpose_f162::slice_b128_cols16_into(&cols16,&mut ws.idx[h]);
+  }
+  let (acc0,acc1)={
+   let [x,y]=&mut ws.acc[..2] else {unreachable!()};
+   (x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32)
+  };
+  let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
+  let kb=kbase.add(b*648*4);
+  vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
+  vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
+  if (b+LOCK)%PP0==0 || b+LOCK==np {
+   sync(b+LOCK);
+  }
+  if (b+LOCK)%CHUNK_PAIRS==0 || b+LOCK==np {
+   // Two finished chunks share one pair of inverse transforms: the first in lanes 0..16, the
+   // second in lanes 16..32 (each chunk's CRT stays exact on its own lanes).
+   let (p0,p1)=ws.partial.split_at_mut(1);
+   finish_pair_stream::<P0,1>(&mut ws.acc[0],&mut p0[0],half);
+   finish_pair_stream::<P1,1>(&mut ws.acc[1],&mut p1[0],half);
+   if half==1 || b+LOCK==np {
+    if half==0 {clear_upper(&mut p0[0]);clear_upper(&mut p1[0]);}
+    p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
+    // finish_pair_stream uses red16: every live lane has |r| < 2*P0; unused lanes are zero.
+    gen_small::intt_hybrid_batch32_3889(&mut p0[0]);
+    gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
+    crt_accumulate(&p0[0],&p1[0],&mut ws.total[0]);
+    half=0;
+   } else {half=1;}
+  }
+ }
+ let [acc0,acc1]=&mut ws.acc[..2] else {unreachable!()};
+ write_pair_group_rows(acc0,acc1,&mut ws.total[0],g,dst);
+}
+
+/// Maximum lead (in pair batches) between two hyperthread siblings on the same physical core:
+/// `2 * PP0 = 32` pair batches = 324 KiB of `pair_keys`, well within the 2 MiB L2 cache.
+const PAIR_LEAD:usize=2*PP0;
+
+/// Column-pair commitment with hyperthread siblings `2k` and `2k + 1` (pinned to physical core
+/// `k`'s two logical CPUs) claiming 32-column super-groups (two 16-column groups) and advancing
+/// through `pair_keys` within [`PAIR_LEAD`] pair batches of each other so both siblings share
+/// every key line in their core's 2 MiB L2 cache.
+fn commit_paired_pairs(
+ keys:&[u32],
+ columns:&[&[B128]],
+ np:usize,
+ workers:usize,
+ placement:Option<&crate::par::CorePlacement>,
+ dst:usize,
+) {
+ use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
+ let g=16usize;let sg=2*g;
+ let pairs=workers/2;
+ let super_groups=columns.len().div_ceil(sg);
+ let rounds=super_groups+1;
+ let next=AtomicUsize::new(0);
+ let slots:Vec<std::sync::OnceLock<usize>>=(0..pairs*rounds).map(|_|std::sync::OnceLock::new()).collect();
+ let done:Vec<Progress>=(0..2*pairs).map(|_|Progress(AtomicUsize::new(0))).collect();
+ let coupled:Vec<AtomicBool>=(0..pairs).map(|_|AtomicBool::new(true)).collect();
+ crate::par::pool().run(2*pairs,|worker|{
+  let _guard=placement.and_then(|p|p.pin(worker));
+  let (pair,s)=(worker/2,worker%2);
+  let mine=&done[worker].0;let other=&done[worker^1].0;let coupled=&coupled[pair];
+  let mut ws:Option<PairWorker>=None;
+  for r in 0..rounds {
+   let gi=*slots[pair*rounds+r].get_or_init(||next.fetch_add(1,Ordering::Relaxed));
+   if gi>=super_groups {break;}
+   let c0=gi*sg;let gc=sg.min(columns.len()-c0);
+   let (lo,n)=if s==0 {(c0,gc.min(g))} else {(c0+g,gc.saturating_sub(g))};
+   let base=r*np;
+   if n==0 {mine.store(base+np,Ordering::Release);continue;}
+   let ws=ws.get_or_insert_with(PairWorker::new);
+   unsafe{group_pairs_full(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),|b_done|{
+    let d=base+b_done;
+    mine.store(d,Ordering::Release);
+    if !coupled.load(Ordering::Relaxed) {return;}
+    if other.load(Ordering::Acquire)+PAIR_LEAD>=d {return;}
+    let start=std::time::Instant::now();
+    let mut spins=0u32;
+    while other.load(Ordering::Acquire)+PAIR_LEAD<d {
+     core::hint::spin_loop();
+     spins+=1;
+     if spins%64==0 && start.elapsed()>SIBLING_WAIT {coupled.store(false,Ordering::Relaxed);return;}
+    }
+   })};
+  }
+  mine.store(usize::MAX/2,Ordering::Release);
+ });
+}
+
+/// [`commit_columns_rows`] in the column-pair layout: groups of 16 columns, one pass over the
+/// pair keys per group, with SMT sibling-pair L2 key sharing when available.
+pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+ assert!(!columns.is_empty(),"at least one witness column");
+ let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
+ assert_eq!(len%8,0);let np=len/8;
+ assert_eq!(keys.len(),4*np*648);
+ let g=16usize;let groups=columns.len().div_ceil(g);
+ // Uninitialised: the groups partition the columns and each writes all three rows of its own.
+ let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;
+ let paired=if workers>=2 && workers%2==0 && groups>1 {crate::par::CorePlacement::for_sibling_pairs(workers)} else {None};
+ if let Some(placement)=paired {
+  commit_paired_pairs(keys,columns,np,workers,Some(&placement),dst);
+ } else {
+  let workers=workers.clamp(1,groups);
+  let next=std::sync::atomic::AtomicUsize::new(0);
+  let placement=crate::par::CorePlacement::for_logical(workers).or_else(||crate::par::CorePlacement::for_workers(workers));
+  crate::par::pool().run(workers,|worker|{
+   let _guard=placement.as_ref().and_then(|p|p.pin(worker));
+   let mut ws:Option<PairWorker>=None;
+   loop {
+    let gi=next.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+    if gi>=groups {break;}
+    let c0=gi*g;let gc=g.min(columns.len()-c0);
+    let ws=ws.get_or_insert_with(PairWorker::new);
+    unsafe{group_pairs_full(&columns[c0..c0+gc],keys,np,ws,(dst as *mut [u32;N]).add(3*c0),|_|{})};
+   }
+  });
+ }
+ unsafe{rows.set_len(columns.len()*3);}
+ rows
+}
+
 #[cfg(test)]
 mod tests {
  use super::*;
@@ -724,6 +1118,71 @@ mod tests {
   fused_register_sink_check::<P0,false>();fused_register_sink_check::<P0,true>();
   fused_register_sink_check::<P1,false>();fused_register_sink_check::<P1,true>();
  }
+ /// The fused LOCK=2 register-resident column-pair consumer equals the staged MultiSink consumer
+ /// at every slot and lane, with and without centered fold-back.
+ fn fused_pair_sink_check<const Q:u16,const RED:bool>() {
+  let mut state=0x71e2b3c4d5f60819u64 ^ Q as u64;
+  let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
+  let mut key=vec![0u32;648*4];
+  let mut got=zeroed_slice::<PAcc>(1);
+  let mut want=zeroed_slice::<PAcc>(1);
+  let mut scratch=[Blk27([0;27*32]),Blk27([0;27*32])];
+  let mut idx=[BinaryIndex32::zero(),BinaryIndex32::zero()];
+  for case in 0..24 {
+   for h in 0..2 {
+    for row in &mut idx[h].rows {for lane in 0..32 {
+     let n=match case {0=>0,1=>15,2=>((lane+h)%16) as u8,_=>(next()&15) as u8};
+     row[2*lane]=n;row[2*lane+1]=16+n;
+    }}
+   }
+   for w in &mut key {
+    let lo=match case {0=>0,1=>Q as i16/2,2=>-(Q as i16/2),_=>(next()%Q as u64) as i16-Q as i16/2};
+    let hi=match case {0=>0,1=>Q as i16/2,2=>-(Q as i16/2),_=>(next()%Q as u64) as i16-Q as i16/2};
+    *w=(lo as u16 as u32)|((hi as u16 as u32)<<16);
+   }
+   for (a,b) in got[0].v.iter_mut().zip(&mut want[0].v) {
+    for s in 0..2 {for l in 0..16 {
+     let v=match case {0=>0,1=>i32::MAX,2=>i32::MIN,_=>next() as i32};
+     a[s][l]=v;b[s][l]=v;
+    }}
+   }
+   unsafe {
+    let ins=[&idx[0],&idx[1]];
+    let bufs=[scratch[0].0.as_mut_ptr(),scratch[1].0.as_mut_ptr()];
+    vb::ntt_bin_batch32_multi_sink::<Q,LOCK,_>(
+     ins,
+     &mut MultiSink::<Q,RED>{bufs,k:key.as_ptr(),acc:want[0].v.as_mut_ptr() as *mut __m512i},
+    );
+    vb::ntt_bin_batch32_pair::<Q>(ins,key.as_ptr(),got[0].v.as_mut_ptr() as *mut i32,RED);
+   }
+   assert_eq!(got[0].v,want[0].v,"pair sink q={Q}, RED={RED}, case={case}");
+  }
+ }
+ #[test]
+ fn fused_pair_sink_matches_multi_sink() {
+  fused_pair_sink_check::<P0,false>();fused_pair_sink_check::<P0,true>();
+  fused_pair_sink_check::<P1,false>();fused_pair_sink_check::<P1,true>();
+ }
+ /// The lane slicer and cols16 slicer equal the direct B128 slicer on random words.
+ #[test]
+ fn lane_slicer_matches_staged() {
+  let mut x=0x243f6a8885a308d3u64;
+  let words:Vec<B128>=(0..128).map(|_|{x^=x<<13;x^=x>>7;x^=x<<17;let a=x;x^=x<<13;x^=x>>7;x^=x<<17;B128((a as u128)<<64|x as u128)}).collect();
+  unsafe {
+   let arr:&[B128;128]=&*(words.as_ptr() as *const [B128;128]);
+   let mut a=BinaryIndex32::zero();crate::simd::transpose_f162::slice_b128_into(arr,&mut a);
+   let ptrs:[*const B128;32]=core::array::from_fn(|p|words.as_ptr().add(4*p));
+   let mut b=BinaryIndex32::zero();crate::simd::transpose_f162::slice_b128_lanes_into(&ptrs,&mut b);
+   let c=crate::simd::transpose_f162::slice_b128_lanes(&ptrs);
+   let cols16:[*const B128;16]=core::array::from_fn(|l|words.as_ptr().add(8*l));
+   let mut d=BinaryIndex32::zero();crate::simd::transpose_f162::slice_b128_cols16_into(&cols16,&mut d);
+   for i in 0..162 {
+    assert_eq!(a.rows[i],b.rows[i],"row {i}");
+    assert_eq!(a.rows[i],c.rows[i],"row {i} (by value)");
+    assert_eq!(a.rows[i],d.rows[i],"row {i} (cols16)");
+   }
+  }
+ }
  #[test]
  fn centered_crt_boundaries() {
   unsafe{
@@ -750,10 +1209,16 @@ mod tests {
   for ch in xs.chunks(16) {
    let mut v=[0i32;16];for (d,&x) in v.iter_mut().zip(ch) {*d=x as i32;}
    let mut r=[0i32;16];
-   unsafe{_mm512_storeu_si512(r.as_mut_ptr() as *mut __m512i,red16::<Q>(_mm512_loadu_si512(v.as_ptr() as *const __m512i)));}
+   let mut c=[0i32;16];
+   unsafe{
+    let xv=_mm512_loadu_si512(v.as_ptr() as *const __m512i);
+    _mm512_storeu_si512(r.as_mut_ptr() as *mut __m512i,red16::<Q>(xv));
+    _mm512_storeu_si512(c.as_mut_ptr() as *mut __m512i,canon_red16::<Q>(xv));
+   }
    for i in 0..16 {
     assert!((r[i] as i64).abs()<2*Q as i64,"red16 {} of {}: {}",Q,v[i],r[i]);
     assert_eq!((r[i] as i64-v[i] as i64).rem_euclid(Q as i64),0,"red16 {} of {}: {}",Q,v[i],r[i]);
+    assert_eq!(c[i],(v[i] as i64).rem_euclid(Q as i64) as i32,"canon_red16 {} of {}: {}",Q,v[i],c[i]);
    }
   }
  }
@@ -773,9 +1238,9 @@ mod tests {
   let expected=*pos.iter().chain(neg.iter()).max().unwrap();
   assert_eq!(certify(&raw,CHUNK_BATCHES),expected);
  }
- /// The transposed-group sink against the folded-lane implementation it replaced, bit for bit,
- /// on random centered keys and random columns: 128 batches (fold-backs at both periods,
- /// 19 tail chunks, several full and partial lane flushes), every group size from 1 to 32
+ /// The transposed-group sink and the column-pair sink against the folded-lane implementation,
+ /// bit for bit, on random centered keys and random columns: 128 batches (fold-backs at both
+ /// periods, 16 tail chunks, several full and partial lane flushes), every group size from 1 to 32
  /// that the prover or the flush logic distinguishes, and a ragged last group.
  #[test]
  fn row_sink_matches_folded_reference() {
@@ -796,6 +1261,17 @@ mod tests {
   for g in [1usize,2,3,4,5,6,8,16,32] {
    let got=commit_columns_rows(&base,&tail,&cols,3,g);
    assert!(got==want,"group size {g} differs from the reference");
+  }
+  let pkeys=pair_keys(&base,&tail,3);
+  for workers in [1usize,2,3,8] {
+   let got=commit_columns_rows_pairs(&pkeys,&cols,workers);
+   assert!(got==want,"pair commitment ({workers} workers) differs from the reference");
+  }
+  for workers in [2usize,4,8] {
+   let mut rows:Vec<[u32;N]>=Vec::with_capacity(ncols*3);
+   commit_paired_pairs(&pkeys,&cols,len/8,workers,None,rows.as_mut_ptr() as usize);
+   unsafe{rows.set_len(ncols*3);}
+   assert!(rows==want,"paired pair commitment ({workers} workers) differs from the reference");
   }
   // the sibling-pair schedule, without placement: ragged groups, empty halves, more pairs
   // than groups

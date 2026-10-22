@@ -1,0 +1,15 @@
+[package]
+name = "labinius-reference126"
+version = "0.1.0"
+edition = "2021"
+build = false
+
+[lib]
+name = "labinius_reference126"
+path = "src/lib.rs"
+
+[dependencies]
+blake3 = "1.8"
+
+[features]
+labrador = []

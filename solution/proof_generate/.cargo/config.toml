@@ -1,2 +1,4 @@
 [build]
+# Keep the build-time native comparison free of concurrent Cargo compilations.
+jobs = 1
 rustflags = ["-C", "target-cpu=native"]

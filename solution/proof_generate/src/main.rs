@@ -26,6 +26,9 @@ use labinius::scheme::*;
 use labinius::{wire, Transcript};
 use serde::{Deserialize, Serialize};
 
+#[cfg(all(labinius_r9_enabled, target_arch = "x86_64", target_os = "linux"))]
+#[path = "../research/r9/mod.rs"]
+mod r9;
 mod keygen;
 mod modulus_choice;
 mod parameters;
@@ -44,6 +47,10 @@ struct Aligned64<T>(T);
 const EMBEDDED_KEY_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")).len();
 static EMBEDDED_KEY: Aligned64<[u8; EMBEDDED_KEY_LEN]> =
     Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")));
+
+const EMBEDDED_R9_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/r9-key.bin")).len();
+static EMBEDDED_R9: Aligned64<[u8; EMBEDDED_R9_LEN]> =
+    Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/r9-key.bin")));
 
 const LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -1368,7 +1375,11 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // ... and so do the embedded arranged keys' (otherwise a page-cache fault per 64 KB inside
     // the commitment, taken by all its workers at once as they reach the same batches: measured
     // 2 ms of commitment for 0.3-0.5 ms here).
-    let image: &[u8] = if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS { &EMBEDDED_HYBRID.0 } else { &[] };
+    let use_r9 = cfg!(all(labinius_r9_enabled, target_arch = "x86_64", target_os = "linux")) && modulus == MODULUS
+        && modulus == modulus_choice::HYBRID_MODULUS;
+    let image: &[u8] = if use_r9 { &EMBEDDED_R9.0 }
+        else if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS { &EMBEDDED_HYBRID.0 }
+        else { &[] };
     populate_words(values, image, workers);
     let matrix_time = clock.elapsed();
     // The hybrid modulus commits against the embedded arranged keys when the build host made
@@ -1383,9 +1394,19 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         None => keygen::build_key(modulus),
     };
     let setup_time = clock.elapsed();
-    let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
-    assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
-    let rows = if let Some(keys) = arranged {
+    let columns: Vec<&[B128]> = if use_r9 { Vec::new() } else { values.chunks_exact(COLUMN_LEN).collect() };
+    assert!(use_r9 || columns.len() == COLUMNS, "the table is COLUMNS columns");
+    #[cfg(all(labinius_r9_enabled, target_arch = "x86_64", target_os = "linux"))]
+    let r9_rows = if use_r9 {
+        // A synchronized dispatch cannot start from a worker still running the
+        // setup's idle job. The existing quiesce API safely stops and joins it;
+        // Output still lazily creates any unfinished mapping when needed.
+        if let Some(output) = output { labinius::par::pool().quiesce(output.job); }
+        Some(r9::commit(values, image))
+    } else { None };
+    #[cfg(not(all(labinius_r9_enabled, target_arch = "x86_64", target_os = "linux")))]
+    let r9_rows: Option<Vec<[u32; N]>> = None;
+    let rows = if let Some(rows) = r9_rows { rows } else if let Some(keys) = arranged {
         labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,hybrid_group())
     } else if modulus==modulus_choice::HYBRID_MODULUS {
         let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));

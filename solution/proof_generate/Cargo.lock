@@ -81,7 +81,15 @@ dependencies = [
  "bincode",
  "blake3",
  "labinius",
+ "labinius-reference126",
  "serde",
+]
+
+[[package]]
+name = "labinius-reference126"
+version = "0.1.0"
+dependencies = [
+ "blake3",
 ]
 
 [[package]]

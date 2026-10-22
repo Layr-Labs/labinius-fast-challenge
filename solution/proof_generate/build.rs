@@ -20,7 +20,19 @@ mod parameters;
 #[path = "src/rq.rs"]
 mod rq;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "research/r9/mod.rs"]
+mod r9;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "research/reference126/keygen.rs"]
+mod reference_keygen;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "research/native_gate.rs"]
+mod native_gate;
+
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(labinius_r9_enabled)");
+    println!("cargo:rerun-if-changed=research");
     let dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed=src/keygen.rs");
     println!("cargo:rerun-if-changed=src/modulus_choice.rs");
@@ -31,6 +43,20 @@ fn main() {
     std::fs::write(dir.join("key.bin"), image).expect("write the key image");
     std::fs::write(dir.join("tail-key.bin"), tail).expect("write the auxiliary key image");
     std::fs::write(dir.join("hybrid-key.bin"), hybrid).expect("write the arranged hybrid key image");
+    // Unsupported development hosts retain the baseline path. A native scored
+    // host must pass the complete three-backend opportunity screen before the
+    // candidate is compiled into the actual prover. Failure is explicit.
+    std::fs::write(dir.join("r9-key.bin"), []).unwrap();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if host_can_run() && parameters::MODULUS == modulus_choice::HYBRID_MODULUS {
+        let image = r9::keys::build_image();
+        let bytes = unsafe { std::slice::from_raw_parts(image.as_ptr() as *const u8, image.len()) };
+        std::fs::write(dir.join("r9-key.bin"), bytes).unwrap();
+        drop(image);
+        assert!(native_gate::evaluate(&dir), "R9 closed: complete commitment did not clear1percent median gain and4of5wins versus BOTH8afg32 andPR126; inspect native gate log");
+        println!("cargo:rustc-cfg=labinius_r9_enabled");
+        println!("cargo:warning=R9 opportunity screen passed; whole-prover five-proof improvement remains unverified");
+    }
 }
 
 #[cfg(target_arch = "x86_64")]

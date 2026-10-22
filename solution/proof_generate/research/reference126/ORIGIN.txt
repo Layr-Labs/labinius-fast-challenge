@@ -1,0 +1,6 @@
+Read-only comparison source from Layr-Labs/labinius-fast-challenge PR126,
+commit 52f946046db3d7ec0816e92951629dc6bdcfae23.
+PCS src/ is copied byte-for-byte. Manifest uses explicit values and build=false
+so the pure-Rust comparison does not run a second Labrador C build.
+keygen.rs adds a crate alias; its algorithms are unchanged.
+Only the build-time native comparison uses this package.

@@ -264,6 +264,25 @@ impl Pool {
         self.shared.busy.store(false, Ordering::Release);
     }
 
+    /// Dispatch as many tasks as runners, with no inline fallback of `run`.
+    /// Tasks may synchronize on a barrier of this width.
+    /// Barrier-synchronized tasks require every runner; if the pool is already
+    /// busy, running an idle chunk, nested, or has another width, no task is called
+    /// and this returns false.
+    pub fn try_run_concurrent<F: Fn(usize) + Sync>(&self, tasks: usize, f: F) -> bool {
+        if tasks != self.width || tasks < 2 || tasks > MAX_TASKS
+            || self.shared.idle_running.load(Ordering::Acquire) != 0
+        {
+            return false;
+        }
+        if self.shared.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            return false;
+        }
+        self.dispatch(tasks, &f);
+        self.shared.busy.store(false, Ordering::Release);
+        true
+    }
+
     fn dispatch<'a>(&self, tasks: usize, f: &'a (dyn Fn(usize) + Sync + 'a)) {
         let s = self.shared;
         // `run` does not return before the dispatch's tasks are done, and no runner touches the

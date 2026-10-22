@@ -1,0 +1,11 @@
+{
+  "baseCommit": "52f946046db3d7ec0816e92951629dc6bdcfae23",
+  "candidate": "N1 same-prime two-quarter prefix index reuse on exact PR126",
+  "files": [
+    {
+      "path": "labinius/crates/pcs/src/simd/ntt/bin_asm.rs",
+      "bytes": 61499,
+      "sha256": "178ba9d40922caebf84fb3a5a3d7279e78640aae66c832369074f706277ded31"
+    }
+  ]
+}

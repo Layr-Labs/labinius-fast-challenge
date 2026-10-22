@@ -141,6 +141,11 @@ unsafe fn xor3(a: __m512i, b: __m512i, c: __m512i) -> __m512i {
 
 const TILE: usize = 64;
 
+// Canonical F162 values have 162 significant bits. Linear combinations of their
+// basis images therefore have zero bytes 21..23. Keep the 24-plane transpose
+// layout, but leave those three planes explicitly zero instead of applying GFNI.
+const F162_LIVE_BYTES: usize = 162usize.div_ceil(8);
+
 /// `v[k] = sum_j bit_k(pi0[j]) eq_hi[j]`, a `128 x n` by `n x 128` bit product: per tile the
 /// bit-transposed bytes of `pi0` are the matrices, those of `eq_hi` the vectors, and
 /// `acc[h][kb].qword[i].byte[t].bit[k']` sums `V[8kb + 7 - k'][8(8h + i) + t]`.
@@ -407,7 +412,7 @@ fn poly_from_eq(eqs: &[&[B128]], batches: &[Vec<F162>], out: &mut super::sumchec
             let mut acc = [_mm512_setzero_si512(); 24];
             for (eq, m) in eqs.iter().zip(&ms) {
                 transpose_tile(eq.as_ptr().add(TILE * t) as *const u8, &mut xe);
-                for (a, row) in acc.iter_mut().zip(m) {
+                for (a, row) in acc[..F162_LIVE_BYTES].iter_mut().zip(m) {
                     for k in (0..16).step_by(2) {
                         *a = xor3(
                             *a,
@@ -1290,31 +1295,35 @@ unsafe fn partials_row(
             *aps.add(g) = slice_group(w.add(8 * g), &idx, ident);
         }
         let next = if q + 1 < blocks { w.add(stride) } else { next_row };
-        for (h, acc_qh) in acc_q.iter_mut().enumerate() {
-            let mut a = *acc_qh;
+        // PR128's kp split: share each matrix broadcast across both halves, keeping
+        // the same sixteen accumulator vectors and the original full sliced-word buffer.
+        for kp in 0..2 {
+            let mut a0: [__m512i; 8] = core::array::from_fn(|k| acc_q[0][8 * kp + k]);
+            let mut a1: [__m512i; 8] = core::array::from_fn(|k| acc_q[1][8 * kp + k]);
             let mut g = 0;
             while g < groups {
                 if !next.is_null() {
-                    // One group of the next block per pair of groups here: half the groups
-                    // in each of the two passes.
-                    let p = next.add(8 * (h * groups / 2 + g / 2)) as *const i8;
+                    // The two passes retain the original next-block prefetch addresses.
+                    let p = next.add(8 * (kp * groups / 2 + g / 2)) as *const i8;
                     _mm_prefetch::<_MM_HINT_T1>(p);
                     _mm_prefetch::<_MM_HINT_T1>(p.add(64));
                 }
-                let x0 = (*xs.add(g))[h];
-                let x1 = (*xs.add(g + 1))[h];
+                let [x0_0, x0_1] = *xs.add(g);
+                let [x1_0, x1_1] = *xs.add(g + 1);
                 let m0 = aps.add(g) as *const i64;
                 let m1 = aps.add(g + 1) as *const i64;
-                for k in 0..16 {
-                    a[k] = xor3(
-                        a[k],
-                        affine(x0, _mm512_set1_epi64(*m0.add(k))),
-                        affine(x1, _mm512_set1_epi64(*m1.add(k))),
-                    );
+                for k in 0..8 {
+                    let b0 = _mm512_set1_epi64(*m0.add(8 * kp + k));
+                    let b1 = _mm512_set1_epi64(*m1.add(8 * kp + k));
+                    a0[k] = xor3(a0[k], affine(x0_0, b0), affine(x1_0, b1));
+                    a1[k] = xor3(a1[k], affine(x0_1, b0), affine(x1_1, b1));
                 }
                 g += 2;
             }
-            *acc_qh = a;
+            for k in 0..8 {
+                acc_q[0][8 * kp + k] = a0[k];
+                acc_q[1][8 * kp + k] = a1[k];
+            }
         }
     }
 }
@@ -1391,8 +1400,19 @@ fn partials_from_blocks(v: &[Vec<B128>], r_hi: &[B128]) -> Vec<B128> {
         (0..prefix).filter(|&k| q & (1 << (prefix - 1 - k)) != 0)
             .fold(B128::ONE, |a, k| a * c[k])
     }).collect();
-    (0..PACK).map(|b| v.iter().zip(&scales)
-        .fold(B128::ZERO, |a, (v, &c)| a + c * v[b])).collect()
+    let mut out = v[0].clone();
+    let mut scaled = [B128::ZERO; PACK];
+    unsafe {
+        for (vq, &scale) in v[1..].iter().zip(&scales[1..]) {
+            scale_b128_row(vq, scale, scaled.as_mut_ptr());
+            for i in (0..PACK).step_by(4) {
+                let a = _mm512_loadu_si512(out.as_ptr().add(i) as *const __m512i);
+                let b = _mm512_loadu_si512(scaled.as_ptr().add(i) as *const __m512i);
+                _mm512_storeu_si512(out.as_mut_ptr().add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+            }
+        }
+    }
+    out
 }
 
 // =============================================================================================
@@ -1592,25 +1612,48 @@ unsafe fn horiz8(acc: [__m512i; 12]) -> F162 {
     out
 }
 
+#[inline(always)]
+unsafe fn map_row(xe: &[__m512i; 16], row: &[u64; 16]) -> __m512i {
+    let mut a = _mm512_xor_si512(
+        affine(xe[0], _mm512_set1_epi64(row[0] as i64)),
+        affine(xe[1], _mm512_set1_epi64(row[1] as i64)),
+    );
+    for k in (2..16).step_by(2) {
+        a = xor3(
+            a,
+            affine(xe[k], _mm512_set1_epi64(row[k] as i64)),
+            affine(xe[k + 1], _mm512_set1_epi64(row[k + 1] as i64)),
+        );
+    }
+    a
+}
+
+#[inline(always)]
+unsafe fn map_xe(xe: &[__m512i; 16], m: &[[u64; 16]; 24], out: &mut [[__m512i; 8]; 3]) {
+    debug_assert_eq!(F162_LIVE_BYTES, 21);
+    for l in 0..2 {
+        out[l] = untranspose_planes(core::array::from_fn(|c| map_row(xe, &m[8 * l + c])));
+    }
+    let z = _mm512_setzero_si512();
+    out[2] = untranspose_planes([
+        map_row(xe, &m[16]),
+        map_row(xe, &m[17]),
+        map_row(xe, &m[18]),
+        map_row(xe, &m[19]),
+        map_row(xe, &m[20]),
+        z,
+        z,
+        z,
+    ]);
+}
+
 /// The map `m` ([`eq_matrices`]) applied to the 64 words at `eq`, word-sliced: `out[l][g]` is
 /// limb `l` of words `8 g .. 8 g + 8` — the tile of [`poly_from_eq`], kept in registers.
 #[inline(always)]
 unsafe fn map_tile(eq: *const B128, m: &[[u64; 16]; 24], out: &mut [[__m512i; 8]; 3]) {
     let mut xe = [_mm512_setzero_si512(); 16];
     transpose_tile(eq as *const u8, &mut xe);
-    let mut acc = [_mm512_setzero_si512(); 24];
-    for (a, row) in acc.iter_mut().zip(m) {
-        for k in (0..16).step_by(2) {
-            *a = xor3(
-                *a,
-                affine(xe[k], _mm512_set1_epi64(row[k] as i64)),
-                affine(xe[k + 1], _mm512_set1_epi64(row[k + 1] as i64)),
-            );
-        }
-    }
-    for (l, o) in out.iter_mut().enumerate() {
-        *o = untranspose_planes(core::array::from_fn(|c| acc[8 * l + c]));
-    }
+    map_xe(&xe, m, out);
 }
 
 /// [`map_tile`] for two maps of the same 64 words, transposing them once.
@@ -1624,21 +1667,8 @@ unsafe fn map_tile2(
 ) {
     let mut xe = [_mm512_setzero_si512(); 16];
     transpose_tile(eq as *const u8, &mut xe);
-    for (m, out) in [(m, out), (mp, outp)] {
-        let mut acc = [_mm512_setzero_si512(); 24];
-        for (a, row) in acc.iter_mut().zip(m) {
-            for k in (0..16).step_by(2) {
-                *a = xor3(
-                    *a,
-                    affine(xe[k], _mm512_set1_epi64(row[k] as i64)),
-                    affine(xe[k + 1], _mm512_set1_epi64(row[k + 1] as i64)),
-                );
-            }
-        }
-        for (l, o) in out.iter_mut().enumerate() {
-            *o = untranspose_planes(core::array::from_fn(|c| acc[8 * l + c]));
-        }
-    }
+    map_xe(&xe, m, out);
+    map_xe(&xe, mp, outp);
 }
 
 /// The first block of the `eq` expansion in factored form, as
@@ -1751,8 +1781,60 @@ unsafe fn message_range(
 /// Words ahead of the current eight that [`materialize_prefix_range`] prefetches in each stream.
 const MATERIALIZE_AHEAD: usize = 64;
 
+#[inline(always)]
+unsafe fn bcast4(x: F162) -> [__m512i; 4] {
+    let w0 = _mm512_set1_epi64(x.0[0] as i64);
+    let w1 = _mm512_set1_epi64(x.0[1] as i64);
+    let w2 = _mm512_set1_epi64(x.0[2] as i64);
+    [w0, w1, w2, _mm512_xor_si512(w0, w1)]
+}
+
+#[inline(always)]
+unsafe fn prods_word10(a: [__m512i; 4], (b0, b1): (__m512i, __m512i)) -> [__m512i; 10] {
+    let sb = _mm512_xor_si512(b0, b1);
+    [
+        _mm512_clmulepi64_epi128::<0x00>(a[0], b0),
+        _mm512_clmulepi64_epi128::<0x11>(a[0], b0),
+        _mm512_clmulepi64_epi128::<0x00>(a[1], b1),
+        _mm512_clmulepi64_epi128::<0x11>(a[1], b1),
+        _mm512_clmulepi64_epi128::<0x00>(a[3], sb),
+        _mm512_clmulepi64_epi128::<0x11>(a[3], sb),
+        _mm512_clmulepi64_epi128::<0x00>(a[2], b0),
+        _mm512_clmulepi64_epi128::<0x11>(a[2], b0),
+        _mm512_clmulepi64_epi128::<0x00>(a[2], b1),
+        _mm512_clmulepi64_epi128::<0x11>(a[2], b1),
+    ]
+}
+
+#[inline(always)]
+unsafe fn mac_word10(acc: &mut [__m512i; 10], a: [__m512i; 4], b: (__m512i, __m512i)) {
+    let p = prods_word10(a, b);
+    for i in 0..10 {
+        acc[i] = _mm512_xor_si512(acc[i], p[i]);
+    }
+}
+
+#[inline(always)]
+unsafe fn reduce_word10(acc: [__m512i; 10]) -> [__m512i; 3] {
+    let z = _mm512_setzero_si512();
+    super::f162::reduce_soa8([
+        acc[0],
+        acc[1],
+        acc[2],
+        acc[3],
+        z,
+        z,
+        acc[4],
+        acc[5],
+        _mm512_xor_si512(acc[6], acc[0]),
+        _mm512_xor_si512(acc[7], acc[1]),
+        _mm512_xor_si512(acc[8], acc[2]),
+        _mm512_xor_si512(acc[9], acc[3]),
+    ])
+}
+
 unsafe fn materialize_prefix_range(
-    words: *const B128, len: usize, weights: &[[__m512i; 3]],
+    words: *const B128, len: usize, weights: &[[__m512i; 4]],
     dst: [*mut u64; 3], range: core::ops::Range<usize>,
 ) {
     let mut j0 = range.start;
@@ -1761,19 +1843,18 @@ unsafe fn materialize_prefix_range(
         for (s, ws) in weights.chunks(BIND_WAYS).enumerate() {
             let q0 = s * BIND_WAYS;
             for j in (j0..j1).step_by(8) {
-                let mut acc = [_mm512_setzero_si512(); 12];
-                for (i, &weight) in ws.iter().enumerate() {
-                    // The streams' lines 1 KB ahead: sixteen read streams per runner, and the
-                    // hardware prefetcher does not run far enough ahead of the clmul work on
-                    // all of them (measured 9.4 -> 8.1 ms for the round; 0.5 KB and 1.5 KB
-                    // ahead are both slower, 32 KB much slower). A prefetch past the end of the
-                    // table is harmless.
-                    let a = words.wrapping_add(j + MATERIALIZE_AHEAD + (q0 + i) * len) as *const i8;
+                let a0 = words.wrapping_add(j + MATERIALIZE_AHEAD + q0 * len) as *const i8;
+                _mm_prefetch::<_MM_HINT_T0>(a0);
+                _mm_prefetch::<_MM_HINT_T0>(a0.wrapping_add(64));
+                let mut acc = prods_word10(ws[0], split_words(words.add(j + q0 * len)));
+                for (i, &weight) in ws.iter().enumerate().skip(1) {
+                    let q = q0 + i;
+                    let a = words.wrapping_add(j + MATERIALIZE_AHEAD + q * len) as *const i8;
                     _mm_prefetch::<_MM_HINT_T0>(a);
                     _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64));
-                    super::f162::mac_soa8_word(&mut acc, weight, load_words(words.add(j + (q0 + i) * len)));
+                    mac_word10(&mut acc, weight, split_words(words.add(j + q * len)));
                 }
-                let mut v = super::f162::reduce_soa8(acc);
+                let mut v = reduce_word10(acc);
                 if s > 0 {
                     v = xor3p(v, load_p(Src::Planes(dst.map(|p| p as *const u64)), j));
                 }
@@ -1799,7 +1880,35 @@ const BIND_STRETCH: usize = 4096;
 /// instances there take the split path too.)
 const PAR_FROM: usize = if cfg!(test) { 1 << 8 } else { 1 << 10 };
 
+/// `f` over `0 .. n` in TILE-aligned chunks handed out from a shared counter, the parts summed
+/// (F162 addition is exact and order-free, so the result does not depend on who took which
+/// chunk). Eight chunks per thread: a runner that starts late or shares its core with another
+/// process takes fewer of them instead of holding the round up. Whole on the calling thread
+/// below [`PAR_FROM`].
+fn dynamic_sum2(n: usize, threads: usize, f: impl Fn(core::ops::Range<usize>) -> [F162; 2] + Sync) -> [F162; 2] {
+    if n < PAR_FROM {
+        return f(0..n);
+    }
+    let chunk = n.div_ceil(8 * threads.max(1)).div_ceil(TILE) * TILE;
+    let chunks = n.div_ceil(chunk);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let parts: Vec<[F162; 2]> = crate::par::pool().map(threads.min(chunks), |_| {
+        let mut m = [F162::ZERO; 2];
+        loop {
+            let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if k >= chunks {
+                break m;
+            }
+            let r = f(k * chunk..((k + 1) * chunk).min(n));
+            m[0] += r[0];
+            m[1] += r[1];
+        }
+    });
+    parts.into_iter().fold([F162::ZERO; 2], |a, p| [a[0] + p[0], a[1] + p[1]])
+}
+
 /// `0 .. n` cut for the pool, or whole when `n` is below [`PAR_FROM`].
+#[allow(dead_code)]
 fn round_ranges(n: usize, threads: usize) -> Vec<core::ops::Range<usize>> {
     if n < PAR_FROM {
         vec![0..n]
@@ -2041,6 +2150,15 @@ impl<'a> LeanSwitch<'a> {
     /// with F162 weights, combine the remaining groups using their GHASH eq ratios,
     /// then apply L_k (for e0) or L'_k (for einf) to the resulting bit partials.
     fn message_from_blocks(&self) -> [F162; 2] {
+        static BASIS: [B128; PACK] = {
+            let mut b = [B128::ZERO; PACK];
+            let mut i = 0;
+            while i < PACK {
+                b[i] = B128(1u128 << i);
+                i += 1;
+            }
+            b
+        };
         let sets = self.blocks.as_ref().expect("partial sets");
         let prefix = sets.len().trailing_zeros() as usize;
         let k = self.round;
@@ -2051,25 +2169,56 @@ impl<'a> LeanSwitch<'a> {
                 .fold(B128::ONE, |a, i| a * ratios[i])
         }).collect();
         let rs = self.prefix_r;
-        let tables = [psi_table(&self.l), psi_table(&self.lp)];
+        let ml = eq_matrices(&self.l);
+        let mlp = eq_matrices(&self.lp);
         let mut msg = [F162::ZERO; 2];
+        let mut sums0 = [B128::ZERO; PACK];
+        let mut sums1 = [B128::ZERO; PACK];
+        let mut tmp = [B128::ZERO; PACK];
         for z in 0..1usize << k {
             let weight = (0..k).fold(F162::ONE, |a, i| {
                 a * if z & (1 << (k - 1 - i)) != 0 { rs[i] } else { F162::ONE + rs[i] }
             });
-            let mut terms = [F162::ZERO; 2];
-            for b in 0..PACK {
-                let mut sums = [B128::ZERO; 2];
-                for (s, &scale) in scales.iter().enumerate() {
-                    let group = (z << (prefix - k)) | s;
-                    sums[0] = sums[0] + scale * sets[group][b];
-                    sums[1] = sums[1] + scale * (sets[group][b] + sets[group | (1 << suffix)][b]);
+            let g0 = z << (prefix - k);
+            let g1 = g0 | (1 << suffix);
+            sums0.copy_from_slice(&sets[g0]);
+            sums1.copy_from_slice(&sets[g1]);
+            unsafe {
+                for (s, &scale) in scales.iter().enumerate().skip(1) {
+                    scale_b128_row(&sets[g0 | s], scale, tmp.as_mut_ptr());
+                    for i in (0..PACK).step_by(4) {
+                        let a = _mm512_loadu_si512(sums0.as_ptr().add(i) as *const __m512i);
+                        let b = _mm512_loadu_si512(tmp.as_ptr().add(i) as *const __m512i);
+                        _mm512_storeu_si512(sums0.as_mut_ptr().add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+                    }
+                    scale_b128_row(&sets[g1 | s], scale, tmp.as_mut_ptr());
+                    for i in (0..PACK).step_by(4) {
+                        let a = _mm512_loadu_si512(sums1.as_ptr().add(i) as *const __m512i);
+                        let b = _mm512_loadu_si512(tmp.as_ptr().add(i) as *const __m512i);
+                        _mm512_storeu_si512(sums1.as_mut_ptr().add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+                    }
                 }
-                let mut monomial = F162::ZERO;
-                monomial.0[b / 64] = 1 << (b % 64);
-                for t in 0..2 { terms[t] += psi(&tables[t], sums[t]) * monomial; }
+                for i in (0..PACK).step_by(4) {
+                    let a = _mm512_loadu_si512(sums0.as_ptr().add(i) as *const __m512i);
+                    let b = _mm512_loadu_si512(sums1.as_ptr().add(i) as *const __m512i);
+                    _mm512_storeu_si512(sums1.as_mut_ptr().add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+                }
+                for (t, (sums, m)) in [(&sums0, &ml), (&sums1, &mlp)].into_iter().enumerate() {
+                    let mut acc = [_mm512_setzero_si512(); 12];
+                    let mut av = [[_mm512_setzero_si512(); 8]; 3];
+                    for tile in 0..PACK / TILE {
+                        map_tile(sums.as_ptr().add(TILE * tile), m, &mut av);
+                        for g in 0..8 {
+                            super::f162::mac_soa8_word(
+                                &mut acc,
+                                [av[0][g], av[1][g], av[2][g]],
+                                load_words(BASIS.as_ptr().add(TILE * tile + 8 * g)),
+                            );
+                        }
+                    }
+                    msg[t] += weight * horiz8(acc);
+                }
             }
-            for t in 0..2 { msg[t] += weight * terms[t]; }
         }
         msg
     }
@@ -2109,17 +2258,8 @@ impl<'a> LeanSwitch<'a> {
         }
         let ml = eq_matrices(&self.l);
         let mlp = eq_matrices(&self.lp);
-        let runs = round_ranges(half, self.threads);
         let eq = self.eq.src();
-        let parts: Vec<[F162; 2]> = crate::par::pool().map(runs.len(), |i| unsafe {
-            message_range(eq, src, half, &ml, &mlp, runs[i].clone())
-        });
-        let mut m = [F162::ZERO; 2];
-        for part in parts {
-            m[0] += part[0];
-            m[1] += part[1];
-        }
-        m
+        dynamic_sum2(half, self.threads, |r| unsafe { message_range(eq, src, half, &ml, &mlp, r) })
     }
 
     fn dst(&mut self) -> [*mut u64; 3] {
@@ -2193,7 +2333,7 @@ impl<'a> LeanSwitch<'a> {
                 self.round += 1;
                 return;
             }
-            let weights: Vec<_> = weights.into_iter().map(|w| unsafe { bcast3(w) }).collect();
+            let weights: Vec<_> = weights.into_iter().map(|w| unsafe { bcast4(w) }).collect();
             let words = self.pi0.as_ptr() as usize;
             let dst = dst.map(|p| p as usize);
             // Handed out in chunks from a shared counter, like the partials' rows: a runner
@@ -2243,27 +2383,11 @@ impl<'a> LeanSwitch<'a> {
         }
         let ml = eq_matrices(&self.l);
         let mlp = eq_matrices(&self.lp);
-        let runs = round_ranges(hh, self.threads);
         let eq = self.eq.src();
         let dst = dst.map(|p| p as usize);
-        let parts: Vec<[F162; 2]> = crate::par::pool().map(runs.len(), |i| unsafe {
-            fold_message_range(
-                eq,
-                src,
-                dst.map(|p| p as *mut u64),
-                half,
-                hh,
-                r,
-                &ml,
-                &mlp,
-                runs[i].clone(),
-            )
+        let m = dynamic_sum2(hh, self.threads, |range| unsafe {
+            fold_message_range(eq, src, dst.map(|p| p as *mut u64), half, hh, r, &ml, &mlp, range)
         });
-        let mut m = [F162::ZERO; 2];
-        for part in parts {
-            m[0] += part[0];
-            m[1] += part[1];
-        }
         self.pending = Some(m);
         self.round += 1;
     }
@@ -2568,5 +2692,59 @@ mod lean_tests {
         }
         let r = B128(next(&mut x));
         assert_eq!((B128::ONE + r) * b128_inv(B128::ONE + r), B128::ONE);
+    }
+}
+
+#[cfg(test)]
+mod live_byte_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_maps_match_scalar_with_poisoned_output() {
+        let mut state = 0x1516_1718_1920_2122u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mask = (1u64 << 34) - 1;
+        let mut images: Vec<_> = (0..PACK)
+            .map(|_| F162([next(), next(), next() & mask]))
+            .collect();
+        for round in 0..24 {
+            let d = B128(next() as u128 | ((next() as u128) << 64));
+            let composed = compose_scale(&images, d);
+            let (m, mp) = (eq_matrices(&images), eq_matrices(&composed));
+            assert!(m[F162_LIVE_BYTES..].iter().flatten().all(|&x| x == 0));
+            assert!(mp[F162_LIVE_BYTES..].iter().flatten().all(|&x| x == 0));
+            for mode in 0..5 {
+                let words: [B128; TILE] = core::array::from_fn(|i| match mode {
+                    0 | 1 => B128(1u128 << (64 * mode + i)),
+                    2 => B128((1u128 << i) ^ (1u128 << ((i + round + 1) % 128))),
+                    3 => B128(!0),
+                    _ => B128(next() as u128 | ((next() as u128) << 64)),
+                });
+                unsafe {
+                    let poison = [[_mm512_set1_epi64(-1); 8]; 3];
+                    let (mut a, mut b, mut single) = (poison, poison, poison);
+                    map_tile2(words.as_ptr(), &m, &mp, &mut a, &mut b);
+                    map_tile(words.as_ptr(), &m, &mut single);
+                    let lanes = |v| core::mem::transmute::<[[__m512i; 8]; 3], [[[u64; 8]; 8]; 3]>(v);
+                    assert_eq!(lanes(a), lanes(single));
+                    for (out, images) in [(lanes(a), &images), (lanes(b), &composed)] {
+                        for i in 0..TILE {
+                            let actual = F162(core::array::from_fn(|l| out[l][i / 8][i % 8]));
+                            assert_eq!(actual, apply_images(images, words[i]));
+                            assert_eq!(actual.0[2] & !mask, 0);
+                        }
+                    }
+                }
+            }
+            let r = F162([next(), next(), next() & mask]);
+            for (l, lp) in images.iter_mut().zip(composed) {
+                *l += r * lp;
+            }
+        }
     }
 }

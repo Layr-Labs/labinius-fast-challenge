@@ -1127,12 +1127,15 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
         }
         let r = fruns[i - cruns.len()].clone();
         let mut dst = out.add(folded_at + FOLDED_BYTES * N * r.start);
-        let mut wide = [0i32; N];
         for e in &elements[r] {
-            for (w, &c) in wide.iter_mut().zip(e.v.iter()) {
-                *w = (c as i32).to_le();
+            // The wire offset need not align to i32. Widen directly into the file instead
+            // of filling a stack row and then copying it; each run owns these bytes.
+            for (j, &c) in e.v.iter().enumerate() {
+                core::ptr::write_unaligned(
+                    dst.add(FOLDED_BYTES * j).cast::<i32>(),
+                    (c as i32).to_le(),
+                );
             }
-            core::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, dst, FOLDED_BYTES * N);
             dst = dst.add(FOLDED_BYTES * N);
         }
     });
@@ -1789,7 +1792,7 @@ mod tests {
                         .map(|_| {
                             let mut e = labinius::RingElement648::zero(Representation::Coefficients);
                             for c in e.v.iter_mut() {
-                                *c = (next() % 4001) as i16 - 2000;
+                                *c = next() as i16;
                             }
                             e
                         })
@@ -1797,9 +1800,18 @@ mod tests {
                 ),
             };
             let layout = ProofLayout::of_parts(&parts);
-            let mut out = vec![0xA5u8; layout.len()];
-            unsafe { encode_into(&parts, &layout, out.as_mut_ptr()) };
-            assert_eq!(out, codec().serialize(&parts.into_proof()).unwrap());
+            let mut outputs = Vec::new();
+            for offset in 0..4 {
+                let mut out = vec![0xA5u8; layout.len() + 8];
+                unsafe { encode_into(&parts, &layout, out.as_mut_ptr().add(offset)) };
+                assert!(out[..offset].iter().all(|&b| b == 0xA5));
+                assert!(out[offset + layout.len()..].iter().all(|&b| b == 0xA5));
+                outputs.push(out[offset..offset + layout.len()].to_vec());
+            }
+            let expected = codec().serialize(&parts.into_proof()).unwrap();
+            for out in outputs {
+                assert_eq!(out, expected);
+            }
         }
         assert_eq!(ProofLayout::of_instance(MODULUS).len(), 13_958_612, "the default proof's length");
     }
@@ -2051,15 +2063,19 @@ mod tests {
     }
     #[test]
     fn hybrid_commitment_matches_schoolbook_under_new_modulus() {
-        let q=modulus_choice::HYBRID_MODULUS;let ring=128usize;let columns=4;
+        // Nine batches cross the seven-batch exact-CRT boundary. Three columns
+        // grouped by two also cover a ragged final group.
+        let q=modulus_choice::HYBRID_MODULUS;let ring=288usize;let columns=3;
         let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
         let matrix=rq::ajtai_matrix(q,ring);
         let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
         let tail=keygen::build_tail_key_from_matrix(&matrix);
         let mut t=Transcript::new(b"hybrid-commitment-regression");
-        let values=t.sample_b128(b"binary",ring*4*columns);
+        let mut values=t.sample_b128(b"binary",ring*4*columns);
+        values[..ring*4].fill(B128::ZERO);
+        values[ring*4..ring*8].fill(B128(u128::MAX));
         let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
-        let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,4);
+        let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,2);
         let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,3,None);
         let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
         for c in 0..columns {

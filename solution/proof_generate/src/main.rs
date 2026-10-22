@@ -1597,8 +1597,12 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is in the shared mapping and stderr is flushed above; skip libc's exit
+    // handlers so the process is reaped as soon as the kernel has torn its mappings down.
+    extern "C" {
+        fn _exit(code: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 #[cfg(test)]

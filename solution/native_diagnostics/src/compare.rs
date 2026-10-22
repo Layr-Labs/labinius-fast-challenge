@@ -9,7 +9,7 @@ pub fn run<T: PartialEq>(case: &str, variants: &mut [(&str, &mut dyn FnMut() -> 
     ];
     let mut expected = None;
     let mut samples = [[0u128; 8]; 4];
-    println!("native-diag case={case} variants=4 validation_passes=1 warmups=2 samples=8");
+    println!("native-diag case={case} variants=4 initial_calls=4 validation_passes=1 warmups=2 samples=8 total_calls=44");
     for (index, (name, run)) in variants.iter_mut().enumerate() {
         let clock = Instant::now();
         let output = black_box(run());

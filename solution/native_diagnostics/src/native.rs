@@ -2,6 +2,9 @@ use labinius::fields::{crossfield as cf, scalar::B128};
 use std::io::Write;
 use std::time::Instant;
 
+#[path="inverse_driver.rs"]
+mod inverse_driver;
+
 const LOG_PACKED: usize = 24;
 const LOG_VARS: usize = 31;
 const COLUMNS: usize = 1024;
@@ -31,24 +34,7 @@ fn write_fixed_input(path: &str) {
     }
 }
 
-pub fn run() {
-    assert!(is_x86_feature_detected!("avx512f")
-        && is_x86_feature_detected!("avx512bw")
-        && is_x86_feature_detected!("avx512vl")
-        && is_x86_feature_detected!("avx512vbmi")
-        && is_x86_feature_detected!("avx512vbmi2")
-        && is_x86_feature_detected!("avx512vnni")
-        && is_x86_feature_detected!("gfni"), "native diagnostic needs the scored CPU features");
-    let clock = Instant::now();
-    let workers = labinius::par::threads();
-    assert_eq!(workers, 8, "native diagnostic needs eight available CPUs");
-    extern "C" { fn sched_getscheduler(pid: i32) -> i32; }
-    let policy = unsafe { sched_getscheduler(0) };
-    assert_eq!(policy, 0, "native diagnostic needs normal scheduling");
-    let paired = labinius::par::CorePlacement::for_sibling_pairs(workers).is_some();
-    println!("native-diag config workers={workers} sibling_pairs={paired} words={} columns={COLUMNS} column_words={COLUMN_LEN} scheduling_policy={policy} allocator=production-copy profile=release opt=3 lto=fat codegen_units=1", Table::WORDS);
-    println!("native-diag config rustflags={:?} encoded_rustflags={:?}", option_env!("LABINIUS_DIAGNOSTIC_RUSTFLAGS"), option_env!("LABINIUS_DIAGNOSTIC_ENCODED_RUSTFLAGS"));
-
+fn run_commit(workers: usize, clock: &Instant) {
     let path = std::env::args().nth(1).expect("fixed diagnostic input path");
     write_fixed_input(&path);
     let table = Table::load(&path);
@@ -67,14 +53,34 @@ pub fn run() {
     assert_eq!(columns.len(), COLUMNS);
     println!("native-diag phase=setup elapsed_ns={} input_address_mod4096={} key_address_mod64={} key_bytes={KEY_LEN}", clock.elapsed().as_nanos(), values.as_ptr() as usize % 4096, KEY.0.as_ptr() as usize % 64);
 
+    crate::pair_checks::run(keys, &columns);
     let mut baseline = || labinius::simd::commit::hybrid::commit_columns_rows_pairs(keys, &columns, workers);
-    let mut shared = || crate::commit_adapter::commit_columns_rows_pairs::<true, true>(keys, &columns, workers);
-    let mut no_wait = || crate::commit_adapter::commit_columns_rows_pairs::<false, false>(keys, &columns, workers);
-    let mut both = || crate::commit_adapter::commit_columns_rows_pairs::<true, false>(keys, &columns, workers);
-    crate::compare::run("commit", &mut [
-        ("baseline", &mut baseline), ("shared-tail", &mut shared),
-        ("no-wait", &mut no_wait), ("shared-tail-no-wait", &mut both),
-    ]);
+    let mut omega = || crate::commit_adapter::commit_columns_rows_pairs::<true>(keys, &columns, workers);
+    crate::compare::run("commit", &mut baseline, &mut omega);
     std::hint::black_box(&planes);
+}
+
+pub fn run() {
+    assert!(is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vl")
+        && is_x86_feature_detected!("avx512vbmi")
+        && is_x86_feature_detected!("avx512vbmi2")
+        && is_x86_feature_detected!("avx512vnni")
+        && is_x86_feature_detected!("gfni"), "native diagnostic needs the scored CPU features");
+    let clock = Instant::now();
+    let workers = labinius::par::threads();
+    assert_eq!(workers, 8, "native diagnostic needs eight available CPUs");
+    extern "C" { fn sched_getscheduler(pid: i32) -> i32; }
+    let policy = unsafe { sched_getscheduler(0) };
+    assert_eq!(policy, 0, "native diagnostic needs normal scheduling");
+    let paired = labinius::par::CorePlacement::for_sibling_pairs(workers).is_some();
+    println!("native-diag config workers={workers} sibling_pairs={paired} words={} columns={COLUMNS} column_words={COLUMN_LEN} scheduling_policy={policy} allocator=production-copy profile=release opt=3 lto=fat codegen_units=1", Table::WORDS);
+    println!("native-diag config rustflags={:?} encoded_rustflags={:?}", option_env!("LABINIUS_DIAGNOSTIC_RUSTFLAGS"), option_env!("LABINIUS_DIAGNOSTIC_ENCODED_RUSTFLAGS"));
+
+    run_commit(workers, &clock);
+    println!("native-diag phase=commit-fixture-released elapsed_ns={}", clock.elapsed().as_nanos());
+    println!("switch-inverse protocol full_calls=24 complete_output_checks=23 warmup_pairs=2 sample_pairs=8 count_gate_scope=partials_plus_switch expected_gate_baseline_inverses=39 expected_gate_candidate_inverses=6 timed_scope=switch_only source_timed_baseline_inverses=34 source_timed_candidate_inverses=1");
+    inverse_driver::run();
     println!("native-diag phase=complete elapsed_ns={}", clock.elapsed().as_nanos());
 }

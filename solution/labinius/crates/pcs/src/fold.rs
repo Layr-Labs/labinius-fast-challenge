@@ -1717,16 +1717,16 @@ mod bitsliced {
     /// the odd slot's plane is the next one, so one scalar offset serves two vector loads. Each
     /// slot keeps the six low counter bits of a 64-input tree in registers, plus a two-bit
     /// counter of the trees' weight-64 carries; every third chunk that counter is added into
-    /// the nine upper counter bits in memory. The `pos` entries add their planes, the `neg`
+    /// the remaining upper counter bits in memory. The `pos` entries add their planes, the `neg`
     /// entries their complements (leaf full adders by [`csa_neg`]).
     #[inline(never)]
-    unsafe fn accumulate_pair(planes: *const __m512i, pos: &[u16], neg: &[u16], acc: *mut __m512i) {
+    unsafe fn accumulate_pair<const COUNTER_BITS: usize>(planes: *const __m512i, pos: &[u16], neg: &[u16], acc: *mut __m512i) {
         let planes = planes as *const u64;
-        let (even, odd) = (acc, acc.add(BITS));
+        let (even, odd) = (acc, acc.add(COUNTER_BITS));
         let mut s0: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(even.add(b)));
         let mut s1: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(odd.add(b)));
         // The weight-64 carries of up to three chunks, in registers at weights 64 and 128;
-        // every third chunk they are added into the nine upper counter bits in memory.
+        // every third chunk they are added into the upper counter bits in memory.
         let zero = _mm512_setzero_si512();
         let (mut h0, mut h1) = ([zero; 2], [zero; 2]);
         let mut pending = 0usize;
@@ -1741,13 +1741,13 @@ mod bitsliced {
                 let x = _mm512_ternarylogic_epi64::<0x96>(m7, $h[1], carry);
                 _mm512_store_si512(p, x);
                 carry = _mm512_ternarylogic_epi64::<0xb2>($h[1], x, carry);
-                for b in 8..BITS - 1 {
+                for b in 8..COUNTER_BITS - 1 {
                     let p = $slot.add(b);
                     let old = _mm512_load_si512(p);
                     _mm512_store_si512(p, _mm512_xor_si512(old, carry));
                     carry = _mm512_and_si512(old, carry);
                 }
-                let p = $slot.add(BITS - 1);
+                let p = $slot.add(COUNTER_BITS - 1);
                 _mm512_store_si512(p, _mm512_xor_si512(_mm512_load_si512(p), carry));
                 $h = [zero; 2];
             }};
@@ -1844,11 +1844,11 @@ mod bitsliced {
 
     /// Inverse bit transpose to 512 ordinary 16-bit lane counts.
     #[inline(always)]
-    unsafe fn unslice(acc: *const __m512i, out: &mut [i16; LANES]) {
+    unsafe fn unslice<const COUNTER_BITS: usize>(acc: *const __m512i, out: &mut [i16; LANES]) {
         let zero = _mm512_setzero_si512();
         let lo = transpose8x8_q(core::array::from_fn(|b| _mm512_load_si512(acc.add(b))));
         let hi = transpose8x8_q(core::array::from_fn(|b| {
-            if b == 7 { zero } else { _mm512_load_si512(acc.add(8 + b)) }
+            if 8 + b >= COUNTER_BITS { zero } else { _mm512_load_si512(acc.add(8 + b)) }
         }));
         let perm = _mm512_load_si512(BACK.0.as_ptr() as *const __m512i);
         let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
@@ -1906,7 +1906,7 @@ mod bitsliced {
     ) {
         debug_assert!(counts.len() >= SLOTS);
         for s in 0..SLOTS {
-            unslice(acc.add(s * BITS), &mut counts[s]);
+            unslice::<BITS>(acc.add(s * BITS), &mut counts[s]);
         }
         write_counts(counts, bias, output);
     }
@@ -1993,8 +1993,6 @@ mod bitsliced {
         if profile {
             eprintln!("bitfold plan_us={}", plan_start.elapsed().as_micros());
         }
-        let blocks = column_words / LANES;
-        let len = column_words / 4;
         // Counters and bias are at most the total weight (checked by the caller), which is
         // what lets the output stage subtract them in i16 lanes.
         assert!(bias.iter().all(|&b| (0..=i16::MAX as i32).contains(&b)));
@@ -2011,18 +2009,51 @@ mod bitsliced {
         .max(1)
         .min(groups.len().max(1));
         let cuts: Vec<usize> = (0..=parts).map(|i| groups.len() * i / parts).collect();
+        match part_counter_bits(&groups, &cuts) {
+            14 => fold_parts::<GROUP, 14>(words, column_words, workers, &groups, &bias, &cuts),
+            _ => fold_parts::<GROUP, BITS>(words, column_words, workers, &groups, &bias, &cuts),
+        }
+    }
+
+    /// A scheduled entry adds at most one to either slot's counter, including negative
+    /// guards and padding. Certify every part and slot pair before choosing a narrower
+    /// counter; the fixed 1024-column shape fits 14 bits in each of its two parts.
+    fn part_counter_bits(groups: &[Group], cuts: &[usize]) -> usize {
+        let mut bound = 0usize;
+        for part in cuts.windows(2) {
+            for q in 0..PAIRS {
+                let n: usize = groups[part[0]..part[1]].iter()
+                    .map(|g| g.offsets[q + 1] - g.offsets[q]).sum();
+                bound = bound.max(n);
+            }
+        }
+        assert!(bound < 1 << BITS, "integer fold counter overflow");
+        if bound < 1 << 14 { 14 } else { BITS }
+    }
+
+    fn fold_parts<const GROUP: usize, const COUNTER_BITS: usize>(
+        words: &[B128],
+        column_words: usize,
+        workers: usize,
+        groups: &[Group],
+        bias: &[i32; SLOTS],
+        cuts: &[usize],
+    ) -> Vec<RingElement> {
+        let blocks = column_words / LANES;
+        let len = column_words / 4;
+        let parts = cuts.len() - 1;
         let tasks = blocks * parts;
         let pending: Vec<std::sync::Mutex<Vec<Vec<[i16; LANES]>>>> =
             (0..blocks).map(|_| std::sync::Mutex::new(Vec::new())).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
         let mut out: Vec<RingElement> = Vec::with_capacity(len);
         let out_addr = out.as_mut_ptr() as usize;
-        let (groups, bias, cuts, pending, next) = (&groups, &bias, &cuts, &pending, &next);
+        let (pending, next) = (&pending, &next);
         crate::par::pool().run(workers.clamp(1, tasks), |_| unsafe {
             let zero = _mm512_setzero_si512();
             // Zero everywhere the columns do not write: the guards and the padding pair.
             let mut planes = vec![zero; GUARD + GROUP * STRIDE];
-            let mut acc = vec![zero; 2 * PAIRS * BITS];
+            let mut acc = vec![zero; 2 * PAIRS * COUNTER_BITS];
             // One counts buffer per worker, for the case where a task owns a whole
             // block: `unslice` writes every lane, so the buffer never has to be
             // cleared, and the task writes straight out of it.
@@ -2051,11 +2082,11 @@ mod bitsliced {
                         slice(src, planes.as_mut_ptr().add(GUARD + j * STRIDE), next_src);
                     }
                     for q in 0..PAIRS {
-                        accumulate_pair(
+                        accumulate_pair::<COUNTER_BITS>(
                             planes.as_ptr(),
                             &group.terms[group.offsets[q]..group.mid[q]],
                             &group.terms[group.mid[q]..group.offsets[q + 1]],
-                            acc.as_mut_ptr().add(2 * q * BITS),
+                            acc.as_mut_ptr().add(2 * q * COUNTER_BITS),
                         );
                     }
                 }
@@ -2063,7 +2094,7 @@ mod bitsliced {
                     // The task owns the whole block: it reads the counters into
                     // its own buffer and writes them straight out.
                     for s in 0..SLOTS {
-                        unslice(acc.as_ptr().add(s * BITS), &mut counts[s]);
+                        unslice::<COUNTER_BITS>(acc.as_ptr().add(s * COUNTER_BITS), &mut counts[s]);
                     }
                     let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
                     write_counts(&counts, bias, output);
@@ -2071,7 +2102,7 @@ mod bitsliced {
                 }
                 let mut own = vec![[0i16; LANES]; SLOTS];
                 for s in 0..SLOTS {
-                    unslice(acc.as_ptr().add(s * BITS), &mut own[s]);
+                    unslice::<COUNTER_BITS>(acc.as_ptr().add(s * COUNTER_BITS), &mut own[s]);
                 }
                 let mut done = {
                     let mut v = pending[block].lock().unwrap();
@@ -2137,7 +2168,7 @@ mod bitsliced {
                 let offsets: Vec<u16> = terms.iter().map(|p| 8 * p).collect();
                 accumulate(planes.as_ptr(), &offsets, acc.as_mut_ptr());
                 let mut counts = [0i16; LANES];
-                unslice(acc.as_ptr(), &mut counts);
+                unslice::<BITS>(acc.as_ptr(), &mut counts);
                 for lane in 0..LANES {
                     let expected: usize = terms.iter().map(|&p| (words[word_of(lane)].0 >> p & 1) as usize).sum();
                     assert_eq!(counts[lane] as usize, expected, "lane {lane}");
@@ -2149,7 +2180,7 @@ mod bitsliced {
                 let mut terms = vec![8; 32768];
                 terms[32767] = 0;
                 accumulate(planes.as_ptr(), &terms, acc.as_mut_ptr());
-                unslice(acc.as_ptr(), &mut counts);
+                unslice::<BITS>(acc.as_ptr(), &mut counts);
                 assert_eq!(counts, [32767; LANES]);
             }
         }
@@ -2159,6 +2190,28 @@ mod bitsliced {
         /// up to the top of the counter range.
         #[test]
         fn bitfold_pair_kernel_partial_chunks() {
+            pair_kernel_partial_chunks::<BITS>();
+        }
+
+        #[test]
+        fn bitfold_pair_kernel_14_bits() {
+            pair_kernel_partial_chunks::<14>();
+            unsafe {
+                let zero = _mm512_setzero_si512();
+                let planes = [zero, zero, _mm512_set1_epi32(-1), _mm512_set1_epi32(-1)];
+                let mut acc = vec![zero; 2 * 14];
+                let mut pos = vec![16u16; 16384];
+                pos[16383] = 0;
+                accumulate_pair::<14>(planes.as_ptr(), &pos, &[], acc.as_mut_ptr());
+                for slot in 0..2 {
+                    let mut counts = [0i16; LANES];
+                    unslice::<14>(acc.as_ptr().add(slot * 14), &mut counts);
+                    assert_eq!(counts, [16383; LANES]);
+                }
+            }
+        }
+
+        fn pair_kernel_partial_chunks<const WIDTH: usize>() {
             let mut x = 0x0123_4567_89AB_CDEFu64;
             let mut next = || {
                 x ^= x << 13;
@@ -2178,7 +2231,7 @@ mod bitsliced {
                 // Each call takes `n` positive entries and the next length's worth of negative
                 // ones (`lens` cycled), so both signs meet every length class, alone and mixed.
                 for lens in [vec![16usize], vec![32], vec![48], vec![80, 112, 144], vec![64 * 7 + 48; 9], vec![16; 40], vec![16000, 752, 15232], vec![0, 64]] {
-                    let mut acc = vec![zero; 2 * BITS];
+                    let mut acc = vec![zero; 2 * WIDTH];
                     let mut want = [[0usize; LANES]; 2];
                     for (i, &n) in lens.iter().enumerate() {
                         let m = lens[(i + 1) % lens.len()];
@@ -2198,13 +2251,13 @@ mod bitsliced {
                                 }
                             }
                         }
-                        accumulate_pair(planes.as_ptr(), &pos, &neg, acc.as_mut_ptr());
+                        accumulate_pair::<WIDTH>(planes.as_ptr(), &pos, &neg, acc.as_mut_ptr());
                     }
                     for slot in 0..2 {
                         let mut got = [0i16; LANES];
-                        unslice(acc.as_ptr().add(slot * BITS), &mut got);
+                        unslice::<WIDTH>(acc.as_ptr().add(slot * WIDTH), &mut got);
                         for l in 0..LANES {
-                            assert_eq!(got[l] as usize, want[slot][l] & 0x7fff, "lens {lens:?} slot {slot} lane {l}");
+                            assert_eq!(got[l] as usize, want[slot][l] & ((1 << WIDTH) - 1), "lens {lens:?} slot {slot} lane {l}");
                         }
                     }
                 }
@@ -2237,7 +2290,7 @@ mod bitsliced {
                     }
                     let mut counts = vec![[0i16; LANES]; SLOTS];
                     for s in 0..SLOTS {
-                        unslice(acc.as_ptr().add(s * BITS), &mut counts[s]);
+                        unslice::<BITS>(acc.as_ptr().add(s * BITS), &mut counts[s]);
                     }
                     // Slots s and their partner t: bias such that the reference fits i16.
                     let mut bias = [0i32; SLOTS];
@@ -2314,12 +2367,57 @@ mod bitsliced {
         }
 
         #[test]
+        fn bitfold_counter_width_is_certified_per_part() {
+            let group = |n: usize| Group {
+                first: 0, columns: 0,
+                offsets: core::array::from_fn(|q| q * n),
+                mid: core::array::from_fn(|q| q * n),
+                terms: Vec::new(),
+            };
+            assert_eq!(part_counter_bits(&[group(16383)], &[0, 1]), 14);
+            assert_eq!(part_counter_bits(&[group(16384)], &[0, 1]), 15);
+            assert_eq!(part_counter_bits(&[group(32767)], &[0, 1]), 15);
+            assert_eq!(part_counter_bits(&[group(8192), group(8192)], &[0, 1, 2]), 14);
+            assert_eq!(part_counter_bits(&[group(8192), group(8192)], &[0, 2]), 15);
+            assert!(std::panic::catch_unwind(|| part_counter_bits(&[group(32768)], &[0, 1])).is_err());
+            let cs = challenges(1024);
+            let (groups, _) = plan::<COL_GROUP>(&cs, 1);
+            assert_eq!(part_counter_bits(&groups, &[0, groups.len() / 2, groups.len()]), 14);
+        }
+
+        #[test]
+        fn bitfold_15_bit_fallback_matches_four_narrow_parts() {
+            // Concentrate 16384 entries in the first part: it must retain 15 bits.
+            // Splitting the same schedule into four parts independently allows 14 bits.
+            let mut c = ShortChallenge::zero();
+            c.positions = core::array::from_fn(|i| i as u8);
+            c.weight = 32;
+            c.signs = 0xAAAA_AAAA; // Every embedded term is positive.
+            let mut cs = vec![ShortChallenge::zero(); 1024];
+            cs[..512].fill(c);
+            assert!(fits(&cs));
+            let words = table(cs.len() * LANES);
+            let (groups, bias) = plan::<COL_GROUP>(&cs, 1);
+            let half = [0, groups.len() / 2, groups.len()];
+            assert_eq!(part_counter_bits(&groups, &half), BITS);
+            let quarters = [0, groups.len() / 4, groups.len() / 2, 3 * groups.len() / 4, groups.len()];
+            assert_eq!(part_counter_bits(&groups, &quarters), 14);
+            assert_eq!(
+                fold_words(&words, &cs, LANES, 2),
+                fold_parts::<COL_GROUP, 14>(&words, LANES, 2, &groups, &bias, &quarters),
+            );
+        }
+
+        #[test]
         fn bitfold_matches_schoolbook_and_ntt() {
             let columns = (COL_GROUP + 2).next_multiple_of(2);
             let words = table(columns * LANES);
             let cs = challenges(columns);
             let exact = fold_words(&words, &cs, LANES, 2);
             assert_eq!(exact, scalar(&words, &cs, LANES));
+            let (groups, bias) = plan::<COL_GROUP>(&cs, 1);
+            let cuts = [0, groups.len() / 2, groups.len()];
+            assert_eq!(exact, fold_parts::<COL_GROUP, BITS>(&words, LANES, 2, &groups, &bias, &cuts));
             for q in [3889, 2917, 4861, 9721, 12637, 17497, 19441] {
                 assert_eq!(exact, super::super::fold_witness_streaming(&words, columns, &cs, 4, q, 2), "q {q}");
             }

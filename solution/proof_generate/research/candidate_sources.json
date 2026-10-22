@@ -1,0 +1,11 @@
+{
+  "baseCommit": "52f946046db3d7ec0816e92951629dc6bdcfae23",
+  "candidate": "L pair fold constants in dead tail registers on exact PR126",
+  "files": [
+    {
+      "path": "labinius/crates/pcs/src/simd/ntt/bin_asm.rs",
+      "bytes": 62140,
+      "sha256": "7c913a6b45b03424039fc84cfd7ba379fffd38272ea37d668a7f7495de828f2f"
+    }
+  ]
+}

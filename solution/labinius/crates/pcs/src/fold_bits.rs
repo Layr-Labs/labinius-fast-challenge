@@ -52,8 +52,15 @@ pub const LANES: usize = 512;
 pub const BLOCK_ELEMENTS: usize = LANES / 4;
 /// Planes of the counter: counts are below `2^15`.
 pub const COUNTER_PLANES: usize = 16;
-/// Columns whose planes are resident together: 16 x 128 planes x 64 bytes = 128 KB.
-pub const BATCH: usize = 16;
+/// Columns whose planes are resident together: 32 x 256 planes x 64 bytes = 512 KB (direct and
+/// complemented), against the official target's 2 MB of L2 per core.
+///
+/// The row loop's fixed costs — the `Pending` ripple, the `flush_into` read-modify-write of the
+/// row's 16-plane counter, and the `Reach::of_row` walk — are paid once per (batch, row), so they
+/// scale with `columns / BATCH`, while the term work itself scales with `columns` and is
+/// unaffected. Doubling this from 16 halves those fixed costs; the resident plane set doubles
+/// with it, which is what sets the ceiling.
+pub const BATCH: usize = 32;
 
 /// A challenge in the sparse form the library samples: `weight` sorted positions below 162, a
 /// sign bit per position (`1` = negative).

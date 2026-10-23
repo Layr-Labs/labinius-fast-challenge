@@ -414,16 +414,14 @@ pub unsafe fn ntt_gen_batch32<const Q: u16>(b: &mut Batch32) {
 // =============================================================================================
 
 /// Compile-time inverse-twiddle tables, level-0 recombination constants, Barrett placement and
-/// the bound recursion of [`intt_gen_batch32`]. AUX defaults to false; its tighter
-/// schedule is instantiated only for the hybrid auxiliary inverse modulo 3889.
-/// AUX=true is unsupported for every other modulus.
+/// the bound recursion of [`intt_gen_batch32`].
 ///
 /// The twiddles are the plain ones inverted (`zeta^-1`, `zeta^-2`), in the same duplicated-u32
 /// broadcast form and the same per-level layout as [`Tw`], so a Gentleman-Sande butterfly reads
 /// its constants exactly where the forward one does.
-pub struct TwI<const Q: u16, const AUX: bool = false>;
+pub struct TwI<const Q: u16>;
 
-impl<const Q: u16, const AUX: bool> TwI<Q, AUX> {
+impl<const Q: u16> TwI<Q> {
     const fn inv(x: u16) -> u16 {
         inv_mod(x as u64, Q as u64) as u16
     }
@@ -492,11 +490,11 @@ impl<const Q: u16, const AUX: bool> TwI<Q, AUX> {
     /// Declared input bound: the largest lazily reduced transform this crate produces, i.e.
     /// `ntt::bin_asm`'s 7.5 q (3889) / 2.3 q (9721). Everything smaller — the forward
     /// kernels' 3.40 q / 2.13 q, the fold's centered `(q-1)/2` — is covered.
-    pub const IN_BOUND: i32 = if AUX { 2 * Q as i32 - 1 } else if Q == 9721 { 22359 } else { 29167 };
+    pub const IN_BOUND: i32 = if Q == 9721 { 22359 } else { 29167 };
 
     /// Barrett the three loaded inputs of a level-6 butterfly. Unavoidable at the declared input
     /// bound: `y1 - y2` alone is 15 q (3889) / 4.6 q (9721) and already leaves i16.
-    pub const BAR_IN: bool = !AUX;
+    pub const BAR_IN: bool = true;
     /// Barrett the untwiddled `y0+y1+y2` output of level 6 / of butterfly `j` of level 5 /
     /// of butterfly `i` of level 4 / of level 3, and `y0+y1` of pair `a` of level 2 / of level 1.
     ///
@@ -507,18 +505,14 @@ impl<const Q: u16, const AUX: bool> TwI<Q, AUX> {
     /// the loop variable that names the class. The placement below is the cheapest one that
     /// keeps every intermediate inside i16 (984 Barretts per batch for 3889, 1836 for 9721,
     /// found by exhaustive search over this flag set); `BOUND` replays it.
-    pub const BAR_S6: bool = AUX || Q == 9721;
+    pub const BAR_S6: bool = Q == 9721;
     pub const BAR_S5: [bool; 3] = if Q == 9721 {
         [true; 3]
-    } else if AUX {
-        [false; 3]
     } else {
         [true, false, false]
     };
     pub const BAR_S4: [bool; 9] = if Q == 9721 {
         [true; 9]
-    } else if AUX {
-        [true, true, true, false, false, false, false, false, false]
     } else {
         [false, true, true, false, false, false, false, false, false]
     };
@@ -528,10 +522,7 @@ impl<const Q: u16, const AUX: bool> TwI<Q, AUX> {
 
     /// `[after level 6, .., after level 1, after level 0 before centering]`, and the largest
     /// intermediate the pass ever forms (`PEAK`, which is what has to stay inside i16).
-    const B: ([i32; 7], i32) = {
-        assert!(!AUX || Q == 3889, "auxiliary inverse schedule is only valid for 3889");
-        inv_bounds::<Q, AUX>()
-    };
+    const B: ([i32; 7], i32) = inv_bounds::<Q>();
     /// Per-level bound `BOUND[l]` = max |lane| after inverse level `l`; see the module comment.
     pub const BOUND: [i32; 7] = Self::B.0;
     /// The largest value formed anywhere in the pass. Must stay inside i16.
@@ -559,8 +550,8 @@ const fn bar_bound(q: u16) -> i32 {
 
 /// The inverse pass replayed on bounds, position by position, with exactly the kernel's Barrett
 /// placement: the per-level maxima and the largest intermediate ever formed.
-const fn inv_bounds<const Q: u16, const AUX: bool>() -> ([i32; 7], i32) {
-    let mut v = [TwI::<Q, AUX>::IN_BOUND; 648];
+const fn inv_bounds<const Q: u16>() -> ([i32; 7], i32) {
+    let mut v = [TwI::<Q>::IN_BOUND; 648];
     let mut lm = [0i32; 7];
     let mut peak = 0i32;
     let r = bar_bound(Q);
@@ -621,7 +612,7 @@ const fn inv_bounds<const Q: u16, const AUX: bool>() -> ([i32; 7], i32) {
         let mut g = 0;
         while g < 9 {
             let b = base + 3 * g;
-            r3!(b, b + 1, b + 2, TwI::<Q, AUX>::BAR_S6, TwI::<Q, AUX>::BAR_IN);
+            r3!(b, b + 1, b + 2, TwI::<Q>::BAR_S6, TwI::<Q>::BAR_IN);
             g += 1;
         }
         k4 += 1;
@@ -635,7 +626,7 @@ const fn inv_bounds<const Q: u16, const AUX: bool>() -> ([i32; 7], i32) {
             let mut j = 0;
             while j < 3 {
                 let b = base + 9 * bb + j;
-                r3!(b, b + 3, b + 6, TwI::<Q, AUX>::BAR_S5[j], false);
+                r3!(b, b + 3, b + 6, TwI::<Q>::BAR_S5[j], false);
                 j += 1;
             }
             bb += 1;
@@ -649,7 +640,7 @@ const fn inv_bounds<const Q: u16, const AUX: bool>() -> ([i32; 7], i32) {
         let mut i = 0;
         while i < 9 {
             let b = base + i;
-            r3!(b, b + 9, b + 18, TwI::<Q, AUX>::BAR_S4[i], false);
+            r3!(b, b + 9, b + 18, TwI::<Q>::BAR_S4[i], false);
             i += 1;
         }
         k4 += 1;
@@ -660,7 +651,7 @@ const fn inv_bounds<const Q: u16, const AUX: bool>() -> ([i32; 7], i32) {
         let mut j = 0;
         while j < 27 {
             let b = 81 * k + j;
-            r3!(b, b + 27, b + 54, TwI::<Q, AUX>::BAR_S3, false);
+            r3!(b, b + 27, b + 54, TwI::<Q>::BAR_S3, false);
             j += 1;
         }
         k += 1;
@@ -673,7 +664,7 @@ const fn inv_bounds<const Q: u16, const AUX: bool>() -> ([i32; 7], i32) {
             let mut j = 0;
             while j < 27 {
                 let b = 162 * blk + 27 * a + j;
-                r2!(b, b + 81, TwI::<Q, AUX>::BAR_S2[a]);
+                r2!(b, b + 81, TwI::<Q>::BAR_S2[a]);
                 j += 1;
             }
             a += 1;
@@ -686,7 +677,7 @@ const fn inv_bounds<const Q: u16, const AUX: bool>() -> ([i32; 7], i32) {
         let mut i = 0;
         while i < 162 {
             let b = 324 * c + i;
-            r2!(b, b + 162, TwI::<Q, AUX>::BAR_S1);
+            r2!(b, b + 162, TwI::<Q>::BAR_S1);
             i += 1;
         }
         c += 1;
@@ -750,23 +741,23 @@ unsafe fn center(x: __m512i, q: __m512i, half: __m512i, nhalf: __m512i) -> __m51
 /// here: at the declared input bound even `y1 - y2` leaves i16, and this is the only place the
 /// input is touched, so no separate reduction pass is needed.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn ipass_d<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
+unsafe fn ipass_d<const Q: u16>(p: *mut __m512i, k4: usize) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
     let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
-    let t6 = TwI::<Q, AUX>::IL6.as_ptr().add(36 * k4);
+    let t6 = TwI::<Q>::IL6.as_ptr().add(36 * k4);
     let base = k4 * 27;
     for g in 0..9 {
         let b = base + 3 * g;
         let (mut y0, mut y1, mut y2) = (ld(p, b), ld(p, b + 1), ld(p, b + 2));
-        if TwI::<Q, AUX>::BAR_IN {
+        if TwI::<Q>::BAR_IN {
             y0 = barrett(y0, bv, q);
             y1 = barrett(y1, bv, q);
             y2 = barrett(y2, bv, q);
         }
         let (mut s, a1, a2) = ir3(y0, y1, y2, t6.add(4 * g), omp, om, q);
-        if TwI::<Q, AUX>::BAR_S6 {
+        if TwI::<Q>::BAR_S6 {
             s = barrett(s, bv, q);
         }
         st(p, b, s);
@@ -779,12 +770,12 @@ unsafe fn ipass_d<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
 /// indexed by `j`, the position class inside the 9-block: only `j = 0` inherits an untwiddled
 /// level-6 output in all three inputs.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn ipass_c5<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
+unsafe fn ipass_c5<const Q: u16>(p: *mut __m512i, k4: usize) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
     let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
-    let t5 = TwI::<Q, AUX>::IL5.as_ptr().add(12 * k4);
+    let t5 = TwI::<Q>::IL5.as_ptr().add(12 * k4);
     let base = k4 * 27;
     for bb in 0..3 {
         macro_rules! bf {
@@ -799,7 +790,7 @@ unsafe fn ipass_c5<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
                     om,
                     q,
                 );
-                if TwI::<Q, AUX>::BAR_S5[$j] {
+                if TwI::<Q>::BAR_S5[$j] {
                     s = barrett(s, bv, q);
                 }
                 st(p, b, s);
@@ -815,12 +806,12 @@ unsafe fn ipass_c5<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
 
 /// Level 4 for one 27-block: 9 butterflies, one per position class `i` of the 9-block.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn ipass_c4<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
+unsafe fn ipass_c4<const Q: u16>(p: *mut __m512i, k4: usize) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
     let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
-    let t4 = TwI::<Q, AUX>::IL4.as_ptr().add(4 * k4);
+    let t4 = TwI::<Q>::IL4.as_ptr().add(4 * k4);
     let base = k4 * 27;
     // written out so that `BAR_S4[i]` is a compile-time constant: LLVM leaves a 9-trip loop
     // rolled, and a per-iteration load-and-branch on the flag costs more than the Barrett.
@@ -828,7 +819,7 @@ unsafe fn ipass_c4<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
         ($i:literal) => {{
             let b = base + $i;
             let (mut s, a1, a2) = ir3(ld(p, b), ld(p, b + 9), ld(p, b + 18), t4, omp, om, q);
-            if TwI::<Q, AUX>::BAR_S4[$i] {
+            if TwI::<Q>::BAR_S4[$i] {
                 s = barrett(s, bv, q);
             }
             st(p, b, s);
@@ -850,14 +841,14 @@ unsafe fn ipass_c4<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
 /// Levels 3 and 2 for one 162-block, the mirror of [`pass_b`]: 27 groups of 6 vectors, 2 inverse
 /// radix-3 butterflies (level 3) followed by 3 inverse radix-2 ones (level 2).
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn ipass_b<const Q: u16, const AUX: bool>(p: *mut __m512i, blk: usize) {
+unsafe fn ipass_b<const Q: u16>(p: *mut __m512i, blk: usize) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
     let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
-    let l2 = TwI::<Q, AUX>::IL2.as_ptr().add(2 * blk);
+    let l2 = TwI::<Q>::IL2.as_ptr().add(2 * blk);
     let (zp, z) = (bc(l2), bc(l2.add(1)));
-    let ta = TwI::<Q, AUX>::IL3.as_ptr().add(8 * blk);
+    let ta = TwI::<Q>::IL3.as_ptr().add(8 * blk);
     let tb = ta.add(4);
     let base = blk * 162;
     for j in 0..27 {
@@ -872,20 +863,20 @@ unsafe fn ipass_b<const Q: u16, const AUX: bool>(p: *mut __m512i, blk: usize) {
             om,
             q,
         );
-        if TwI::<Q, AUX>::BAR_S3 {
+        if TwI::<Q>::BAR_S3 {
             n0 = barrett(n0, bv, q);
             m0 = barrett(m0, bv, q);
         }
         let (mut s0, t0) = ir2(n0, m0, zp, z, q);
         let (mut s1, t1) = ir2(n1, m1, zp, z, q);
         let (mut s2, t2) = ir2(n2, m2, zp, z, q);
-        if TwI::<Q, AUX>::BAR_S2[0] {
+        if TwI::<Q>::BAR_S2[0] {
             s0 = barrett(s0, bv, q);
         }
-        if TwI::<Q, AUX>::BAR_S2[1] {
+        if TwI::<Q>::BAR_S2[1] {
             s1 = barrett(s1, bv, q);
         }
-        if TwI::<Q, AUX>::BAR_S2[2] {
+        if TwI::<Q>::BAR_S2[2] {
             s2 = barrett(s2, bv, q);
         }
         st(p, b, s0);
@@ -901,21 +892,21 @@ unsafe fn ipass_b<const Q: u16, const AUX: bool>(p: *mut __m512i, blk: usize) {
 /// the two inverse radix-2 butterflies of level 1, then the two Phi_6 recombinations, which
 /// carry the whole normalisation ([`TwI::KA`]) and center their four outputs.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn ipass_a<const Q: u16, const AUX: bool>(p: *mut __m512i) {
+unsafe fn ipass_a<const Q: u16>(p: *mut __m512i) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
     let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
-    let half = _mm512_set1_epi32(TwI::<Q, AUX>::HALF as i32);
-    let nhalf = _mm512_set1_epi32(TwI::<Q, AUX>::NHALF as i32);
-    let l1 = TwI::<Q, AUX>::IL1.as_ptr();
+    let half = _mm512_set1_epi32(TwI::<Q>::HALF as i32);
+    let nhalf = _mm512_set1_epi32(TwI::<Q>::NHALF as i32);
+    let l1 = TwI::<Q>::IL1.as_ptr();
     let (zap, za) = (bc(l1), bc(l1.add(1)));
     let (zbp, zb) = (bc(l1.add(2)), bc(l1.add(3)));
-    let ka = TwI::<Q, AUX>::KA.as_ptr();
-    let kb = TwI::<Q, AUX>::KB.as_ptr();
-    let kc = TwI::<Q, AUX>::KC.as_ptr();
+    let ka = TwI::<Q>::KA.as_ptr();
+    let kb = TwI::<Q>::KB.as_ptr();
+    let kc = TwI::<Q>::KC.as_ptr();
     for i in 0..162 {
         let (mut c0, c1) = ir2(ld(p, i), ld(p, i + 162), zap, za, q);
         let (mut c2, c3) = ir2(ld(p, i + 324), ld(p, i + 486), zbp, zb, q);
-        if TwI::<Q, AUX>::BAR_S1 {
+        if TwI::<Q>::BAR_S1 {
             c0 = barrett(c0, bv, q);
             c2 = barrett(c2, bv, q);
         }
@@ -940,24 +931,6 @@ unsafe fn ipass_a<const Q: u16, const AUX: bool>(p: *mut __m512i) {
     }
 }
 
-/// Shared inverse implementation; public entry points specify the input contract.
-#[inline(never)]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn intt_core<const Q: u16, const AUX: bool>(b: &mut Batch32) {
-    debug_assert_eq!(b.representation, Representation::Ntt);
-    let p = b.v.as_mut_ptr() as *mut __m512i;
-    for blk in 0..4 {
-        for k4 in 6 * blk..6 * blk + 6 {
-            ipass_d::<Q, AUX>(p, k4);
-            ipass_c5::<Q, AUX>(p, k4);
-            ipass_c4::<Q, AUX>(p, k4);
-        }
-        ipass_b::<Q, AUX>(p, blk);
-    }
-    ipass_a::<Q, AUX>(p);
-    b.representation = Representation::Coefficients;
-}
-
 /// Inverse NTT of a batch of 32 polynomials in place: `Ntt -> Coefficients` (tree order), the
 /// exact inverse of [`ntt_gen_batch32`].
 ///
@@ -969,67 +942,16 @@ unsafe fn intt_core<const Q: u16, const AUX: bool>(b: &mut Batch32) {
 /// The host must have AVX-512 F/BW/VL; `b` must be 64-byte aligned (`Batch32` is).
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 pub unsafe fn intt_gen_batch32<const Q: u16>(b: &mut Batch32) {
-    intt_core::<Q, false>(b);
-}
-
-/// Inverse for the hybrid auxiliary stream modulo 3889 only.
-///
-/// Requires every input lane to satisfy |x| < 2*3889, as guaranteed by
-/// hybrid::tail_words/red16. All outputs remain fully reduced and centered.
-/// The narrower input allows 504 Barrett reductions rather than 984 per Batch32.
-/// The complete bound recursion checks every intermediate, not sampled inputs.
-///
-/// # Safety
-/// AVX-512 F/BW/VL; b is aligned and in NTT representation, with the stated lane bound.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-pub unsafe fn intt_hybrid_batch32_3889(b: &mut Batch32) {
-    intt_core::<3889, true>(b);
-}
-
-const _: () = {
-    assert!(TwI::<3889, true>::IN_BOUND == 7777);
-    assert!(TwI::<3889, true>::PEAK <= 32767);
-    assert!(TwI::<3889, true>::BOUND[0] <= (3 * 3889 - 1) / 2);
-};
-
-#[cfg(test)]
-mod hybrid_inverse_tests {
-    use super::*;
-
-    #[test]
-    fn tight_inverse_matches_generic_on_extrema_and_random_lanes() {
-        if !std::is_x86_feature_detected!("avx512f")
-            || !std::is_x86_feature_detected!("avx512bw")
-            || !std::is_x86_feature_detected!("avx512vl")
-        {
-            return;
+    debug_assert_eq!(b.representation, Representation::Ntt);
+    let p = b.v.as_mut_ptr() as *mut __m512i;
+    for blk in 0..4 {
+        for k4 in 6 * blk..6 * blk + 6 {
+            ipass_d::<Q>(p, k4);
+            ipass_c5::<Q>(p, k4);
+            ipass_c4::<Q>(p, k4);
         }
-        let mut state = 0x7c899b4538d198a3u64;
-        for case in 0..24 {
-            let mut generic = Batch32::zero(Representation::Ntt);
-            for j in 0..648 {
-                for lane in 0..32 {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    generic.v[j][lane] = match case {
-                        0 => 0,
-                        1 => 7777,
-                        2 => -7777,
-                        3 => if j % 2 == 0 { 7777 } else { -7777 },
-                        4 => if j % 3 == 0 { 7777 } else { -7777 },
-                        5 => if (j / 27 + lane) % 2 == 0 { 7777 } else { -7777 },
-                        _ => (state % 15555) as i16 - 7777,
-                    };
-                }
-            }
-            let mut tight = generic.clone();
-            unsafe {
-                intt_gen_batch32::<3889>(&mut generic);
-                intt_hybrid_batch32_3889(&mut tight);
-            }
-            assert_eq!(tight.v, generic.v, "tight inverse case {case}");
-            assert_eq!(tight.representation, Representation::Coefficients);
-        }
+        ipass_b::<Q>(p, blk);
     }
+    ipass_a::<Q>(p);
+    b.representation = Representation::Coefficients;
 }

@@ -254,55 +254,21 @@ pub(crate) fn binary_check(p0: &[F162], v: &[RingElement], u_folded: F162) -> bo
 // the row evaluation straight from the words
 // =============================================================================================
 
-/// The eight `B128` at `x` as `[limb0, limb1]` of their lifts.
+/// The eight `B128` at `x` as the word-sliced `[limb0, limb1, 0]` of their lifts.
 ///
 /// # Safety
 /// `x` addresses 8 readable `B128`.
 #[inline(always)]
-unsafe fn load_words2(x: *const F162Word, lo: __m512i, hi: __m512i) -> [__m512i; 2] {
+unsafe fn load_soa8_words(x: *const F162Word) -> [__m512i; 3] {
     let a = _mm512_loadu_si512(x as *const __m512i);
     let b = _mm512_loadu_si512(x.add(4) as *const __m512i);
+    let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+    let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
     [
         _mm512_permutex2var_epi64(a, lo, b),
         _mm512_permutex2var_epi64(a, hi, b),
+        _mm512_setzero_si512(),
     ]
-}
-
-/// Accumulate the 10 nonzero `clmul` products of 8 `F162` (`x = [x0, x1, x2]`, `sa = x0 ^ x1`)
-/// against 8 lifted `B128` words (`b = [b0, b1]`). The two `x2 * b2` products are zero and the
-/// Karatsuba cross-term adjustment `acc[8..12] ^= acc[0..4]` is deferred to [`horizontal_word10`].
-#[inline(always)]
-unsafe fn mac_word10(acc: &mut [__m512i; 10], x: [__m512i; 3], sa: __m512i, b: [__m512i; 2]) {
-    let sb = _mm512_xor_si512(b[0], b[1]);
-    acc[0] = _mm512_xor_si512(acc[0], _mm512_clmulepi64_epi128::<0x00>(x[0], b[0]));
-    acc[1] = _mm512_xor_si512(acc[1], _mm512_clmulepi64_epi128::<0x11>(x[0], b[0]));
-    acc[2] = _mm512_xor_si512(acc[2], _mm512_clmulepi64_epi128::<0x00>(x[1], b[1]));
-    acc[3] = _mm512_xor_si512(acc[3], _mm512_clmulepi64_epi128::<0x11>(x[1], b[1]));
-    acc[4] = _mm512_xor_si512(acc[4], _mm512_clmulepi64_epi128::<0x00>(sa, sb));
-    acc[5] = _mm512_xor_si512(acc[5], _mm512_clmulepi64_epi128::<0x11>(sa, sb));
-    acc[6] = _mm512_xor_si512(acc[6], _mm512_clmulepi64_epi128::<0x00>(x[2], b[0]));
-    acc[7] = _mm512_xor_si512(acc[7], _mm512_clmulepi64_epi128::<0x11>(x[2], b[0]));
-    acc[8] = _mm512_xor_si512(acc[8], _mm512_clmulepi64_epi128::<0x00>(x[2], b[1]));
-    acc[9] = _mm512_xor_si512(acc[9], _mm512_clmulepi64_epi128::<0x11>(x[2], b[1]));
-}
-
-#[inline(always)]
-unsafe fn horizontal_word10(acc: [__m512i; 10]) -> F162 {
-    let z = _mm512_setzero_si512();
-    horizontal([
-        acc[0],
-        acc[1],
-        acc[2],
-        acc[3],
-        z,
-        z,
-        acc[4],
-        acc[5],
-        _mm512_xor_si512(acc[6], acc[0]),
-        _mm512_xor_si512(acc[7], acc[1]),
-        _mm512_xor_si512(acc[8], acc[2]),
-        _mm512_xor_si512(acc[9], acc[3]),
-    ])
 }
 
 type F162Word = crate::fields::scalar::B128;
@@ -313,9 +279,7 @@ type F162Word = crate::fields::scalar::B128;
 /// `b` addresses `n` words and `a` holds at least `n` elements.
 unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
     debug_assert!(a.n >= n);
-    let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
-    let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
-    let (mut acc, blocks) = ([_mm512_setzero_si512(); 10], n / 8);
+    let (mut acc, blocks) = ([_mm512_setzero_si512(); 12], n / 8);
     for t in 0..blocks {
         // The words' lines 1 KB ahead, requested explicitly: with eight runners streaming the
         // table the hardware prefetcher alone leaves the clmul work waiting (6.6 -> 5.9 ms for
@@ -328,58 +292,15 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
             _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
             _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
         ];
-        let sa = _mm512_xor_si512(x[0], x[1]);
-        mac_word10(&mut acc, x, sa, load_words2(b.add(8 * t), lo, hi));
+        bf::mac_soa8_word(&mut acc, x, load_soa8_words(b.add(8 * t)));
     }
     let mut out = if blocks > 0 {
-        horizontal_word10(acc)
+        horizontal(acc)
     } else {
         F162::ZERO
     };
     for k in 8 * blocks..n {
         out += a.get(k) * F162::from_b128(*b.add(k));
-    }
-    out
-}
-
-/// [`dot_words`] on two columns of `n` `B128` words at once: the word-sliced `eq` table (`a`,
-/// 384 KB at `n = 2^14`) is loaded from L2 once per pair of columns while both witness streams
-/// are prefetched 1 KB ahead.
-///
-/// # Safety
-/// `b0` and `b1` each address `n` words and `a` holds at least `n` elements.
-unsafe fn dot_words2(a: &Poly, b0: *const F162Word, b1: *const F162Word, n: usize) -> [F162; 2] {
-    debug_assert!(a.n >= n);
-    let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
-    let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
-    let mut acc0 = [_mm512_setzero_si512(); 10];
-    let mut acc1 = [_mm512_setzero_si512(); 10];
-    let blocks = n / 8;
-    for t in 0..blocks {
-        let ahead0 = b0.wrapping_add(8 * t + 64) as *const i8;
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0);
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0.wrapping_add(64));
-        let ahead1 = b1.wrapping_add(8 * t + 64) as *const i8;
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead1);
-        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead1.wrapping_add(64));
-        let x = [
-            _mm512_loadu_si512(a.w[0].as_ptr().add(8 * t) as *const __m512i),
-            _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
-            _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
-        ];
-        let sa = _mm512_xor_si512(x[0], x[1]);
-        mac_word10(&mut acc0, x, sa, load_words2(b0.add(8 * t), lo, hi));
-        mac_word10(&mut acc1, x, sa, load_words2(b1.add(8 * t), lo, hi));
-    }
-    let mut out = if blocks > 0 {
-        [horizontal_word10(acc0), horizontal_word10(acc1)]
-    } else {
-        [F162::ZERO; 2]
-    };
-    for k in 8 * blocks..n {
-        let ak = a.get(k);
-        out[0] += ak * F162::from_b128(*b0.add(k));
-        out[1] += ak * F162::from_b128(*b1.add(k));
     }
     out
 }
@@ -434,13 +355,9 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     let columns = words.len() / wdim;
     let eq = eq_poly(p0, workers);
     let mut out = vec![F162::ZERO; columns];
-    if columns == 0 {
-        return out;
-    }
-    // Columns handed out in even-sized chunks from a shared counter: a runner that starts late
-    // or shares its core with another process takes fewer of them instead of holding the phase
-    // up, and each pair of columns in a chunk shares one pass over `eq` via `dot_words2`.
-    let chunk = columns.div_ceil(32 * workers.max(1)).max(2).next_multiple_of(2);
+    // Columns handed out a few at a time from a shared counter: a runner that starts late or
+    // shares its core with another process takes fewer of them instead of holding the phase up.
+    let chunk = columns.div_ceil(32 * workers.max(1)).max(1);
     let chunks = columns.div_ceil(chunk);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out_addr = out.as_mut_ptr() as usize;
@@ -450,24 +367,7 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
             break;
         }
         // Chunk `k` owns `out[k * chunk ..]`.
-        let end = ((k + 1) * chunk).min(columns);
-        let mut j = k * chunk;
-        while j + 1 < end {
-            let [v0, v1] = unsafe {
-                dot_words2(
-                    &eq,
-                    words.as_ptr().add(j * wdim),
-                    words.as_ptr().add((j + 1) * wdim),
-                    wdim,
-                )
-            };
-            unsafe {
-                (out_addr as *mut F162).add(j).write(v0);
-                (out_addr as *mut F162).add(j + 1).write(v1);
-            }
-            j += 2;
-        }
-        if j < end {
+        for j in k * chunk..((k + 1) * chunk).min(columns) {
             let value = unsafe { dot_words(&eq, words.as_ptr().add(j * wdim), wdim) };
             unsafe { (out_addr as *mut F162).add(j).write(value) };
         }

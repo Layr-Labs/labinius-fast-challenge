@@ -268,105 +268,12 @@ impl Garner {
 fn inverse_rows(q: u16, batch: &mut Batch32) {
     batch.representation = Representation::Ntt;
     unsafe {
-        if q == 3889 {
-            crate::simd::ntt::gen_small::intt_hybrid_batch32_3889(batch);
-            return;
-        }
         dispatch_limb!(
             q,
             small |Q| intt_gen_batch32::<Q>(batch),
             large |Q| vgl::intt_gen_batch32::<Q>(batch),
             quad |Q| intt_quad_gen_batch32::<Q>(batch),
         )
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn tr8_inlane_i16(x: &[core::arch::x86_64::__m512i; 8]) -> [core::arch::x86_64::__m512i; 8] {
-    use core::arch::x86_64::*;
-    let a0 = _mm512_unpacklo_epi16(x[0], x[1]);
-    let a1 = _mm512_unpackhi_epi16(x[0], x[1]);
-    let a2 = _mm512_unpacklo_epi16(x[2], x[3]);
-    let a3 = _mm512_unpackhi_epi16(x[2], x[3]);
-    let a4 = _mm512_unpacklo_epi16(x[4], x[5]);
-    let a5 = _mm512_unpackhi_epi16(x[4], x[5]);
-    let a6 = _mm512_unpacklo_epi16(x[6], x[7]);
-    let a7 = _mm512_unpackhi_epi16(x[6], x[7]);
-    let b0 = _mm512_unpacklo_epi32(a0, a2);
-    let b1 = _mm512_unpackhi_epi32(a0, a2);
-    let b2 = _mm512_unpacklo_epi32(a1, a3);
-    let b3 = _mm512_unpackhi_epi32(a1, a3);
-    let b4 = _mm512_unpacklo_epi32(a4, a6);
-    let b5 = _mm512_unpackhi_epi32(a4, a6);
-    let b6 = _mm512_unpacklo_epi32(a5, a7);
-    let b7 = _mm512_unpackhi_epi32(a5, a7);
-    [
-        _mm512_unpacklo_epi64(b0, b4),
-        _mm512_unpackhi_epi64(b0, b4),
-        _mm512_unpacklo_epi64(b1, b5),
-        _mm512_unpackhi_epi64(b1, b5),
-        _mm512_unpacklo_epi64(b2, b6),
-        _mm512_unpackhi_epi64(b2, b6),
-        _mm512_unpacklo_epi64(b3, b7),
-        _mm512_unpackhi_epi64(b3, b7),
-    ]
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn coefficients_from_rows_32(q: u16, rows: &[&[u32; N]], out: &mut [i16]) {
-    use core::arch::x86_64::*;
-    const PERM: [i64; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
-    let half = _mm512_set1_epi32(((q - 1) / 2) as i32);
-    let qv = _mm512_set1_epi32(q as i32);
-    let perm = _mm512_loadu_si512(PERM.as_ptr() as *const __m512i);
-    let mut batch = core::mem::MaybeUninit::<Batch32>::uninit();
-    let bp = batch.as_mut_ptr();
-    (*bp).representation = Representation::Ntt;
-    let bv = (*bp).v.as_mut_ptr();
-    for b in 0..(N / 8) {
-        let u0 = 8 * b;
-        let mut c = [_mm512_setzero_si512(); 8];
-        for w in 0..8 {
-            let v0 = _mm256_loadu_si256(rows[w].as_ptr().add(u0) as *const __m256i);
-            let v1 = _mm256_loadu_si256(rows[8 + w].as_ptr().add(u0) as *const __m256i);
-            let v2 = _mm256_loadu_si256(rows[16 + w].as_ptr().add(u0) as *const __m256i);
-            let v3 = _mm256_loadu_si256(rows[24 + w].as_ptr().add(u0) as *const __m256i);
-            let lo = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(v0), v1);
-            let hi = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(v2), v3);
-            let lo = _mm512_mask_sub_epi32(lo, _mm512_cmpgt_epi32_mask(lo, half), lo, qv);
-            let hi = _mm512_mask_sub_epi32(hi, _mm512_cmpgt_epi32_mask(hi, half), hi, qv);
-            c[w] = _mm512_permutexvar_epi64(perm, _mm512_packs_epi32(lo, hi));
-        }
-        let r = tr8_inlane_i16(&c);
-        for k in 0..8 {
-            _mm512_store_si512((*bv.add(u0 + k)).as_mut_ptr() as *mut __m512i, r[k]);
-        }
-    }
-    let batch = batch.assume_init_mut();
-    inverse_rows(q, batch);
-    let op = out.as_mut_ptr();
-    for b in 0..(N / 8) {
-        let i0 = 8 * b;
-        let r: [__m512i; 8] =
-            core::array::from_fn(|k| _mm512_load_si512(batch.v[i0 + k].as_ptr() as *const __m512i));
-        let c = tr8_inlane_i16(&r);
-        for w in 0..8 {
-            _mm_storeu_si128(op.add(w * N + i0) as *mut __m128i, _mm512_castsi512_si128(c[w]));
-            _mm_storeu_si128(
-                op.add((8 + w) * N + i0) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<1>(c[w]),
-            );
-            _mm_storeu_si128(
-                op.add((16 + w) * N + i0) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<2>(c[w]),
-            );
-            _mm_storeu_si128(
-                op.add((24 + w) * N + i0) as *mut __m128i,
-                _mm512_extracti32x4_epi32::<3>(c[w]),
-            );
-        }
     }
 }
 
@@ -381,15 +288,6 @@ unsafe fn coefficients_from_rows_32(q: u16, rows: &[&[u32; N]], out: &mut [i16])
 pub fn coefficients_from_rows(q: u16, rows: &[&[u32; N]], out: &mut [i16]) {
     assert!(!rows.is_empty() && rows.len() <= 32, "a batch holds 32 columns");
     assert_eq!(out.len(), rows.len() * N);
-    #[cfg(target_arch = "x86_64")]
-    if rows.len() == 32
-        && std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx512bw")
-        && std::arch::is_x86_feature_detected!("avx512vl")
-    {
-        unsafe { coefficients_from_rows_32(q, rows, out) };
-        return;
-    }
     let half = ((q - 1) / 2) as u32;
     let mut batch = Batch32::zero(Representation::Ntt);
     for (p, column) in rows.iter().enumerate() {
@@ -403,35 +301,6 @@ pub fn coefficients_from_rows(q: u16, rows: &[&[u32; N]], out: &mut [i16]) {
     for p in 0..rows.len() {
         for i in 0..N {
             out[p * N + i] = batch.v[i][p];
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn coefficients_from_rows_32_matches_scalar() {
-        let mut s = 0x726f777333325f74u64;
-        for q in [3889u16, 9721] {
-            let owned: Vec<[u32; N]> = (0..32)
-                .map(|_| {
-                    core::array::from_fn(|_| {
-                        s ^= s << 13;
-                        s ^= s >> 7;
-                        s ^= s << 17;
-                        (s % q as u64) as u32
-                    })
-                })
-                .collect();
-            let refs: Vec<&[u32; N]> = owned.iter().collect();
-            let mut got = vec![0i16; 32 * N];
-            coefficients_from_rows(q, &refs, &mut got);
-            let mut want = vec![0i16; 32 * N];
-            coefficients_from_rows(q, &refs[..16], &mut want[..16 * N]);
-            coefficients_from_rows(q, &refs[16..], &mut want[16 * N..]);
-            assert_eq!(got, want, "q={q}");
         }
     }
 }

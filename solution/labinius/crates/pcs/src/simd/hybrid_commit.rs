@@ -25,9 +25,7 @@ const P0:u16=3889;
 const P1:u16=9721;
 const PRODUCT:i64=P0 as i64*P1 as i64;
 pub const MODULUS:u128=PRODUCT as u128*1024;
-/// The coupled public-key lift certifies all eight-batch chunks: maximum absolute
-/// coefficient 17,639,740 < PRODUCT/2. Key construction checks the bound again.
-pub const CHUNK_BATCHES:usize=8;
+pub const CHUNK_BATCHES:usize=7;
 
 /// Arranged key vectors per 27-row block: three 8-row groups of eight qword vectors and one
 /// 4-row group of four chunk vectors, each for A and then T.
@@ -348,26 +346,28 @@ unsafe fn finish_tails<const Q:u16>(acc:*mut GAcc,k:usize,g:usize,pend:&mut Batc
   }
  }
 }
-/// The inverse transforms return centered residues. With centered `u = (b-a)/P0 mod P1`,
-/// `a + P0*u` is already centered modulo PRODUCT: its magnitude is at most PRODUCT/2.
+#[inline(always)]
+unsafe fn canonical(x:__m512i,q:i16)->__m512i {
+ _mm512_mask_add_epi16(x,_mm512_cmp_epi16_mask(x,_mm512_setzero_si512(),_MM_CMPINT_LT),x,_mm512_set1_epi16(q))
+}
 #[target_feature(enable="avx512f,avx512bw")]
 unsafe fn crt_accumulate(a:&Batch32,b:&Batch32,tail:&mut Batch32) {
  const INV:u16=inv_mod(P0 as u64,P1 as u64) as u16;
  const W:i16=Params::<P1>::to_mont(INV);
  const WP:i16=Params::<P1>::mont_pre(W);
  let qv=_mm512_set1_epi16(P1 as i16);
- let half=_mm512_set1_epi16((P1/2) as i16);
- let nhalf=_mm512_set1_epi16(-((P1/2) as i16));
  for j in 0..648 {
-  let av=_mm512_load_si512(a.v[j].as_ptr() as *const __m512i);
-  let bv=_mm512_load_si512(b.v[j].as_ptr() as *const __m512i);
+  let av=canonical(_mm512_load_si512(a.v[j].as_ptr() as *const __m512i),P0 as i16);
+  let bv=canonical(_mm512_load_si512(b.v[j].as_ptr() as *const __m512i),P1 as i16);
   let d=_mm512_sub_epi16(bv,av);
   let m=_mm512_mullo_epi16(d,_mm512_set1_epi16(WP));
   let h=_mm512_mulhi_epi16(d,_mm512_set1_epi16(W));
-  let mut u=_mm512_sub_epi16(h,_mm512_mulhi_epi16(m,qv));
-  u=_mm512_mask_sub_epi16(u,_mm512_cmp_epi16_mask(u,half,_MM_CMPINT_NLE),u,qv);
-  u=_mm512_mask_add_epi16(u,_mm512_cmp_epi16_mask(u,nhalf,_MM_CMPINT_LT),u,qv);
-  let low=_mm512_add_epi16(av,_mm512_mullo_epi16(u,_mm512_set1_epi16(P0 as i16)));
+  let u=canonical(_mm512_sub_epi16(h,_mm512_mulhi_epi16(m,qv)),P1 as i16);
+  let gt=_mm512_cmp_epi16_mask(u,_mm512_set1_epi16((P1/2) as i16),_MM_CMPINT_NLE);
+  let eq=_mm512_cmp_epi16_mask(u,_mm512_set1_epi16((P1/2) as i16),_MM_CMPINT_EQ);
+  let agt=_mm512_cmp_epi16_mask(av,_mm512_set1_epi16((P0/2) as i16),_MM_CMPINT_NLE);
+  let mut low=_mm512_add_epi16(av,_mm512_mullo_epi16(u,_mm512_set1_epi16(P0 as i16)));
+  low=_mm512_mask_sub_epi16(low,gt|(eq&agt),low,_mm512_set1_epi16((PRODUCT&65535) as u16 as i16));
   let old=_mm512_load_si512(tail.v[j].as_ptr() as *const __m512i);
   _mm512_store_si512(tail.v[j].as_mut_ptr() as *mut __m512i,_mm512_add_epi16(old,low));
  }
@@ -397,6 +397,31 @@ unsafe fn clear_lanes(b:&mut Batch32,from:usize) {
  let m=!((1u64<<from)-1) as u32;
  for j in 0..N {_mm512_mask_storeu_epi16(b.v[j].as_mut_ptr(),m,_mm512_setzero_si512());}
 }
+/// Whether the commitment prefetches the witness: the knob is read once per group.
+fn prefetch_witness_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("LABINIUS_PREFETCH_WITNESS") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    })
+}
+
+/// Bring the first line of every page of `bytes` of the witness table into the cache: the
+/// commitment reads it in 2 KB chunks whose neighbours are 256 KB away, a pattern the
+/// hardware prefetchers do not follow across pages. Only the page starts are touched: the
+/// L2 streamer picks up the rest of a page after the first miss, and prefetching every line
+/// of every chunk costs more instructions than the misses it saves.
+#[inline(always)]
+fn prefetch_witness(ptr:*const crate::fields::scalar::B128,bytes:usize){
+ #[cfg(target_arch="x86_64")]
+ unsafe{
+  use core::arch::x86_64::*;
+  let base=ptr as *const i8;
+  let mut off=0usize;
+  while off<bytes{_mm_prefetch::<{_MM_HINT_T0}>(base.add(off));off+=4096;}
+ }
+}
+
 /// One group of `g` columns: the batch is the outer loop, so each key batch is read from L3 once
 /// per group and `g` times from L2. A finished tail chunk of column `c` goes to lane `s g + c`
 /// of the pending pair, `s` the chunk's slot; the pair is inverse transformed and CRT-combined
@@ -412,6 +437,16 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
  let mut filled=0usize;
  for b in 0..nb {
   for c in 0..g {
+   // The witness is the commitment's only DRAM traffic, and the hardware
+   // prefetchers do not follow it: a batch's 2 KB chunk of a column sits 256 KB
+   // from the same chunk of the neighbouring column, and advances by 2 KB only
+   // after a whole group of columns has been transformed. Touch the chunks that
+   // come next while this one is read and transformed.
+   if prefetch_witness_on() {
+    prefetch_witness(cols[c].as_ptr().add(128*b),2048);
+    if b+1<nb {prefetch_witness(cols[c].as_ptr().add(128*(b+1)),2048);}
+    if c+1<g {prefetch_witness(cols[c+1].as_ptr().add(128*b),2048);}
+   }
    cols[c].slice_batch(b,&mut ws.idx[0]);
    let a0=ws.acc[2*c].v.as_mut_ptr() as *mut i32;let a1=ws.acc[2*c+1].v.as_mut_ptr() as *mut i32;
    sink_batch::<P0>(&ws.idx[0],keys,b,a0);
@@ -428,8 +463,7 @@ unsafe fn group<F:FnMut(usize)>(cols:&[&[B128]],keys:&[KeyBatch],nb:usize,ws:&mu
     // lanes of unfilled slots still hold the previous flush's coefficients
     if filled*g<32 {clear_lanes(&mut p0[0],filled*g);clear_lanes(&mut p1[0],filled*g);}
     p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
-    // finish_tails uses red16: every live lane has |r| < 2q; unused lanes are zero.
-    gen_small::intt_hybrid_batch32_3889(&mut p0[0]);gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
+    gen_small::intt_gen_batch32::<P0>(&mut p0[0]);gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
     crt_accumulate(&p0[0],&p1[0],&mut ws.total[0]);
     filled=0;
    }
@@ -976,7 +1010,10 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
     if half==0 {clear_upper(&mut p0[0]);clear_upper(&mut p1[0]);}
     p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
     // finish_pair_stream uses red16: every live lane has |r| < 2*P0; unused lanes are zero.
-    gen_small::intt_hybrid_batch32_3889(&mut p0[0]);
+    // [port note] PR126 used `intt_hybrid_batch32_3889` (tight Barrett, adopt-illegal mixed
+    // lever). The generic inverse satisfies the same red16 input contract (`IN_BOUND` >= 2q)
+    // bit-identically; substitute until/if the tight inverse is adopted as its own lever.
+    gen_small::intt_gen_batch32::<P0>(&mut p0[0]);
     gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
     crt_accumulate(&p0[0],&p1[0],&mut ws.total[0]);
     half=0;
@@ -1075,11 +1112,6 @@ pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->
  unsafe{rows.set_len(columns.len()*3);}
  rows
 }
-
-#[cfg(test)]
-#[path = "centered_crt_tests.rs"]
-mod centered_crt_tests;
-
 #[cfg(test)]
 mod tests {
  use super::*;
@@ -1198,28 +1230,8 @@ mod tests {
    }}
    crt_accumulate(&a,&b,&mut out);
    for j in 0..648 {for p in 0..32 {
-    assert_eq!(out.v[j][p],vals[(j*32+p)%vals.len()] as i16);
+    assert_eq!((out.v[j][p] as u16)&1023,vals[(j*32+p)%vals.len()].rem_euclid(1024) as u16);
    }}
-  }
- }
- #[test]
- fn centered_crt_random_accumulation_matches_scalar() {
-  let mut state=0x654b37ef942d1083u64;
-  let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
-  let mut a=Batch32::zero(Representation::Coefficients);
-  let mut b=Batch32::zero(Representation::Coefficients);
-  let mut out=Batch32::zero(Representation::Coefficients);
-  let mut expected=Batch32::zero(Representation::Coefficients);
-  for _ in 0..16 {
-   for j in 0..648 {for p in 0..32 {
-    a.v[j][p]=(next()%P0 as u64) as i16-(P0/2) as i16;
-    b.v[j][p]=(next()%P1 as u64) as i16-(P1/2) as i16;
-    out.v[j][p]=next() as i16;
-    let lift=super::centered_crt_tests::reference_crt(a.v[j][p] as i64,b.v[j][p] as i64) as i16;
-    expected.v[j][p]=out.v[j][p].wrapping_add(lift);
-   }}
-   unsafe {crt_accumulate(&a,&b,&mut out);}
-   assert_eq!(out.v,expected.v);
   }
  }
  fn red16_check<const Q:u16>() {

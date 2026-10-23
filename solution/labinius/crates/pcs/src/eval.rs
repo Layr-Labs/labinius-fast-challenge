@@ -342,6 +342,28 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
     out
 }
 
+/// Accumulate selector pairs for one final column total. Per-word lanes are not preserved.
+#[inline(always)]
+unsafe fn mac_word5(acc: &mut [__m512i; 5], x: [__m512i; 3], sa: __m512i, b: [__m512i; 2]) {
+    let sb = _mm512_xor_si512(b[0], b[1]);
+    acc[0] = _mm512_xor_si512(acc[0], _mm512_clmulepi64_epi128::<0x00>(x[0], b[0]));
+    acc[0] = _mm512_xor_si512(acc[0], _mm512_clmulepi64_epi128::<0x11>(x[0], b[0]));
+    acc[1] = _mm512_xor_si512(acc[1], _mm512_clmulepi64_epi128::<0x00>(x[1], b[1]));
+    acc[1] = _mm512_xor_si512(acc[1], _mm512_clmulepi64_epi128::<0x11>(x[1], b[1]));
+    acc[2] = _mm512_xor_si512(acc[2], _mm512_clmulepi64_epi128::<0x00>(sa, sb));
+    acc[2] = _mm512_xor_si512(acc[2], _mm512_clmulepi64_epi128::<0x11>(sa, sb));
+    acc[3] = _mm512_xor_si512(acc[3], _mm512_clmulepi64_epi128::<0x00>(x[2], b[0]));
+    acc[3] = _mm512_xor_si512(acc[3], _mm512_clmulepi64_epi128::<0x11>(x[2], b[0]));
+    acc[4] = _mm512_xor_si512(acc[4], _mm512_clmulepi64_epi128::<0x00>(x[2], b[1]));
+    acc[4] = _mm512_xor_si512(acc[4], _mm512_clmulepi64_epi128::<0x11>(x[2], b[1]));
+}
+
+#[inline(always)]
+unsafe fn horizontal_word5(acc: [__m512i; 5]) -> F162 {
+    let z = _mm512_setzero_si512();
+    horizontal_word10([acc[0], z, acc[1], z, acc[2], z, acc[3], z, acc[4], z])
+}
+
 /// [`dot_words`] on two columns of `n` `B128` words at once: the word-sliced `eq` table (`a`,
 /// 384 KB at `n = 2^14`) is loaded from L2 once per pair of columns while both witness streams
 /// are prefetched 1 KB ahead.
@@ -352,8 +374,8 @@ unsafe fn dot_words2(a: &Poly, b0: *const F162Word, b1: *const F162Word, n: usiz
     debug_assert!(a.n >= n);
     let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
     let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
-    let mut acc0 = [_mm512_setzero_si512(); 10];
-    let mut acc1 = [_mm512_setzero_si512(); 10];
+    let mut acc0 = [_mm512_setzero_si512(); 5];
+    let mut acc1 = [_mm512_setzero_si512(); 5];
     let blocks = n / 8;
     for t in 0..blocks {
         let ahead0 = b0.wrapping_add(8 * t + 64) as *const i8;
@@ -368,11 +390,11 @@ unsafe fn dot_words2(a: &Poly, b0: *const F162Word, b1: *const F162Word, n: usiz
             _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
         ];
         let sa = _mm512_xor_si512(x[0], x[1]);
-        mac_word10(&mut acc0, x, sa, load_words2(b0.add(8 * t), lo, hi));
-        mac_word10(&mut acc1, x, sa, load_words2(b1.add(8 * t), lo, hi));
+        mac_word5(&mut acc0, x, sa, load_words2(b0.add(8 * t), lo, hi));
+        mac_word5(&mut acc1, x, sa, load_words2(b1.add(8 * t), lo, hi));
     }
     let mut out = if blocks > 0 {
-        [horizontal_word10(acc0), horizontal_word10(acc1)]
+        [horizontal_word5(acc0), horizontal_word5(acc1)]
     } else {
         [F162::ZERO; 2]
     };

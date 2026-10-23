@@ -961,6 +961,13 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
   };
   let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
   let kb=kbase.add(b*648*4);
+  if b+LOCK<np {
+   for l in 0..g {
+    let nxt=cols[l].as_ptr().add(8*(b+LOCK)) as *const i8;
+    core::arch::x86_64::_mm_prefetch::<{core::arch::x86_64::_MM_HINT_T1}>(nxt);
+    core::arch::x86_64::_mm_prefetch::<{core::arch::x86_64::_MM_HINT_T1}>(nxt.add(128));
+   }
+  }
   vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
   vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
   if (b+LOCK)%PP0==0 || b+LOCK==np {

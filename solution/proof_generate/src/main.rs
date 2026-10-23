@@ -1433,6 +1433,35 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pkeys,&columns,workers)
     } else {key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
     let commit_time = clock.elapsed();
+    // [pair-audit v2, opt-in] With LABINIUS_PAIR_AUDIT set, and before any proof byte is
+    // written, the first 16 hybrid columns are re-committed through the arranged kernel and
+    // their rows are compared bit-for-bit against the pair kernel's rows for those columns.
+    // The check runs through the paired multi-worker path (16 columns at group 8, satisfying
+    // the dispatch's columns.len() > group_size condition) and costs about 3-4 ms. Unset, it
+    // is inert and scored runs pay nothing. Diagnostics only: no timing selects code, and
+    // every scored proof is verifier-gated.
+    if std::env::var_os("LABINIUS_PAIR_AUDIT").is_some()
+        && modulus == modulus_choice::HYBRID_MODULUS
+        && modulus == MODULUS
+    {
+        if let Some(keys) = labinius::simd::commit::hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES) {
+            // This workspace's parity audit: covers the first three column groups and the
+            // last (see below); with LABINIUS_PAIR_AUDIT=full it covers every one of the
+            // 32 column groups, for a slower but complete pass at the same code path.
+            for w in if std::env::var("LABINIUS_PAIR_AUDIT").map(|v| v == "full").unwrap_or(false) {
+                (0..32usize).collect::<Vec<_>>()
+            } else {
+                vec![0usize, 1, 2, 63]
+            } {
+                let audit = labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys, &columns[16 * w..16 * w + 16], workers, 8);
+                let ok = audit == rows[(3 * 16 * w)..(3 * 16 * w + audit.len())];
+                eprintln!("[pair-audit] window{w} first_group_parity={}", if ok { "ok" } else { "MISMATCH" });
+                if !ok {
+                    panic!("[pair-audit] pair rows != arranged rows on columns {}; aborting before proof write", 16 * w);
+                }
+            }
+        }
+    }
     let buffer = output.and_then(|o| o.commitment_buffer());
     let commitment = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer);
     let recombine_time = clock.elapsed();

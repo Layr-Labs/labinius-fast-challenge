@@ -1145,6 +1145,41 @@ macro_rules! pair_register_sink {
     };
 }
 
+// Store the first pass after all 27 outputs are in registers.
+macro_rules! pair_stage27 {
+    () => {
+        concat!(
+            "vmovdqa64 [{w0}+64], zmm2\n",
+            "vmovdqa64 [{w0}+128], zmm1\n",
+            "vmovdqa64 [{w0}+0], zmm0\n",
+            "vmovdqa64 [{w0}+256], zmm8\n",
+            "vmovdqa64 [{w0}+320], zmm7\n",
+            "vmovdqa64 [{w0}+192], zmm6\n",
+            "vmovdqa64 [{w0}+448], zmm5\n",
+            "vmovdqa64 [{w0}+512], zmm4\n",
+            "vmovdqa64 [{w0}+384], zmm3\n",
+            "vmovdqa64 [{w0}+640], zmm20\n",
+            "vmovdqa64 [{w0}+704], zmm19\n",
+            "vmovdqa64 [{w0}+576], zmm18\n",
+            "vmovdqa64 [{w0}+832], zmm26\n",
+            "vmovdqa64 [{w0}+896], zmm25\n",
+            "vmovdqa64 [{w0}+768], zmm24\n",
+            "vmovdqa64 [{w0}+1024], zmm23\n",
+            "vmovdqa64 [{w0}+1088], zmm22\n",
+            "vmovdqa64 [{w0}+960], zmm21\n",
+            "vmovdqa64 [{w0}+1216], zmm11\n",
+            "vmovdqa64 [{w0}+1280], zmm10\n",
+            "vmovdqa64 [{w0}+1152], zmm9\n",
+            "vmovdqa64 [{w0}+1408], zmm17\n",
+            "vmovdqa64 [{w0}+1472], zmm16\n",
+            "vmovdqa64 [{w0}+1344], zmm15\n",
+            "vmovdqa64 [{w0}+1600], zmm14\n",
+            "vmovdqa64 [{w0}+1664], zmm13\n",
+            "vmovdqa64 [{w0}+1536], zmm12\n",
+        )
+    };
+}
+
 #[inline(always)]
 unsafe fn tail27_pair<const Q: u16>(
     bp: *const i16, w0: *const i16, t4: *const u32, t5: *const u32, t6: *const u32,
@@ -1154,8 +1189,19 @@ unsafe fn tail27_pair<const Q: u16>(
         ($m4:ident, $m6:ident) => {
             core::arch::asm!(
                 concat!(
+                    // Bit 1 selects the first pass. Both input registers are restored
+                    // before exit. Thus the operand contract needs no extra GPR.
+                    "or {red:r}, 2\n",
+                    "4:\n",
                     "vmovdqa64 zmm27, [{c}]\n",
                     tail27!($m4, $m6, bfly_registers),
+                    "test {red:e}, 2\n",
+                    "jz 5f\n",
+                    pair_stage27!(),
+                    "add {i}, {stride}\n",
+                    "xor {red:r}, 2\n",
+                    "jmp 4b\n",
+                    "5:\n",
                     "test {red:e}, {red:e}\n",
                     "jnz 2f\n",
                     pair_register_sink!(plain),
@@ -1163,12 +1209,14 @@ unsafe fn tail27_pair<const Q: u16>(
                     "2:\n",
                     pair_register_sink!(reduce),
                     "3:\n",
+                    "sub {i}, {stride}\n",
                     "/* {fold} */\n",
                 ),
                 i = in(reg) bp, w0 = in(reg) w0, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,
                 c = in(reg) cv, key = in(reg) key, acc = in(reg) acc,
                 fold = in(reg) &const { hybrid_fold::<Q>() },
                 red = in(reg) red,
+                stride = const core::mem::size_of::<Blk>(),
                 out("zmm0") _,
                 out("zmm1") _,
                 out("zmm2") _,
@@ -1333,7 +1381,6 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
         om: bc(&t.om[0]),
         omp: bc(&t.om[1]),
     };
-    let bar = needs_barrett(Q);
     let ips: [*const u8; 2] = [
         ins[0].rows.as_ptr() as *const u8,
         ins[1].rows.as_ptr() as *const u8,
@@ -1417,14 +1464,8 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
                     t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
                 );
                 let bp0 = bps[2 * qpair].add(32 * 27 * j);
-                if bar {
-                    tail27_b(bp0, w0p, t4, t5, t6, cv);
-                } else {
-                    tail27_p(bp0, w0p, t4, t5, t6, cv);
-                }
-                let bp1 = bps[2 * qpair + 1].add(32 * 27 * j);
                 tail27_pair::<Q>(
-                    bp1,
+                    bp0,
                     w0p,
                     t4,
                     t5,

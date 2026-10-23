@@ -384,6 +384,65 @@ unsafe fn dot_words2(a: &Poly, b0: *const F162Word, b1: *const F162Word, n: usiz
     out
 }
 
+/// [`dot_words`] on four columns of `n` `B128` words at once: the word-sliced `eq` table (`a`,
+/// 384 KB at `n = 2^14`) is loaded from L2 once per 4-column group while all four witness
+/// streams are prefetched 1 KB ahead.
+///
+/// # Safety
+/// `b0..b3` each address `n` words and `a` holds at least `n` elements.
+unsafe fn dot_words4(
+    a: &Poly,
+    b0: *const F162Word,
+    b1: *const F162Word,
+    b2: *const F162Word,
+    b3: *const F162Word,
+    n: usize,
+) -> [F162; 4] {
+    debug_assert!(a.n >= n);
+    let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+    let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+    let mut acc0 = [_mm512_setzero_si512(); 10];
+    let mut acc1 = [_mm512_setzero_si512(); 10];
+    let mut acc2 = [_mm512_setzero_si512(); 10];
+    let mut acc3 = [_mm512_setzero_si512(); 10];
+    let blocks = n / 8;
+    for t in 0..blocks {
+        for &bp in &[b0, b1, b2, b3] {
+            let ahead = bp.wrapping_add(8 * t + 64) as *const i8;
+            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead);
+            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead.wrapping_add(64));
+        }
+        let x = [
+            _mm512_loadu_si512(a.w[0].as_ptr().add(8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
+        ];
+        let sa = _mm512_xor_si512(x[0], x[1]);
+        mac_word10(&mut acc0, x, sa, load_words2(b0.add(8 * t), lo, hi));
+        mac_word10(&mut acc1, x, sa, load_words2(b1.add(8 * t), lo, hi));
+        mac_word10(&mut acc2, x, sa, load_words2(b2.add(8 * t), lo, hi));
+        mac_word10(&mut acc3, x, sa, load_words2(b3.add(8 * t), lo, hi));
+    }
+    let mut out = if blocks > 0 {
+        [
+            horizontal_word10(acc0),
+            horizontal_word10(acc1),
+            horizontal_word10(acc2),
+            horizontal_word10(acc3),
+        ]
+    } else {
+        [F162::ZERO; 4]
+    };
+    for k in 8 * blocks..n {
+        let ak = a.get(k);
+        out[0] += ak * F162::from_b128(*b0.add(k));
+        out[1] += ak * F162::from_b128(*b1.add(k));
+        out[2] += ak * F162::from_b128(*b2.add(k));
+        out[3] += ak * F162::from_b128(*b3.add(k));
+    }
+    out
+}
+
 /// [`row_evaluate`] of the witness `Witness::lifted` would build from `words`, read in place
 /// and one column per task over `workers` threads: `u_j = sum_i eq(p0, i) lift(words[i + wdim j])`.
 /// `eq(p0, .)` straight into the word-sliced layout [`dot_words`] reads: entry `i` is
@@ -440,7 +499,7 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     // Columns handed out in even-sized chunks from a shared counter: a runner that starts late
     // or shares its core with another process takes fewer of them instead of holding the phase
     // up, and each pair of columns in a chunk shares one pass over `eq` via `dot_words2`.
-    let chunk = columns.div_ceil(32 * workers.max(1)).max(2).next_multiple_of(2);
+    let chunk = columns.div_ceil(16 * workers.max(1)).max(4).next_multiple_of(4);
     let chunks = columns.div_ceil(chunk);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out_addr = out.as_mut_ptr() as usize;
@@ -452,6 +511,25 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
         // Chunk `k` owns `out[k * chunk ..]`.
         let end = ((k + 1) * chunk).min(columns);
         let mut j = k * chunk;
+        while j + 3 < end {
+            let [v0, v1, v2, v3] = unsafe {
+                dot_words4(
+                    &eq,
+                    words.as_ptr().add(j * wdim),
+                    words.as_ptr().add((j + 1) * wdim),
+                    words.as_ptr().add((j + 2) * wdim),
+                    words.as_ptr().add((j + 3) * wdim),
+                    wdim,
+                )
+            };
+            unsafe {
+                (out_addr as *mut F162).add(j).write(v0);
+                (out_addr as *mut F162).add(j + 1).write(v1);
+                (out_addr as *mut F162).add(j + 2).write(v2);
+                (out_addr as *mut F162).add(j + 3).write(v3);
+            }
+            j += 4;
+        }
         while j + 1 < end {
             let [v0, v1] = unsafe {
                 dot_words2(

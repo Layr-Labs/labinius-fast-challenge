@@ -33,10 +33,6 @@ fn main() {
     std::fs::write(dir.join("key.bin"), image).expect("write the key image");
     std::fs::write(dir.join("tail-key.bin"), tail).expect("write the auxiliary key image");
     std::fs::write(dir.join("hybrid-key.bin"), hybrid).expect("write the arranged hybrid key image");
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    if host_can_run() && parameters::MODULUS == modulus_choice::HYBRID_MODULUS {
-        native_diagnostics(&dir);
-    }
 }
 
 #[cfg(target_arch = "x86_64")]

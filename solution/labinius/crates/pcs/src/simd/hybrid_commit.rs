@@ -1043,9 +1043,62 @@ fn commit_paired_pairs(
  });
 }
 
+// Four compute tasks use the existing eight-task sibling placement and 32-column claims.
+fn commit_four_pairs(
+ keys:&[u32],
+ columns:&[&[B128]],
+ np:usize,
+ placement:Option<&crate::par::CorePlacement>,
+ dst:usize,
+) {
+ use std::sync::atomic::{AtomicUsize,Ordering};
+ let g=16usize;let sg=2*g;let pairs=4usize;
+ let super_groups=columns.len().div_ceil(sg);
+ let rounds=super_groups+1;
+ let next=AtomicUsize::new(0);
+ let slots:Vec<std::sync::OnceLock<usize>>=(0..pairs*rounds).map(|_|std::sync::OnceLock::new()).collect();
+ crate::par::pool().run(2*pairs,|worker|{
+  let _guard=placement.and_then(|p|p.pin(worker));
+  if worker%2!=0 {return;}
+  let pair=worker/2;
+  let mut ws:Option<PairWorker>=None;
+  for r in 0..rounds {
+   let gi=*slots[pair*rounds+r].get_or_init(||next.fetch_add(1,Ordering::Relaxed));
+   if gi>=super_groups {break;}
+   let c0=gi*sg;let gc=sg.min(columns.len()-c0);
+   for s in 0..2 {
+    let (lo,n)=if s==0 {(c0,gc.min(g))} else {(c0+g,gc.saturating_sub(g))};
+    if n==0 {continue;}
+    let ws=ws.get_or_insert_with(PairWorker::new);
+    unsafe{group_pairs_full(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),|_|{})};
+   }
+  }
+ });
+}
+
+/// Column-pair commitment with four compute tasks on the existing eight-task sibling dispatch.
+/// Other pool widths, mappings and input shapes retain the original paired dispatch.
+pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+ assert!(!columns.is_empty(),"at least one witness column");
+ let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
+ assert_eq!(len%8,0);let np=len/8;
+ assert_eq!(keys.len(),4*np*648);
+ let groups=columns.len().div_ceil(16);
+ if workers!=8 || groups<=1 || crate::par::pool().width()!=8 {
+  return commit_columns_rows_pairs_baseline8(keys,columns,workers);
+ }
+ let Some(placement)=crate::par::CorePlacement::for_sibling_pairs(workers) else {
+  return commit_columns_rows_pairs_baseline8(keys,columns,workers);
+ };
+ let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;
+ commit_four_pairs(keys,columns,np,Some(&placement),dst);
+ unsafe{rows.set_len(columns.len()*3);}
+ rows
+}
+
 /// [`commit_columns_rows`] in the column-pair layout: groups of 16 columns, one pass over the
 /// pair keys per group, with SMT sibling-pair L2 key sharing when available.
-pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+pub fn commit_columns_rows_pairs_baseline8(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
  assert!(!columns.is_empty(),"at least one witness column");
  let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
  assert_eq!(len%8,0);let np=len/8;

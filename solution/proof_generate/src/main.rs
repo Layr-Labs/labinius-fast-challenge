@@ -114,6 +114,7 @@ mod sys {
     pub const MAP_ANONYMOUS: i32 = 0x20;
     pub const MAP_NORESERVE: i32 = 0x4000;
     pub const MADV_HUGEPAGE: i32 = 14;
+    pub const MADV_DONTNEED: i32 = 4;
     /// Linux 5.14+: fault the range in now, read-only, without blocking a later writer.
     pub const MADV_POPULATE_READ: i32 = 22;
     /// Linux 5.14+: fault the range in now, writable (for a shared file mapping: page-cache pages
@@ -424,6 +425,32 @@ impl Table {
             #[cfg(target_os = "linux")]
             Table::Mapped { ptr, .. } => unsafe { std::slice::from_raw_parts(*ptr, Self::WORDS) },
             Table::Owned(v) => v,
+        }
+    }
+
+    ///
+    fn release_pages(&self, parts: usize) {
+        #[cfg(target_os = "linux")]
+        {
+            if let Table::Mapped { ptr, bytes } = self {
+                let (addr, bytes) = (*ptr as usize, *bytes);
+                let runs = labinius::par::ranges(bytes / 16, parts, 4096 / 16);
+                let chunks = runs.len();
+                labinius::par::pool().run(chunks, move |i| {
+                    let r = &runs[i];
+                    unsafe {
+                        sys::madvise(
+                            (addr + r.start * 16) as *mut core::ffi::c_void,
+                            r.len() * 16,
+                            sys::MADV_DONTNEED,
+                        )
+                    };
+                });
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = parts;
         }
     }
 
@@ -1619,8 +1646,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
     ));
     let fold_time = clock.elapsed();
-    // The mapping is left to the exit, which tears it down without the TLB shootdowns an unmap
-    // beside the pool's threads needs.
+    table.release_pages(workers);
     std::mem::forget(table);
     let proof = ProofParts {
         modulus,

@@ -381,6 +381,57 @@ impl Table {
     const WORDS: usize = 1 << LOG_PACKED;
     const BYTES: usize = (1 << LOG_VARS) / 8;
 
+    #[cfg(target_os = "linux")]
+    fn map_huge(file: &std::fs::File) -> Option<Table> {
+        use std::os::fd::AsRawFd;
+        const HUGE: usize = 2 << 20;
+        let bytes = Self::BYTES;
+        let span = bytes + HUGE;
+        let reserved = unsafe {
+            sys::mmap(
+                core::ptr::null_mut(),
+                span,
+                sys::PROT_NONE,
+                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if reserved as isize == -1 || reserved.is_null() {
+            return None;
+        }
+        let base = reserved as usize;
+        let at = (base + HUGE - 1) & !(HUGE - 1);
+        let ptr = unsafe {
+            sys::mmap(
+                at as *mut core::ffi::c_void,
+                bytes,
+                sys::PROT_READ,
+                sys::MAP_PRIVATE | sys::MAP_FIXED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr as isize == -1 || ptr as usize != at {
+            unsafe { sys::munmap(reserved, span) };
+            return None;
+        }
+        let head = at - base;
+        if head != 0 {
+            unsafe { sys::munmap(reserved, head) };
+        }
+        let tail_at = at + bytes;
+        let tail = base + span - tail_at;
+        if tail != 0 {
+            unsafe { sys::munmap(tail_at as *mut core::ffi::c_void, tail) };
+        }
+        unsafe { sys::madvise(ptr, bytes, sys::MADV_HUGEPAGE) };
+        Some(Table::Mapped {
+            ptr: ptr as *const B128,
+            bytes,
+        })
+    }
+
     fn load(path: &str) -> Table {
         assert!(cfg!(target_endian = "little"), "the table is little-endian");
         assert_eq!(core::mem::size_of::<B128>(), 16, "B128 is 16 bytes");
@@ -390,6 +441,9 @@ impl Table {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
+            if let Some(mapped) = Self::map_huge(&file) {
+                return mapped;
+            }
             let ptr = unsafe {
                 sys::mmap(
                     core::ptr::null_mut(),

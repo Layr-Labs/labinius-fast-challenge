@@ -390,16 +390,62 @@ impl Table {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
-            let ptr = unsafe {
+            let fd = file.as_raw_fd();
+            const HUGE: usize = 2 << 20;
+            let mut ptr: *mut core::ffi::c_void = !0usize as *mut core::ffi::c_void;
+            let reserved = unsafe {
                 sys::mmap(
                     core::ptr::null_mut(),
-                    Self::BYTES,
-                    sys::PROT_READ,
-                    sys::MAP_PRIVATE,
-                    file.as_raw_fd(),
+                    Self::BYTES + HUGE,
+                    sys::PROT_NONE,
+                    sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+                    -1,
                     0,
                 )
             };
+            if reserved as isize != -1 && !reserved.is_null() {
+                let at = ((reserved as usize + HUGE - 1) & !(HUGE - 1)) as *mut core::ffi::c_void;
+                let mapped = unsafe {
+                    sys::mmap(
+                        at,
+                        Self::BYTES,
+                        sys::PROT_READ,
+                        sys::MAP_PRIVATE | sys::MAP_FIXED,
+                        fd,
+                        0,
+                    )
+                };
+                let (lo, hi) = (reserved as usize, reserved as usize + Self::BYTES + HUGE);
+                if mapped == at {
+                    unsafe {
+                        if at as usize > lo {
+                            sys::munmap(lo as *mut core::ffi::c_void, at as usize - lo);
+                        }
+                        if at as usize + Self::BYTES < hi {
+                            sys::munmap(
+                                (at as usize + Self::BYTES) as *mut core::ffi::c_void,
+                                hi - at as usize - Self::BYTES,
+                            );
+                        }
+                        sys::madvise(at, Self::BYTES, sys::MADV_HUGEPAGE);
+                    }
+                    ptr = at;
+                } else {
+                    unsafe { sys::munmap(reserved, Self::BYTES + HUGE) };
+                }
+            }
+            if ptr as isize == -1 {
+                ptr = unsafe {
+                    sys::mmap(
+                        core::ptr::null_mut(),
+                        Self::BYTES,
+                        sys::PROT_READ,
+                        sys::MAP_PRIVATE,
+                        fd,
+                        0,
+                    )
+                };
+            }
             if ptr as isize != -1 && !ptr.is_null() && (ptr as usize) % 16 == 0 {
                 return Table::Mapped {
                     ptr: ptr as *const B128,

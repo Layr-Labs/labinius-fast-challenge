@@ -712,8 +712,10 @@ const _:()=assert!(acc_after_reduce_c(P1)+(PP1 as i64)*pair_per_batch(P1)<=bias(
 /// Pair batches per certified chunk (the chunk is `CHUNK_BATCHES * 32` ring elements).
 const CHUNK_PAIRS:usize=CHUNK_BATCHES*16;
 /// Pair batches transformed in lockstep per accumulator read-modify-write.
-const LOCK:usize=2;
-const _:()=assert!(CHUNK_PAIRS%PP0==0 && CHUNK_PAIRS%PP1==0 && PP0%LOCK==0 && PP1%LOCK==0 && CHUNK_PAIRS%LOCK==0);
+const LOCK:usize=4;
+/// The immutable public key image still bundles two pairs per prime.
+const KEY_LOCK:usize=2;
+const _:()=assert!(LOCK%KEY_LOCK==0 && CHUNK_PAIRS%PP0==0 && CHUNK_PAIRS%PP1==0 && PP0%LOCK==0 && PP1%LOCK==0 && CHUNK_PAIRS%LOCK==0);
 
 /// Interleaved base (`[j][0]`) and tail (`[j][1]`) 16-column accumulators for one prime:
 /// 128 bytes per slot `j` so both streams share a single 128-byte L2 spatial-prefetcher sector.
@@ -741,12 +743,12 @@ unsafe fn dp_bc<const OFF:usize>(acc:__m512i,x:__m512i,k:*const u32)->__m512i {
 /// Staged reference pair sink for `LOCK = 2` consecutive pair batches at once: both products enter
 /// each accumulator in one read-modify-write (`RED` when the second batch closes a fold-back period).
 #[cfg(test)]
-struct MultiSink<const Q:u16,const RED:bool> {bufs:[*mut i16;LOCK],k:*const u32,acc:*mut __m512i}
+struct MultiSink<const Q:u16,const RED:bool> {bufs:[*mut i16;KEY_LOCK],k:*const u32,acc:*mut __m512i}
 #[cfg(test)]
-impl<const Q:u16,const RED:bool> vb::MultiBlockSink<LOCK> for MultiSink<Q,RED> {
- #[inline(always)]unsafe fn dsts(&mut self,_:usize)->[*mut i16;LOCK] {self.bufs}
+impl<const Q:u16,const RED:bool> vb::MultiBlockSink<KEY_LOCK> for MultiSink<Q,RED> {
+ #[inline(always)]unsafe fn dsts(&mut self,_:usize)->[*mut i16;KEY_LOCK] {self.bufs}
  #[inline(always)]
- unsafe fn blocks(&mut self,blk:usize,w:[*mut i16;LOCK]) {
+ unsafe fn blocks(&mut self,blk:usize,w:[*mut i16;KEY_LOCK]) {
   let s0=27*blk;
   let k=self.k.add(4*s0);
   let p0=self.acc.add(2*s0);
@@ -943,13 +945,15 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
  dst:*mut [u32;N],
  mut sync:F,
 ) {
- let g=cols.len();assert!(g>=1 && g<=16 && np%LOCK==0);
+ let g=cols.len();assert!(g>=1 && g<=16 && np%KEY_LOCK==0);
  // Lanes of columns past the group's end read a zero element.
  static ZERO8:[B128;8]=[B128::ZERO;8];
  let kbase=keys.as_ptr();
  let mut half=0usize;
  for b in (0..np).step_by(LOCK) {
-  for h in 0..LOCK {
+  let active=LOCK.min(np-b);
+  let end=b+active;
+  for h in 0..active {
    let cols16:[*const B128;16]=core::array::from_fn(|l|{
     if l<g {cols[l].as_ptr().add(8*(b+h))} else {ZERO8.as_ptr()}
    });
@@ -959,20 +963,28 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
    let [x,y]=&mut ws.acc[..2] else {unreachable!()};
    (x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32)
   };
-  let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
   let kb=kbase.add(b*648*4);
-  vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
-  vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
-  if (b+LOCK)%PP0==0 || b+LOCK==np {
-   sync(b+LOCK);
+  if active==LOCK {
+   let ins:[&BinaryIndex32;LOCK]=core::array::from_fn(|h|&ws.idx[h]);
+   vb::ntt_bin_batch32_pair4::<P0>(ins,kb,acc0,end%PP0==0);
+   vb::ntt_bin_batch32_pair4::<P1>(ins,kb.add(648*4),acc1,end%PP1==0);
+  } else {
+   // Preserve the previous API's even-pair tail, without reading a nonexistent key bundle.
+   debug_assert_eq!(active,KEY_LOCK);
+   let ins=[&ws.idx[0],&ws.idx[1]];
+   vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,end%PP0==0);
+   vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,end%PP1==0);
   }
-  if (b+LOCK)%CHUNK_PAIRS==0 || b+LOCK==np {
+  if end%PP0==0 || end==np {
+   sync(end);
+  }
+  if end%CHUNK_PAIRS==0 || end==np {
    // Two finished chunks share one pair of inverse transforms: the first in lanes 0..16, the
    // second in lanes 16..32 (each chunk's CRT stays exact on its own lanes).
    let (p0,p1)=ws.partial.split_at_mut(1);
    finish_pair_stream::<P0,1>(&mut ws.acc[0],&mut p0[0],half);
    finish_pair_stream::<P1,1>(&mut ws.acc[1],&mut p1[0],half);
-   if half==1 || b+LOCK==np {
+   if half==1 || end==np {
     if half==0 {clear_upper(&mut p0[0]);clear_upper(&mut p1[0]);}
     p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
     // finish_pair_stream uses red16: every live lane has |r| < 2*P0; unused lanes are zero.
@@ -1151,7 +1163,7 @@ mod tests {
    unsafe {
     let ins=[&idx[0],&idx[1]];
     let bufs=[scratch[0].0.as_mut_ptr(),scratch[1].0.as_mut_ptr()];
-    vb::ntt_bin_batch32_multi_sink::<Q,LOCK,_>(
+    vb::ntt_bin_batch32_multi_sink::<Q,KEY_LOCK,_>(
      ins,
      &mut MultiSink::<Q,RED>{bufs,k:key.as_ptr(),acc:want[0].v.as_mut_ptr() as *mut __m512i},
     );
@@ -1164,6 +1176,117 @@ mod tests {
  fn fused_pair_sink_matches_multi_sink() {
   fused_pair_sink_check::<P0,false>();fused_pair_sink_check::<P0,true>();
   fused_pair_sink_check::<P1,false>();fused_pair_sink_check::<P1,true>();
+ }
+ /// Differential oracle: the unchanged two-pair assembly consumes each key bundle
+ /// separately. Deliberately distinct inputs, key bundles and the intervening prime
+ /// catch tail/register permutations and an incorrect same-prime key stride.
+ fn pair4_sink_check<const Q:u16,const RED:bool>() {
+  let mut state=0x8172b34c56d90aefu64 ^ Q as u64;
+  let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
+  let mut keys=vec![0u32;3*648*4];
+  let mut idx:[BinaryIndex32;4]=core::array::from_fn(|_|BinaryIndex32::zero());
+  let mut got=zeroed_slice::<PAcc>(1);
+  let mut want=zeroed_slice::<PAcc>(1);
+  for case in 0..12 {
+   for (h,input) in idx.iter_mut().enumerate() {
+    for row in &mut input.rows {for lane in 0..32 {
+     let n=match case {0=>0,1=>15,2=>((3*lane+h)%16) as u8,_=>(next()&15) as u8};
+     row[2*lane]=n;row[2*lane+1]=16+n;
+    }}
+   }
+   for (i,w) in keys.iter_mut().enumerate() {
+    let mut lane=||match case {
+     0=>0,1=>Q as i16/2,2=>if i%2==0 {-(Q as i16/2)} else {Q as i16/2},
+     _=>(next()%Q as u64) as i16-Q as i16/2,
+    };
+    *w=(lane() as u16 as u32)|((lane() as u16 as u32)<<16);
+   }
+   for (a,b) in got[0].v.iter_mut().zip(&mut want[0].v) {
+    for stream in 0..2 {for lane in 0..16 {
+     // These extrema exercise bit-exact wrapping instructions, not production bounds.
+     let x=match case {0=>0,1=>i32::MAX,2=>i32::MIN,_=>next() as i32};
+     a[stream][lane]=x;b[stream][lane]=x;
+    }}
+   }
+   unsafe {
+    vb::ntt_bin_batch32_pair::<Q>([&idx[0],&idx[1]],keys.as_ptr(),want[0].v.as_mut_ptr() as *mut i32,false);
+    vb::ntt_bin_batch32_pair::<Q>([&idx[2],&idx[3]],keys.as_ptr().add(2*648*4),want[0].v.as_mut_ptr() as *mut i32,RED);
+    vb::ntt_bin_batch32_pair4::<Q>(core::array::from_fn(|h|&idx[h]),keys.as_ptr(),got[0].v.as_mut_ptr() as *mut i32,RED);
+   }
+   assert!(got[0].v==want[0].v,"four-pair sink q={Q}, RED={RED}, case={case}");
+  }
+ }
+ #[test]
+ fn pair4_sink_matches_two_pair_calls() {
+  pair4_sink_check::<P0,false>();pair4_sink_check::<P0,true>();
+  pair4_sink_check::<P1,false>();pair4_sink_check::<P1,true>();
+ }
+
+ /// Compare every quartet immediately before, on, and after two reduction periods.
+ /// Positive and negative centered key extrema exercise the signed accumulator bound.
+ fn pair4_boundary_check<const Q:u16>() {
+  let period=pair_period(Q);
+  assert_eq!(period%4,0);
+  assert!(acc_after_reduce_c(Q)+(period as i64)*pair_per_batch(Q)<=bias(Q));
+  for sign in [-1i16,1] {
+   let lane=sign*(Q as i16/2);
+   let packed=(lane as u16 as u32)|((lane as u16 as u32)<<16);
+   let keys=vec![packed;3*648*4];
+   let mut idx:[BinaryIndex32;4]=core::array::from_fn(|_|BinaryIndex32::zero());
+   for input in &mut idx {for row in &mut input.rows {for l in 0..32 {
+    row[2*l]=15;row[2*l+1]=31;
+   }}}
+   let mut got=zeroed_slice::<PAcc>(1);
+   let mut want=zeroed_slice::<PAcc>(1);
+   for b in (0..2*period+4).step_by(4) {
+    let red=(b+4)%period==0;
+    unsafe {
+     let dst=want[0].v.as_mut_ptr() as *mut i32;
+     vb::ntt_bin_batch32_pair::<Q>([&idx[0],&idx[1]],keys.as_ptr(),dst,(b+2)%period==0);
+     vb::ntt_bin_batch32_pair::<Q>([&idx[2],&idx[3]],keys.as_ptr().add(2*648*4),dst,red);
+     vb::ntt_bin_batch32_pair4::<Q>(core::array::from_fn(|h|&idx[h]),keys.as_ptr(),got[0].v.as_mut_ptr() as *mut i32,red);
+    }
+    assert!(got[0].v==want[0].v,"four-pair boundary q={Q}, b={b}, sign={sign}");
+   }
+  }
+ }
+ #[test]
+ fn pair4_reduction_boundaries_match_reference() {
+  pair4_boundary_check::<P0>();pair4_boundary_check::<P1>();
+ }
+
+ /// Whole commitment rows against the independent folded-lane implementation.
+ /// Short columns are padded with zero witness elements for the reference: this
+ /// keeps its 32-ring-element batch API while testing a final two-pair lock here.
+ /// np=112/128/130 exercise before/on/after the certified chunk boundary;
+ /// 144/256/272 also cover partial, full and odd final inverse-transform halves.
+ #[test]
+ fn pair4_commitment_edges_match_folded_reference() {
+  use crate::key::CommitmentKey;
+  use crate::ring::Modulus;
+  for np in [2usize,6,112,128,130,144,256,272] {
+   let len=np*8;let padded_len=np.div_ceil(16)*128;
+   let base=CommitmentKey::random(padded_len,31,Modulus::Q3889_FS_S,&[Modulus::Q9721_FS_S]);
+   let tail=CommitmentKey::random(padded_len,32,Modulus::Q3889_FS_S,&[Modulus::Q9721_FS_S]);
+   let keys=pair_keys(&base,&tail,1);
+   let mut state=0x97b5a312c468def0u64 ^ np as u64;
+   let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
+   for case in 0..3 {
+    let mut words=vec![B128::ZERO;17*padded_len];
+    for column in words.chunks_exact_mut(padded_len) {for word in &mut column[..len] {
+     *word=match case {
+      0=>B128::ZERO,1=>B128(u128::MAX),_=>B128(((next() as u128)<<64)|next() as u128),
+     };
+    }}
+    for count in [1usize,15,16,17] {
+     let padded:Vec<&[B128]>=words.chunks_exact(padded_len).take(count).collect();
+     let columns:Vec<&[B128]>=padded.iter().map(|column|&column[..len]).collect();
+     let want=reference::commit_columns_rows(&base,&tail,&padded,1,16);
+     let got=commit_columns_rows_pairs(&keys[..4*np*648],&columns,1);
+     assert!(got==want,"four-pair commitment np={np}, columns={count}, case={case}");
+    }
+   }
+  }
  }
  /// The lane slicer and cols16 slicer equal the direct B128 slicer on random words.
  #[test]

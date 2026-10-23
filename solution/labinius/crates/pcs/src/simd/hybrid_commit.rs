@@ -1043,9 +1043,122 @@ fn commit_paired_pairs(
  });
 }
 
+impl PairWorker {
+ fn new_bundle2()->Self {
+  PairWorker{
+   acc:zeroed_slice(4),
+   partial:zeroed_slice(4),
+   total:zeroed_slice(2),
+   idx:zeroed_slice(LOCK),
+  }
+ }
+}
+
+// Two cohorts retain separate arithmetic state and share only index scratch.
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn group_bundle2<F:FnMut(usize)>(
+ cols:&[&[B128]],keys:&[u32],np:usize,ws:&mut PairWorker,dst:*mut [u32;N],mut sync:F,
+) {
+ assert!(!cols.is_empty() && cols.len()<=32 && np%LOCK==0);
+ let cohorts=cols.len().div_ceil(16);
+ static ZERO8:[B128;8]=[B128::ZERO;8];
+ let kbase=keys.as_ptr();
+ let mut half=0usize;
+ for b in (0..np).step_by(LOCK) {
+  for cohort in 0..cohorts {
+   let c0=16*cohort;let g=(cols.len()-c0).min(16);
+   for h in 0..LOCK {
+    let cols16:[*const B128;16]=core::array::from_fn(|l|{
+     if l<g {cols[c0+l].as_ptr().add(8*(b+h))} else {ZERO8.as_ptr()}
+    });
+    crate::simd::transpose_f162::slice_b128_cols16_into(&cols16,&mut ws.idx[h]);
+   }
+   let (acc0,acc1)={
+    let [x,y]=&mut ws.acc[2*cohort..2*cohort+2] else {unreachable!()};
+    (x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32)
+   };
+   let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
+   let kb=kbase.add(b*648*4);
+   vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
+   vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
+  }
+  // The key address advances only after all cohorts use the batch.
+  if (b+LOCK)%PP0==0 || b+LOCK==np {sync(b+LOCK);}
+  if (b+LOCK)%CHUNK_PAIRS==0 || b+LOCK==np {
+   for cohort in 0..cohorts {
+    let (p0,p1)=ws.partial[2*cohort..2*cohort+2].split_at_mut(1);
+    finish_pair_stream::<P0,1>(&mut ws.acc[2*cohort],&mut p0[0],half);
+    finish_pair_stream::<P1,1>(&mut ws.acc[2*cohort+1],&mut p1[0],half);
+    if half==1 || b+LOCK==np {
+     if half==0 {clear_upper(&mut p0[0]);clear_upper(&mut p1[0]);}
+     p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
+     gen_small::intt_hybrid_batch32_3889(&mut p0[0]);
+     gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
+     crt_accumulate(&p0[0],&p1[0],&mut ws.total[cohort]);
+    }
+   }
+   if half==1 || b+LOCK==np {half=0;} else {half=1;}
+  }
+ }
+ for cohort in 0..cohorts {
+  let g=(cols.len()-16*cohort).min(16);
+  let [acc0,acc1]=&mut ws.acc[2*cohort..2*cohort+2] else {unreachable!()};
+  write_pair_group_rows(acc0,acc1,&mut ws.total[cohort],g,dst.add(3*16*cohort));
+ }
+}
+
+// Four compute tasks reuse each key window across two independent groups.
+fn commit_four_bundles(
+ keys:&[u32],
+ columns:&[&[B128]],
+ np:usize,
+ placement:Option<&crate::par::CorePlacement>,
+ dst:usize,
+) {
+ use std::sync::atomic::{AtomicUsize,Ordering};
+ let sg=32usize;let pairs=4usize;
+ let super_groups=columns.len().div_ceil(sg);
+ let rounds=super_groups+1;
+ let next=AtomicUsize::new(0);
+ let slots:Vec<std::sync::OnceLock<usize>>=(0..pairs*rounds).map(|_|std::sync::OnceLock::new()).collect();
+ crate::par::pool().run(2*pairs,|worker|{
+  let _guard=placement.and_then(|p|p.pin(worker));
+  if worker%2!=0 {return;}
+  let pair=worker/2;
+  let mut ws:Option<PairWorker>=None;
+  for r in 0..rounds {
+   let gi=*slots[pair*rounds+r].get_or_init(||next.fetch_add(1,Ordering::Relaxed));
+   if gi>=super_groups {break;}
+   let c0=gi*sg;let gc=sg.min(columns.len()-c0);
+   let ws=ws.get_or_insert_with(PairWorker::new_bundle2);
+   unsafe{group_bundle2(&columns[c0..c0+gc],keys,np,ws,(dst as *mut [u32;N]).add(3*c0),|_|{})};
+  }
+ });
+}
+
+/// Four compute tasks advance two independent groups at each LOCK2 key address.
+/// Unsupported worker widths or sibling mappings use the original dispatch.
+pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+ assert!(!columns.is_empty(),"at least one witness column");
+ let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
+ assert_eq!(len%8,0);let np=len/8;
+ assert_eq!(keys.len(),4*np*648);
+ let groups=columns.len().div_ceil(16);
+ if workers!=8 || groups<=1 || crate::par::pool().width()!=8 {
+  return commit_columns_rows_pairs_baseline8(keys,columns,workers);
+ }
+ let Some(placement)=crate::par::CorePlacement::for_sibling_pairs(workers) else {
+  return commit_columns_rows_pairs_baseline8(keys,columns,workers);
+ };
+ let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;
+ commit_four_bundles(keys,columns,np,Some(&placement),dst);
+ unsafe{rows.set_len(columns.len()*3);}
+ rows
+}
+
 /// [`commit_columns_rows`] in the column-pair layout: groups of 16 columns, one pass over the
 /// pair keys per group, with SMT sibling-pair L2 key sharing when available.
-pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+pub fn commit_columns_rows_pairs_baseline8(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
  assert!(!columns.is_empty(),"at least one witness column");
  let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
  assert_eq!(len%8,0);let np=len/8;

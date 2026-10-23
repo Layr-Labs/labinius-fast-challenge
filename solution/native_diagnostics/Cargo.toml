@@ -1,0 +1,27 @@
+[package]
+name = "labinius-native-diagnostics"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+resolver = "2"
+
+[[bin]]
+name = "prefix-context-baseline"
+path = "src/bin/context_baseline.rs"
+
+[[bin]]
+name = "prefix-context-candidate"
+path = "src/bin/context_candidate.rs"
+
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
+labinius = { path = "../labinius/crates/pcs" }
+blake3 = "=1.8.7"
+serde = { version = "=1.0.229", features = ["derive"] }
+bincode = "=1.3.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

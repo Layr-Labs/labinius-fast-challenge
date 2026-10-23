@@ -1433,6 +1433,55 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pkeys,&columns,workers)
     } else {key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
     let commit_time = clock.elapsed();
+    // [pair-audit v2, opt-in] With LABINIUS_PAIR_AUDIT set, and before any proof byte is
+    // written, the first 16 hybrid columns are re-committed through the arranged kernel and
+    // their rows are compared bit-for-bit against the pair kernel's rows for those columns.
+    // The check runs through the paired multi-worker path (16 columns at group 8, satisfying
+    // the dispatch's columns.len() > group_size condition) and costs about 3-4 ms. Unset, it
+    // is inert and scored runs pay nothing. Diagnostics only: no timing selects code, and
+    // every scored proof is verifier-gated.
+    if std::env::var_os("LABINIUS_PAIR_AUDIT").is_some()
+        && modulus == modulus_choice::HYBRID_MODULUS
+        && modulus == MODULUS
+    {
+        if let Some(keys) = labinius::simd::commit::hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES) {
+            // Window selection: the default covers the paired dispatcher's first five group
+            // boundaries plus the last group; LABINIUS_PAIR_AUDIT=full covers all 64
+            // 16-column windows of the 1024-column commitment; LABINIUS_PAIR_AUDIT=<a>..<b>
+            // enumerates exactly windows [a, b) for a targeted pass at the same code path;
+            // LABINIUS_PAIR_AUDIT=tail checks the last two windows.
+            let windows: Vec<usize> = {
+                let spec = std::env::var("LABINIUS_PAIR_AUDIT").unwrap_or_default();
+                match spec.as_str() {
+                    "full" => (0..64usize).collect::<Vec<_>>(),
+                    "tail" => vec![62usize, 63],
+                    s => s
+                        .split_once("..")
+                        .and_then(|(a, b)| {
+                            let a = a.trim().parse::<usize>().ok()?;
+                            let b = b.trim().parse::<usize>().ok()?;
+                            (a < b && b <= 64).then(|| (a..b).collect::<Vec<_>>())
+                        })
+                        .unwrap_or_else(|| vec![0usize, 1, 2, 3, 4, 5, 63]),
+                }
+            };
+            let audit_clock = std::time::Instant::now();
+            for &w in &windows {
+                let audit = labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys, &columns[16 * w..16 * w + 16], workers, 8);
+                let ok = audit == rows[(3 * 16 * w)..(3 * 16 * w + audit.len())];
+                eprintln!("[pair-audit] window{w} first_group_parity={}", if ok { "ok" } else { "MISMATCH" });
+                if !ok {
+                    panic!("[pair-audit] pair rows != arranged rows on columns {}; aborting before proof write", 16 * w);
+                }
+            }
+            eprintln!(
+                "[pair-audit] audit_us={} windows={} workers={}",
+                audit_clock.elapsed().as_micros(),
+                windows.len(),
+                workers
+            );
+        }
+    }
     let buffer = output.and_then(|o| o.commitment_buffer());
     let commitment = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer);
     let recombine_time = clock.elapsed();
@@ -1448,18 +1497,6 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
             (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
         });
         output.populate(first.collect());
-    }
-    if std::env::var_os("LABINIUS_COMMIT_DIGEST").is_some() {
-        // Diagnostic only, gated off in the scored environment: a content digest of the
-        // commitment bytes the transcript absorbs, for A/B of commitment changes.
-        let mut h = blake3::Hasher::new();
-        h.update(&commitment);
-        let mut digest = [0u8; 32];
-        h.finalize_xof().fill(&mut digest);
-        eprintln!(
-            "labinius-commit-digest {}",
-            digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        );
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
@@ -1508,22 +1545,6 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
     ));
     let fold_time = clock.elapsed();
-    if std::env::var_os("LABINIUS_FOLD_DIGEST").is_some() {
-        // Diagnostic only, gated off in the scored environment (which carries LABINIUS_SEED
-        // alone): a content digest of the folded witness, for A/B of fold changes.
-        let mut h = blake3::Hasher::new();
-        for e in folded.elements() {
-            for &x in e.v.iter() {
-                h.update(&x.to_le_bytes());
-            }
-        }
-        let mut digest = [0u8; 32];
-        h.finalize_xof().fill(&mut digest);
-        eprintln!(
-            "labinius-fold-digest {}",
-            digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        );
-    }
     // The mapping is left to the exit, which tears it down without the TLB shootdowns an unmap
     // beside the pool's threads needs.
     std::mem::forget(table);
@@ -1625,12 +1646,8 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is in the shared mapping and stderr is flushed above; skip libc's exit
-    // handlers so the process is reaped as soon as the kernel has torn its mappings down.
-    extern "C" {
-        fn _exit(code: i32) -> !;
-    }
-    unsafe { _exit(0) }
+    // The proof is on disk; nothing the destructors would do is observable.
+    std::process::exit(0);
 }
 
 #[cfg(test)]

@@ -1552,6 +1552,9 @@ unsafe fn stream_p(dst: [*mut u64; 3], j: usize, v: [__m512i; 3]) {
 const STREAM_FROM: usize = 1 << 21;
 /// Words ahead of the current tile that [`fold_message_range`] prefetches in each stream.
 const FOLD_AHEAD: usize = 128;
+/// `B128` words ahead of the current tile that [`message_range`] prefetches in each stream.
+/// 1.25 KB: on the 1 KB point the neighbouring bases measured best; swept with 1 and 2 KB.
+const MESSAGE_AHEAD: usize = 80;
 
 unsafe fn get_p(src: Src, j: usize) -> F162 {
     match src {
@@ -1754,6 +1757,28 @@ unsafe fn message_range(
     let mut apv = [[_mm512_setzero_si512(); 8]; 3];
     let mut buf = EqTile([B128::ZERO; TILE]);
     for j0 in range.step_by(TILE) {
+        // Ask for the two source streams before the arithmetic reaches them. The binding pass
+        // and later fold rounds already carry the same kind of hint; these early rounds walk
+        // the table with the same eight-element stride. A prefetch past the end is harmless.
+        match src {
+            Src::Words(w) | Src::WordsFolded { words: w, .. } => {
+                for o in [j0, j0 + half] {
+                    let a = w.wrapping_add(o + MESSAGE_AHEAD) as *const i8;
+                    _mm_prefetch::<_MM_HINT_T0>(a);
+                    _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64));
+                }
+            }
+            Src::Planes(p) => {
+                for k in 0..3 {
+                    for o in [j0, j0 + half] {
+                        let a = p[k].wrapping_add(o + FOLD_AHEAD) as *const i8;
+                        for l in 0..(TILE * 8 / 64) {
+                            _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64 * l));
+                        }
+                    }
+                }
+            }
+        }
         map_tile2(eq.tile(j0, &mut buf), ml, mlp, &mut av, &mut apv);
         for g in 0..8 {
             let j = j0 + 8 * g;
@@ -2219,6 +2244,123 @@ impl<'a> LeanSwitch<'a> {
         msg
     }
 
+    /// Prefix messages have independent `(z, tile)` contributions. Split those contributions
+    /// over the persistent pool; this makes the sixth prefix round useful without paying for
+    /// fresh scoped threads or changing the exact field sum.
+    fn message_from_blocks_parallel(&self) -> [F162; 2] {
+        static BASIS: [B128; PACK] = {
+            let mut b = [B128::ZERO; PACK];
+            let mut i = 0;
+            while i < PACK {
+                b[i] = B128(1u128 << i);
+                i += 1;
+            }
+            b
+        };
+        let sets = self.blocks.as_ref().expect("partial sets");
+        let prefix = sets.len().trailing_zeros() as usize;
+        let k = self.round;
+        let suffix = prefix - k - 1;
+        let ratios: Vec<_> = self.r_hi[k + 1..prefix]
+            .iter()
+            .copied()
+            .map(half_ratio)
+            .collect();
+        let scales: Vec<_> = (0..1usize << suffix)
+            .map(|q| {
+                (0..suffix)
+                    .filter(|&i| q & (1 << (suffix - 1 - i)) != 0)
+                    .fold(B128::ONE, |a, i| a * ratios[i])
+            })
+            .collect();
+        let rs = self.prefix_r;
+        let weights: Vec<_> = (0..1usize << k)
+            .map(|z| {
+                (0..k).fold(F162::ONE, |a, i| {
+                    a * if z & (1 << (k - 1 - i)) != 0 {
+                        rs[i]
+                    } else {
+                        F162::ONE + rs[i]
+                    }
+                })
+            })
+            .collect();
+        let ml = eq_matrices(&self.l);
+        let mlp = eq_matrices(&self.lp);
+        let ranges = crate::par::ranges((1usize << k) * (PACK / TILE), self.threads, 1);
+        let parts = crate::par::pool().map(ranges.len(), |runner| {
+            let mut msg = [F162::ZERO; 2];
+            let mut sums0 = [B128::ZERO; TILE];
+            let mut sums1 = [B128::ZERO; TILE];
+            let mut tmp = [B128::ZERO; TILE];
+            for task in ranges[runner].clone() {
+                let z = task / (PACK / TILE);
+                let tile = task % (PACK / TILE);
+                let start = TILE * tile;
+                let weight = weights[z];
+                let g0 = z << (prefix - k);
+                let g1 = g0 | (1 << suffix);
+                sums0.copy_from_slice(&sets[g0][start..start + TILE]);
+                sums1.copy_from_slice(&sets[g1][start..start + TILE]);
+                unsafe {
+                    for (s, &scale) in scales.iter().enumerate().skip(1) {
+                        scale_b128_row(
+                            &sets[g0 | s][start..start + TILE],
+                            scale,
+                            tmp.as_mut_ptr(),
+                        );
+                        for i in (0..TILE).step_by(4) {
+                            let a = _mm512_loadu_si512(sums0.as_ptr().add(i) as *const __m512i);
+                            let b = _mm512_loadu_si512(tmp.as_ptr().add(i) as *const __m512i);
+                            _mm512_storeu_si512(
+                                sums0.as_mut_ptr().add(i) as *mut __m512i,
+                                _mm512_xor_si512(a, b),
+                            );
+                        }
+                        scale_b128_row(
+                            &sets[g1 | s][start..start + TILE],
+                            scale,
+                            tmp.as_mut_ptr(),
+                        );
+                        for i in (0..TILE).step_by(4) {
+                            let a = _mm512_loadu_si512(sums1.as_ptr().add(i) as *const __m512i);
+                            let b = _mm512_loadu_si512(tmp.as_ptr().add(i) as *const __m512i);
+                            _mm512_storeu_si512(
+                                sums1.as_mut_ptr().add(i) as *mut __m512i,
+                                _mm512_xor_si512(a, b),
+                            );
+                        }
+                    }
+                    for i in (0..TILE).step_by(4) {
+                        let a = _mm512_loadu_si512(sums0.as_ptr().add(i) as *const __m512i);
+                        let b = _mm512_loadu_si512(sums1.as_ptr().add(i) as *const __m512i);
+                        _mm512_storeu_si512(
+                            sums1.as_mut_ptr().add(i) as *mut __m512i,
+                            _mm512_xor_si512(a, b),
+                        );
+                    }
+                    for (t, (sums, m)) in [(&sums0, &ml), (&sums1, &mlp)].into_iter().enumerate() {
+                        let mut acc = [_mm512_setzero_si512(); 12];
+                        let mut av = [[_mm512_setzero_si512(); 8]; 3];
+                        map_tile(sums.as_ptr(), m, &mut av);
+                        for g in 0..8 {
+                            super::f162::mac_soa8_word(
+                                &mut acc,
+                                [av[0][g], av[1][g], av[2][g]],
+                                load_words(BASIS.as_ptr().add(start + 8 * g)),
+                            );
+                        }
+                        msg[t] += weight * horiz8(acc);
+                    }
+                }
+            }
+            msg
+        });
+        parts
+            .into_iter()
+            .fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])
+    }
+
     /// The buffers for a fresh switch over `n` words.
     pub fn planes(n: usize) -> [HugeBuf<u64>; 3] {
         let len = Self::plane_len(n);
@@ -2273,7 +2415,7 @@ impl<'a> LeanSwitch<'a> {
             return m;
         }
         if self.blocks.as_ref().is_some_and(|v| self.round < v.len().trailing_zeros() as usize) {
-            return self.message_from_blocks();
+            return self.message_from_blocks_parallel();
         }
         debug_assert_eq!(self.round, 0);
         self.message(self.src(), self.half)

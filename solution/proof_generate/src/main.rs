@@ -981,7 +981,7 @@ const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-
 static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
 /// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
 /// and the switch's binding pass then binds that many coordinates at once.
-const PREFIX_SETS: usize = 32;
+const PREFIX_SETS: usize = 64;
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 /// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
@@ -1720,8 +1720,12 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is in the shared mapping and stderr is flushed above; skip libc's exit
+    // handlers so the process is reaped as soon as the kernel has torn its mappings down.
+    extern "C" {
+        fn _exit(code: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 #[cfg(test)]

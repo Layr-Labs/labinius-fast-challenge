@@ -342,6 +342,28 @@ unsafe fn dot_words(a: &Poly, b: *const F162Word, n: usize) -> F162 {
     out
 }
 
+/// Accumulate selector pairs for one final column total. Per-word lanes are not preserved.
+#[inline(always)]
+unsafe fn mac_word5(acc: &mut [__m512i; 5], x: [__m512i; 3], sa: __m512i, b: [__m512i; 2]) {
+    let sb = _mm512_xor_si512(b[0], b[1]);
+    acc[0] = _mm512_xor_si512(acc[0], _mm512_clmulepi64_epi128::<0x00>(x[0], b[0]));
+    acc[0] = _mm512_xor_si512(acc[0], _mm512_clmulepi64_epi128::<0x11>(x[0], b[0]));
+    acc[1] = _mm512_xor_si512(acc[1], _mm512_clmulepi64_epi128::<0x00>(x[1], b[1]));
+    acc[1] = _mm512_xor_si512(acc[1], _mm512_clmulepi64_epi128::<0x11>(x[1], b[1]));
+    acc[2] = _mm512_xor_si512(acc[2], _mm512_clmulepi64_epi128::<0x00>(sa, sb));
+    acc[2] = _mm512_xor_si512(acc[2], _mm512_clmulepi64_epi128::<0x11>(sa, sb));
+    acc[3] = _mm512_xor_si512(acc[3], _mm512_clmulepi64_epi128::<0x00>(x[2], b[0]));
+    acc[3] = _mm512_xor_si512(acc[3], _mm512_clmulepi64_epi128::<0x11>(x[2], b[0]));
+    acc[4] = _mm512_xor_si512(acc[4], _mm512_clmulepi64_epi128::<0x00>(x[2], b[1]));
+    acc[4] = _mm512_xor_si512(acc[4], _mm512_clmulepi64_epi128::<0x11>(x[2], b[1]));
+}
+
+#[inline(always)]
+unsafe fn horizontal_word5(acc: [__m512i; 5]) -> F162 {
+    let z = _mm512_setzero_si512();
+    horizontal_word10([acc[0], z, acc[1], z, acc[2], z, acc[3], z, acc[4], z])
+}
+
 /// [`dot_words`] on two columns of `n` `B128` words at once: the word-sliced `eq` table (`a`,
 /// 384 KB at `n = 2^14`) is loaded from L2 once per pair of columns while both witness streams
 /// are prefetched 1 KB ahead.
@@ -380,6 +402,54 @@ unsafe fn dot_words2(a: &Poly, b0: *const F162Word, b1: *const F162Word, n: usiz
         let ak = a.get(k);
         out[0] += ak * F162::from_b128(*b0.add(k));
         out[1] += ak * F162::from_b128(*b1.add(k));
+    }
+    out
+}
+
+/// [`dot_words`] on three columns, with five selector-pair states per column.
+///
+/// # Safety
+/// `b0`, `b1` and `b2` each address `n` words and `a` holds at least `n` elements.
+unsafe fn dot_words3(
+    a: &Poly, b0: *const F162Word, b1: *const F162Word, b2: *const F162Word, n: usize,
+) -> [F162; 3] {
+    debug_assert!(a.n >= n);
+    let lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+    let hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+    let mut acc0 = [_mm512_setzero_si512(); 5];
+    let mut acc1 = [_mm512_setzero_si512(); 5];
+    let mut acc2 = [_mm512_setzero_si512(); 5];
+    let blocks = n / 8;
+    for t in 0..blocks {
+        let ahead0 = b0.wrapping_add(8 * t + 64) as *const i8;
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0);
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0.wrapping_add(64));
+        let ahead1 = b1.wrapping_add(8 * t + 64) as *const i8;
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead1);
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead1.wrapping_add(64));
+        let ahead2 = b2.wrapping_add(8 * t + 64) as *const i8;
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead2);
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead2.wrapping_add(64));
+        let x = [
+            _mm512_loadu_si512(a.w[0].as_ptr().add(8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[1].as_ptr().add(8 * t) as *const __m512i),
+            _mm512_loadu_si512(a.w[2].as_ptr().add(8 * t) as *const __m512i),
+        ];
+        let sa = _mm512_xor_si512(x[0], x[1]);
+        mac_word5(&mut acc0, x, sa, load_words2(b0.add(8 * t), lo, hi));
+        mac_word5(&mut acc1, x, sa, load_words2(b1.add(8 * t), lo, hi));
+        mac_word5(&mut acc2, x, sa, load_words2(b2.add(8 * t), lo, hi));
+    }
+    let mut out = if blocks > 0 {
+        [horizontal_word5(acc0), horizontal_word5(acc1), horizontal_word5(acc2)]
+    } else {
+        [F162::ZERO; 3]
+    };
+    for k in 8 * blocks..n {
+        let ak = a.get(k);
+        out[0] += ak * F162::from_b128(*b0.add(k));
+        out[1] += ak * F162::from_b128(*b1.add(k));
+        out[2] += ak * F162::from_b128(*b2.add(k));
     }
     out
 }
@@ -437,10 +507,10 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     if columns == 0 {
         return out;
     }
-    // Columns handed out in even-sized chunks from a shared counter: a runner that starts late
+    // Columns handed out in chunks divisible by three: a runner that starts late
     // or shares its core with another process takes fewer of them instead of holding the phase
-    // up, and each pair of columns in a chunk shares one pass over `eq` via `dot_words2`.
-    let chunk = columns.div_ceil(32 * workers.max(1)).max(2).next_multiple_of(2);
+    // up, and each triple shares one pass over `eq` via `dot_words3`.
+    let chunk = columns.div_ceil(32 * workers.max(1)).max(3).next_multiple_of(3);
     let chunks = columns.div_ceil(chunk);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out_addr = out.as_mut_ptr() as usize;
@@ -452,6 +522,23 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
         // Chunk `k` owns `out[k * chunk ..]`.
         let end = ((k + 1) * chunk).min(columns);
         let mut j = k * chunk;
+        while j + 2 < end {
+            let [v0, v1, v2] = unsafe {
+                dot_words3(
+                    &eq,
+                    words.as_ptr().add(j * wdim),
+                    words.as_ptr().add((j + 1) * wdim),
+                    words.as_ptr().add((j + 2) * wdim),
+                    wdim,
+                )
+            };
+            unsafe {
+                (out_addr as *mut F162).add(j).write(v0);
+                (out_addr as *mut F162).add(j + 1).write(v1);
+                (out_addr as *mut F162).add(j + 2).write(v2);
+            }
+            j += 3;
+        }
         while j + 1 < end {
             let [v0, v1] = unsafe {
                 dot_words2(

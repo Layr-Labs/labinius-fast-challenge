@@ -1537,14 +1537,15 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         folded,
     };
     let encode_time = clock.elapsed();
-    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}\n",
+    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}\n{}",
         load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
         (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
         (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
         (row_time-switch_time).as_micros(), (challenge_time-row_time).as_micros(),
         (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
         encode_time.as_micros(), workers,
-        labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed)));
+        labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed),
+        labinius::simd::commit::hybrid::pair_profile_report()));
     proof
 }
 
@@ -1568,31 +1569,8 @@ fn monotonic_ns() -> u128 {
     ts.sec as u128 * 1_000_000_000 + ts.nsec as u128
 }
 
-/// Run every thread of this process under `SCHED_IDLE`: on a CPU where another runnable task
-/// appears (a timer's wakeup, a kernel worker, the runner's agent) that task runs at once instead
-/// of waiting for one of the prover's threads to be preempted. The prover still has every CPU
-/// nothing else wants, which on an otherwise idle host is all of them. Threads created later
-/// inherit the policy. Lowering one's own policy needs no privilege; a refusal changes nothing.
-/// `LABINIUS_NORMAL_SCHED` (any value) keeps the default policy, for A/B measurements.
-#[cfg(target_os = "linux")]
-fn yield_to_everything_else() {
-    #[repr(C)]
-    struct SchedParam {
-        priority: i32,
-    }
-    extern "C" {
-        fn sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> i32;
-    }
-    const SCHED_IDLE: i32 = 5;
-    unsafe { sched_setscheduler(0, SCHED_IDLE, &SchedParam { priority: 0 }) };
-}
-
 fn main() {
     let main_ns = monotonic_ns();
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
-        yield_to_everything_else();
-    }
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 5 || args.len() == 7,

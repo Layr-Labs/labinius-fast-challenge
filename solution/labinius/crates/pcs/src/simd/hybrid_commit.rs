@@ -29,6 +29,20 @@ pub const MODULUS:u128=PRODUCT as u128*1024;
 /// coefficient 17,639,740 < PRODUCT/2. Key construction checks the bound again.
 pub const CHUNK_BATCHES:usize=8;
 
+/// Diagnostic-only sums of elapsed worker intervals. Concurrent groups overlap; these are
+/// not critical-path contributions. No arithmetic, scheduling or proof output uses them.
+static PAIR_PROFILE:[std::sync::atomic::AtomicU64;18]=
+ [const {std::sync::atomic::AtomicU64::new(0)};18];
+pub fn take_pair_profile()->[u64;18] {
+ core::array::from_fn(|i|PAIR_PROFILE[i].swap(0,std::sync::atomic::Ordering::Relaxed))
+}
+pub fn pair_profile_report()->String {
+ let p=take_pair_profile();
+ format!("labinius-pair-detail init_ns={} slice_ns={} p0_plain_ns={} p0_red_ns={} p1_plain_ns={} p1_red_ns={} sync_ns={} pack_ns={} aux_ns={} crt_ns={} finish_ns={} group_ns={} groups={} iterations={} slice_calls={} pack_calls={} flush_calls={} sync_calls={}\n",
+  p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],p[16],p[17])
+}
+
+
 /// Arranged key vectors per 27-row block: three 8-row groups of eight qword vectors and one
 /// 4-row group of four chunk vectors, each for A and then T.
 const KBLK:usize=56;
@@ -943,18 +957,23 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
  dst:*mut [u32;N],
  mut sync:F,
 ) {
+ let whole=std::time::Instant::now();
+ let mut prof=[0u64;18];
  let g=cols.len();assert!(g>=1 && g<=16 && np%LOCK==0);
  // Lanes of columns past the group's end read a zero element.
  static ZERO8:[B128;8]=[B128::ZERO;8];
  let kbase=keys.as_ptr();
  let mut half=0usize;
+ prof[0]=whole.elapsed().as_nanos() as u64;
  for b in (0..np).step_by(LOCK) {
+  let t0=std::time::Instant::now();
   for h in 0..LOCK {
    let cols16:[*const B128;16]=core::array::from_fn(|l|{
     if l<g {cols[l].as_ptr().add(8*(b+h))} else {ZERO8.as_ptr()}
    });
    crate::simd::transpose_f162::slice_b128_cols16_into(&cols16,&mut ws.idx[h]);
   }
+  let t1=std::time::Instant::now();
   let (acc0,acc1)={
    let [x,y]=&mut ws.acc[..2] else {unreachable!()};
    (x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32)
@@ -962,29 +981,48 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
   let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
   let kb=kbase.add(b*648*4);
   vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
+  let t2=std::time::Instant::now();
   vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
+  let t3=std::time::Instant::now();
+  prof[1]+=t1.duration_since(t0).as_nanos() as u64;
+  prof[2+usize::from((b+LOCK)%PP0==0)]+=t2.duration_since(t1).as_nanos() as u64;
+  prof[4+usize::from((b+LOCK)%PP1==0)]+=t3.duration_since(t2).as_nanos() as u64;
+  prof[13]+=1;prof[14]+=LOCK as u64;
   if (b+LOCK)%PP0==0 || b+LOCK==np {
+   let sync_start=std::time::Instant::now();
    sync(b+LOCK);
+   prof[6]+=sync_start.elapsed().as_nanos() as u64;prof[17]+=1;
   }
   if (b+LOCK)%CHUNK_PAIRS==0 || b+LOCK==np {
    // Two finished chunks share one pair of inverse transforms: the first in lanes 0..16, the
    // second in lanes 16..32 (each chunk's CRT stays exact on its own lanes).
+   let pack_start=std::time::Instant::now();
    let (p0,p1)=ws.partial.split_at_mut(1);
    finish_pair_stream::<P0,1>(&mut ws.acc[0],&mut p0[0],half);
    finish_pair_stream::<P1,1>(&mut ws.acc[1],&mut p1[0],half);
+   prof[7]+=pack_start.elapsed().as_nanos() as u64;prof[15]+=1;
    if half==1 || b+LOCK==np {
+    let aux_start=std::time::Instant::now();
     if half==0 {clear_upper(&mut p0[0]);clear_upper(&mut p1[0]);}
     p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
     // finish_pair_stream uses red16: every live lane has |r| < 2*P0; unused lanes are zero.
     gen_small::intt_hybrid_batch32_3889(&mut p0[0]);
     gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
+    let aux_end=std::time::Instant::now();
     crt_accumulate(&p0[0],&p1[0],&mut ws.total[0]);
+    let crt_end=std::time::Instant::now();
+    prof[8]+=aux_end.duration_since(aux_start).as_nanos() as u64;
+    prof[9]+=crt_end.duration_since(aux_end).as_nanos() as u64;prof[16]+=1;
     half=0;
    } else {half=1;}
   }
  }
+ let finish_start=std::time::Instant::now();
  let [acc0,acc1]=&mut ws.acc[..2] else {unreachable!()};
  write_pair_group_rows(acc0,acc1,&mut ws.total[0],g,dst);
+ prof[10]=finish_start.elapsed().as_nanos() as u64;
+ prof[11]=whole.elapsed().as_nanos() as u64;prof[12]=1;
+ for (a,v) in PAIR_PROFILE.iter().zip(prof) {a.fetch_add(v,std::sync::atomic::Ordering::Relaxed);}
 }
 
 /// Maximum lead (in pair batches) between two hyperthread siblings on the same physical core:

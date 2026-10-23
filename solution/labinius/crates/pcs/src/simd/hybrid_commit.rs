@@ -949,6 +949,21 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
  let kbase=keys.as_ptr();
  let mut half=0usize;
  for b in (0..np).step_by(LOCK) {
+  let ahead=b+2*LOCK;
+  if ahead+1<np {
+   for grp in 0..4 {
+    let c0=grp*4;
+    if c0>=g {break;}
+    let end=(c0+4).min(g);
+    for l in c0..end {
+     for ha in 0..LOCK {
+      let p=cols[l].as_ptr().add(8*(ahead+ha)) as *const i8;
+      core::arch::x86_64::_mm_prefetch::<{core::arch::x86_64::_MM_HINT_T1}>(p);
+      core::arch::x86_64::_mm_prefetch::<{core::arch::x86_64::_MM_HINT_T1}>(p.add(64));
+     }
+    }
+   }
+  }
   for h in 0..LOCK {
    let cols16:[*const B128;16]=core::array::from_fn(|l|{
     if l<g {cols[l].as_ptr().add(8*(b+h))} else {ZERO8.as_ptr()}
@@ -1004,6 +1019,7 @@ fn commit_paired_pairs(
  dst:usize,
 ) {
  use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
+ let workers=workers.clamp(1,8);
  let g=16usize;let sg=2*g;
  let pairs=workers/2;
  let super_groups=columns.len().div_ceil(sg);
@@ -1050,6 +1066,7 @@ pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->
  let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
  assert_eq!(len%8,0);let np=len/8;
  assert_eq!(keys.len(),4*np*648);
+ let workers=workers.clamp(1,8);
  let g=16usize;let groups=columns.len().div_ceil(g);
  // Uninitialised: the groups partition the columns and each writes all three rows of its own.
  let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;

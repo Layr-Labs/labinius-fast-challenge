@@ -546,6 +546,18 @@ const fn row_lane() -> [usize; 16] {
     t
 }
 const ROW_LANE: [usize; 16] = row_lane();
+const INV_ROW_LANE: [usize; 16] = inv_row_lane();
+
+const fn inv_row_lane() -> [usize; 16] {
+    let rl = row_lane();
+    let mut t = [0usize; 16];
+    let mut i = 0;
+    while i < 16 {
+        t[rl[i]] = i;
+        i += 1;
+    }
+    t
+}
 static LANE_IU: A64<[i64; 8]> = A64([0, 1, 8, 9, 2, 3, 10, 11]);
 static LANE_IV: A64<[i64; 8]> = A64([4, 5, 12, 13, 6, 7, 14, 15]);
 
@@ -626,10 +638,17 @@ pub unsafe fn slice_b128_cols16_into(
     let mut g: MaybeUninit<[[__m512i; 16]; 2]> = MaybeUninit::uninit();
     let gp = g.as_mut_ptr() as *mut [__m512i; 16];
     for h in 0..2 {
-        let mut r: [__m512i; 16] = core::array::from_fn(|row| {
-            let lane = 16 * h + ROW_LANE[row];
-            _mm512_loadu_si512(cols[lane >> 1].add(4 * (lane & 1)) as *const __m512i)
-        });
+        let mut r = [_mm512_setzero_si512(); 16];
+        for grp in 0..2 {
+            for c in 0..4 {
+                let local = grp * 4 + c;
+                let col = 8 * h + local;
+                for e in 0..2 {
+                    let row = INV_ROW_LANE[2 * local + e];
+                    r[row] = _mm512_loadu_si512(cols[col].add(4 * e) as *const __m512i);
+                }
+            }
+        }
         macro_rules! stage {
             ($lo:ident, $hi:ident) => {{
                 let n: [__m512i; 16] = core::array::from_fn(|j| {

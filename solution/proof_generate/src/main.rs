@@ -982,13 +982,9 @@ static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_by
 /// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
 /// and the switch's binding pass then binds that many coordinates at once.
 const PREFIX_SETS: usize = 32;
-const COMMIT_GROUP: usize = 8;
-const COMMIT_WORKERS: usize = 4;
-/// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
-/// a host of two-thread cores the two threads of a core take the halves of each 32-column group,
-/// so each batch of the arranged keys, 168 KB, is read from L3 once per 32 columns; 32 per
-/// worker measured 1.8 ms slower (L2 pressure).
-const HYBRID_GROUP: usize = 16;
+const COMMIT_GROUP: usize = 4;
+const COMMIT_WORKERS: usize = 8;
+const HYBRID_GROUP: usize = 4;
 
 
 // =============================================================================================
@@ -1424,13 +1420,13 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
     let rows = if let Some(pairs) = pairs {
-        labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers)
+        labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers.min(COMMIT_WORKERS))
     } else if let Some(keys) = arranged {
-        labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,HYBRID_GROUP)
+        labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers.min(COMMIT_WORKERS),HYBRID_GROUP)
     } else if modulus==modulus_choice::HYBRID_MODULUS {
         let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
         let pkeys=labinius::simd::commit::hybrid::pair_keys(&key(),&tail,workers);
-        labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pkeys,&columns,workers)
+        labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pkeys,&columns,workers.min(COMMIT_WORKERS))
     } else {key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
     let commit_time = clock.elapsed();
     // [pair-audit v2, opt-in] With LABINIUS_PAIR_AUDIT set, and before any proof byte is

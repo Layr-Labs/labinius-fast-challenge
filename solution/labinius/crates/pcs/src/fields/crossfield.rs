@@ -1389,7 +1389,21 @@ pub fn partials_from_sets(v: &[Vec<B128>], r_hi: &[B128]) -> Vec<B128> {
     partials_from_blocks(v, r_hi)
 }
 
+/// The partials and their prefix ratios, for the same point used by the switch.
+pub fn partials_from_sets_with_ratios(
+    v: &[Vec<B128>], r_hi: &[B128],
+) -> (Vec<B128>, Vec<B128>) {
+    assert!(v.len().is_power_of_two());
+    partials_from_blocks_with_ratios(v, r_hi)
+}
+
 fn partials_from_blocks(v: &[Vec<B128>], r_hi: &[B128]) -> Vec<B128> {
+    partials_from_blocks_with_ratios(v, r_hi).0
+}
+
+fn partials_from_blocks_with_ratios(
+    v: &[Vec<B128>], r_hi: &[B128],
+) -> (Vec<B128>, Vec<B128>) {
     let prefix = v.len().trailing_zeros() as usize;
     let c: Vec<_> = r_hi[..prefix].iter().copied().map(half_ratio).collect();
     let scales: Vec<_> = (0..v.len()).map(|q| {
@@ -1408,7 +1422,7 @@ fn partials_from_blocks(v: &[Vec<B128>], r_hi: &[B128]) -> Vec<B128> {
             }
         }
     }
-    out
+    (out, c)
 }
 
 // =============================================================================================
@@ -2001,6 +2015,7 @@ pub struct LeanSwitch<'a> {
     pi0: &'a [B128],
     eq: EqView<'a>,
     r_hi: &'a [B128],
+    prefix_ratios: Vec<B128>,
     /// `L_k`, as the images of the 128 basis words.
     l: Vec<F162>,
     /// `L'_k = L_k o (x -> d_k x)`.
@@ -2037,7 +2052,7 @@ impl<'a> LeanSwitch<'a> {
         threads: usize,
         planes: [HugeBuf<u64>; 3],
     ) -> Option<Self> {
-        Self::build(pi0, EqView::Table(eq), r_hi, batch, threads, planes, None)
+        Self::build(pi0, EqView::Table(eq), r_hi, batch, threads, planes, None, Vec::new())
     }
 
     /// The prover over the first quarter of the expansion and the four quarter partial sets
@@ -2053,7 +2068,7 @@ impl<'a> LeanSwitch<'a> {
         blocks: [Vec<B128>; 4],
     ) -> Option<Self> {
         assert!(r_hi.len() >= 3, "the quarter path wants rounds past the second");
-        Self::build(pi0, EqView::Table(eq_quarter), r_hi, batch, threads, planes, Some(blocks.into()))
+        Self::build(pi0, EqView::Table(eq_quarter), r_hi, batch, threads, planes, Some(blocks.into()), Vec::new())
     }
 
     /// Eight blocks provide the first three messages without storing p1 or p2.
@@ -2062,7 +2077,7 @@ impl<'a> LeanSwitch<'a> {
         threads: usize, planes: [HugeBuf<u64>; 3], sets: [Vec<B128>; 8],
     ) -> Option<Self> {
         assert!(r_hi.len() >= 4);
-        Self::build(pi0, EqView::Table(eq), r_hi, batch, threads, planes, Some(sets.into()))
+        Self::build(pi0, EqView::Table(eq), r_hi, batch, threads, planes, Some(sets.into()), Vec::new())
     }
 
     /// Sixteen partial sets provide the first four messages without storing p1..p3.
@@ -2071,7 +2086,7 @@ impl<'a> LeanSwitch<'a> {
         threads: usize, planes: [HugeBuf<u64>; 3], sets: [Vec<B128>; 16],
     ) -> Option<Self> {
         assert!(r_hi.len() >= 5);
-        Self::build(pi0, EqView::Table(eq), r_hi, batch, threads, planes, Some(sets.into()))
+        Self::build(pi0, EqView::Table(eq), r_hi, batch, threads, planes, Some(sets.into()), Vec::new())
     }
 
     /// [`with_sixteenths`](Self::with_sixteenths) over the first block in the factored form
@@ -2082,7 +2097,7 @@ impl<'a> LeanSwitch<'a> {
     ) -> Option<Self> {
         assert!(r_hi.len() >= 5);
         assert!(eq.low.len() % TILE == 0, "a tile is within one row of the factors");
-        Self::build(pi0, EqView::Factored(eq), r_hi, batch, threads, planes, Some(sets.into()))
+        Self::build(pi0, EqView::Factored(eq), r_hi, batch, threads, planes, Some(sets.into()), Vec::new())
     }
 
     /// [`with_sixteenths_factored`](Self::with_sixteenths_factored) for any power-of-two
@@ -2096,7 +2111,20 @@ impl<'a> LeanSwitch<'a> {
         assert!(sets.len().is_power_of_two() && (1..=MAX_PREFIX).contains(&prefix));
         assert!(r_hi.len() > prefix);
         assert!(eq.low.len() % TILE == 0, "a tile is within one row of the factors");
-        Self::build(pi0, EqView::Factored(eq), r_hi, batch, threads, planes, Some(sets))
+        Self::build(pi0, EqView::Factored(eq), r_hi, batch, threads, planes, Some(sets), Vec::new())
+    }
+
+    /// Reuse the ratios returned with the partials for the same sets and point.
+    pub fn with_sets_factored_with_ratios(
+        pi0: &'a [B128], eq: EqFactors, r_hi: &'a [B128], batch: &[F162],
+        threads: usize, planes: [HugeBuf<u64>; 3], sets: Vec<Vec<B128>>,
+        ratios: Vec<B128>,
+    ) -> Option<Self> {
+        let prefix = sets.len().trailing_zeros() as usize;
+        assert!(sets.len().is_power_of_two() && (1..=MAX_PREFIX).contains(&prefix));
+        assert!(r_hi.len() > prefix);
+        assert!(eq.low.len() % TILE == 0, "a tile is within one row of the factors");
+        Self::build(pi0, EqView::Factored(eq), r_hi, batch, threads, planes, Some(sets), ratios)
     }
 
     fn build(
@@ -2107,6 +2135,7 @@ impl<'a> LeanSwitch<'a> {
         threads: usize,
         planes: [HugeBuf<u64>; 3],
         blocks: Option<Vec<Vec<B128>>>,
+        prefix_ratios: Vec<B128>,
     ) -> Option<Self> {
         let n = pi0.len();
         assert!(n >= 2 && n.is_power_of_two() && n == 1 << r_hi.len(), "2^l words");
@@ -2124,12 +2153,22 @@ impl<'a> LeanSwitch<'a> {
         if r_hi.iter().any(|&r| r == B128::ONE) {
             return None;
         }
+        if !prefix_ratios.is_empty() {
+            let prefix = blocks.as_ref().expect("partial sets").len().trailing_zeros() as usize;
+            assert_eq!(prefix_ratios.len(), prefix, "one ratio per prefix coordinate");
+        }
         let l = batch.to_vec();
-        let lp = compose_scale(&l, b128_inv(B128::ONE + r_hi[0]));
+        let reciprocal = if prefix_ratios.is_empty() {
+            b128_inv(B128::ONE + r_hi[0])
+        } else {
+            B128::ONE + prefix_ratios[0]
+        };
+        let lp = compose_scale(&l, reciprocal);
         Some(LeanSwitch {
             pi0,
             eq,
             r_hi,
+            prefix_ratios,
             l,
             lp,
             p: planes,
@@ -2219,6 +2258,91 @@ impl<'a> LeanSwitch<'a> {
         msg
     }
 
+    fn message_from_blocks_parallel(&self) -> [F162; 2] {
+        static BASIS: [B128; PACK] = {
+            let mut b = [B128::ZERO; PACK];
+            let mut i = 0;
+            while i < PACK {
+                b[i] = B128(1u128 << i);
+                i += 1;
+            }
+            b
+        };
+        let sets = self.blocks.as_ref().expect("partial sets");
+        let prefix = sets.len().trailing_zeros() as usize;
+        let k = self.round;
+        let suffix = prefix - k - 1;
+        let owned_ratios;
+        let ratios: &[B128] = if self.prefix_ratios.is_empty() {
+            owned_ratios = self.r_hi[k + 1..prefix].iter().copied().map(half_ratio).collect::<Vec<_>>();
+            &owned_ratios
+        } else {
+            &self.prefix_ratios[k + 1..prefix]
+        };
+        let scales: Vec<_> = (0..1usize << suffix).map(|q| {
+            (0..suffix).filter(|&i| q & (1 << (suffix - 1 - i)) != 0)
+                .fold(B128::ONE, |a, i| a * ratios[i])
+        }).collect();
+        let rs = self.prefix_r;
+        let ml = eq_matrices(&self.l);
+        let mlp = eq_matrices(&self.lp);
+        let ranges = crate::par::ranges((1usize << k) * (PACK / TILE), self.threads, 1);
+        let parts = crate::par::pool().map(ranges.len(), |runner| {
+            let mut msg = [F162::ZERO; 2];
+            let mut sums0 = [B128::ZERO; TILE];
+            let mut sums1 = [B128::ZERO; TILE];
+            let mut tmp = [B128::ZERO; TILE];
+            for task in ranges[runner].clone() {
+                let z = task / (PACK / TILE);
+                let tile = task % (PACK / TILE);
+                let start = TILE * tile;
+                let weight = (0..k).fold(F162::ONE, |a, i| {
+                    a * if z & (1 << (k - 1 - i)) != 0 { rs[i] } else { F162::ONE + rs[i] }
+                });
+                let g0 = z << (prefix - k);
+                let g1 = g0 | (1 << suffix);
+                sums0.copy_from_slice(&sets[g0][start..start + TILE]);
+                sums1.copy_from_slice(&sets[g1][start..start + TILE]);
+                unsafe {
+                    for (s, &scale) in scales.iter().enumerate().skip(1) {
+                        scale_b128_row(&sets[g0 | s][start..start + TILE], scale, tmp.as_mut_ptr());
+                        for i in (0..TILE).step_by(4) {
+                            let a = _mm512_loadu_si512(sums0.as_ptr().add(i) as *const __m512i);
+                            let b = _mm512_loadu_si512(tmp.as_ptr().add(i) as *const __m512i);
+                            _mm512_storeu_si512(sums0.as_mut_ptr().add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+                        }
+                        scale_b128_row(&sets[g1 | s][start..start + TILE], scale, tmp.as_mut_ptr());
+                        for i in (0..TILE).step_by(4) {
+                            let a = _mm512_loadu_si512(sums1.as_ptr().add(i) as *const __m512i);
+                            let b = _mm512_loadu_si512(tmp.as_ptr().add(i) as *const __m512i);
+                            _mm512_storeu_si512(sums1.as_mut_ptr().add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+                        }
+                    }
+                    for i in (0..TILE).step_by(4) {
+                        let a = _mm512_loadu_si512(sums0.as_ptr().add(i) as *const __m512i);
+                        let b = _mm512_loadu_si512(sums1.as_ptr().add(i) as *const __m512i);
+                        _mm512_storeu_si512(sums1.as_mut_ptr().add(i) as *mut __m512i, _mm512_xor_si512(a, b));
+                    }
+                    for (t, (sums, m)) in [(&sums0, &ml), (&sums1, &mlp)].into_iter().enumerate() {
+                        let mut acc = [_mm512_setzero_si512(); 12];
+                        let mut av = [[_mm512_setzero_si512(); 8]; 3];
+                        map_tile(sums.as_ptr(), m, &mut av);
+                        for g in 0..8 {
+                            super::f162::mac_soa8_word(
+                                &mut acc,
+                                [av[0][g], av[1][g], av[2][g]],
+                                load_words(BASIS.as_ptr().add(start + 8 * g)),
+                            );
+                        }
+                        msg[t] += weight * horiz8(acc);
+                    }
+                }
+            }
+            msg
+        });
+        parts.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])
+    }
+
     /// The buffers for a fresh switch over `n` words.
     pub fn planes(n: usize) -> [HugeBuf<u64>; 3] {
         let len = Self::plane_len(n);
@@ -2267,13 +2391,26 @@ impl<'a> LeanSwitch<'a> {
     }
 
     /// The round's two message values.
-    pub fn msg(&mut self) -> [F162; 2] {
+    pub fn msg_baseline(&mut self) -> [F162; 2] {
         self.half /= 2;
         if let Some(m) = self.pending.take() {
             return m;
         }
         if self.blocks.as_ref().is_some_and(|v| self.round < v.len().trailing_zeros() as usize) {
             return self.message_from_blocks();
+        }
+        debug_assert_eq!(self.round, 0);
+        self.message(self.src(), self.half)
+    }
+
+    /// The round's two message values.
+    pub fn msg(&mut self) -> [F162; 2] {
+        self.half /= 2;
+        if let Some(m) = self.pending.take() {
+            return m;
+        }
+        if self.blocks.as_ref().is_some_and(|v| self.round < v.len().trailing_zeros() as usize) {
+            return self.message_from_blocks_parallel();
         }
         debug_assert_eq!(self.round, 0);
         self.message(self.src(), self.half)
@@ -2293,7 +2430,13 @@ impl<'a> LeanSwitch<'a> {
             self.l[i] = self.l[i] + r * self.lp[i];
         }
         if !last {
-            self.lp = compose_scale(&self.l, b128_inv(B128::ONE + self.r_hi[self.round + 1]));
+            let next = self.round + 1;
+            let reciprocal = if next < self.prefix_ratios.len() {
+                B128::ONE + self.prefix_ratios[next]
+            } else {
+                b128_inv(B128::ONE + self.r_hi[next])
+            };
+            self.lp = compose_scale(&self.l, reciprocal);
         }
         if last {
             debug_assert_eq!(half, 1);

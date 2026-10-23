@@ -981,7 +981,7 @@ const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-
 static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
 /// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
 /// and the switch's binding pass then binds that many coordinates at once.
-const PREFIX_SETS: usize = 32;
+const PREFIX_SETS: usize = 64;
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 /// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
@@ -1433,129 +1433,6 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pkeys,&columns,workers)
     } else {key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
     let commit_time = clock.elapsed();
-    // [pair-audit v2, opt-in] With LABINIUS_PAIR_AUDIT set, and before any proof byte is
-    // written, the first 16 hybrid columns are re-committed through the arranged kernel and
-    // their rows are compared bit-for-bit against the pair kernel's rows for those columns.
-    // The check runs through the paired multi-worker path (16 columns at group 8, satisfying
-    // the dispatch's columns.len() > group_size condition) and costs about 3-4 ms. Unset, it
-    // is inert and scored runs pay nothing. Diagnostics only: no timing selects code, and
-    // every scored proof is verifier-gated.
-    if std::env::var_os("LABINIUS_PAIR_AUDIT").is_some()
-        && modulus == modulus_choice::HYBRID_MODULUS
-        && modulus == MODULUS
-    {
-        if let Some(keys) = labinius::simd::commit::hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES) {
-            // Window selection: the default covers the paired dispatcher's first five group
-            // boundaries, the middle boundary and the last group; LABINIUS_PAIR_AUDIT=full
-            // covers all 64 16-column windows of the 1024-column commitment;
-            // LABINIUS_PAIR_AUDIT=<a>..<b> enumerates exactly windows [a, b) for a targeted
-            // pass at the same code path; LABINIUS_PAIR_AUDIT=tail checks the last two
-            // windows.
-            let windows: Vec<usize> = {
-                let spec = std::env::var("LABINIUS_PAIR_AUDIT").unwrap_or_default();
-                match spec.as_str() {
-                    "full" => (0..64usize).collect::<Vec<_>>(),
-                    "tail" => vec![62usize, 63],
-                    "even" => (0..64usize).step_by(2).collect::<Vec<_>>(),
-                    "odd" => (0..64usize).skip(1).step_by(2).collect::<Vec<_>>(),
-                    "mid" => vec![31usize, 32],
-                    "quarter" => (0..64usize).step_by(4).collect::<Vec<_>>(),
-                    "eighth" => (0..64usize).step_by(8).collect::<Vec<_>>(),
-                    "third" => (0..64usize).step_by(3).collect::<Vec<_>>(),
-                    "head" => vec![0usize, 1, 2, 3, 4, 5, 31, 32, 63],
-                    "first" => vec![0usize],
-                    "last" => vec![63usize],
-                    "rev" => (0..64usize).rev().collect::<Vec<_>>(),
-                    "boundary" => vec![0usize, 31, 32, 63],
-                    s if s.starts_with("step:") => {
-                        let n = s[5..].trim().parse::<usize>().ok().filter(|&n| n >= 1).unwrap_or(1);
-                        (0..64usize).step_by(n).collect::<Vec<_>>()
-                    }
-                    s => s
-                        .split_once("..")
-                        .and_then(|(a, b)| {
-                            let a = a.trim().parse::<usize>().ok()?;
-                            let b = b.trim().parse::<usize>().ok()?;
-                            (a < b && b <= 64).then(|| (a..b).collect::<Vec<_>>())
-                        })
-                        .or_else(|| {
-                            s.split(',')
-                                .map(|x| x.trim().parse::<usize>())
-                                .collect::<Result<Vec<usize>, _>>()
-                                .ok()
-                                .filter(|l| !l.is_empty() && l.iter().all(|&w| w < 64))
-                                .map(|mut l| {
-                                    l.sort_unstable();
-                                    l.dedup();
-                                    l
-                                })
-                        })
-                        .unwrap_or_else(|| vec![0usize, 1, 2, 3, 4, 5, 31, 32, 63]),
-                }
-            };
-            let audit_groups: usize = std::env::var("LABINIUS_PAIR_AUDIT_GROUPS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .filter(|&n| (1..=32).contains(&n))
-                .unwrap_or(8);
-            let audit_jobs: usize = std::env::var("LABINIUS_PAIR_AUDIT_JOBS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .filter(|&n| (1..=64).contains(&n))
-                .unwrap_or(workers);
-            let audit_clock = std::time::Instant::now();
-            let (mut worst_w, mut worst_us) = (usize::MAX, 0usize);
-            for &w in &windows {
-                let window_clock = std::time::Instant::now();
-                let audit = labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys, &columns[16 * w..16 * w + 16], audit_jobs, audit_groups);
-                let window_us = window_clock.elapsed().as_micros() as usize;
-                if window_us > worst_us {
-                    worst_us = window_us;
-                    worst_w = w;
-                }
-                let ok = audit == rows[(3 * 16 * w)..(3 * 16 * w + audit.len())];
-                eprintln!(
-                    "[pair-audit] window{w} rows={}..{} us={window_us} first_group_parity={}",
-                    3 * 16 * w,
-                    3 * 16 * w + audit.len(),
-                    if ok { "ok" } else { "MISMATCH" }
-                );
-                if !ok {
-                    let mismatches = audit
-                        .iter()
-                        .zip(rows[(3 * 16 * w)..(3 * 16 * w + audit.len())].iter())
-                        .filter(|(p, a)| p != a)
-                        .count();
-                    let first = audit
-                        .iter()
-                        .zip(rows[(3 * 16 * w)..(3 * 16 * w + audit.len())].iter())
-                        .position(|(p, a)| p != a);
-                    eprintln!(
-                        "[pair-audit] window{w} diverging at row-offset {first:?}, {mismatches} of {} rows differ",
-                        audit.len()
-                    );
-                    panic!(
-                        "[pair-audit] pair rows != arranged rows on columns {} (first differing row-offset {first:?}, {mismatches} of {} rows); aborting before proof write",
-                        16 * w,
-                        audit.len()
-                    );
-                }
-            }
-            let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-            eprintln!(
-                "[pair-audit] audit_us={} windows={} coverage={}..{} workers={} jobs={} groups={} avail={} slowest={}",
-                audit_clock.elapsed().as_micros(),
-                windows.len(),
-                windows.first().copied().unwrap_or(0),
-                windows.last().copied().unwrap_or(0),
-                workers,
-                audit_jobs,
-                audit_groups,
-                avail,
-                if worst_w == usize::MAX { "none".to_string() } else { format!("w{worst_w}@{worst_us}us") }
-            );
-        }
-    }
     let buffer = output.and_then(|o| o.commitment_buffer());
     let commitment = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer);
     let recombine_time = clock.elapsed();
@@ -1582,11 +1459,11 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     } else {
         Some(cf::eq_expand_and_partials_factored_blocks::<PREFIX_SETS>(&hi, values, workers))
     };
-    let partials = match &prefix_sets {
-        Some((sets, _)) => cf::partials_from_sets(sets, &hi),
+    let (partials, prefix_ratios) = match &prefix_sets {
+        Some((sets, _)) => cf::partials_from_sets_with_ratios(sets, &hi),
         None => {
             let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-            ws.partial_evals(0, values, &hi)
+            (ws.partial_evals(0, values, &hi), Vec::new())
         }
     };
     let value = claim(&partials, &lo);
@@ -1596,7 +1473,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
     let lean = prefix_sets.and_then(|(sets, eq)| {
         // The first block of the expansion, as factors: the switch recomputes its tiles.
-        cf::LeanSwitch::with_sets_factored(values, eq, &hi, &batch, workers, planes, sets.into())
+        cf::LeanSwitch::with_sets_factored_with_ratios(values, eq, &hi, &batch, workers, planes, sets.into(), prefix_ratios)
     });
     let (rounds, coords, opened) = match lean {
         Some(mut sw) => switch_rounds(&mut sw, &mut t),

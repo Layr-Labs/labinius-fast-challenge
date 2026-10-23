@@ -463,53 +463,113 @@ unsafe fn gather8_z(p0: *const i64, p1: *const i64, p2: *const i64, dst: *mut u6
     _mm512_store_si512(o.add(3), _mm512_shuffle_i64x2::<0xDD>(s1, s3));
 }
 
-/// Phases 3 and 4 for B128 inputs (where planes 128..192 are zero): only `u[128..136]` and
-/// `v[128..136]` are zeroed for the partial loads at `t = 0`, and `t >= 8` uses [`gather8_z`].
+#[repr(C, align(64))]
+struct B128Work {
+    u: [u64; 136],
+    v: [u64; 136],
+}
+
+// Four adjacent-entry pack controls and eight j-dependent matrix controls.
+const fn vbmi_controls() -> [[u8; 64]; 12] {
+    let mut controls = [[0; 64]; 12];
+    let mut pair = 0;
+    while pair < 4 {
+        let j = 2 * pair;
+        let mut e = 0;
+        while e < 64 {
+            let b = e % 32;
+            controls[pair][e] = if b < 16 {
+                (8 * j + b) as u8
+            } else {
+                (64 + 8 * j + b - 16) as u8
+            };
+            e += 1;
+        }
+        let mut r = 0;
+        while r < 2 {
+            let mut q = 0;
+            while q < 8 {
+                let c = 4 * (q >> 2) + (q & 3);
+                let k = &mut controls[4 + 2 * pair + r];
+                k[8 * q + 7] = (8 * r + c) as u8;
+                k[8 * q + 6] = (16 + 8 * r + c) as u8;
+                k[8 * q + 5] = (64 + 8 * (j + r) + c) as u8;
+                k[8 * q + 4] = (64 + 16 + 8 * r + c) as u8;
+                q += 1;
+            }
+            r += 1;
+        }
+        pair += 1;
+    }
+    controls
+}
+static VBMI_CONTROLS: A64<[[u8; 64]; 12]> = A64(vbmi_controls());
+
+/// B128 mask streams -> the existing GFNI matrices and index rows, without ag/bg staging.
 #[inline(always)]
-unsafe fn uv_b128_to_rows(wk: *mut Work, out: &mut BinaryIndex32) {
+unsafe fn uv_b128_to_rows(wk: *mut B128Work, out: &mut BinaryIndex32) {
     let u = (*wk).u.as_mut_ptr();
     let v = (*wk).v.as_mut_ptr();
-    // planes 128.. are zero; phase 3 reads u[128..130] and v[128] through its partial loads
     _mm512_store_si512(u.add(128) as *mut __m512i, _mm512_setzero_si512());
     _mm512_store_si512(v.add(128) as *mut __m512i, _mm512_setzero_si512());
-
-    // phase 3 as in `slice_raw`; the fourth stream (v[t+121..], u[t+122..]) is all zero from
-    // t = 8 on
-    let (ag, bg) = ((*wk).ag.as_mut_ptr(), (*wk).bg.as_mut_ptr());
-    gather8(
-        u as *const i64,
-        v.add(40) as *const i64,
-        u.add(81) as *const i64,
-        v.add(121) as *const i64,
-        ag,
-    );
-    for i in 1..6 {
-        let t = 8 * i;
-        gather8_z(
-            u.add(t) as *const i64,
-            v.add(t + 40) as *const i64,
-            u.add(t + 81) as *const i64,
-            ag.add(4 * t),
-        );
+    let pack: [__m512i; 4] = core::array::from_fn(|j| {
+        _mm512_load_si512(VBMI_CONTROLS.0[j].as_ptr() as *const __m512i)
+    });
+    let matrix: [[__m512i; 2]; 4] = core::array::from_fn(|j| core::array::from_fn(|r| {
+        _mm512_load_si512(VBMI_CONTROLS.0[4 + 2 * j + r].as_ptr() as *const __m512i)
+    }));
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    let da = _mm512_load_si512(DUP_A.0.as_ptr() as *const __m512i);
+    let db = _mm512_load_si512(DUP_B.0.as_ptr() as *const __m512i);
+    let p16 = _mm512_load_si512(PLUS16.0.as_ptr() as *const __m512i);
+    let lo4 = _mm512_set1_epi8(0x0f);
+    let op = out.rows.as_mut_ptr() as *mut __m512i;
+    macro_rules! emit {
+        ($matrix:expr, $row:expr) => {{
+            let n = _mm512_gf2p8affine_epi64_epi8::<0>(ident, $matrix);
+            let a = _mm512_permutexvar_epi8(da, n);
+            let b = _mm512_permutexvar_epi8(db, n);
+            _mm512_store_si512(op.add($row), _mm512_ternarylogic_epi32::<0xEA>(a, lo4, p16));
+            _mm512_store_si512(op.add($row + 1), _mm512_ternarylogic_epi32::<0xEA>(b, lo4, p16));
+        }};
     }
-    gather8(
-        v as *const i64,
-        u.add(41) as *const i64,
-        v.add(81) as *const i64,
-        u.add(122) as *const i64,
-        bg,
-    );
-    for i in 1..5 {
-        let t = 8 * i;
-        gather8_z(
-            v.add(t) as *const i64,
-            u.add(t + 41) as *const i64,
-            v.add(t + 81) as *const i64,
-            bg.add(4 * t),
-        );
+    for side in 0..2 {
+        let (p0, p1, p2, p3) = if side == 0 {
+            (u, v.add(40), u.add(81), v.add(121))
+        } else {
+            (v, u.add(41), v.add(81), u.add(122))
+        };
+        let a = _mm512_loadu_si512(p0 as *const __m512i);
+        let b = _mm512_loadu_si512(p1 as *const __m512i);
+        let c = _mm512_loadu_si512(p2 as *const __m512i);
+        let d = _mm512_loadu_si512(p3 as *const __m512i);
+        for j in 0..4 {
+            let x = _mm512_permutex2var_epi8(a, pack[j], b);
+            let y = _mm512_permutex2var_epi8(c, pack[j], d);
+            for r in 0..2 {
+                emit!(_mm512_permutex2var_epi8(x, matrix[0][r], y), 4 * (2 * j + r) + 2 * side);
+            }
+        }
+        for t in (8..40).step_by(8) {
+            let a = _mm512_loadu_si512(p0.add(t) as *const __m512i);
+            let b = _mm512_loadu_si512(p1.add(t) as *const __m512i);
+            let c = _mm512_loadu_si512(p2.add(t) as *const __m512i);
+            for j in 0..4 {
+                let x = _mm512_permutex2var_epi8(a, pack[j], b);
+                for r in 0..2 {
+                    emit!(_mm512_maskz_permutex2var_epi8(0xe0e0e0e0e0e0e0e0, x, matrix[j][r], c),
+                        4 * (t + 2 * j + r) + 2 * side);
+                }
+            }
+        }
+        if side == 0 {
+            let a = _mm512_loadu_si512(p0.add(40) as *const __m512i);
+            let b = _mm512_loadu_si512(p1.add(40) as *const __m512i);
+            let c = _mm512_loadu_si512(p2.add(40) as *const __m512i);
+            let x = _mm512_permutex2var_epi8(a, pack[0], b);
+            emit!(_mm512_maskz_permutex2var_epi8(0xe0e0e0e0e0e0e0e0, x, matrix[0][0], c), 160);
+        }
     }
-
-    index_rows(ag, bg, out);
 }
 
 /// 128 `B128` words (2048 contiguous bytes at `base`) -> the kernel's index rows.
@@ -519,7 +579,7 @@ unsafe fn slice_b128_raw(base: *const u8, out: &mut BinaryIndex32) {
     let cp = cols.as_mut_ptr() as *mut __m512i;
     columns_b128(base, cp);
 
-    let mut work: MaybeUninit<Work> = MaybeUninit::uninit();
+    let mut work: MaybeUninit<B128Work> = MaybeUninit::uninit();
     let wk = work.as_mut_ptr();
     let u = (*wk).u.as_mut_ptr();
     let v = (*wk).v.as_mut_ptr();
@@ -562,7 +622,7 @@ pub unsafe fn slice_b128_lanes_into(
     elems: &[*const crate::fields::scalar::B128; 32],
     out: &mut BinaryIndex32,
 ) {
-    let mut work: MaybeUninit<Work> = MaybeUninit::uninit();
+    let mut work: MaybeUninit<B128Work> = MaybeUninit::uninit();
     let wk = work.as_mut_ptr();
     let u = (*wk).u.as_mut_ptr();
     let v = (*wk).v.as_mut_ptr();
@@ -619,7 +679,7 @@ pub unsafe fn slice_b128_cols16_into(
     cols: &[*const crate::fields::scalar::B128; 16],
     out: &mut BinaryIndex32,
 ) {
-    let mut work: MaybeUninit<Work> = MaybeUninit::uninit();
+    let mut work: MaybeUninit<B128Work> = MaybeUninit::uninit();
     let wk = work.as_mut_ptr();
     let u = (*wk).u.as_mut_ptr();
     let v = (*wk).v.as_mut_ptr();

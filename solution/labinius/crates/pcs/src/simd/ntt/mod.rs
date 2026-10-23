@@ -1,4 +1,5 @@
 pub mod bin_asm;
+pub mod bin_asm_ymm;
 pub mod bin_large;
 pub mod bin_quad;
 pub mod bin_small;

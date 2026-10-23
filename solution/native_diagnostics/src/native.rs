@@ -46,6 +46,7 @@ pub fn run() {
     let policy = unsafe { sched_getscheduler(0) };
     assert_eq!(policy, 0, "native diagnostic needs normal scheduling");
     let paired = labinius::par::CorePlacement::for_sibling_pairs(workers).is_some();
+    assert!(paired, "mixed-width comparison needs four complete exposed sibling pairs");
     println!("native-diag config workers={workers} sibling_pairs={paired} words={} columns={COLUMNS} column_words={COLUMN_LEN} scheduling_policy={policy} allocator=production-copy profile=release opt=3 lto=fat codegen_units=1", Table::WORDS);
     println!("native-diag config rustflags={:?} encoded_rustflags={:?}", option_env!("LABINIUS_DIAGNOSTIC_RUSTFLAGS"), option_env!("LABINIUS_DIAGNOSTIC_ENCODED_RUSTFLAGS"));
 
@@ -67,14 +68,9 @@ pub fn run() {
     assert_eq!(columns.len(), COLUMNS);
     println!("native-diag phase=setup elapsed_ns={} input_address_mod4096={} key_address_mod64={} key_bytes={KEY_LEN}", clock.elapsed().as_nanos(), values.as_ptr() as usize % 4096, KEY.0.as_ptr() as usize % 64);
 
-    let mut baseline = || labinius::simd::commit::hybrid::commit_columns_rows_pairs(keys, &columns, workers);
-    let mut shared = || crate::commit_adapter::commit_columns_rows_pairs::<true, true>(keys, &columns, workers);
-    let mut no_wait = || crate::commit_adapter::commit_columns_rows_pairs::<false, false>(keys, &columns, workers);
-    let mut both = || crate::commit_adapter::commit_columns_rows_pairs::<true, false>(keys, &columns, workers);
-    crate::compare::run("commit", &mut [
-        ("baseline", &mut baseline), ("shared-tail", &mut shared),
-        ("no-wait", &mut no_wait), ("shared-tail-no-wait", &mut both),
-    ]);
+    let mut baseline = || labinius::simd::commit::hybrid::commit_columns_rows_pairs_baseline8(keys, &columns, workers);
+    let mut candidate = || labinius::simd::commit::hybrid::commit_columns_rows_pairs(keys, &columns, workers);
+    crate::compare::run("commit", &mut baseline, &mut candidate);
     std::hint::black_box(&planes);
     println!("native-diag phase=complete elapsed_ns={}", clock.elapsed().as_nanos());
 }

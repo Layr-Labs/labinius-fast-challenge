@@ -987,6 +987,60 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
  write_pair_group_rows(acc0,acc1,&mut ws.total[0],g,dst);
 }
 
+/// Eight-column group with the full index layout and unchanged full-width finish.
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn group_pairs_narrow<F:FnMut(usize)>(
+ cols:&[&[B128]],
+ keys:&[u32],
+ np:usize,
+ ws:&mut PairWorker,
+ dst:*mut [u32;N],
+ mut sync:F,
+) {
+ let g=cols.len();assert!(g>=1 && g<=8 && np%LOCK==0);
+ // Lanes of columns past the group's end read a zero element.
+ static ZERO8:[B128;8]=[B128::ZERO;8];
+ let kbase=keys.as_ptr();
+ let mut half=0usize;
+ for b in (0..np).step_by(LOCK) {
+  for h in 0..LOCK {
+   let cols16:[*const B128;16]=core::array::from_fn(|l|{
+    if l<g {cols[l].as_ptr().add(8*(b+h))} else {ZERO8.as_ptr()}
+   });
+   crate::simd::transpose_f162::slice_b128_cols16_into(&cols16,&mut ws.idx[h]);
+  }
+  let (acc0,acc1)={
+   let [x,y]=&mut ws.acc[..2] else {unreachable!()};
+   (x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32)
+  };
+  let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
+  let kb=kbase.add(b*648*4);
+  crate::simd::ntt::bin_asm_ymm::ntt_bin_batch16_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
+  crate::simd::ntt::bin_asm_ymm::ntt_bin_batch16_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
+  if (b+LOCK)%PP0==0 || b+LOCK==np {
+   sync(b+LOCK);
+  }
+  if (b+LOCK)%CHUNK_PAIRS==0 || b+LOCK==np {
+   // Two finished chunks share one pair of inverse transforms: the first in lanes 0..16, the
+   // second in lanes 16..32 (each chunk's CRT stays exact on its own lanes).
+   let (p0,p1)=ws.partial.split_at_mut(1);
+   finish_pair_stream::<P0,1>(&mut ws.acc[0],&mut p0[0],half);
+   finish_pair_stream::<P1,1>(&mut ws.acc[1],&mut p1[0],half);
+   if half==1 || b+LOCK==np {
+    if half==0 {clear_upper(&mut p0[0]);clear_upper(&mut p1[0]);}
+    p0[0].representation=Representation::Ntt;p1[0].representation=Representation::Ntt;
+    // finish_pair_stream uses red16: every live lane has |r| < 2*P0; unused lanes are zero.
+    gen_small::intt_hybrid_batch32_3889(&mut p0[0]);
+    gen_small::intt_gen_batch32::<P1>(&mut p1[0]);
+    crt_accumulate(&p0[0],&p1[0],&mut ws.total[0]);
+    half=0;
+   } else {half=1;}
+  }
+ }
+ let [acc0,acc1]=&mut ws.acc[..2] else {unreachable!()};
+ write_pair_group_rows(acc0,acc1,&mut ws.total[0],g,dst);
+}
+
 /// Maximum lead (in pair batches) between two hyperthread siblings on the same physical core:
 /// `2 * PP0 = 32` pair batches = 324 KiB of `pair_keys`, well within the 2 MiB L2 cache.
 const PAIR_LEAD:usize=2*PP0;
@@ -1043,9 +1097,76 @@ fn commit_paired_pairs(
  });
 }
 
+/// Independent eight-column-unit claims with bounded sibling key-scan progress.
+fn commit_mixed_width_pairs(
+ keys:&[u32],
+ columns:&[&[B128]],
+ np:usize,
+ placement:&crate::par::CorePlacement,
+ dst:usize,
+) {
+ use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
+ let next=AtomicUsize::new(0);
+ let done:Vec<Progress>=(0..8).map(|_|Progress(AtomicUsize::new(0))).collect();
+ let coupled:Vec<AtomicBool>=(0..4).map(|_|AtomicBool::new(true)).collect();
+ crate::par::pool().run(8,|worker|{
+  let _guard=placement.pin(worker);
+  let units=if worker%2==0 {2}else{1};
+  let mine=&done[worker].0;let other=&done[worker^1].0;let coupled=&coupled[worker/2];
+  let mut ws:Option<PairWorker>=None;
+  let mut round=0usize;
+  loop {
+   let unit=next.fetch_add(units,Ordering::Relaxed);
+   let lo=8*unit;
+   if lo>=columns.len() {break;}
+   let n=(8*units).min(columns.len()-lo);
+   let base=round*np;round+=1;
+   let ws=ws.get_or_insert_with(PairWorker::new);
+   let sync=|b_done|{
+    let d=base+b_done;
+    mine.store(d,Ordering::Release);
+    if !coupled.load(Ordering::Relaxed) {return;}
+    if other.load(Ordering::Acquire)+PAIR_LEAD>=d {return;}
+    let start=std::time::Instant::now();
+    let mut spins=0u32;
+    while other.load(Ordering::Acquire)+PAIR_LEAD<d {
+     core::hint::spin_loop();
+     spins+=1;
+     if spins%64==0 && start.elapsed()>SIBLING_WAIT {coupled.store(false,Ordering::Relaxed);return;}
+    }
+   };
+   unsafe{
+    if n<=8 {
+     group_pairs_narrow(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),sync);
+    } else {
+     group_pairs_full(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),sync);
+    }
+   }
+  }
+  mine.store(usize::MAX/2,Ordering::Release);
+ });
+}
+
+/// Mixed wide/narrow groups on the existing eight-task sibling placement.
+pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+ assert!(!columns.is_empty(),"at least one witness column");
+ let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
+ assert_eq!(len%8,0);let np=len/8;
+ assert_eq!(keys.len(),4*np*648);
+ let groups=columns.len().div_ceil(16);
+ let paired=if workers==8 && crate::par::pool().width()==8 && groups>1 && np%LOCK==0 {
+  crate::par::CorePlacement::for_sibling_pairs(workers)
+ }else{None};
+ let Some(placement)=paired else {return commit_columns_rows_pairs_baseline8(keys,columns,workers);};
+ let mut rows:Vec<[u32;N]>=Vec::with_capacity(columns.len()*3);let dst=rows.as_mut_ptr() as usize;
+ commit_mixed_width_pairs(keys,columns,np,&placement,dst);
+ unsafe{rows.set_len(columns.len()*3);}
+ rows
+}
+
 /// [`commit_columns_rows`] in the column-pair layout: groups of 16 columns, one pass over the
 /// pair keys per group, with SMT sibling-pair L2 key sharing when available.
-pub fn commit_columns_rows_pairs(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
+pub fn commit_columns_rows_pairs_baseline8(keys:&[u32],columns:&[&[B128]],workers:usize)->Vec<[u32;N]> {
  assert!(!columns.is_empty(),"at least one witness column");
  let len=columns[0].len();for c in columns {assert_eq!(c.len(),len);}
  assert_eq!(len%8,0);let np=len/8;

@@ -1391,7 +1391,13 @@ pub fn partials_from_sets(v: &[Vec<B128>], r_hi: &[B128]) -> Vec<B128> {
 
 fn partials_from_blocks(v: &[Vec<B128>], r_hi: &[B128]) -> Vec<B128> {
     let prefix = v.len().trailing_zeros() as usize;
-    let c: Vec<_> = r_hi[..prefix].iter().copied().map(half_ratio).collect();
+    let c: Vec<_> = match inverse_one_plus(&r_hi[..prefix]) {
+        // In characteristic two, r / (1 + r) = 1 + 1 / (1 + r).
+        Some(inverses) => inverses.into_iter().map(|d| B128::ONE + d).collect(),
+        // Preserve the existing public helper's behavior for a degenerate point.
+        // The production caller uses the full switch for these points.
+        None => r_hi[..prefix].iter().copied().map(half_ratio).collect(),
+    };
     let scales: Vec<_> = (0..v.len()).map(|q| {
         (0..prefix).filter(|&k| q & (1 << (prefix - 1 - k)) != 0)
             .fold(B128::ONE, |a, k| a * c[k])
@@ -1457,6 +1463,32 @@ fn b128_inv(x: B128) -> B128 {
         e >>= 1;
     }
     r
+}
+
+/// All `(1 + r[i])^-1` using one inversion and `3 * (len - 1)` multiplications.
+/// Prefix products are overwritten in reverse order only after their last read.
+/// A coordinate equal to one has no inverse; the lean prover must use its fallback.
+fn inverse_one_plus(r: &[B128]) -> Option<Vec<B128>> {
+    if r.iter().any(|&coordinate| coordinate == B128::ONE) {
+        return None;
+    }
+    let Some((&first, rest)) = r.split_first() else {
+        return Some(Vec::new());
+    };
+    let mut product = B128::ONE + first;
+    let mut inverses = Vec::with_capacity(r.len());
+    inverses.push(product);
+    for &coordinate in rest {
+        product = product * (B128::ONE + coordinate);
+        inverses.push(product);
+    }
+    let mut reciprocal = b128_inv(product);
+    for i in (1..r.len()).rev() {
+        inverses[i] = inverses[i - 1] * reciprocal;
+        reciprocal = reciprocal * (B128::ONE + r[i]);
+    }
+    inverses[0] = reciprocal;
+    Some(inverses)
 }
 
 /// `L(x) = sum_k bit_k(x) images[k]`.
@@ -2001,6 +2033,8 @@ pub struct LeanSwitch<'a> {
     pi0: &'a [B128],
     eq: EqView<'a>,
     r_hi: &'a [B128],
+    /// `(1 + r_hi[k])^-1`, shared by prefix messages and every map update.
+    inverse_denominators: Vec<B128>,
     /// `L_k`, as the images of the 128 basis words.
     l: Vec<F162>,
     /// `L'_k = L_k o (x -> d_k x)`.
@@ -2121,15 +2155,14 @@ impl<'a> LeanSwitch<'a> {
         for plane in &planes {
             assert!(plane.len() >= Self::plane_len(n), "a plane is too short");
         }
-        if r_hi.iter().any(|&r| r == B128::ONE) {
-            return None;
-        }
+        let inverse_denominators = inverse_one_plus(r_hi)?;
         let l = batch.to_vec();
-        let lp = compose_scale(&l, b128_inv(B128::ONE + r_hi[0]));
+        let lp = compose_scale(&l, inverse_denominators[0]);
         Some(LeanSwitch {
             pi0,
             eq,
             r_hi,
+            inverse_denominators,
             l,
             lp,
             p: planes,
@@ -2159,7 +2192,8 @@ impl<'a> LeanSwitch<'a> {
         let prefix = sets.len().trailing_zeros() as usize;
         let k = self.round;
         let suffix = prefix - k - 1;
-        let ratios: Vec<_> = self.r_hi[k + 1..prefix].iter().copied().map(half_ratio).collect();
+        let ratios: Vec<_> = self.inverse_denominators[k + 1..prefix]
+            .iter().map(|&d| B128::ONE + d).collect();
         let scales: Vec<_> = (0..1usize << suffix).map(|q| {
             (0..suffix).filter(|&i| q & (1 << (suffix - 1 - i)) != 0)
                 .fold(B128::ONE, |a, i| a * ratios[i])
@@ -2293,7 +2327,7 @@ impl<'a> LeanSwitch<'a> {
             self.l[i] = self.l[i] + r * self.lp[i];
         }
         if !last {
-            self.lp = compose_scale(&self.l, b128_inv(B128::ONE + self.r_hi[self.round + 1]));
+            self.lp = compose_scale(&self.l, self.inverse_denominators[self.round + 1]);
         }
         if last {
             debug_assert_eq!(half, 1);
@@ -2418,6 +2452,127 @@ mod lean_tests {
         *x ^= *x >> 7;
         *x ^= *x << 17;
         x.wrapping_mul(0x2545F4914F6CDD1Du128) ^ (*x >> 64)
+    }
+
+    #[test]
+    fn batch_inverse_denominators_match_scalar() {
+        let mut x = 0x7281_9ACE_5310_FEDC_2468_1357_ABCD_9001u128;
+        for len in [0usize, 1, 2, 5, 24, 128] {
+            let mut r: Vec<_> = (0..len).map(|_| B128(next(&mut x) & !1)).collect();
+            for case in 0..3 {
+                if case == 1 {
+                    r.fill(B128::ZERO);
+                } else if case == 2 {
+                    r.fill(B128(u128::MAX));
+                }
+                let got = inverse_one_plus(&r).unwrap();
+                assert_eq!(got.len(), r.len());
+                for (&coordinate, &inverse) in r.iter().zip(&got) {
+                    let denominator = B128::ONE + coordinate;
+                    assert_eq!(inverse, b128_inv(denominator));
+                    assert_eq!(denominator * inverse, B128::ONE);
+                    assert_eq!(B128::ONE + inverse, half_ratio(coordinate));
+                }
+            }
+        }
+        for bit in 1..128 {
+            let r = [B128(1u128 << bit), B128::ZERO];
+            let got = inverse_one_plus(&r).unwrap();
+            assert_eq!(got[0] * (B128::ONE + r[0]), B128::ONE);
+            assert_eq!(got[1], B128::ONE);
+        }
+    }
+
+    #[test]
+    fn batch_inverse_degenerate_point_keeps_fallback() {
+        let words = vec![B128::ZERO; 16];
+        let eq = vec![B128::ZERO; words.len()];
+        let batch = vec![F162::ONE; PACK];
+        for i in 0..4 {
+            let mut r = vec![B128::ZERO; 4];
+            r[i] = B128::ONE;
+            assert!(inverse_one_plus(&r).is_none());
+            assert!(LeanSwitch::new(
+                &words, &eq, &r, &batch, 1, LeanSwitch::planes(words.len()),
+            ).is_none());
+        }
+    }
+
+    #[test]
+    fn batch_inverse_prefix_partials_preserve_degenerate_behavior() {
+        let mut x = 0x1234_5678_ABCD_EF01u128;
+        let sets: Vec<Vec<_>> = (0..32)
+            .map(|_| (0..PACK).map(|_| B128(next(&mut x))).collect())
+            .collect();
+        for degenerate in 0..=5 {
+            let mut r: Vec<_> = (0..5).map(|_| B128(next(&mut x) & !1)).collect();
+            if degenerate < r.len() {
+                r[degenerate] = B128::ONE;
+            }
+            let mut want = vec![B128::ZERO; PACK];
+            for (q, set) in sets.iter().enumerate() {
+                let mut scale = B128::ONE;
+                for (i, &coordinate) in r.iter().enumerate() {
+                    if q & (1 << (4 - i)) != 0 {
+                        scale = scale * half_ratio(coordinate);
+                    }
+                }
+                for (sum, &value) in want.iter_mut().zip(set) {
+                    *sum = *sum + scale * value;
+                }
+            }
+            assert_eq!(partials_from_sets(&sets, &r), want);
+        }
+    }
+
+    /// Small end-to-end differential cases against the full workspace prover.
+    /// Cover cached maps, prefix messages, scalar/tiled paths and zero/one folds.
+    #[test]
+    fn batch_inverse_switch_messages_match_reference() {
+        let mut x = 0xA3A3_1212_4567_89AB_9999_1111_CDEF_0123u128;
+        for l in [1usize, 6, 8, 10] {
+            let n = 1 << l;
+            let words: Vec<_> = (0..n).map(|_| B128(next(&mut x))).collect();
+            let mut hi: Vec<_> = (0..l).map(|_| B128(next(&mut x) & !1)).collect();
+            hi[0] = B128::ZERO;
+            let eq = eq_expand_b128(&hi);
+            let mut field = || F162([
+                next(&mut x) as u64,
+                next(&mut x) as u64,
+                next(&mut x) as u64 & ((1 << 34) - 1),
+            ]);
+            let batch: Vec<_> = (0..PACK).map(|_| field()).collect();
+            let mut challenges: Vec<_> = (0..l).map(|_| field()).collect();
+            challenges[0] = F162::ZERO;
+            if l > 1 {
+                challenges[1] = F162::ONE;
+            }
+            for prefix in [0usize, 2, 4, 5, 8] {
+                if prefix >= l {
+                    continue;
+                }
+                let block_len = n >> prefix;
+                let blocks = if prefix == 0 {
+                    None
+                } else {
+                    let sets: Vec<_> = words.chunks_exact(block_len)
+                        .map(|part| partial_evals(part, &eq[..block_len])).collect();
+                    assert_eq!(partials_from_sets(&sets, &hi), partial_evals(&words, &eq));
+                    Some(sets)
+                };
+                let mut reference = SwitchProver::new(&words, &eq, &batch);
+                let mut lean = LeanSwitch::build(
+                    &words, EqView::Table(&eq[..block_len]), &hi, &batch, 1,
+                    LeanSwitch::planes(n), blocks,
+                ).unwrap();
+                for (round, &challenge) in challenges.iter().enumerate() {
+                    assert_eq!(lean.msg(), reference.msg(), "l {l}, prefix {prefix}, round {round}");
+                    lean.fold(challenge);
+                    reference.fold(challenge);
+                }
+                assert_eq!(lean.final_eval(), reference.final_eval());
+            }
+        }
     }
 
     /// The lean prover sends the messages `SwitchProver` sends and ends on the same value, at

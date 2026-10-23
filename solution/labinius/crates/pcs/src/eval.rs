@@ -424,7 +424,232 @@ fn eq_poly(p0: &[F162], workers: usize) -> Poly {
     Poly { w, n }
 }
 
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct EqBlock([__m512i; 3]);
+
+/// `eq(p0, .)` packed into contiguous 3-vector blocks `[a01_0, a01_1, a2_pair]` for [`dot_words_4cols`]:
+/// in each block `ih`, `a01_0` holds `[a0, a1]` of elements `0..4`, `a01_1` holds `[a0, a1]` of
+/// elements `4..8`, and `a2_pair` holds `[a2[0..4], a2[4..8]]` interleaved in even/odd qwords.
+fn eq_packed(p0: &[F162], workers: usize) -> Vec<EqBlock> {
+    const LO: usize = 3;
+    let n = 1usize << p0.len();
+    debug_assert!(p0.len() >= 2 * LO);
+    let blocks = n / 8;
+    let lo = eq_table(&p0[..LO]);
+    let hi = eq_table(&p0[LO..]);
+    let mut out: Vec<EqBlock> = Vec::with_capacity(blocks);
+    let out_addr = out.as_mut_ptr() as usize;
+    let runs = crate::par::ranges(hi.len(), workers, 8);
+    crate::par::pool().run(runs.len(), |r| unsafe {
+        const ORDER: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+        let lo_v: [__m512i; 3] = core::array::from_fn(|k| {
+            let limbs: [u64; 8] = core::array::from_fn(|i| lo[ORDER[i]].0[k]);
+            _mm512_loadu_si512(limbs.as_ptr() as *const __m512i)
+        });
+        let dst = out_addr as *mut EqBlock;
+        for ih in runs[r].clone() {
+            let h = hi[ih].0;
+            let v = bf::mul_soa8(lo_v, [
+                _mm512_set1_epi64(h[0] as i64),
+                _mm512_set1_epi64(h[1] as i64),
+                _mm512_set1_epi64(h[2] as i64),
+            ]);
+            let a01_0 = _mm512_unpacklo_epi64(v[0], v[1]);
+            let a01_1 = _mm512_unpackhi_epi64(v[0], v[1]);
+            dst.add(ih).write(EqBlock([a01_0, a01_1, v[2]]));
+        }
+    });
+    unsafe { out.set_len(blocks) };
+    out
+}
+
+#[inline(always)]
+unsafe fn fold_lanes128(v: __m512i) -> (u64, u64) {
+    let a = _mm256_xor_si256(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64::<1>(v));
+    let b = _mm_xor_si128(_mm256_castsi256_si128(a), _mm256_extracti128_si256::<1>(a));
+    (_mm_cvtsi128_si64(b) as u64, _mm_extract_epi64::<1>(b) as u64)
+}
+
+#[inline(always)]
+unsafe fn reduce_acc4(acc: [__m512i; 4]) -> F162 {
+    let (s0_lo, s0_hi) = fold_lanes128(acc[0]);
+    let (s1_lo, s1_hi) = fold_lanes128(acc[1]);
+    let (s2_lo, s2_hi) = fold_lanes128(acc[2]);
+    let (s3_lo, s3_hi) = fold_lanes128(acc[3]);
+
+    let p0 = s0_lo;
+    let p1 = s0_hi ^ s1_lo;
+    let p2 = s1_hi ^ s2_lo;
+    let p3 = s2_hi ^ s3_lo;
+    let p4 = s3_hi;
+
+    const M17: u64 = (1u64 << 17) - 1;
+    const M34: u64 = (1u64 << 34) - 1;
+    let h00 = (p2 >> 34) | (p3 << 30);
+    let h01 = (p3 >> 34) & M17;
+    let h10 = (p3 >> 51) | (p4 << 13);
+    let h11 = p4 >> 51;
+
+    let r0 = p0 ^ h00 ^ h10;
+    let r1 = p1 ^ h01 ^ h11 ^ (h00 << 17);
+    let r2 = (p2 & M34) ^ (h01 << 17) ^ (h00 >> 47);
+    F162([r0, r1, r2])
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,vpclmulqdq")]
+unsafe fn dot_words_4cols(eq: &[EqBlock], cols: [*const F162Word; 4]) -> [F162; 4] {
+    let zero = _mm512_setzero_si512();
+    let mut acc = [[zero; 5]; 4];
+    for (t, e) in eq.iter().enumerate() {
+        let a01_0 = e.0[0];
+        let a01_1 = e.0[1];
+        let a2 = e.0[2];
+        let sa0 = _mm512_xor_si512(a01_0, _mm512_shuffle_epi32::<0x4e>(a01_0));
+        let sa1 = _mm512_xor_si512(a01_1, _mm512_shuffle_epi32::<0x4e>(a01_1));
+        for c in 0..4 {
+            let b = cols[c].add(8 * t);
+            let ahead = b.wrapping_add(64) as *const i8;
+            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead);
+            core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead.wrapping_add(64));
+            let mut z0 = _mm512_loadu_si512(b as *const __m512i);
+            let mut z1 = _mm512_loadu_si512(b.add(4) as *const __m512i);
+            acc[c][0] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[c][0],
+                _mm512_clmulepi64_epi128::<0x00>(a01_0, z0),
+                _mm512_clmulepi64_epi128::<0x00>(a01_1, z1),
+            );
+            acc[c][2] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[c][2],
+                _mm512_clmulepi64_epi128::<0x11>(a01_0, z0),
+                _mm512_clmulepi64_epi128::<0x11>(a01_1, z1),
+            );
+            acc[c][3] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[c][3],
+                _mm512_clmulepi64_epi128::<0x00>(a2, z0),
+                _mm512_clmulepi64_epi128::<0x01>(a2, z1),
+            );
+            acc[c][4] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[c][4],
+                _mm512_clmulepi64_epi128::<0x10>(a2, z0),
+                _mm512_clmulepi64_epi128::<0x11>(a2, z1),
+            );
+            z0 = _mm512_xor_si512(z0, _mm512_shuffle_epi32::<0x4e>(z0));
+            z1 = _mm512_xor_si512(z1, _mm512_shuffle_epi32::<0x4e>(z1));
+            acc[c][1] = _mm512_ternarylogic_epi64::<0x96>(
+                acc[c][1],
+                _mm512_clmulepi64_epi128::<0x00>(sa0, z0),
+                _mm512_clmulepi64_epi128::<0x00>(sa1, z1),
+            );
+        }
+    }
+    core::array::from_fn(|c| {
+        let [m0, m1, m2, m3, m4] = acc[c];
+        reduce_acc4([
+            m0,
+            _mm512_ternarylogic_epi64::<0x96>(m1, m0, m2),
+            _mm512_xor_si512(m3, m2),
+            m4,
+        ])
+    })
+}
+
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,vpclmulqdq")]
+unsafe fn dot_words_1col(eq: &[EqBlock], col: *const F162Word) -> F162 {
+    let zero = _mm512_setzero_si512();
+    let mut acc = [zero; 4];
+    for (t, e) in eq.iter().enumerate() {
+        let a01_0 = e.0[0];
+        let a01_1 = e.0[1];
+        let a2 = e.0[2];
+        let b = col.add(8 * t);
+        let ahead = b.wrapping_add(64) as *const i8;
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead);
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead.wrapping_add(64));
+        let z0 = _mm512_loadu_si512(b as *const __m512i);
+        let z1 = _mm512_loadu_si512(b.add(4) as *const __m512i);
+        acc[0] = _mm512_ternarylogic_epi64::<0x96>(
+            acc[0],
+            _mm512_clmulepi64_epi128::<0x00>(a01_0, z0),
+            _mm512_clmulepi64_epi128::<0x00>(a01_1, z1),
+        );
+        acc[1] = _mm512_ternarylogic_epi64::<0x96>(
+            acc[1],
+            _mm512_clmulepi64_epi128::<0x01>(a01_0, z0),
+            _mm512_clmulepi64_epi128::<0x10>(a01_0, z0),
+        );
+        acc[1] = _mm512_ternarylogic_epi64::<0x96>(
+            acc[1],
+            _mm512_clmulepi64_epi128::<0x01>(a01_1, z1),
+            _mm512_clmulepi64_epi128::<0x10>(a01_1, z1),
+        );
+        acc[2] = _mm512_ternarylogic_epi64::<0x96>(
+            acc[2],
+            _mm512_clmulepi64_epi128::<0x11>(a01_0, z0),
+            _mm512_clmulepi64_epi128::<0x00>(a2, z0),
+        );
+        acc[2] = _mm512_ternarylogic_epi64::<0x96>(
+            acc[2],
+            _mm512_clmulepi64_epi128::<0x11>(a01_1, z1),
+            _mm512_clmulepi64_epi128::<0x01>(a2, z1),
+        );
+        acc[3] = _mm512_ternarylogic_epi64::<0x96>(
+            acc[3],
+            _mm512_clmulepi64_epi128::<0x10>(a2, z0),
+            _mm512_clmulepi64_epi128::<0x11>(a2, z1),
+        );
+    }
+    reduce_acc4(acc)
+}
+
 pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Vec<F162> {
+    let wdim = 1usize << p0.len();
+    assert_eq!(
+        words.len() % wdim,
+        0,
+        "the words are not a whole number of columns of {wdim}"
+    );
+    let columns = words.len() / wdim;
+    if p0.len() < 6 {
+        return row_evaluate_words_baseline(words, p0, workers);
+    }
+    let eq = eq_packed(p0, workers);
+    let mut out = vec![F162::ZERO; columns];
+    if columns == 0 {
+        return out;
+    }
+    // Columns handed out in multiples of 4 from a shared counter: each 4-column group shares one
+    // pass over `eq` in registers.
+    let chunk = (columns.div_ceil(32 * workers.max(1)).max(4) + 3) & !3;
+    let chunks = columns.div_ceil(chunk);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out_addr = out.as_mut_ptr() as usize;
+    crate::par::pool().run(workers.clamp(1, chunks), |_| loop {
+        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if k >= chunks {
+            break;
+        }
+        let start = k * chunk;
+        let end = ((k + 1) * chunk).min(columns);
+        let mut j = start;
+        while j + 4 <= end {
+            let cols = core::array::from_fn(|c| unsafe { words.as_ptr().add((j + c) * wdim) });
+            let values = unsafe { dot_words_4cols(&eq, cols) };
+            for (c, value) in values.into_iter().enumerate() {
+                unsafe { (out_addr as *mut F162).add(j + c).write(value) };
+            }
+            j += 4;
+        }
+        while j < end {
+            let value = unsafe { dot_words_1col(&eq, words.as_ptr().add(j * wdim)) };
+            unsafe { (out_addr as *mut F162).add(j).write(value) };
+            j += 1;
+        }
+    });
+    out
+}
+
+pub fn row_evaluate_words_baseline(words: &[F162Word], p0: &[F162], workers: usize) -> Vec<F162> {
     let wdim = 1usize << p0.len();
     assert_eq!(
         words.len() % wdim,

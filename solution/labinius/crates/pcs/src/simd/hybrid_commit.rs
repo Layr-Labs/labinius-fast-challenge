@@ -918,6 +918,7 @@ struct PairWorker {
  partial:Box<[Batch32]>,
  total:Box<[Batch32]>,
  idx:Box<[BinaryIndex32]>,
+ pad:Box<[B128]>,
 }
 impl PairWorker {
  fn new()->Self {
@@ -926,6 +927,7 @@ impl PairWorker {
    partial:zeroed_slice(2),
    total:zeroed_slice(1),
    idx:zeroed_slice(LOCK),
+   pad:Vec::new().into_boxed_slice(),
   }
  }
 }
@@ -944,15 +946,17 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
  mut sync:F,
 ) {
  let g=cols.len();assert!(g>=1 && g<=16 && np%LOCK==0);
- // Lanes of columns past the group's end read a zero element.
- static ZERO8:[B128;8]=[B128::ZERO;8];
- let kbase=keys.as_ptr();
+ if g<16 && ws.pad.len()<8*np {ws.pad=zeroed_slice(8*np);}
+ let zbase=if g<16 {ws.pad.as_ptr()} else {core::ptr::null::<B128>()};
+ let base16:[*const B128;16]=core::array::from_fn(|l|{
+  if l<g {cols[l].as_ptr()} else {zbase}
+ });
+ let mut kb=keys.as_ptr();
  let mut half=0usize;
  for b in (0..np).step_by(LOCK) {
   for h in 0..LOCK {
-   let cols16:[*const B128;16]=core::array::from_fn(|l|{
-    if l<g {cols[l].as_ptr().add(8*(b+h))} else {ZERO8.as_ptr()}
-   });
+   let off=8*(b+h);
+   let cols16:[*const B128;16]=core::array::from_fn(|l|base16[l].add(off));
    crate::simd::transpose_f162::slice_b128_cols16_into(&cols16,&mut ws.idx[h]);
   }
   let (acc0,acc1)={
@@ -960,9 +964,9 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
    (x.v.as_mut_ptr() as *mut i32,y.v.as_mut_ptr() as *mut i32)
   };
   let ins:[&BinaryIndex32;LOCK]=[&ws.idx[0],&ws.idx[1]];
-  let kb=kbase.add(b*648*4);
   vb::ntt_bin_batch32_pair::<P0>(ins,kb,acc0,(b+LOCK)%PP0==0);
   vb::ntt_bin_batch32_pair::<P1>(ins,kb.add(648*4),acc1,(b+LOCK)%PP1==0);
+  kb=kb.add(LOCK*648*4);
   if (b+LOCK)%PP0==0 || b+LOCK==np {
    sync(b+LOCK);
   }

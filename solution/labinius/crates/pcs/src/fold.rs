@@ -1341,6 +1341,23 @@ pub fn fold_witness_bitsliced(
     bitsliced::fold_words(words, challenges, 128 * bpc, workers)
 }
 
+/// Original PR147 fold for a direct paired comparison.
+pub fn fold_witness_bitsliced_baseline(
+    words: &[B128],
+    columns: usize,
+    challenges: &[ShortChallenge],
+    bpc: usize,
+    q: u16,
+    workers: usize,
+) -> Vec<RingElement> {
+    assert_eq!(challenges.len(), columns, "one challenge per column");
+    assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
+    if bpc % 4 != 0 || !bitsliced::fits(challenges) {
+        return fold_witness_streaming(words, columns, challenges, bpc, q, workers);
+    }
+    bitsliced::fold_words_baseline(words, challenges, 128 * bpc, workers)
+}
+
 // Exact fold of the binary witness, independent of commitment-modulus arithmetic.
 mod bitsliced {
     //! Integer convolution in Z[Y]/(Y^243 + 1), followed by reduction modulo
@@ -2072,6 +2089,141 @@ mod bitsliced {
         assert!(overflow == 0, "integer fold overflow");
     }
 
+    // One qword from each bit plane; the scale is eight bytes.
+    static PARTIAL_GATHER: Aligned<[i64; 8]> = Aligned([0, 8, 16, 24, 32, 40, 48, 56]);
+    static PARTIAL_JOIN: Aligned<[[u8; 64]; 2]> = Aligned({
+        let mut a = [[0u8; 64]; 2];
+        let mut h = 0;
+        while h < 2 {
+            let mut q = 0;
+            while q < 8 {
+                let mut v = 0;
+                while v < 8 {
+                    a[h][8 * q + v] = (64 * (q / 4) + 8 * (7 - v) + 2 * (q % 4) + h) as u8;
+                    v += 1;
+                }
+                q += 1;
+            }
+            h += 1;
+        }
+        a
+    });
+    static PARTIAL_ORDER: Aligned<[u8; 64]> = Aligned({
+        let mut a = [0u8; 64];
+        let mut t = 0;
+        while t < 8 {
+            let mut k = 0;
+            while k < 4 {
+                let mut u = 0;
+                while u < 2 {
+                    a[8 * t + 2 * k + u] = (32 * u + 8 * k + t) as u8;
+                    u += 1;
+                }
+                k += 1;
+            }
+            t += 1;
+        }
+        a
+    });
+
+    /// Decode the32 lanes for eight complete elements. The high gather reads only planes8..14.
+    #[inline(always)]
+    unsafe fn decode32(
+        acc: *const __m512i,
+        s: usize,
+        g: usize,
+        gather: __m512i,
+        join: __m512i,
+        order: __m512i,
+        ident: __m512i,
+    ) -> __m512i {
+        let base = (acc.add(s * BITS) as *const i64).add(g);
+        let lo = _mm512_i64gather_epi64::<8>(gather, base);
+        let hi = _mm512_mask_i64gather_epi64::<8>(
+            _mm512_setzero_si512(), 0x7f, gather, base.add(64),
+        );
+        let joined = _mm512_permutex2var_epi8(lo, join, hi);
+        let counts = _mm512_gf2p8affine_epi64_epi8::<0>(ident, joined);
+        _mm512_permutexvar_epi8(order, counts)
+    }
+
+    // Direct full-accumulator output for the one-part path, with one fixed32-lane tile.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+    unsafe fn write_acc(
+        acc: *const __m512i,
+        bias: &[i32; SLOTS],
+        output: *mut RingElement,
+    ) {
+        for e in 0..LANES / 4 {
+            core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
+        }
+        let zero = _mm512_setzero_si512();
+        let gather = _mm512_load_si512(PARTIAL_GATHER.0.as_ptr() as *const __m512i);
+        let order = _mm512_load_si512(PARTIAL_ORDER.0.as_ptr() as *const __m512i);
+        let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
+        let mut overflow = 0u32;
+        for i0 in (0..81).step_by(8) {
+            let n = (81 - i0).min(8);
+            let mask = ((1u32 << n) - 1) as __mmask8;
+            for h in 0..2 {
+                let join = _mm512_load_si512(PARTIAL_JOIN.0[h].as_ptr() as *const __m512i);
+                for g in 0..LANES / 64 {
+                    macro_rules! row {
+                        ($ds:literal) => {{
+                            if $ds < n {
+                                let i = i0 + $ds;
+                                let c = _mm512_sub_epi16(
+                                    decode32(acc, 162 + i, g, gather, join, order, ident),
+                                    _mm512_set1_epi16(*bias.get_unchecked(162 + i) as i16),
+                                );
+                                let a = _mm512_sub_epi16(
+                                    decode32(acc, i, g, gather, join, order, ident),
+                                    _mm512_set1_epi16(*bias.get_unchecked(i) as i16),
+                                );
+                                let low = _mm512_sub_epi16(a, c);
+                                overflow |= _mm512_cmpneq_epi16_mask(low, _mm512_subs_epi16(a, c));
+                                let b = _mm512_sub_epi16(
+                                    decode32(acc, 81 + i, g, gather, join, order, ident),
+                                    _mm512_set1_epi16(*bias.get_unchecked(81 + i) as i16),
+                                );
+                                let high = _mm512_add_epi16(b, c);
+                                overflow |= _mm512_cmpneq_epi16_mask(high, _mm512_adds_epi16(b, c));
+                                (low, high)
+                            } else {
+                                (zero, zero)
+                            }
+                        }};
+                    }
+                    let (lo0, hi0) = row!(0);
+                    let (lo1, hi1) = row!(1);
+                    let (lo2, hi2) = row!(2);
+                    let (lo3, hi3) = row!(3);
+                    let (lo4, hi4) = row!(4);
+                    let (lo5, hi5) = row!(5);
+                    let (lo6, hi6) = row!(6);
+                    let (lo7, hi7) = row!(7);
+                    for (region, rows) in [
+                        [lo0, lo1, lo2, lo3, lo4, lo5, lo6, lo7],
+                        [hi0, hi1, hi2, hi3, hi4, hi5, hi6, hi7],
+                    ].into_iter().enumerate() {
+                        let rows = transpose8x8_q(rows);
+                        for j in 0..8 {
+                            let e = 16 * g + 8 * h + 7 - j;
+                            let slot = i0 + 81 * region;
+                            let dst = (core::ptr::addr_of_mut!((*output.add(e)).v) as *mut i16).add(4 * slot);
+                            if n == 8 {
+                                _mm512_storeu_si512(dst as *mut __m512i, rows[j]);
+                            } else {
+                                _mm512_mask_storeu_epi64(dst as *mut i64, mask, rows[j]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(overflow == 0, "integer fold overflow");
+    }
+
     /// Allocate capacity for `SLOTS` counts; `unslice` initializes every lane before `set_len`.
     #[inline]
     fn uninit_counts() -> Vec<[i16; LANES]> {
@@ -2079,7 +2231,7 @@ mod bitsliced {
     }
 
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-    unsafe fn run_worker<const GROUP: usize>(
+    unsafe fn run_worker<const GROUP: usize, const FUSED: bool>(
         worker: usize,
         words: &[B128],
         column_words: usize,
@@ -2107,7 +2259,7 @@ mod bitsliced {
             planes.as_mut_ptr().add(GUARD + j * STRIDE + 128).write(zero);
         }
         let mut acc: Vec<__m512i> = Vec::with_capacity(2 * PAIRS * BITS);
-        let mut counts = uninit_counts();
+        let mut counts = if FUSED { Vec::new() } else { uninit_counts() };
         loop {
             let task = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if task >= tasks {
@@ -2152,6 +2304,13 @@ mod bitsliced {
             }
             #[cfg(test)]
             let start = profile.then(std::time::Instant::now);
+            if FUSED {
+                let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
+                write_acc(acc.as_ptr(), bias, output);
+                #[cfg(test)]
+                if let Some(start) = start { times[2] += start.elapsed(); }
+                continue;
+            }
             for s in 0..SLOTS {
                 unslice(acc.as_ptr().add(s * BITS), counts.as_mut_ptr().add(s).cast());
             }
@@ -2194,10 +2353,19 @@ mod bitsliced {
         column_words: usize,
         workers: usize,
     ) -> Vec<RingElement> {
-        fold_config::<COL_GROUP>(words, challenges, column_words, workers)
+        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers)
     }
 
-    fn fold_config<const GROUP: usize>(
+    pub(super) fn fold_words_baseline(
+        words: &[B128],
+        challenges: &[ShortChallenge],
+        column_words: usize,
+        workers: usize,
+    ) -> Vec<RingElement> {
+        fold_config::<COL_GROUP, false>(words, challenges, column_words, workers)
+    }
+
+    fn fold_config<const GROUP: usize, const FUSED: bool>(
         words: &[B128],
         challenges: &[ShortChallenge],
         column_words: usize,
@@ -2222,11 +2390,11 @@ mod bitsliced {
         // shared core does fewer of them; the second part of a block to finish adds its counts
         // to the first's in `write_counts` (counts are additive and stay within the total weight)
         // and writes.
-        let parts = PARTS.min(groups.len().max(1));
+        let parts = if FUSED { 1 } else { PARTS.min(groups.len().max(1)) };
         let cuts: Vec<usize> = (0..=parts).map(|i| groups.len() * i / parts).collect();
         let tasks = blocks * parts;
         let pending: Vec<std::sync::Mutex<Option<Vec<[i16; LANES]>>>> =
-            (0..blocks).map(|_| std::sync::Mutex::new(None)).collect();
+            if FUSED { Vec::new() } else { (0..blocks).map(|_| std::sync::Mutex::new(None)).collect() };
         let free: std::sync::Mutex<Vec<Vec<[i16; LANES]>>> =
             std::sync::Mutex::new(Vec::new());
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -2234,7 +2402,7 @@ mod bitsliced {
         let out_addr = out.as_mut_ptr() as usize;
         let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
         crate::par::pool().run(workers.clamp(1, tasks), |worker| unsafe {
-            run_worker::<GROUP>(
+            run_worker::<GROUP, FUSED>(
                 worker,
                 words,
                 column_words,
@@ -2533,8 +2701,8 @@ mod bitsliced {
             for (group, workers) in [(16, 4), (31, 4), (31, 2), (16, 2)] {
                 let start = std::time::Instant::now();
                 let v = match group {
-                    16 => fold_config::<16>(&words, &cs, 1 << 14, workers),
-                    31 => fold_config::<31>(&words, &cs, 1 << 14, workers),
+                    16 => fold_config::<16, false>(&words, &cs, 1 << 14, workers),
+                    31 => fold_config::<31, false>(&words, &cs, 1 << 14, workers),
                     _ => unreachable!(),
                 };
                 eprintln!("bitfold group={} workers={} exact_us={}", group, workers, start.elapsed().as_micros());

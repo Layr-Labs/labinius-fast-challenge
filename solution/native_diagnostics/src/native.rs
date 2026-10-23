@@ -1,4 +1,5 @@
-use labinius::fields::{crossfield as cf, scalar::B128};
+use labinius::fields::scalar::B128;
+use labinius::Transcript;
 use std::io::Write;
 use std::time::Instant;
 
@@ -56,25 +57,20 @@ pub fn run() {
     std::fs::remove_file(&path).expect("remove fixed diagnostic input name");
     let values = table.words();
     let _ = labinius::par::pool();
-    let planes = cf::LeanSwitch::planes(1 << LOG_PACKED);
     populate_words(values, &KEY.0, workers);
     let key_words = 4 * (4096 / 2) * 648;
     assert_eq!(KEY_LEN, 4 * key_words, "exact production pair key image length");
     assert_eq!(KEY.0.as_ptr() as usize % 64, 0, "production key alignment");
     assert!(cfg!(target_endian = "little"));
-    let keys = unsafe { std::slice::from_raw_parts(KEY.0.as_ptr().cast::<u32>(), key_words) };
-    let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
-    assert_eq!(columns.len(), COLUMNS);
+    assert_eq!(values.len(), COLUMNS * COLUMN_LEN);
+    let mut transcript = Transcript::new(b"labinius-fast/row-eqblock-diagnostic/v1");
+    let p0 = transcript.sample_f162(b"row-point", 14);
+    assert_eq!(1usize << p0.len(), COLUMN_LEN);
+    println!("native-diag fixture=row-eqblock-v1 point_sampler=production row_variables={} output_fields={COLUMNS} prior_switch_workspace=absent timing_scope=whole-public-row", p0.len());
     println!("native-diag phase=setup elapsed_ns={} input_address_mod4096={} key_address_mod64={} key_bytes={KEY_LEN}", clock.elapsed().as_nanos(), values.as_ptr() as usize % 4096, KEY.0.as_ptr() as usize % 64);
 
-    let mut baseline = || labinius::simd::commit::hybrid::commit_columns_rows_pairs(keys, &columns, workers);
-    let mut shared = || crate::commit_adapter::commit_columns_rows_pairs::<true, true>(keys, &columns, workers);
-    let mut no_wait = || crate::commit_adapter::commit_columns_rows_pairs::<false, false>(keys, &columns, workers);
-    let mut both = || crate::commit_adapter::commit_columns_rows_pairs::<true, false>(keys, &columns, workers);
-    crate::compare::run("commit", &mut [
-        ("baseline", &mut baseline), ("shared-tail", &mut shared),
-        ("no-wait", &mut no_wait), ("shared-tail-no-wait", &mut both),
-    ]);
-    std::hint::black_box(&planes);
+    let mut baseline = || labinius::eval::row_evaluate_words_baseline(values, &p0, workers);
+    let mut candidate = || labinius::eval::row_evaluate_words(values, &p0, workers);
+    crate::compare::run("row", &mut baseline, &mut candidate);
     println!("native-diag phase=complete elapsed_ns={}", clock.elapsed().as_nanos());
 }

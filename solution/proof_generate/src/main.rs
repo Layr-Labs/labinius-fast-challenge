@@ -1433,129 +1433,6 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pkeys,&columns,workers)
     } else {key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
     let commit_time = clock.elapsed();
-    // [pair-audit v2, opt-in] With LABINIUS_PAIR_AUDIT set, and before any proof byte is
-    // written, the first 16 hybrid columns are re-committed through the arranged kernel and
-    // their rows are compared bit-for-bit against the pair kernel's rows for those columns.
-    // The check runs through the paired multi-worker path (16 columns at group 8, satisfying
-    // the dispatch's columns.len() > group_size condition) and costs about 3-4 ms. Unset, it
-    // is inert and scored runs pay nothing. Diagnostics only: no timing selects code, and
-    // every scored proof is verifier-gated.
-    if std::env::var_os("LABINIUS_PAIR_AUDIT").is_some()
-        && modulus == modulus_choice::HYBRID_MODULUS
-        && modulus == MODULUS
-    {
-        if let Some(keys) = labinius::simd::commit::hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES) {
-            // Window selection: the default covers the paired dispatcher's first five group
-            // boundaries, the middle boundary and the last group; LABINIUS_PAIR_AUDIT=full
-            // covers all 64 16-column windows of the 1024-column commitment;
-            // LABINIUS_PAIR_AUDIT=<a>..<b> enumerates exactly windows [a, b) for a targeted
-            // pass at the same code path; LABINIUS_PAIR_AUDIT=tail checks the last two
-            // windows.
-            let windows: Vec<usize> = {
-                let spec = std::env::var("LABINIUS_PAIR_AUDIT").unwrap_or_default();
-                match spec.as_str() {
-                    "full" => (0..64usize).collect::<Vec<_>>(),
-                    "tail" => vec![62usize, 63],
-                    "even" => (0..64usize).step_by(2).collect::<Vec<_>>(),
-                    "odd" => (0..64usize).skip(1).step_by(2).collect::<Vec<_>>(),
-                    "mid" => vec![31usize, 32],
-                    "quarter" => (0..64usize).step_by(4).collect::<Vec<_>>(),
-                    "eighth" => (0..64usize).step_by(8).collect::<Vec<_>>(),
-                    "third" => (0..64usize).step_by(3).collect::<Vec<_>>(),
-                    "head" => vec![0usize, 1, 2, 3, 4, 5, 31, 32, 63],
-                    "first" => vec![0usize],
-                    "last" => vec![63usize],
-                    "rev" => (0..64usize).rev().collect::<Vec<_>>(),
-                    "boundary" => vec![0usize, 31, 32, 63],
-                    s if s.starts_with("step:") => {
-                        let n = s[5..].trim().parse::<usize>().ok().filter(|&n| n >= 1).unwrap_or(1);
-                        (0..64usize).step_by(n).collect::<Vec<_>>()
-                    }
-                    s => s
-                        .split_once("..")
-                        .and_then(|(a, b)| {
-                            let a = a.trim().parse::<usize>().ok()?;
-                            let b = b.trim().parse::<usize>().ok()?;
-                            (a < b && b <= 64).then(|| (a..b).collect::<Vec<_>>())
-                        })
-                        .or_else(|| {
-                            s.split(',')
-                                .map(|x| x.trim().parse::<usize>())
-                                .collect::<Result<Vec<usize>, _>>()
-                                .ok()
-                                .filter(|l| !l.is_empty() && l.iter().all(|&w| w < 64))
-                                .map(|mut l| {
-                                    l.sort_unstable();
-                                    l.dedup();
-                                    l
-                                })
-                        })
-                        .unwrap_or_else(|| vec![0usize, 1, 2, 3, 4, 5, 31, 32, 63]),
-                }
-            };
-            let audit_groups: usize = std::env::var("LABINIUS_PAIR_AUDIT_GROUPS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .filter(|&n| (1..=32).contains(&n))
-                .unwrap_or(8);
-            let audit_jobs: usize = std::env::var("LABINIUS_PAIR_AUDIT_JOBS")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .filter(|&n| (1..=64).contains(&n))
-                .unwrap_or(workers);
-            let audit_clock = std::time::Instant::now();
-            let (mut worst_w, mut worst_us) = (usize::MAX, 0usize);
-            for &w in &windows {
-                let window_clock = std::time::Instant::now();
-                let audit = labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys, &columns[16 * w..16 * w + 16], audit_jobs, audit_groups);
-                let window_us = window_clock.elapsed().as_micros() as usize;
-                if window_us > worst_us {
-                    worst_us = window_us;
-                    worst_w = w;
-                }
-                let ok = audit == rows[(3 * 16 * w)..(3 * 16 * w + audit.len())];
-                eprintln!(
-                    "[pair-audit] window{w} rows={}..{} us={window_us} first_group_parity={}",
-                    3 * 16 * w,
-                    3 * 16 * w + audit.len(),
-                    if ok { "ok" } else { "MISMATCH" }
-                );
-                if !ok {
-                    let mismatches = audit
-                        .iter()
-                        .zip(rows[(3 * 16 * w)..(3 * 16 * w + audit.len())].iter())
-                        .filter(|(p, a)| p != a)
-                        .count();
-                    let first = audit
-                        .iter()
-                        .zip(rows[(3 * 16 * w)..(3 * 16 * w + audit.len())].iter())
-                        .position(|(p, a)| p != a);
-                    eprintln!(
-                        "[pair-audit] window{w} diverging at row-offset {first:?}, {mismatches} of {} rows differ",
-                        audit.len()
-                    );
-                    panic!(
-                        "[pair-audit] pair rows != arranged rows on columns {} (first differing row-offset {first:?}, {mismatches} of {} rows); aborting before proof write",
-                        16 * w,
-                        audit.len()
-                    );
-                }
-            }
-            let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-            eprintln!(
-                "[pair-audit] audit_us={} windows={} coverage={}..{} workers={} jobs={} groups={} avail={} slowest={}",
-                audit_clock.elapsed().as_micros(),
-                windows.len(),
-                windows.first().copied().unwrap_or(0),
-                windows.last().copied().unwrap_or(0),
-                workers,
-                audit_jobs,
-                audit_groups,
-                avail,
-                if worst_w == usize::MAX { "none".to_string() } else { format!("w{worst_w}@{worst_us}us") }
-            );
-        }
-    }
     let buffer = output.and_then(|o| o.commitment_buffer());
     let commitment = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer);
     let recombine_time = clock.elapsed();
@@ -1571,6 +1448,18 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
             (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
         });
         output.populate(first.collect());
+    }
+    if std::env::var_os("LABINIUS_COMMIT_DIGEST").is_some() {
+        // Diagnostic only, gated off in the scored environment: a content digest of the
+        // commitment bytes the transcript absorbs, for A/B of commitment changes.
+        let mut h = blake3::Hasher::new();
+        h.update(&commitment);
+        let mut digest = [0u8; 32];
+        h.finalize_xof().fill(&mut digest);
+        eprintln!(
+            "labinius-commit-digest {}",
+            digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
@@ -1613,12 +1502,62 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let point = EvaluationPoint::msb_first(&p, &coords);
     let row = RowEvaluation::of(labinius::eval::row_evaluate_words(values, point.p0(), workers));
     let row_time = clock.elapsed();
+    if std::env::var_os("LABINIUS_ROW_DIGEST").is_some() {
+        // Diagnostic only, gated off in the scored environment: a content digest of the row
+        // evaluation, for A/B of the row pass.
+        let mut h = blake3::Hasher::new();
+        for x in row.values() {
+            for limb in x.0 {
+                h.update(&limb.to_le_bytes());
+            }
+        }
+        let mut digest = [0u8; 32];
+        h.finalize_xof().fill(&mut digest);
+        eprintln!(
+            "labinius-row-digest {}",
+            digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+    }
     let challenges = folding_challenges(&mut t, &row);
     let challenge_time = clock.elapsed();
+    if std::env::var_os("LABINIUS_CHALLENGE_DIGEST").is_some() {
+        // Diagnostic only, gated off in the scored environment: a content digest of the
+        // folding challenges, for A/B of the transcript/fold front end.
+        let mut h = blake3::Hasher::new();
+        for c in &challenges {
+            h.update(&(c.weight as u64).to_le_bytes());
+            h.update(&c.signs.to_le_bytes());
+            for &p in &c.positions[..c.weight] {
+                h.update(&[p]);
+            }
+        }
+        let mut digest = [0u8; 32];
+        h.finalize_xof().fill(&mut digest);
+        eprintln!(
+            "labinius-challenge-digest {}",
+            digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+    }
     let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
         values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
     ));
     let fold_time = clock.elapsed();
+    if std::env::var_os("LABINIUS_FOLD_DIGEST").is_some() {
+        // Diagnostic only, gated off in the scored environment (which carries LABINIUS_SEED
+        // alone): a content digest of the folded witness, for A/B of fold changes.
+        let mut h = blake3::Hasher::new();
+        for e in folded.elements() {
+            for &x in e.v.iter() {
+                h.update(&x.to_le_bytes());
+            }
+        }
+        let mut digest = [0u8; 32];
+        h.finalize_xof().fill(&mut digest);
+        eprintln!(
+            "labinius-fold-digest {}",
+            digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+    }
     // The mapping is left to the exit, which tears it down without the TLB shootdowns an unmap
     // beside the pool's threads needs.
     std::mem::forget(table);
@@ -1720,8 +1659,12 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is in the shared mapping and stderr is flushed above; skip libc's exit
+    // handlers so the process is reaped as soon as the kernel has torn its mappings down.
+    extern "C" {
+        fn _exit(code: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 #[cfg(test)]

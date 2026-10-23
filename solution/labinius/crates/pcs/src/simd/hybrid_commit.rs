@@ -989,6 +989,7 @@ unsafe fn group_pairs_full<F:FnMut(usize)>(
 
 /// Maximum lead (in pair batches) between two hyperthread siblings on the same physical core:
 /// `2 * PP0 = 32` pair batches = 324 KiB of `pair_keys`, well within the 2 MiB L2 cache.
+#[allow(dead_code)]
 const PAIR_LEAD:usize=2*PP0;
 
 /// Column-pair commitment with hyperthread siblings `2k` and `2k + 1` (pinned to physical core
@@ -1003,43 +1004,26 @@ fn commit_paired_pairs(
  placement:Option<&crate::par::CorePlacement>,
  dst:usize,
 ) {
- use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
+ use std::sync::atomic::{AtomicUsize,Ordering};
  let g=16usize;let sg=2*g;
  let pairs=workers/2;
  let super_groups=columns.len().div_ceil(sg);
  let rounds=super_groups+1;
  let next=AtomicUsize::new(0);
  let slots:Vec<std::sync::OnceLock<usize>>=(0..pairs*rounds).map(|_|std::sync::OnceLock::new()).collect();
- let done:Vec<Progress>=(0..2*pairs).map(|_|Progress(AtomicUsize::new(0))).collect();
- let coupled:Vec<AtomicBool>=(0..pairs).map(|_|AtomicBool::new(true)).collect();
  crate::par::pool().run(2*pairs,|worker|{
   let _guard=placement.and_then(|p|p.pin(worker));
   let (pair,s)=(worker/2,worker%2);
-  let mine=&done[worker].0;let other=&done[worker^1].0;let coupled=&coupled[pair];
   let mut ws:Option<PairWorker>=None;
   for r in 0..rounds {
    let gi=*slots[pair*rounds+r].get_or_init(||next.fetch_add(1,Ordering::Relaxed));
    if gi>=super_groups {break;}
    let c0=gi*sg;let gc=sg.min(columns.len()-c0);
    let (lo,n)=if s==0 {(c0,gc.min(g))} else {(c0+g,gc.saturating_sub(g))};
-   let base=r*np;
-   if n==0 {mine.store(base+np,Ordering::Release);continue;}
+   if n==0 {continue;}
    let ws=ws.get_or_insert_with(PairWorker::new);
-   unsafe{group_pairs_full(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),|b_done|{
-    let d=base+b_done;
-    mine.store(d,Ordering::Release);
-    if !coupled.load(Ordering::Relaxed) {return;}
-    if other.load(Ordering::Acquire)+PAIR_LEAD>=d {return;}
-    let start=std::time::Instant::now();
-    let mut spins=0u32;
-    while other.load(Ordering::Acquire)+PAIR_LEAD<d {
-     core::hint::spin_loop();
-     spins+=1;
-     if spins%64==0 && start.elapsed()>SIBLING_WAIT {coupled.store(false,Ordering::Relaxed);return;}
-    }
-   })};
+   unsafe{group_pairs_full(&columns[lo..lo+n],keys,np,ws,(dst as *mut [u32;N]).add(3*lo),|_|{})};
   }
-  mine.store(usize::MAX/2,Ordering::Release);
  });
 }
 

@@ -1652,7 +1652,8 @@ unsafe fn map_tile(eq: *const B128, m: &[[u64; 16]; 24], out: &mut [[__m512i; 8]
     map_xe(&xe, m, out);
 }
 
-/// [`map_tile`] for two maps of the same 64 words, transposing them once.
+/// [`map_tile`] for two maps of the same 64 words, transposing them once and evaluating both
+/// maps per limb so `xe[0..16]` is traversed three times instead of six.
 #[inline(always)]
 unsafe fn map_tile2(
     eq: *const B128,
@@ -1663,8 +1664,32 @@ unsafe fn map_tile2(
 ) {
     let mut xe = [_mm512_setzero_si512(); 16];
     transpose_tile(eq as *const u8, &mut xe);
-    map_xe(&xe, m, out);
-    map_xe(&xe, mp, outp);
+    debug_assert_eq!(F162_LIVE_BYTES, 21);
+    for l in 0..2 {
+        out[l] = untranspose_planes(core::array::from_fn(|c| map_row(&xe, &m[8 * l + c])));
+        outp[l] = untranspose_planes(core::array::from_fn(|c| map_row(&xe, &mp[8 * l + c])));
+    }
+    let z = _mm512_setzero_si512();
+    out[2] = untranspose_planes([
+        map_row(&xe, &m[16]),
+        map_row(&xe, &m[17]),
+        map_row(&xe, &m[18]),
+        map_row(&xe, &m[19]),
+        map_row(&xe, &m[20]),
+        z,
+        z,
+        z,
+    ]);
+    outp[2] = untranspose_planes([
+        map_row(&xe, &mp[16]),
+        map_row(&xe, &mp[17]),
+        map_row(&xe, &mp[18]),
+        map_row(&xe, &mp[19]),
+        map_row(&xe, &mp[20]),
+        z,
+        z,
+        z,
+    ]);
 }
 
 /// The first block of the `eq` expansion in factored form, as
@@ -1748,12 +1773,23 @@ unsafe fn message_range(
     mlp: &[[u64; 16]; 24],
     range: core::ops::Range<usize>,
 ) -> [F162; 2] {
+    const MESSAGE_AHEAD: usize = TILE;
     let mut acc0 = [_mm512_setzero_si512(); 12];
     let mut acci = [_mm512_setzero_si512(); 12];
     let mut av = [[_mm512_setzero_si512(); 8]; 3];
     let mut apv = [[_mm512_setzero_si512(); 8]; 3];
     let mut buf = EqTile([B128::ZERO; TILE]);
     for j0 in range.step_by(TILE) {
+        if let Src::Planes(p) = src {
+            for k in 0..3 {
+                for o in [j0, j0 + half] {
+                    let a = p[k].wrapping_add(o + MESSAGE_AHEAD) as *const i8;
+                    for l in 0..(TILE * 8 / 64) {
+                        _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64 * l));
+                    }
+                }
+            }
+        }
         map_tile2(eq.tile(j0, &mut buf), ml, mlp, &mut av, &mut apv);
         for g in 0..8 {
             let j = j0 + 8 * g;

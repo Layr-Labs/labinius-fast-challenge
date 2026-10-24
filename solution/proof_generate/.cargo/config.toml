@@ -1,2 +1,7 @@
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+# Link the prover statically: the harness times the whole `subprocess.run`, so
+# the dynamic loader's work is part of the score (see static-link.sh).
+[target.x86_64-unknown-linux-gnu]
+linker = "./static-link.sh"

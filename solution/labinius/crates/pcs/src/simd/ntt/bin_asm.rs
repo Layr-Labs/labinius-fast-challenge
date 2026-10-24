@@ -1092,55 +1092,106 @@ pub unsafe fn ntt_bin_batch32_hybrid<const Q: u16, const RED: bool>(
 }
 
 macro_rules! pair_slot {
-    ($mode:ident, $reg:literal, $w_off:literal, $k0:literal, $k1:literal, $k2:literal, $k3:literal, $a0:literal, $a1:literal) => {
+    ($mode:ident, $temp:literal, $reg:literal, $w_off:literal, $k0:literal, $k1:literal, $k2:literal, $k3:literal, $a0:literal, $a1:literal) => {
         concat!(
-            "vmovdqa64 zmm29, [{acc}+", $a0, "]\n",
+            "vmovdqa64 zmm", $temp, ", [{acc}+", $a0, "]\n",
             "vmovdqa64 zmm30, [{acc}+", $a1, "]\n",
-            "vmovdqa64 zmm28, [{w0}+", $w_off, "]\n",
-            "vpdpwssd zmm29, zmm28, dword ptr [{key}+", $k0, "]{{1to16}}\n",
-            "vpdpwssd zmm30, zmm28, dword ptr [{key}+", $k1, "]{{1to16}}\n",
-            "vpdpwssd zmm29, zmm", $reg, ", dword ptr [{key}+", $k2, "]{{1to16}}\n",
+            "vmovdqa64 zmm31, [{w0}+", $w_off, "]\n",
+            "vpdpwssd zmm", $temp, ", zmm31, dword ptr [{key}+", $k0, "]{{1to16}}\n",
+            "vpdpwssd zmm30, zmm31, dword ptr [{key}+", $k1, "]{{1to16}}\n",
+            "vpdpwssd zmm", $temp, ", zmm", $reg, ", dword ptr [{key}+", $k2, "]{{1to16}}\n",
             "vpdpwssd zmm30, zmm", $reg, ", dword ptr [{key}+", $k3, "]{{1to16}}\n",
-            hybrid_store!($mode, 29, $a0),
+            hybrid_store!($mode, $temp, $a0),
             hybrid_store!($mode, 30, $a1),
         )
     };
 }
 
-/// Register-resident LOCK=2 column-pair sink: consumes the second batch's 27 transformed vectors
-/// directly from `zmm0..zmm26` while reading the first batch's 27 vectors from L1D-resident `w0`,
-/// accumulating both against broadcast dword keys into `PAcc` (`[{acc} + 128*s]`, `[{acc} + 128*s + 64]`)
-/// with zero `tr8`/`tr4` shuffles.
-macro_rules! pair_register_sink {
-    ($mode:ident) => {
+/// Consume one completed final radix-3 butterfly in slot order (a0, a2, a1).
+/// Its omega temporary is dead, so it can hold the base accumulator while the other
+/// temporary (28 or 29) retains the next butterfly's pending omega product. zmm31
+/// holds the staged first batch until its two MACs, then is free for fold-back.
+macro_rules! pair_triplet_sink {
+    ($mode:ident, $temp:literal, $a0:literal, $a1:literal, $a2:literal, 0) => {
         concat!(
-            pair_slot!($mode, 0,    0,   0,   4,   8,  12,    0,   64),
-            pair_slot!($mode, 2,   64,  16,  20,  24,  28,  128,  192),
-            pair_slot!($mode, 1,  128,  32,  36,  40,  44,  256,  320),
-            pair_slot!($mode, 6,  192,  48,  52,  56,  60,  384,  448),
-            pair_slot!($mode, 8,  256,  64,  68,  72,  76,  512,  576),
-            pair_slot!($mode, 7,  320,  80,  84,  88,  92,  640,  704),
-            pair_slot!($mode, 3,  384,  96, 100, 104, 108,  768,  832),
-            pair_slot!($mode, 5,  448, 112, 116, 120, 124,  896,  960),
-            pair_slot!($mode, 4,  512, 128, 132, 136, 140, 1024, 1088),
-            pair_slot!($mode, 18, 576, 144, 148, 152, 156, 1152, 1216),
-            pair_slot!($mode, 20, 640, 160, 164, 168, 172, 1280, 1344),
-            pair_slot!($mode, 19, 704, 176, 180, 184, 188, 1408, 1472),
-            pair_slot!($mode, 24, 768, 192, 196, 200, 204, 1536, 1600),
-            pair_slot!($mode, 26, 832, 208, 212, 216, 220, 1664, 1728),
-            pair_slot!($mode, 25, 896, 224, 228, 232, 236, 1792, 1856),
-            pair_slot!($mode, 21, 960, 240, 244, 248, 252, 1920, 1984),
-            pair_slot!($mode, 23,1024, 256, 260, 264, 268, 2048, 2112),
-            pair_slot!($mode, 22,1088, 272, 276, 280, 284, 2176, 2240),
-            pair_slot!($mode, 9, 1152, 288, 292, 296, 300, 2304, 2368),
-            pair_slot!($mode, 11,1216, 304, 308, 312, 316, 2432, 2496),
-            pair_slot!($mode, 10,1280, 320, 324, 328, 332, 2560, 2624),
-            pair_slot!($mode, 15,1344, 336, 340, 344, 348, 2688, 2752),
-            pair_slot!($mode, 17,1408, 352, 356, 360, 364, 2816, 2880),
-            pair_slot!($mode, 16,1472, 368, 372, 376, 380, 2944, 3008),
-            pair_slot!($mode, 12,1536, 384, 388, 392, 396, 3072, 3136),
-            pair_slot!($mode, 14,1600, 400, 404, 408, 412, 3200, 3264),
-            pair_slot!($mode, 13,1664, 416, 420, 424, 428, 3328, 3392),
+            pair_slot!($mode, $temp, $a0,    0,   0,   4,   8,  12,    0,   64),
+            pair_slot!($mode, $temp, $a2,   64,  16,  20,  24,  28,  128,  192),
+            pair_slot!($mode, $temp, $a1,  128,  32,  36,  40,  44,  256,  320),
+        )
+    };
+    ($mode:ident, $temp:literal, $a0:literal, $a1:literal, $a2:literal, 192) => {
+        concat!(
+            pair_slot!($mode, $temp, $a0,  192,  48,  52,  56,  60,  384,  448),
+            pair_slot!($mode, $temp, $a2,  256,  64,  68,  72,  76,  512,  576),
+            pair_slot!($mode, $temp, $a1,  320,  80,  84,  88,  92,  640,  704),
+        )
+    };
+    ($mode:ident, $temp:literal, $a0:literal, $a1:literal, $a2:literal, 384) => {
+        concat!(
+            pair_slot!($mode, $temp, $a0,  384,  96, 100, 104, 108,  768,  832),
+            pair_slot!($mode, $temp, $a2,  448, 112, 116, 120, 124,  896,  960),
+            pair_slot!($mode, $temp, $a1,  512, 128, 132, 136, 140, 1024, 1088),
+        )
+    };
+    ($mode:ident, $temp:literal, $a0:literal, $a1:literal, $a2:literal, 576) => {
+        concat!(
+            pair_slot!($mode, $temp, $a0,  576, 144, 148, 152, 156, 1152, 1216),
+            pair_slot!($mode, $temp, $a2,  640, 160, 164, 168, 172, 1280, 1344),
+            pair_slot!($mode, $temp, $a1,  704, 176, 180, 184, 188, 1408, 1472),
+        )
+    };
+    ($mode:ident, $temp:literal, $a0:literal, $a1:literal, $a2:literal, 768) => {
+        concat!(
+            pair_slot!($mode, $temp, $a0,  768, 192, 196, 200, 204, 1536, 1600),
+            pair_slot!($mode, $temp, $a2,  832, 208, 212, 216, 220, 1664, 1728),
+            pair_slot!($mode, $temp, $a1,  896, 224, 228, 232, 236, 1792, 1856),
+        )
+    };
+    ($mode:ident, $temp:literal, $a0:literal, $a1:literal, $a2:literal, 960) => {
+        concat!(
+            pair_slot!($mode, $temp, $a0,  960, 240, 244, 248, 252, 1920, 1984),
+            pair_slot!($mode, $temp, $a2, 1024, 256, 260, 264, 268, 2048, 2112),
+            pair_slot!($mode, $temp, $a1, 1088, 272, 276, 280, 284, 2176, 2240),
+        )
+    };
+    ($mode:ident, $temp:literal, $a0:literal, $a1:literal, $a2:literal, 1152) => {
+        concat!(
+            pair_slot!($mode, $temp, $a0, 1152, 288, 292, 296, 300, 2304, 2368),
+            pair_slot!($mode, $temp, $a2, 1216, 304, 308, 312, 316, 2432, 2496),
+            pair_slot!($mode, $temp, $a1, 1280, 320, 324, 328, 332, 2560, 2624),
+        )
+    };
+    ($mode:ident, $temp:literal, $a0:literal, $a1:literal, $a2:literal, 1344) => {
+        concat!(
+            pair_slot!($mode, $temp, $a0, 1344, 336, 340, 344, 348, 2688, 2752),
+            pair_slot!($mode, $temp, $a2, 1408, 352, 356, 360, 364, 2816, 2880),
+            pair_slot!($mode, $temp, $a1, 1472, 368, 372, 376, 380, 2944, 3008),
+        )
+    };
+    ($mode:ident, $temp:literal, $a0:literal, $a1:literal, $a2:literal, 1536) => {
+        concat!(
+            pair_slot!($mode, $temp, $a0, 1536, 384, 388, 392, 396, 3072, 3136),
+            pair_slot!($mode, $temp, $a2, 1600, 400, 404, 408, 412, 3200, 3264),
+            pair_slot!($mode, $temp, $a1, 1664, 416, 420, 424, 428, 3328, 3392),
+        )
+    };
+}
+
+/// Keep the existing two-butterfly pipeline, but consume each finished triplet before
+/// the next level-6 multiplication. Only the just-consumed omega temporary is reused.
+/// Each triplet selects its original plain or reduced store; the transform body is shared.
+macro_rules! bfly_pair_sink {
+    ($a0:literal, $a1:literal, $a2:literal, $t:literal,
+     $o0:tt, $o1:literal, $o2:literal) => {
+        concat!(
+            bfly!($a0, $a1, $a2, $t),
+            "test {red:e}, {red:e}\n",
+            "jnz 2f\n",
+            pair_triplet_sink!(plain, $t, $a0, $a1, $a2, $o0),
+            "jmp 3f\n",
+            "2:\n",
+            pair_triplet_sink!(reduce, $t, $a0, $a1, $a2, $o0),
+            "3:\n",
         )
     };
 }
@@ -1155,14 +1206,7 @@ unsafe fn tail27_pair<const Q: u16>(
             core::arch::asm!(
                 concat!(
                     "vmovdqa64 zmm27, [{c}]\n",
-                    tail27!($m4, $m6, bfly_registers),
-                    "test {red:e}, {red:e}\n",
-                    "jnz 2f\n",
-                    pair_register_sink!(plain),
-                    "jmp 3f\n",
-                    "2:\n",
-                    pair_register_sink!(reduce),
-                    "3:\n",
+                    tail27!($m4, $m6, bfly_pair_sink),
                     "/* {fold} */\n",
                 ),
                 i = in(reg) bp, w0 = in(reg) w0, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,

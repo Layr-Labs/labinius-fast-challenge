@@ -1150,66 +1150,71 @@ unsafe fn tail27_pair<const Q: u16>(
     bp: *const i16, w0: *const i16, t4: *const u32, t5: *const u32, t6: *const u32,
     cv: *const i16, key: *const u32, acc: *mut i32, red: u32,
 ) {
-    macro_rules! run {
+    if red != 0 {
+        tail27_pair_body::<Q, true>(bp, w0, t4, t5, t6, cv, key, acc);
+    } else {
+        tail27_pair_body::<Q, false>(bp, w0, t4, t5, t6, cv, key, acc);
+    }
+}
+
+#[inline(never)]
+unsafe fn tail27_pair_body<const Q: u16, const RED: bool>(
+    bp: *const i16, w0: *const i16, t4: *const u32, t5: *const u32, t6: *const u32,
+    cv: *const i16, key: *const u32, acc: *mut i32,
+) {
+    macro_rules! run_acc {
         ($m4:ident, $m6:ident) => {
             core::arch::asm!(
                 concat!(
                     "vmovdqa64 zmm27, [{c}]\n",
                     tail27!($m4, $m6, bfly_registers),
-                    "test {red:e}, {red:e}\n",
-                    "jnz 2f\n",
                     pair_register_sink!(plain),
-                    "jmp 3f\n",
-                    "2:\n",
+                ),
+                i = in(reg) bp, w0 = in(reg) w0, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,
+                c = in(reg) cv, key = in(reg) key, acc = in(reg) acc,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _,
+                out("zmm12") _, out("zmm13") _, out("zmm14") _, out("zmm15") _,
+                out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _,
+                out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _,
+                out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _,
+                out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
+                out("k1") _,
+                options(nostack)
+            )
+        };
+    }
+    macro_rules! run_fold {
+        ($m4:ident, $m6:ident) => {
+            core::arch::asm!(
+                concat!(
+                    "vmovdqa64 zmm27, [{c}]\n",
+                    tail27!($m4, $m6, bfly_registers),
                     pair_register_sink!(reduce),
-                    "3:\n",
-                    "/* {fold} */\n",
                 ),
                 i = in(reg) bp, w0 = in(reg) w0, t4 = in(reg) t4, t5 = in(reg) t5, t6 = in(reg) t6,
                 c = in(reg) cv, key = in(reg) key, acc = in(reg) acc,
                 fold = in(reg) &const { hybrid_fold::<Q>() },
-                red = in(reg) red,
-                out("zmm0") _,
-                out("zmm1") _,
-                out("zmm2") _,
-                out("zmm3") _,
-                out("zmm4") _,
-                out("zmm5") _,
-                out("zmm6") _,
-                out("zmm7") _,
-                out("zmm8") _,
-                out("zmm9") _,
-                out("zmm10") _,
-                out("zmm11") _,
-                out("zmm12") _,
-                out("zmm13") _,
-                out("zmm14") _,
-                out("zmm15") _,
-                out("zmm16") _,
-                out("zmm17") _,
-                out("zmm18") _,
-                out("zmm19") _,
-                out("zmm20") _,
-                out("zmm21") _,
-                out("zmm22") _,
-                out("zmm23") _,
-                out("zmm24") _,
-                out("zmm25") _,
-                out("zmm26") _,
-                out("zmm27") _,
-                out("zmm28") _,
-                out("zmm29") _,
-                out("zmm30") _,
-                out("zmm31") _,
+                out("zmm0") _, out("zmm1") _, out("zmm2") _, out("zmm3") _,
+                out("zmm4") _, out("zmm5") _, out("zmm6") _, out("zmm7") _,
+                out("zmm8") _, out("zmm9") _, out("zmm10") _, out("zmm11") _,
+                out("zmm12") _, out("zmm13") _, out("zmm14") _, out("zmm15") _,
+                out("zmm16") _, out("zmm17") _, out("zmm18") _, out("zmm19") _,
+                out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _,
+                out("zmm24") _, out("zmm25") _, out("zmm26") _, out("zmm27") _,
+                out("zmm28") _, out("zmm29") _, out("zmm30") _, out("zmm31") _,
                 out("k1") _,
                 options(nostack)
             )
         };
     }
     if needs_barrett(Q) {
-        run!(lut, barrett);
+        if RED { run_fold!(lut, barrett); } else { run_acc!(lut, barrett); }
+    } else if RED {
+        run_fold!(plain, plain);
     } else {
-        run!(plain, plain);
+        run_acc!(plain, plain);
     }
 }
 

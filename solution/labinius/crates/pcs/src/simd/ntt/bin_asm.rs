@@ -377,7 +377,7 @@ macro_rules! mont {
             "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
             "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
             "vpmullw zmm30, zmm", $t, ", [{c}+128]\n",
-            "vpmulhw zmm", $t, ", zmm", $t, ", [{c}+64]\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm31\n",
             "vpmulhw zmm30, zmm30, zmm27\n",
             "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
         )
@@ -456,7 +456,7 @@ macro_rules! level6 {
             "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
             "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
             "vpmullw zmm30, zmm", $t, ", [{c}+128]\n",
-            "vpmulhw zmm", $t, ", zmm", $t, ", [{c}+64]\n",
+            "vpmulhw zmm", $t, ", zmm", $t, ", zmm31\n",
             "vpmulhw zmm30, zmm30, zmm27\n",
             "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
         )
@@ -537,7 +537,8 @@ unsafe fn tail27_p(
     cv: *const i16,
 ) {
     core::arch::asm!(
-        concat!("vmovdqa64 zmm27, [{c}]\n", tail27!(plain, plain)),
+        concat!("vmovdqa64 zmm27, [{c}]\n",
+                    "vmovdqa64 zmm31, [{c}+64]\n", tail27!(plain, plain)),
         i = in(reg) bp,
         o = in(reg) op,
         t4 = in(reg) t4,
@@ -575,6 +576,7 @@ unsafe fn tail27_p(
         out("zmm28") _,
         out("zmm29") _,
         out("zmm30") _,
+        out("zmm31") _,
         options(nostack)
     );
 }
@@ -591,6 +593,7 @@ unsafe fn tail27_b(
     core::arch::asm!(
         concat!(
             "vmovdqa64 zmm27, [{c}]\n",
+                    "vmovdqa64 zmm31, [{c}+64]\n",
             tail27!(lut, barrett),
         ),
         i = in(reg) bp,
@@ -630,6 +633,7 @@ unsafe fn tail27_b(
         out("zmm28") _,
         out("zmm29") _,
         out("zmm30") _,
+        out("zmm31") _,
         options(nostack)
     );
 }
@@ -847,6 +851,7 @@ unsafe fn tail27_hybrid<const Q: u16, const RED: bool>(
             core::arch::asm!(
                 concat!(
                     "vmovdqa64 zmm27, [{c}]\n",
+                    "vmovdqa64 zmm31, [{c}+64]\n",
                     tail27!($m4, $m6, bfly_registers),
                     hybrid_register_sink!($red),
                     "/* {fold} */\n",
@@ -1155,6 +1160,7 @@ unsafe fn tail27_pair<const Q: u16>(
             core::arch::asm!(
                 concat!(
                     "vmovdqa64 zmm27, [{c}]\n",
+                    "vmovdqa64 zmm31, [{c}+64]\n",
                     tail27!($m4, $m6, bfly_registers),
                     "test {red:e}, {red:e}\n",
                     "jnz 2f\n",

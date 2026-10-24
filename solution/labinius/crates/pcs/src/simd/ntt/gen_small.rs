@@ -234,8 +234,35 @@ unsafe fn r3(
     om: __m512i,
     q: __m512i,
 ) -> (__m512i, __m512i, __m512i) {
-    let t1 = mont(a1, bc(tw), bc(tw.add(1)), q);
-    let t2 = mont(a2, bc(tw.add(2)), bc(tw.add(3)), q);
+    r3_w(
+        a0,
+        a1,
+        a2,
+        bc(tw),
+        bc(tw.add(1)),
+        bc(tw.add(2)),
+        bc(tw.add(3)),
+        omp,
+        om,
+        q,
+    )
+}
+
+#[inline(always)]
+unsafe fn r3_w(
+    a0: __m512i,
+    a1: __m512i,
+    a2: __m512i,
+    w0: __m512i,
+    w1: __m512i,
+    w2: __m512i,
+    w3: __m512i,
+    omp: __m512i,
+    om: __m512i,
+    q: __m512i,
+) -> (__m512i, __m512i, __m512i) {
+    let t1 = mont(a1, w0, w1, q);
+    let t2 = mont(a2, w2, w3, q);
     let u = mont(sub(t1, t2), omp, om, q);
     (
         add(a0, add(t1, t2)),
@@ -288,6 +315,8 @@ unsafe fn pass_b<const Q: u16>(p: *mut __m512i, blk: usize) {
     let (zp, z) = (bc(l2), bc(l2.add(1)));
     let ta = Tw::<Q>::L3.as_ptr().add(8 * blk);
     let tb = ta.add(4);
+    let (ta0, ta1, ta2, ta3) = (bc(ta), bc(ta.add(1)), bc(ta.add(2)), bc(ta.add(3)));
+    let (tb0, tb1, tb2, tb3) = (bc(tb), bc(tb.add(1)), bc(tb.add(2)), bc(tb.add(3)));
     let base = blk * 162;
     for j in 0..27 {
         let b = base + j;
@@ -307,8 +336,8 @@ unsafe fn pass_b<const Q: u16>(p: *mut __m512i, blk: usize) {
             n0 = barrett(n0, bv, q);
             m0 = barrett(m0, bv, q);
         }
-        let (y0, y1, y2) = r3(n0, n1, n2, ta, omp, om, q);
-        let (w0, w1, w2) = r3(m0, m1, m2, tb, omp, om, q);
+        let (y0, y1, y2) = r3_w(n0, n1, n2, ta0, ta1, ta2, ta3, omp, om, q);
+        let (w0, w1, w2) = r3_w(m0, m1, m2, tb0, tb1, tb2, tb3, omp, om, q);
         st(p, b, y0);
         st(p, b + 27, y1);
         st(p, b + 54, y2);
@@ -347,6 +376,7 @@ unsafe fn pass_c4<const Q: u16>(p: *mut __m512i, k4: usize) {
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
     let t4 = Tw::<Q>::L4.as_ptr().add(4 * k4);
+    let (w0, w1, w2, w3) = (bc(t4), bc(t4.add(1)), bc(t4.add(2)), bc(t4.add(3)));
     let base = k4 * 27;
     for c in 0..3 {
         for i in 3 * c..3 * c + 3 {
@@ -355,7 +385,7 @@ unsafe fn pass_c4<const Q: u16>(p: *mut __m512i, k4: usize) {
             if Tw::<Q>::BAR_L[4] {
                 c0 = barrett(c0, bv, q);
             }
-            let (y0, y1, y2) = r3(c0, ld(p, b + 9), ld(p, b + 18), t4, omp, om, q);
+            let (y0, y1, y2) = r3_w(c0, ld(p, b + 9), ld(p, b + 18), w0, w1, w2, w3, omp, om, q);
             st(p, b, y0);
             st(p, b + 9, y1);
             st(p, b + 18, y2);
@@ -373,13 +403,15 @@ unsafe fn pass_c5<const Q: u16>(p: *mut __m512i, k4: usize) {
     let t5 = Tw::<Q>::L5.as_ptr().add(12 * k4);
     let base = k4 * 27;
     for bb in 0..3 {
+        let tw = t5.add(4 * bb);
+        let (w0, w1, w2, w3) = (bc(tw), bc(tw.add(1)), bc(tw.add(2)), bc(tw.add(3)));
         for j in 0..3 {
             let b = base + 9 * bb + j;
             let mut c0 = ld(p, b);
             if Tw::<Q>::BAR_L[5] {
                 c0 = barrett(c0, bv, q);
             }
-            let (y0, y1, y2) = r3(c0, ld(p, b + 3), ld(p, b + 6), t5.add(4 * bb), omp, om, q);
+            let (y0, y1, y2) = r3_w(c0, ld(p, b + 3), ld(p, b + 6), w0, w1, w2, w3, omp, om, q);
             st(p, b, y0);
             st(p, b + 3, y1);
             st(p, b + 6, y2);
@@ -722,10 +754,37 @@ unsafe fn ir3(
     om: __m512i,
     q: __m512i,
 ) -> (__m512i, __m512i, __m512i) {
+    ir3_w(
+        y0,
+        y1,
+        y2,
+        bc(tw),
+        bc(tw.add(1)),
+        bc(tw.add(2)),
+        bc(tw.add(3)),
+        omp,
+        om,
+        q,
+    )
+}
+
+#[inline(always)]
+unsafe fn ir3_w(
+    y0: __m512i,
+    y1: __m512i,
+    y2: __m512i,
+    w0: __m512i,
+    w1: __m512i,
+    w2: __m512i,
+    w3: __m512i,
+    omp: __m512i,
+    om: __m512i,
+    q: __m512i,
+) -> (__m512i, __m512i, __m512i) {
     let u = mont(sub(y2, y1), omp, om, q);
     let s = add(y0, add(y1, y2));
-    let a1 = mont(add(sub(y0, y1), u), bc(tw), bc(tw.add(1)), q);
-    let a2 = mont(sub(sub(y0, y2), u), bc(tw.add(2)), bc(tw.add(3)), q);
+    let a1 = mont(add(sub(y0, y1), u), w0, w1, q);
+    let a2 = mont(sub(sub(y0, y2), u), w2, w3, q);
     (s, a1, a2)
 }
 
@@ -787,14 +846,19 @@ unsafe fn ipass_c5<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
     let t5 = TwI::<Q, AUX>::IL5.as_ptr().add(12 * k4);
     let base = k4 * 27;
     for bb in 0..3 {
+        let tw = t5.add(4 * bb);
+        let (w0, w1, w2, w3) = (bc(tw), bc(tw.add(1)), bc(tw.add(2)), bc(tw.add(3)));
         macro_rules! bf {
             ($j:literal) => {{
                 let b = base + 9 * bb + $j;
-                let (mut s, a1, a2) = ir3(
+                let (mut s, a1, a2) = ir3_w(
                     ld(p, b),
                     ld(p, b + 3),
                     ld(p, b + 6),
-                    t5.add(4 * bb),
+                    w0,
+                    w1,
+                    w2,
+                    w3,
                     omp,
                     om,
                     q,
@@ -821,13 +885,14 @@ unsafe fn ipass_c4<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
     let t4 = TwI::<Q, AUX>::IL4.as_ptr().add(4 * k4);
+    let (w0, w1, w2, w3) = (bc(t4), bc(t4.add(1)), bc(t4.add(2)), bc(t4.add(3)));
     let base = k4 * 27;
     // written out so that `BAR_S4[i]` is a compile-time constant: LLVM leaves a 9-trip loop
     // rolled, and a per-iteration load-and-branch on the flag costs more than the Barrett.
     macro_rules! bf {
         ($i:literal) => {{
             let b = base + $i;
-            let (mut s, a1, a2) = ir3(ld(p, b), ld(p, b + 9), ld(p, b + 18), t4, omp, om, q);
+            let (mut s, a1, a2) = ir3_w(ld(p, b), ld(p, b + 9), ld(p, b + 18), w0, w1, w2, w3, omp, om, q);
             if TwI::<Q, AUX>::BAR_S4[$i] {
                 s = barrett(s, bv, q);
             }
@@ -859,15 +924,20 @@ unsafe fn ipass_b<const Q: u16, const AUX: bool>(p: *mut __m512i, blk: usize) {
     let (zp, z) = (bc(l2), bc(l2.add(1)));
     let ta = TwI::<Q, AUX>::IL3.as_ptr().add(8 * blk);
     let tb = ta.add(4);
+    let (ta0, ta1, ta2, ta3) = (bc(ta), bc(ta.add(1)), bc(ta.add(2)), bc(ta.add(3)));
+    let (tb0, tb1, tb2, tb3) = (bc(tb), bc(tb.add(1)), bc(tb.add(2)), bc(tb.add(3)));
     let base = blk * 162;
     for j in 0..27 {
         let b = base + j;
-        let (mut n0, n1, n2) = ir3(ld(p, b), ld(p, b + 27), ld(p, b + 54), ta, omp, om, q);
-        let (mut m0, m1, m2) = ir3(
+        let (mut n0, n1, n2) = ir3_w(ld(p, b), ld(p, b + 27), ld(p, b + 54), ta0, ta1, ta2, ta3, omp, om, q);
+        let (mut m0, m1, m2) = ir3_w(
             ld(p, b + 81),
             ld(p, b + 108),
             ld(p, b + 135),
-            tb,
+            tb0,
+            tb1,
+            tb2,
+            tb3,
             omp,
             om,
             q,
@@ -912,6 +982,9 @@ unsafe fn ipass_a<const Q: u16, const AUX: bool>(p: *mut __m512i) {
     let ka = TwI::<Q, AUX>::KA.as_ptr();
     let kb = TwI::<Q, AUX>::KB.as_ptr();
     let kc = TwI::<Q, AUX>::KC.as_ptr();
+    let (kap, kav) = (bc(ka), bc(ka.add(1)));
+    let (kbp, kbv) = (bc(kb), bc(kb.add(1)));
+    let (kcp, kcv) = (bc(kc), bc(kc.add(1)));
     for i in 0..162 {
         let (mut c0, c1) = ir2(ld(p, i), ld(p, i + 162), zap, za, q);
         let (mut c2, c3) = ir2(ld(p, i + 324), ld(p, i + 486), zbp, zb, q);
@@ -921,18 +994,12 @@ unsafe fn ipass_a<const Q: u16, const AUX: bool>(p: *mut __m512i) {
         }
         let d0 = sub(c0, c2);
         let s0 = add(c0, c2);
-        let a1 = mont(d0, bc(ka), bc(ka.add(1)), q);
-        let a0 = add(
-            mont(s0, bc(kb), bc(kb.add(1)), q),
-            mont(d0, bc(kc), bc(kc.add(1)), q),
-        );
+        let a1 = mont(d0, kap, kav, q);
+        let a0 = add(mont(s0, kbp, kbv, q), mont(d0, kcp, kcv, q));
         let d1 = sub(c1, c3);
         let s1 = add(c1, c3);
-        let b1 = mont(d1, bc(ka), bc(ka.add(1)), q);
-        let b0 = add(
-            mont(s1, bc(kb), bc(kb.add(1)), q),
-            mont(d1, bc(kc), bc(kc.add(1)), q),
-        );
+        let b1 = mont(d1, kap, kav, q);
+        let b0 = add(mont(s1, kbp, kbv, q), mont(d1, kcp, kcv, q));
         st(p, i, center(a0, q, half, nhalf));
         st(p, i + 162, center(b0, q, half, nhalf));
         st(p, i + 324, center(a1, q, half, nhalf));

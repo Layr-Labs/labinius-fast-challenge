@@ -1318,6 +1318,7 @@ pub unsafe fn ntt_bin_batch32_multi_sink<const Q: u16, const H: usize, S: MultiB
 /// [`tail27_pair`], eliminating `tr8`/`tr4` shuffles, eliminating the second batch's L1D
 /// store/reload round-trip, and keeping the 6-block tail loop rolled (`black_box(6)`) so the
 /// kernel stays inside the 32 KiB L1 instruction cache.
+///
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
@@ -1338,32 +1339,25 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
         ins[0].rows.as_ptr() as *const u8,
         ins[1].rows.as_ptr() as *const u8,
     ];
-    let mut blks: [core::mem::MaybeUninit<Blk>; 4] =
-        [const { core::mem::MaybeUninit::uninit() }; 4];
-    let bps: [*mut i16; 4] = [
+    let mut blks: [core::mem::MaybeUninit<Blk>; 2] =
+        [const { core::mem::MaybeUninit::uninit() }; 2];
+    let bps: [*mut i16; 2] = [
         blks[0].as_mut_ptr() as *mut i16,
         blks[1].as_mut_ptr() as *mut i16,
-        blks[2].as_mut_ptr() as *mut i16,
-        blks[3].as_mut_ptr() as *mut i16,
     ];
     let mut w0: core::mem::MaybeUninit<Blk27> = core::mem::MaybeUninit::uninit();
     let w0p = w0.as_mut_ptr() as *mut i16;
     let red_u32 = red as u32;
 
-    // Process fixed adjacent quarter pairs: both prefixes share each six-row index load.
-    // Each quarter retains its own two LOCK=2 buffers until its original six tails finish.
-    for kp in 0..2 {
-        let load_luts = |k: usize| {
-            let lut = t.lut.as_ptr().add(12 * k) as *const u8;
-            let l = |r: usize, ab: usize| -> __m512i {
-                _mm512_load_si512(lut.add(64 * (r * 2 + ab)) as *const __m512i)
-            };
-            (l(0, 0), l(0, 1), l(1, 0), l(1, 1), l(2, 0), l(2, 1))
+    for k in 0..4 {
+        let lut = t.lut.as_ptr().add(12 * k) as *const u8;
+        let l = |r: usize, ab: usize| -> __m512i {
+            _mm512_load_si512(lut.add(64 * (r * 2 + ab)) as *const __m512i)
         };
-        let ls0 = load_luts(2 * kp);
-        let ls1 = load_luts(2 * kp + 1);
+        let ls = (l(0, 0), l(0, 1), l(1, 0), l(1, 1), l(2, 0), l(2, 1));
         for h in 0..2 {
             let ip = ips[h];
+            let bp = bps[h];
             for i in 0..27 {
                 let n0 = ldb(ip, i);
                 let n0h = ldb(ip, i + 81);
@@ -1372,69 +1366,59 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
                 let n2 = ldb(ip, i + 54);
                 let n2h = ldb(ip, i + 135);
 
-                macro_rules! prefix {
-                    ($bp:expr, $ls:expr) => {{
-                        let bp = $bp;
-                        let (l000, l001, l010, l011, l020, l021) = $ls;
-                        let x = _mm512_permutexvar_epi8(n0, l000);
-                        let y = _mm512_permutexvar_epi8(n0h, l001);
-                        let a0 = _mm512_add_epi16(x, y);
-                        let b0 = _mm512_sub_epi16(x, y);
+                let (l000, l001, l010, l011, l020, l021) = ls;
+                let x = _mm512_permutexvar_epi8(n0, l000);
+                let y = _mm512_permutexvar_epi8(n0h, l001);
+                let a0 = _mm512_add_epi16(x, y);
+                let b0 = _mm512_sub_epi16(x, y);
 
-                        let x = _mm512_permutexvar_epi8(n1, l010);
-                        let y = _mm512_permutexvar_epi8(n1h, l011);
-                        let a1 = _mm512_add_epi16(x, y);
-                        let b1 = _mm512_sub_epi16(y, x);
+                let x = _mm512_permutexvar_epi8(n1, l010);
+                let y = _mm512_permutexvar_epi8(n1h, l011);
+                let a1 = _mm512_add_epi16(x, y);
+                let b1 = _mm512_sub_epi16(y, x);
 
-                        let x = _mm512_permutexvar_epi8(n2, l020);
-                        let y = _mm512_permutexvar_epi8(n2h, l021);
-                        let a2 = _mm512_add_epi16(x, y);
-                        let b2 = _mm512_sub_epi16(x, y);
+                let x = _mm512_permutexvar_epi8(n2, l020);
+                let y = _mm512_permutexvar_epi8(n2h, l021);
+                let a2 = _mm512_add_epi16(x, y);
+                let b2 = _mm512_sub_epi16(x, y);
 
-                        let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
-                        let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
-                        st(bp, i, u0);
-                        st(bp, i + 27, u1);
-                        st(bp, i + 54, u2);
-                        st(bp, i + 81, v2);
-                        st(bp, i + 108, v0);
-                        st(bp, i + 135, v1);
-                    }};
-                }
-                prefix!(bps[h], ls0);
-                prefix!(bps[2 + h], ls1);
+                let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
+                let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
+                st(bp, i, u0);
+                st(bp, i + 27, u1);
+                st(bp, i + 54, u2);
+                st(bp, i + 81, v2);
+                st(bp, i + 108, v0);
+                st(bp, i + 135, v1);
             }
         }
-        for qpair in 0..core::hint::black_box(2usize) {
-            let k = 2 * kp + qpair;
-            let cv = t.cv.as_ptr() as *const i16;
-            let tail_blocks = core::hint::black_box(6usize);
-            for j in 0..tail_blocks {
-                let kk = 6 * k + j;
-                let (t4, t5, t6) = (
-                    t.tw4.as_ptr().add(kk).cast::<u32>(),
-                    t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
-                    t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
-                );
-                let bp0 = bps[2 * qpair].add(32 * 27 * j);
-                if bar {
-                    tail27_b(bp0, w0p, t4, t5, t6, cv);
-                } else {
-                    tail27_p(bp0, w0p, t4, t5, t6, cv);
-                }
-                let bp1 = bps[2 * qpair + 1].add(32 * 27 * j);
-                tail27_pair::<Q>(
-                    bp1,
-                    w0p,
-                    t4,
-                    t5,
-                    t6,
-                    cv,
-                    key.add(4 * 27 * kk),
-                    acc.add(32 * 27 * kk),
-                    red_u32,
-                );
+        let cv = t.cv.as_ptr() as *const i16;
+        let tail_blocks = core::hint::black_box(6usize);
+        for j in 0..tail_blocks {
+            let kk = 6 * k + j;
+            let (t4, t5, t6) = (
+                t.tw4.as_ptr().add(kk).cast::<u32>(),
+                t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
+                t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
+            );
+            let bp0 = bps[0].add(32 * 27 * j);
+            if bar {
+                tail27_b(bp0, w0p, t4, t5, t6, cv);
+            } else {
+                tail27_p(bp0, w0p, t4, t5, t6, cv);
             }
+            let bp1 = bps[1].add(32 * 27 * j);
+            tail27_pair::<Q>(
+                bp1,
+                w0p,
+                t4,
+                t5,
+                t6,
+                cv,
+                key.add(4 * 27 * kk),
+                acc.add(32 * 27 * kk),
+                red_u32,
+            );
         }
     }
 }

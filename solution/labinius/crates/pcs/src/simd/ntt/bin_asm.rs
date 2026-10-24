@@ -1362,9 +1362,9 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
         };
         let ls0 = load_luts(2 * kp);
         let ls1 = load_luts(2 * kp + 1);
-        for h in 0..2 {
-            let ip = ips[h];
-            for i in 0..27 {
+        for i in 0..27 {
+            for h in 0..2 {
+                let ip = ips[h];
                 let n0 = ldb(ip, i);
                 let n0h = ldb(ip, i + 81);
                 let n1 = ldb(ip, i + 27);

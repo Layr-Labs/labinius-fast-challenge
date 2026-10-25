@@ -819,12 +819,21 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
                 let i = i0 + 18 * a;
                 let (n0, n1, n2) = (ldb(ip, i), ldb(ip, i + 54), ldb(ip, i + 108));
                 if fold3 {
+                    // At r=0,a=0 the scale is one for every output s, so these three
+                    // table rows are byte-exact. Share their lookup, including its
+                    // centered representative, rather than permuting it three times.
+                    let shared = if a == 0 {
+                        permb_m(n0, l3.add(64 * 27 * k))
+                    } else {
+                        _mm512_setzero_si512()
+                    };
                     // level 2 straight out of the tables: output s is the sum of the three
                     // lookups whose tables carry omega^{r s} and the level-3 twiddle of role a.
                     for s in 0..3 {
                         let p = l3.add(64 * (9 * (3 * k + s) + a));
+                        let x0 = if a == 0 { shared } else { permb_m(n0, p) };
                         y[3 * s + a] = _mm512_add_epi16(
-                            _mm512_add_epi16(permb_m(n0, p), permb_m(n1, p.add(192))),
+                            _mm512_add_epi16(x0, permb_m(n1, p.add(192))),
                             permb_m(n2, p.add(384)),
                         );
                     }

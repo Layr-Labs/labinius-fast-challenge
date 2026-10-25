@@ -1386,3 +1386,6 @@ pub fn commit_limbs(elems: &[F162], limbs: &[Limb], w: Option<&mut [Batch32]>) -
 
 #[path="hybrid_commit.rs"]
 pub mod hybrid;
+
+#[path="hybrid_mixed.rs"]
+pub mod hybrid_mixed;

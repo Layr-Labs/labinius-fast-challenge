@@ -1453,7 +1453,7 @@ fn b128_inv(x: B128) -> B128 {
         if e & 1 == 1 {
             r = r * b;
         }
-        b = b * b;
+        b = b.square();
         e >>= 1;
     }
     r

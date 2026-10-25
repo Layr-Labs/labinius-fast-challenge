@@ -29,6 +29,23 @@ impl B128 {
     pub const ZERO: Self = Self(0);
     pub const ONE: Self = Self(1);
 
+    /// Square in the GHASH field. In characteristic two the cross terms cancel,
+    /// so only the two diagonal carryless products precede the usual reduction.
+    #[inline]
+    pub fn square(self) -> Self {
+        let (a0, a1) = (self.0 as u64, (self.0 >> 64) as u64);
+        let mut acc = clmul(a0, a0);
+        let mut h = clmul(a1, a1);
+        for _ in 0..2 {
+            let c = clmul(h as u64, GHASH_MOD as u64)
+                ^ ((clmul((h >> 64) as u64, GHASH_MOD as u64)) << 64);
+            let carry = clmul((h >> 64) as u64, GHASH_MOD as u64) >> 64;
+            acc ^= c;
+            h = carry;
+        }
+        Self(acc)
+    }
+
     #[inline]
     pub fn bit(self, i: usize) -> bool {
         (self.0 >> i) & 1 == 1

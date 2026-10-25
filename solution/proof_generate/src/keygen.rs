@@ -101,20 +101,20 @@ fn lift_tail_pair(a:i16,b:i16)->(i16,i16) {
     let norm=|a:i32,b:i32| a.abs()+b.abs()+(a+b).abs();
     let mut best=(a,b);let mut bound=norm(a,b);
     for u in -1..=1 {for v in -1..=1 {
-        let (x,y)=(a+1024*u,b+1024*v);
+        let (x,y)=(a+2048*u,b+2048*v);
         let next=norm(x,y);
         if next<bound {best=(x,y);bound=next;}
     }}
     (best.0 as i16,best.1 as i16)
 }
 
-/// A cyclotomic-coupled coefficient lift of A mod 1024, certified for every B128 input.
+/// A cyclotomic-coupled coefficient lift of A mod 2048, certified for every B128 input.
 pub fn build_tail_key_from_matrix(matrix:&[u128])->CommitmentKey {
-    use labinius::simd::commit::hybrid;
+    use labinius::simd::commit::hybrid_mixed as hybrid;
     assert_eq!(matrix.len()%648,0);
     let raw:Vec<[i16;648]>=matrix.chunks_exact(648).map(|a|{
         let mut out=core::array::from_fn(|j|{
-            let v=(a[j]&1023) as i16;if v>=512 {v-1024}else{v}
+            let v=(a[j]&2047) as i16;if v>=1024 {v-2048}else{v}
         });
         for j in 0..324 {
             (out[j],out[j+324])=lift_tail_pair(out[j],out[j+324]);
@@ -122,9 +122,9 @@ pub fn build_tail_key_from_matrix(matrix:&[u128])->CommitmentKey {
         out
     }).collect();
     let _bound=hybrid::certify(&raw,hybrid::CHUNK_BATCHES);
-    let product=3889u128*9721;
+    let product=9721u128*2917;
     let lifted:Vec<u128>=raw.iter().flatten().map(|&v|(v as i64).rem_euclid(product as i64) as u128).collect();
-    let p=params(&[3889,9721]);
+    let p=params(&[9721,2917]);
     CommitmentKey::from_coefficients(raw.len()*4,&lifted,product,p.base,&p.extra_moduli)
 }
 pub fn build_tail_key(modulus:u128)->CommitmentKey {
@@ -137,7 +137,7 @@ pub fn build_tail_key(modulus:u128)->CommitmentKey {
 /// has the size of one at this shape. `image` must be 64-byte aligned.
 #[allow(dead_code)]
 pub fn pair_words(image: &'static [u8]) -> Option<&'static [u32]> {
-    let words = 4 * (crate::parameters::RING_ELEMENTS / 2) * 648;
+    let words = (crate::parameters::RING_ELEMENTS / 4) * labinius::simd::commit::hybrid_mixed::LOCK_KEY_WORDS;
     if image.len() != 4 * words || image.as_ptr() as usize % 64 != 0 {
         return None;
     }
@@ -151,15 +151,15 @@ mod tail_lift_tests {
     #[test]
     fn all_tail_pairs_preserve_residues_and_minimize_cyclotomic_norm() {
         let norm=|a:i32,b:i32| a.abs()+b.abs()+(a+b).abs();
-        for a in -512i16..512 {for b in -512i16..512 {
+        for a in -1024i16..1024 {for b in -1024i16..1024 {
             let (x,y)=lift_tail_pair(a,b);
-            assert_eq!((x-a).rem_euclid(1024),0);
-            assert_eq!((y-b).rem_euclid(1024),0);
-            assert!(x.abs()<=682 && y.abs()<=682);
+            assert_eq!((x-a).rem_euclid(2048),0);
+            assert_eq!((y-b).rem_euclid(2048),0);
+            assert!(x.abs()<=1365 && y.abs()<=1365);
             let n=norm(x as i32,y as i32);
             assert!(n<=norm(a as i32,b as i32));
             for u in -2..=2 {for v in -2..=2 {
-                assert!(n<=norm(a as i32+1024*u,b as i32+1024*v));
+                assert!(n<=norm(a as i32+2048*u,b as i32+2048*v));
             }}
             if n==norm(a as i32,b as i32) {assert_eq!((x,y),(a,b));}
         }}

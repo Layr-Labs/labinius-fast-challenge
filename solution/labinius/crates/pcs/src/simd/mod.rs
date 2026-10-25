@@ -14,3 +14,5 @@ pub mod ntt;
 pub mod slots;
 pub mod transpose32;
 pub mod transpose_f162;
+
+pub mod mixed_quad_mac;

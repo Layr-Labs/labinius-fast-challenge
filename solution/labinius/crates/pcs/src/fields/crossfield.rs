@@ -1551,7 +1551,11 @@ unsafe fn stream_p(dst: [*mut u64; 3], j: usize, v: [__m512i; 3]) {
 /// 24 bytes per element this is 50 MB, past what stays in the cache between two rounds.
 const STREAM_FROM: usize = 1 << 21;
 /// Words ahead of the current tile that [`fold_message_range`] prefetches in each stream.
-const FOLD_AHEAD: usize = 128;
+/// 1.75 KB: twelve steps above the measured 1 KB point, with the six digests.
+const FOLD_AHEAD: usize = 224;
+/// `B128` words ahead of the current tile that [`message_range`] prefetches in each stream.
+/// 2 KB: the top of the sweep, with the six digests.
+const MESSAGE_AHEAD: usize = 128;
 
 unsafe fn get_p(src: Src, j: usize) -> F162 {
     match src {
@@ -1754,6 +1758,28 @@ unsafe fn message_range(
     let mut apv = [[_mm512_setzero_si512(); 8]; 3];
     let mut buf = EqTile([B128::ZERO; TILE]);
     for j0 in range.step_by(TILE) {
+        // The two source streams of the next tiles, requested a KB ahead: the binding pass and
+        // the later fold rounds already carry this hint, and these early rounds read the same
+        // table in the same 8-element stride. A prefetch past the end is harmless.
+        match src {
+            Src::Words(w) | Src::WordsFolded { words: w, .. } => {
+                for o in [j0, j0 + half] {
+                    let a = w.wrapping_add(o + MESSAGE_AHEAD) as *const i8;
+                    _mm_prefetch::<_MM_HINT_T0>(a);
+                    _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64));
+                }
+            }
+            Src::Planes(p) => {
+                for k in 0..3 {
+                    for o in [j0, j0 + half] {
+                        let a = p[k].wrapping_add(o + FOLD_AHEAD) as *const i8;
+                        for l in 0..(TILE * 8 / 64) {
+                            _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64 * l));
+                        }
+                    }
+                }
+            }
+        }
         map_tile2(eq.tile(j0, &mut buf), ml, mlp, &mut av, &mut apv);
         for g in 0..8 {
             let j = j0 + 8 * g;

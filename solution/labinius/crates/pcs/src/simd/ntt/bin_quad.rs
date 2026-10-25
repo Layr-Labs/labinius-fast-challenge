@@ -761,6 +761,26 @@ pub trait BlockSink {
     unsafe fn dst(&mut self, blk: usize) -> *mut i16;
     /// Called once the 18 vectors of block `blk` are stored at `dst`.
     unsafe fn block(&mut self, blk: usize, dst: *const i16);
+    /// Three complete quadratic leaves from the final even/odd butterflies.
+    /// The default stores the original six rows before `block` observes them.
+    /// An override may consume the vectors directly; `dst` must still be valid.
+    #[inline(always)]
+    unsafe fn final3(
+        &mut self,
+        _blk: usize,
+        group: usize,
+        dst: *mut i16,
+        even: [__m512i; 3],
+        odd: [__m512i; 3],
+    ) {
+        let b = 6 * group;
+        st(dst, b, even[0]);
+        st(dst, b + 2, even[1]);
+        st(dst, b + 4, even[2]);
+        st(dst, b + 1, odd[0]);
+        st(dst, b + 3, odd[1]);
+        st(dst, b + 5, odd[2]);
+    }
 }
 
 /// The sink of the plain entry points: block `blk` goes to its own place in the output batch and
@@ -819,12 +839,21 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
                 let i = i0 + 18 * a;
                 let (n0, n1, n2) = (ldb(ip, i), ldb(ip, i + 54), ldb(ip, i + 108));
                 if fold3 {
+                    // At r=0,a=0 the scale is one for every output s, so these three
+                    // table rows are byte-exact. Share their lookup, including its
+                    // centered representative, rather than permuting it three times.
+                    let shared = if a == 0 {
+                        permb_m(n0, l3.add(64 * 27 * k))
+                    } else {
+                        _mm512_setzero_si512()
+                    };
                     // level 2 straight out of the tables: output s is the sum of the three
                     // lookups whose tables carry omega^{r s} and the level-3 twiddle of role a.
                     for s in 0..3 {
                         let p = l3.add(64 * (9 * (3 * k + s) + a));
+                        let x0 = if a == 0 { shared } else { permb_m(n0, p) };
                         y[3 * s + a] = _mm512_add_epi16(
-                            _mm512_add_epi16(permb_m(n0, p), permb_m(n1, p.add(192))),
+                            _mm512_add_epi16(x0, permb_m(n1, p.add(192))),
                             permb_m(n2, p.add(384)),
                         );
                     }
@@ -873,14 +902,11 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
             for g in 0..3 {
                 let t5 = t.tw5[3 * kk + g].as_ptr();
                 let b = 6 * g;
-                for i in 0..2 {
-                    let (b0, b1, b2) = (base + b + i, base + b + i + 2, base + b + i + 4);
-                    let (o0, o1, o2) =
-                        bar_switch!(r3, bar[2], &c, ld(bp, b0), ld(bp, b1), ld(bp, b2), t5);
-                    st(op, b + i, o0);
-                    st(op, b + i + 2, o1);
-                    st(op, b + i + 4, o2);
-                }
+                let (e0, e1, e2) = bar_switch!(r3, bar[2], &c,
+                    ld(bp, base + b), ld(bp, base + b + 2), ld(bp, base + b + 4), t5);
+                let (o0, o1, o2) = bar_switch!(r3, bar[2], &c,
+                    ld(bp, base + b + 1), ld(bp, base + b + 3), ld(bp, base + b + 5), t5);
+                sink.final3(kk, g, op, [e0, e1, e2], [o0, o1, o2]);
             }
             sink.block(kk, op);
         }

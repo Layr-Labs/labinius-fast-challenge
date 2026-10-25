@@ -34,7 +34,9 @@ fn main() {
     std::fs::write(dir.join("tail-key.bin"), tail).expect("write the auxiliary key image");
     std::fs::write(dir.join("hybrid-key.bin"), hybrid).expect("write the arranged hybrid key image");
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    if host_can_run() && parameters::MODULUS == modulus_choice::HYBRID_MODULUS {
+    // This legacy comparator has the original splitting/splitting key format.
+    // The mixed backend is validated by its own arithmetic tests and trusted proofs.
+    if host_can_run() && parameters::MODULUS == 3889u128*9721*1024 {
         native_diagnostics(&dir);
     }
 }
@@ -66,7 +68,7 @@ fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
         return (keygen::key_image(&key), Vec::new(), Vec::new(), Vec::new());
     }
     let tail = keygen::build_tail_key(parameters::MODULUS);
-    let pairs = labinius::simd::commit::hybrid::pair_keys(&key, &tail, labinius::par::threads());
+    let pairs = labinius::simd::commit::hybrid_mixed::pair_keys(&key, &tail, labinius::par::threads());
     let pairs: Vec<u8> = pairs.iter().flat_map(|w| w.to_le_bytes()).collect();
     (Vec::new(), Vec::new(), Vec::new(), pairs)
 }

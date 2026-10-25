@@ -1,7 +1,7 @@
 //! Packed-binary PCS opening, including the GHASH-to-F162 field switch.
 //!
-//! The default commitment modulus is 3889 * 9721 * 1024. Two witness NTTs feed
-//! ordinary residues and an exact auxiliary computation of the 1024 residue.
+//! The default commitment modulus is 9721 * 2917 * 2048. Two witness NTTs feed
+//! ordinary residues and an exact auxiliary computation of the 2048 residue.
 //! Public matrix images and reconstruction bounds are computed at build time
 //! from the fixed matrix seed and modulus. Other supported prime products use
 //! the generic RNS implementation.
@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 mod keygen;
 mod modulus_choice;
 mod parameters;
+mod mixed_lift;
 /// Byte-for-byte the checker's `rq.rs`, so that the two sides of the format can be diffed. A
 /// release build of the prover only uses the matrix expansion and the packer; the rest is what
 /// the tests check the proof against.
@@ -800,23 +801,9 @@ fn lift_hybrid_wide_available() -> bool {
     }
 }
 
-/// Output byte `k < 40` of eight lifted coefficients is byte `k % 5` of 64-bit lane `k / 5`.
-#[cfg(target_arch = "x86_64")]
-static LIFT_BYTES: [u8; 64] = {
-    let mut t = [0u8; 64];
-    let mut k = 0;
-    while k < 40 {
-        t[k] = ((k / 5) * 8 + k % 5) as u8;
-        k += 1;
-    }
-    t
-};
-
-/// [`lift_hybrid`] of one column's `N` coefficients, eight per step in 64-bit lanes, written as
-/// the wire's 5-byte little-endian words: the same arithmetic with `t = b - a` brought into
-/// `[0, 9721)` instead of `b + 9721 - a`, and `x mod 9721` for `x = 3242 t < 2^25` by Barrett's
-/// `q = floor(x ceil(2^45 / 9721) / 2^45)`, exact there (the error term is below
-/// `x / 2^45 < 2^-20 < 1 / 9721`).
+/// The mixed-modulus lift, eight coefficients at a time, in the original
+/// five-byte little-endian wire format. See [`mixed_lift`] for the exact CRT
+/// ordinary inverse833 modulo2917 and the auxiliary inverse277 modulo2048.
 ///
 /// # Safety
 /// The CPU must have AVX-512 F, BW and VBMI ([`lift_hybrid_wide_available`]); `r0`, `r1` must
@@ -824,37 +811,7 @@ static LIFT_BYTES: [u8; 64] = {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
 unsafe fn lift_hybrid_column(r0: &[i16], r1: &[i16], tail: &[u32; N], out: &mut [u8]) {
-    use core::arch::x86_64::*;
-    assert!(r0.len() == N && r1.len() == N && out.len() == 5 * N && N % 8 == 0);
-    let q0 = _mm512_set1_epi64(3889);
-    let q1 = _mm512_set1_epi64(9721);
-    let inv = _mm512_set1_epi64(3242);
-    let magic = _mm512_set1_epi64(3_619_418_999);
-    let k153 = _mm512_set1_epi64(153);
-    let low10 = _mm512_set1_epi64(1023);
-    let product = _mm512_set1_epi64(3889 * 9721);
-    let pick = _mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
-    let keep: __mmask64 = (1u64 << 40) - 1;
-    for j in 0..N / 8 {
-        let a = _mm512_cvtepi16_epi64(_mm_loadu_si128(r0.as_ptr().add(8 * j) as *const __m128i));
-        let a = _mm512_add_epi64(a, _mm512_and_si512(_mm512_srai_epi64::<63>(a), q0));
-        let b = _mm512_cvtepi16_epi64(_mm_loadu_si128(r1.as_ptr().add(8 * j) as *const __m128i));
-        let b = _mm512_add_epi64(b, _mm512_and_si512(_mm512_srai_epi64::<63>(b), q1));
-        let t = _mm512_sub_epi64(b, a);
-        let t = _mm512_add_epi64(t, _mm512_and_si512(_mm512_srai_epi64::<63>(t), q1));
-        let x = _mm512_mul_epu32(t, inv);
-        let q = _mm512_srli_epi64::<45>(_mm512_mul_epu32(x, magic));
-        let m = _mm512_sub_epi64(x, _mm512_mul_epu32(q, q1));
-        let value = _mm512_add_epi64(a, _mm512_mul_epu32(m, q0));
-        let tl = _mm512_cvtepu32_epi64(_mm256_loadu_si256(tail.as_ptr().add(8 * j) as *const __m256i));
-        let digit = _mm512_and_si512(_mm512_mul_epu32(_mm512_sub_epi64(tl, value), k153), low10);
-        let lifted = _mm512_add_epi64(value, _mm512_mul_epu32(digit, product));
-        _mm512_mask_storeu_epi8(
-            out.as_mut_ptr().add(40 * j) as *mut i8,
-            keep,
-            _mm512_permutexvar_epi8(pick, lifted),
-        );
-    }
+    mixed_lift::lift_column(r0,r1,tail,out);
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -862,15 +819,10 @@ unsafe fn lift_hybrid_column(_: &[i16], _: &[i16], _: &[u32; N], _: &mut [u8]) {
     unreachable!("no wide lift off x86-64")
 }
 
-/// The hybrid modulus's lift with constant reductions: centered residues modulo 3889 and 9721
-/// (3889^-1 mod 9721 = 3242), then the 1024 digit from the tail row's residue.
+/// Exact CRT for centered9721/2917 residues and the coefficient-domain2048tail.
 #[inline(always)]
 fn lift_hybrid(r0: i16, r1: i16, tail: u32) -> u64 {
-    let a = (if r0 < 0 { r0 as i32 + 3889 } else { r0 as i32 }) as u64;
-    let b = (if r1 < 0 { r1 as i32 + 9721 } else { r1 as i32 }) as u64;
-    let value = a + 3889 * (((b + 9721 - a) * 3242) % 9721);
-    let digit = (tail as u64).wrapping_sub(value).wrapping_mul(153) & 1023;
-    value + 3889 * 9721 * digit
+    mixed_lift::lift(r0,r1,tail)
 }
 
 /// The baseline's recombination through the library's commitment matrix, kept as the reference
@@ -988,7 +940,6 @@ const COMMIT_WORKERS: usize = 4;
 /// a host of two-thread cores the two threads of a core take the halves of each 32-column group,
 /// so each batch of the arranged keys, 168 KB, is read from L3 once per 32 columns; 32 per
 /// worker measured 1.8 ms slower (L2 pressure).
-const HYBRID_GROUP: usize = 16;
 
 
 // =============================================================================================
@@ -1411,11 +1362,6 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     } else {
         None
     };
-    let arranged = if pairs.is_none() && modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
-        labinius::simd::commit::hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES)
-    } else {
-        None
-    };
     let key = || match keygen::key_from_image(modulus, &EMBEDDED_KEY.0) {
         Some(key) => key,
         None => keygen::build_key(modulus),
@@ -1424,13 +1370,11 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
     let rows = if let Some(pairs) = pairs {
-        labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers)
-    } else if let Some(keys) = arranged {
-        labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,HYBRID_GROUP)
+        labinius::simd::commit::hybrid_mixed::commit_columns_rows_pairs(pairs,&columns,workers)
     } else if modulus==modulus_choice::HYBRID_MODULUS {
         let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
-        let pkeys=labinius::simd::commit::hybrid::pair_keys(&key(),&tail,workers);
-        labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pkeys,&columns,workers)
+        let pkeys=labinius::simd::commit::hybrid_mixed::pair_keys(&key(),&tail,workers);
+        labinius::simd::commit::hybrid_mixed::commit_columns_rows_pairs(&pkeys,&columns,workers)
     } else {key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
     let commit_time = clock.elapsed();
     // [pair-audit v2, opt-in] With LABINIUS_PAIR_AUDIT set, and before any proof byte is
@@ -1441,7 +1385,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // is inert and scored runs pay nothing. Diagnostics only: no timing selects code, and
     // every scored proof is verifier-gated.
     if std::env::var_os("LABINIUS_PAIR_AUDIT").is_some()
-        && modulus == modulus_choice::HYBRID_MODULUS
+        && modulus == 3889u128*9721*1024
         && modulus == MODULUS
     {
         if let Some(keys) = labinius::simd::commit::hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES) {
@@ -1984,13 +1928,13 @@ mod tests {
             x
         };
         for round in 0..400 {
-            let r0: Vec<i16> = (0..N).map(|_| (next() % 7777) as i16 - 3888).collect();
-            let r1: Vec<i16> = (0..N).map(|_| (next() % 19441) as i16 - 9720).collect();
+            let r0: Vec<i16> = (0..N).map(|_| (next() % 9721) as i16 - 4860).collect();
+            let r1: Vec<i16> = (0..N).map(|_| (next() % 2917) as i16 - 1458).collect();
             let mut tail = [0u32; N];
             for (j, t) in tail.iter_mut().enumerate() {
                 *t = match round % 3 {
                     0 => next() as u32,
-                    1 => (next() % 1024) as u32,
+                    1 => (next() % 2048) as u32,
                     _ => (j as u32).wrapping_mul(2654435761),
                 };
             }
@@ -2003,9 +1947,9 @@ mod tests {
             }
         }
         // The residue extremes.
-        let r0: Vec<i16> = (0..N).map(|i| [-3888i16, 3888, 0, -1, 1][i % 5]).collect();
-        let r1: Vec<i16> = (0..N).map(|i| [9720i16, -9720, 0, 1, -1, 4860][i % 6]).collect();
-        let tail: [u32; N] = core::array::from_fn(|i| [0u32, 1023, u32::MAX, 512][i % 4]);
+        let r0: Vec<i16> = (0..N).map(|i| [-4860i16, 4860, 0, -1, 1][i % 5]).collect();
+        let r1: Vec<i16> = (0..N).map(|i| [1458i16, -1458, 0, 1, -1, 729][i % 6]).collect();
+        let tail: [u32; N] = core::array::from_fn(|i| [0u32, 2047, u32::MAX, 1024][i % 4]);
         let mut wide = vec![0u8; 5 * N];
         unsafe { lift_hybrid_column(&r0, &r1, &tail, &mut wide) };
         for i in 0..N {
@@ -2205,7 +2149,7 @@ mod tests {
     #[test]
     fn embedded_hybrid_image_matches_the_built_keys() {
         use labinius::simd::commit::hybrid;
-        if MODULUS != modulus_choice::HYBRID_MODULUS { return; }
+        if MODULUS != 3889u128*9721*1024 { return; }
         let key = keygen::build_key(MODULUS);
         let tail = keygen::build_tail_key(MODULUS);
         let image = hybrid::arranged_image(&key, &tail);
@@ -2221,15 +2165,14 @@ mod tests {
         if MODULUS != modulus_choice::HYBRID_MODULUS || EMBEDDED_PAIRS.0.is_empty() { return; }
         let key = keygen::build_key(MODULUS);
         let tail = keygen::build_tail_key(MODULUS);
-        let built = labinius::simd::commit::hybrid::pair_keys(&key, &tail, 1);
+        let built = labinius::simd::commit::hybrid_mixed::pair_keys(&key, &tail, 1);
         assert_eq!(keygen::pair_words(&EMBEDDED_PAIRS.0).expect("a valid image"), &built[..]);
     }
-    /// The column-pair kernel's rows equal the arranged kernel's exactly, across a full and a
-    /// partial certified chunk and a full and a partial 16-column group, and the commitment is
-    /// the schoolbook product.
+    /// The mixed pair kernel matches the independent schoolbook product across a
+    /// full/partial certified chunk and a full/partial16-column group.
     #[test]
-    fn pair_commitment_matches_arranged_kernel_and_schoolbook() {
-        let q=modulus_choice::HYBRID_MODULUS;let ring=288usize;let columns=17;
+    fn mixed_pair_commitment_matches_schoolbook() {
+        let q=modulus_choice::HYBRID_MODULUS;let ring=320usize;let columns=17;
         let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
         let matrix=rq::ajtai_matrix(q,ring);
         let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
@@ -2237,10 +2180,8 @@ mod tests {
         let mut t=Transcript::new(b"pair-commitment-regression");
         let values=t.sample_b128(b"binary",ring*4*columns);
         let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
-        let arranged=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,1,4);
-        let pairs=labinius::simd::commit::hybrid::pair_keys(&key,&tail,1);
-        let rows=labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pairs,&cols,1);
-        assert!(rows==arranged, "the pair kernel's rows differ");
+        let pairs=labinius::simd::commit::hybrid_mixed::pair_keys(&key,&tail,1);
+        let rows=labinius::simd::commit::hybrid_mixed::commit_columns_rows_pairs(&pairs,&cols,1);
         let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,1,None);
         let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
         for c in [0,16] {
@@ -2258,7 +2199,7 @@ mod tests {
         let mut t=Transcript::new(b"hybrid-commitment-regression");
         let values=t.sample_b128(b"binary",ring*4*columns);
         let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
-        let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,4);
+        let rows=labinius::simd::commit::hybrid_mixed::commit_columns_rows(&key,&tail,&cols,3,4);
         let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,3,None);
         let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
         for c in 0..columns {

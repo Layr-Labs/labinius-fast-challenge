@@ -10,6 +10,6 @@ pub const COLUMNS: usize = 1 << COLUMN_LOG;
 pub const COLUMN_LEN: usize = 1 << (LOG_PACKED - COLUMN_LOG as usize);
 /// Ring elements of one column: four `F162` make one element of `R_648`.
 pub const RING_ELEMENTS: usize = COLUMN_LEN / 4;
-/// Two NTT primes plus a 1024 residue. The latter reuses the witness transforms
+/// One splitting and one quadratic NTT prime plus a 1280 residue. The latter reuses the witness transforms
 /// through a certified exact-integer lift of the fixed public matrix.
-pub const MODULUS:u128=38_712_288_256;
+pub const MODULUS:u128=36_295_880_960;

@@ -1,3 +1,9 @@
+//! C8 schedule: q=9721 uses the existing word-lookup Barrett at levels 4 AND 6.
+//! The original conservative output bound and accumulator periods are retained.
+//! The schedule table and client-CPU measurements below describe the inherited
+//! baseline; they are historical evidence, not measurements of this variant.
+//! Level 6 now trades two multiply instructions for one shift and one word permute.
+//!
 //! Forward NTT for **binary** inputs in the vertical batch-of-32 layout, with levels 4, 5 and 6
 //! hand-scheduled in one `asm!` block per 27-block (27 zmm data registers resident).
 //! Generated; see the report for the schedule variants tried.
@@ -273,8 +279,8 @@ pub fn barrett_lut_i16(a: i16, q: u16) -> i16 {
 /// Which of levels 4, 5 and 6 reduce their un-twiddled `a0` input with the lookup Barrett
 /// ([`barrett_lut_i16`]) and which with the two-multiply one ([`params::barrett_i16`]),
 /// for q = 9721; q = 3889 reduces nothing.
-pub const LUT_BARRETT_LEVELS: [bool; 3] = [true, false, false];
-pub const MUL_BARRETT_LEVELS: [bool; 3] = [false, false, true];
+pub const LUT_BARRETT_LEVELS: [bool; 3] = [true, false, true];
+pub const MUL_BARRETT_LEVELS: [bool; 3] = [false, false, false];
 
 /// Does the 7.5 q growth of the un-Barretted schedule still fit in i16?
 pub const fn needs_barrett(q: u16) -> bool {
@@ -441,9 +447,9 @@ macro_rules! level6 {
         concat!(
             "vpbroadcastd zmm", $t, ", dword ptr [{t6}", $off, "+4]\n",
             "vpmullw zmm", $t, ", zmm", $a1, ", zmm", $t, "\n",
-            "vpmulhrsw zmm30, zmm", $a0, ", [{c}+192]\n",
-            "vpmullw zmm30, zmm30, zmm27\n",
-            "vpsubw zmm", $a0, ", zmm", $a0, ", zmm30\n",
+            "vpsrlw zmm30, zmm", $a0, ", 11\n",
+            "vpermw zmm30, zmm30, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm", $a0, ", zmm", $a0, ", zmm30\n",
             "vpbroadcastd zmm30, dword ptr [{t6}", $off, "]\n",
             "vpmulhw zmm", $a1, ", zmm", $a1, ", zmm30\n",
             "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",

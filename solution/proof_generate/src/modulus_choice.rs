@@ -1,12 +1,12 @@
 //! Supported commitment moduli.
 //!
-//! The hybrid default is 3889 * 9721 * 1024. Its two returned primes identify
+//! The hybrid default is 9721 * 4861 * 1024 (quadratic second limb). Its two returned primes identify
 //! witness transforms; the 1024 residue is computed by exact auxiliary CRT.
 //! Other supported moduli are products of distinct primes from the original
 //! library. The verifier accepts more moduli than this implementation supports.
 
 /// The primes the library has opening arithmetic for.
-pub const HYBRID_MODULUS:u128=3889u128*9721*1024;
+pub const HYBRID_MODULUS:u128=9721u128*4861*1024;
 
 pub const SUPPORTED_PRIMES: [u16; 7] = [2917, 3889, 4861, 9721, 12637, 17497, 19441];
 
@@ -36,7 +36,7 @@ const _: () = {
 
 pub fn limbs(modulus: u128) -> Result<Vec<u16>, &'static str> {
     // These are the witness transform primes; the 1024 residue reuses both transforms.
-    if modulus == HYBRID_MODULUS { return Ok(vec![3889,9721]); }
+    if modulus == HYBRID_MODULUS { return Ok(vec![9721,4861]); }
     if modulus < 2 {
         return Err("a modulus is at least 2");
     }
@@ -67,7 +67,7 @@ mod tests {
     use super::*;
     #[test]
     fn supported_choices() {
-        assert_eq!(limbs(HYBRID_MODULUS),Ok(vec![3889,9721]));
+        assert_eq!(limbs(HYBRID_MODULUS),Ok(vec![9721,4861]));
         for q in SUPPORTED_PRIMES {
             assert_eq!(limbs(q as u128), Ok(vec![q]));
         }

@@ -110,7 +110,7 @@ fn lift_tail_pair(a:i16,b:i16)->(i16,i16) {
 
 /// A cyclotomic-coupled coefficient lift of A mod 1024, certified for every B128 input.
 pub fn build_tail_key_from_matrix(matrix:&[u128])->CommitmentKey {
-    use labinius::simd::commit::hybrid;
+    use labinius::simd::commit::hybrid_mixed as hybrid;
     assert_eq!(matrix.len()%648,0);
     let raw:Vec<[i16;648]>=matrix.chunks_exact(648).map(|a|{
         let mut out=core::array::from_fn(|j|{
@@ -122,9 +122,9 @@ pub fn build_tail_key_from_matrix(matrix:&[u128])->CommitmentKey {
         out
     }).collect();
     let _bound=hybrid::certify(&raw,hybrid::CHUNK_BATCHES);
-    let product=3889u128*9721;
+    let product=9721u128*4861;
     let lifted:Vec<u128>=raw.iter().flatten().map(|&v|(v as i64).rem_euclid(product as i64) as u128).collect();
-    let p=params(&[3889,9721]);
+    let p=params(&[9721,4861]);
     CommitmentKey::from_coefficients(raw.len()*4,&lifted,product,p.base,&p.extra_moduli)
 }
 pub fn build_tail_key(modulus:u128)->CommitmentKey {
@@ -137,7 +137,7 @@ pub fn build_tail_key(modulus:u128)->CommitmentKey {
 /// has the size of one at this shape. `image` must be 64-byte aligned.
 #[allow(dead_code)]
 pub fn pair_words(image: &'static [u8]) -> Option<&'static [u32]> {
-    let words = 4 * (crate::parameters::RING_ELEMENTS / 2) * 648;
+    let words = (crate::parameters::RING_ELEMENTS / 4) * labinius::simd::commit::hybrid_mixed::LOCK_KEY_WORDS;
     if image.len() != 4 * words || image.as_ptr() as usize % 64 != 0 {
         return None;
     }

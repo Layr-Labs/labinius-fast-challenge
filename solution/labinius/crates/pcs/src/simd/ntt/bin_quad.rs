@@ -761,6 +761,26 @@ pub trait BlockSink {
     unsafe fn dst(&mut self, blk: usize) -> *mut i16;
     /// Called once the 18 vectors of block `blk` are stored at `dst`.
     unsafe fn block(&mut self, blk: usize, dst: *const i16);
+    /// Three complete quadratic leaves from the final even/odd butterflies.
+    /// The default stores the original six rows before `block` observes them.
+    /// An override may consume the vectors directly; `dst` must still be valid.
+    #[inline(always)]
+    unsafe fn final3(
+        &mut self,
+        _blk: usize,
+        group: usize,
+        dst: *mut i16,
+        even: [__m512i; 3],
+        odd: [__m512i; 3],
+    ) {
+        let b = 6 * group;
+        st(dst, b, even[0]);
+        st(dst, b + 2, even[1]);
+        st(dst, b + 4, even[2]);
+        st(dst, b + 1, odd[0]);
+        st(dst, b + 3, odd[1]);
+        st(dst, b + 5, odd[2]);
+    }
 }
 
 /// The sink of the plain entry points: block `blk` goes to its own place in the output batch and
@@ -819,12 +839,21 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
                 let i = i0 + 18 * a;
                 let (n0, n1, n2) = (ldb(ip, i), ldb(ip, i + 54), ldb(ip, i + 108));
                 if fold3 {
+                    // At r=0,a=0 the scale is one for every output s, so these three
+                    // table rows are byte-exact. Share their lookup, including its
+                    // centered representative, rather than permuting it three times.
+                    let shared = if a == 0 {
+                        permb_m(n0, l3.add(64 * 27 * k))
+                    } else {
+                        _mm512_setzero_si512()
+                    };
                     // level 2 straight out of the tables: output s is the sum of the three
                     // lookups whose tables carry omega^{r s} and the level-3 twiddle of role a.
                     for s in 0..3 {
                         let p = l3.add(64 * (9 * (3 * k + s) + a));
+                        let x0 = if a == 0 { shared } else { permb_m(n0, p) };
                         y[3 * s + a] = _mm512_add_epi16(
-                            _mm512_add_epi16(permb_m(n0, p), permb_m(n1, p.add(192))),
+                            _mm512_add_epi16(x0, permb_m(n1, p.add(192))),
                             permb_m(n2, p.add(384)),
                         );
                     }
@@ -873,14 +902,11 @@ unsafe fn ntt_core<const Q: u16, S: BlockSink>(input: &BinaryIndex32, sink: &mut
             for g in 0..3 {
                 let t5 = t.tw5[3 * kk + g].as_ptr();
                 let b = 6 * g;
-                for i in 0..2 {
-                    let (b0, b1, b2) = (base + b + i, base + b + i + 2, base + b + i + 4);
-                    let (o0, o1, o2) =
-                        bar_switch!(r3, bar[2], &c, ld(bp, b0), ld(bp, b1), ld(bp, b2), t5);
-                    st(op, b + i, o0);
-                    st(op, b + i + 2, o1);
-                    st(op, b + i + 4, o2);
-                }
+                let (e0, e1, e2) = bar_switch!(r3, bar[2], &c,
+                    ld(bp, base + b), ld(bp, base + b + 2), ld(bp, base + b + 4), t5);
+                let (o0, o1, o2) = bar_switch!(r3, bar[2], &c,
+                    ld(bp, base + b + 1), ld(bp, base + b + 3), ld(bp, base + b + 5), t5);
+                sink.final3(kk, g, op, [e0, e1, e2], [o0, o1, o2]);
             }
             sink.block(kk, op);
         }
@@ -909,4 +935,143 @@ pub unsafe fn ntt_quad_bin_batch32_sink<const Q: u16, S: BlockSink>(
     sink: &mut S,
 ) {
     ntt_core::<Q, S>(input, sink);
+}
+
+/// Consumer of two completed quadratic NTT batches, three leaves at a time.
+/// Values are handed directly to the consumer; no destination pointer exists.
+/// Both batch coordinate pairs use leaf j=9*blk+3*group+t for t in0..3.
+pub trait PairSink {
+    unsafe fn final3(&mut self, blk:usize, group:usize,
+        first_even:[__m512i;3], first_odd:[__m512i;3],
+        second_even:[__m512i;3], second_odd:[__m512i;3]);
+}
+
+/// Run both prefixes for a quarter, then pair its final quadratic leaves.
+/// Two162-vector scratch blocks replace a complete materialized H0 batch.
+/// The prefix and radix4 bodies below retain the original arithmetic text.
+///
+/// # Safety
+/// AVX512F/BW/VL/VBMI/VBMI2/VNNI/GFNI. The sink must preserve its own key,
+/// accumulator and reduction contracts and cover the same target features.
+#[inline(never)]
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+pub unsafe fn ntt_quad_bin_batch32_pair_sink<const Q:u16,S:PairSink>(
+    inputs:[&BinaryIndex32;2],sink:&mut S,
+) {
+    let t = tables::<Q>();
+    let cvp = t.cv.as_ptr() as *const __m512i;
+    let c = C {
+        q: bc(&t.qd),
+        om: bc(&t.om[0]),
+        omp: bc(&t.om[1]),
+        ms: _mm512_load_si512(cvp),
+        corr: _mm512_load_si512(cvp.add(1)),
+        andm: _mm512_load_si512(cvp.add(2)),
+        orm: _mm512_load_si512(cvp.add(3)),
+    };
+    let bar = bar_levels(Q);
+    // As an associated const so the choice is made at compile time and only one phase 1 is
+    // emitted: `fold3(Q)` on its own is a `const fn` call LLVM does not fold, and both bodies
+    // alive at once spills every table.
+    let fold3 = Sched::<Q>::FOLD3;
+
+
+    let mut blocks:[core::mem::MaybeUninit<Blk>;2]=
+        [const {core::mem::MaybeUninit::uninit()};2];
+    let bps=[blocks[0].as_mut_ptr() as *mut i16,blocks[1].as_mut_ptr() as *mut i16];
+    for k in 0..4 {
+        for h in 0..2 {
+            let ip=inputs[h].rows.as_ptr() as *const u8;
+            let bp=bps[h];
+        let lut = t.lut.as_ptr().add(3 * k) as *const u8;
+        let l = |r: usize| -> __m512i { _mm512_load_si512(lut.add(64 * r) as *const __m512i) };
+        let (l0, l1, l2) = (l(0), l(1), l(2));
+        let l3 = t.lut3.as_ptr() as *const u8;
+
+        // Levels 0-3, 9 vectors at a time: the three level-2 triples (i, i+54, i+108) for
+        // i = i0, i0+18, i0+36 are exactly the three inputs of one level-3 butterfly in each of
+        // the three 54-blocks, so the nine level-2 outputs of one `i0` never leave registers.
+        for i0 in 0..18 {
+            let mut y = [_mm512_setzero_si512(); 9];
+            for a in 0..3 {
+                let i = i0 + 18 * a;
+                let (n0, n1, n2) = (ldb(ip, i), ldb(ip, i + 54), ldb(ip, i + 108));
+                if fold3 {
+                    // At r=0,a=0 the scale is one for every output s, so these three
+                    // table rows are byte-exact. Share their lookup, including its
+                    // centered representative, rather than permuting it three times.
+                    let shared = if a == 0 {
+                        permb_m(n0, l3.add(64 * 27 * k))
+                    } else {
+                        _mm512_setzero_si512()
+                    };
+                    // level 2 straight out of the tables: output s is the sum of the three
+                    // lookups whose tables carry omega^{r s} and the level-3 twiddle of role a.
+                    for s in 0..3 {
+                        let p = l3.add(64 * (9 * (3 * k + s) + a));
+                        let x0 = if a == 0 { shared } else { permb_m(n0, p) };
+                        y[3 * s + a] = _mm512_add_epi16(
+                            _mm512_add_epi16(x0, permb_m(n1, p.add(192))),
+                            permb_m(n2, p.add(384)),
+                        );
+                    }
+                } else {
+                    let x0 = _mm512_permutexvar_epi8(n0, l0);
+                    let x1 = _mm512_permutexvar_epi8(n1, l1);
+                    let x2 = _mm512_permutexvar_epi8(n2, l2);
+                    let (u0, u1, u2) = r3_folded(&c, x0, x1, x2);
+                    y[a] = u0;
+                    y[3 + a] = u1;
+                    y[6 + a] = u2;
+                }
+            }
+            for s in 0..3 {
+                let (v0, v1, v2) = if fold3 {
+                    r3_folded(&c, y[3 * s], y[3 * s + 1], y[3 * s + 2])
+                } else {
+                    let tw = t.tw3[3 * k + s].as_ptr();
+                    bar_switch!(r3, bar[0], &c, y[3 * s], y[3 * s + 1], y[3 * s + 2], tw)
+                };
+                let b = 54 * s + i0;
+                st(bp, b, v0);
+                st(bp, b + 18, v1);
+                st(bp, b + 36, v2);
+            }
+        }
+
+
+        }
+        for j in 0..9 {
+            let kk=9*k+j;
+            let base=18*j;
+            for h in 0..2 {
+                let bp=bps[h];
+            let t4 = t.tw4[kk].as_ptr();
+            for i in 0..6 {
+                let (b0, b1, b2) = (base + i, base + i + 6, base + i + 12);
+                let (o0, o1, o2) =
+                    bar_switch!(r3, bar[1], &c, ld(bp, b0), ld(bp, b1), ld(bp, b2), t4);
+                st(bp, b0, o0);
+                st(bp, b1, o1);
+                st(bp, b2, o2);
+            }
+
+            }
+            for g in 0..3 {
+                let t5=t.tw5[3*kk+g].as_ptr();
+                let b=6*g;
+                let p=bps[0];
+                let (a0,a1,a2)=bar_switch!(r3,bar[2],&c,
+                    ld(p,base+b),ld(p,base+b+2),ld(p,base+b+4),t5);
+                let (a3,a4,a5)=bar_switch!(r3,bar[2],&c,
+                    ld(p,base+b+1),ld(p,base+b+3),ld(p,base+b+5),t5);
+                let p=bps[1];
+                let (b0,b1,b2)=bar_switch!(r3,bar[2],&c,
+                    ld(p,base+b),ld(p,base+b+2),ld(p,base+b+4),t5);
+                let (b3,b4,b5)=bar_switch!(r3,bar[2],&c,
+                    ld(p,base+b+1),ld(p,base+b+3),ld(p,base+b+5),t5);
+                sink.final3(kk,g,[a0,a1,a2],[a3,a4,a5],[b0,b1,b2],[b3,b4,b5]);
+            }
+        }
+    }
 }

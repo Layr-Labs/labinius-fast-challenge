@@ -148,6 +148,18 @@ fn scalar_f162_order_243() {
     assert_eq!(acc, F162::ONE);
 }
 
+/// Check every pair of GHASH monomials across all reduction boundaries.
+#[test]
+fn scalar_b128_basis_products_match_reference() {
+    for i in 0..128 {
+        for j in 0..128 {
+            let a = 1u128 << i;
+            let b = 1u128 << j;
+            assert_eq!((B128(a) * B128(b)).0, mul_ghash(a, b), "basis {i}, {j}");
+        }
+    }
+}
+
 #[test]
 fn scalar_b128_matches_reference() {
     let mut r = Rng::new(21);

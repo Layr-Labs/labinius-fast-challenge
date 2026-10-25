@@ -47,23 +47,27 @@ impl Mul for B128 {
     type Output = Self;
     #[inline]
     fn mul(self, o: Self) -> Self {
-        let (a0, a1) = (self.0 as u64, (self.0 >> 64) as u64);
-        let (b0, b1) = (o.0 as u64, (o.0 >> 64) as u64);
-        let lo = clmul(a0, b0);
-        let hi = clmul(a1, b1);
-        let mid = clmul(a0 ^ a1, b0 ^ b1) ^ lo ^ hi;
-        let p_lo = lo ^ (mid << 64);
-        let p_hi = hi ^ (mid >> 64);
-        let mut acc = p_lo;
-        let mut h = p_hi;
-        for _ in 0..2 {
-            let c = clmul(h as u64, GHASH_MOD as u64)
-                ^ ((clmul((h >> 64) as u64, GHASH_MOD as u64)) << 64);
-            let carry = clmul((h >> 64) as u64, GHASH_MOD as u64) >> 64;
-            acc ^= c;
-            h = carry;
+        // The fixed-operand GHASH formula used by scale_b128_row, in one
+        // 128-bit lane. Folding the high operand first leaves one final fold.
+        unsafe {
+            let a = core::mem::transmute::<u128, __m128i>(self.0);
+            let b = core::mem::transmute::<u128, __m128i>(o.0);
+            let poly = _mm_set_epi64x(0, GHASH_MOD as i64);
+            let kh = _mm_clmulepi64_si128::<0x01>(b, poly);
+            let k = _mm_xor_si128(kh, _mm_slli_si128::<8>(b));
+            let y0 = _mm_xor_si128(
+                _mm_clmulepi64_si128::<0x00>(a, b),
+                _mm_clmulepi64_si128::<0x01>(a, k),
+            );
+            let y1 = _mm_xor_si128(
+                _mm_clmulepi64_si128::<0x10>(a, b),
+                _mm_clmulepi64_si128::<0x11>(a, k),
+            );
+            let lo = _mm_xor_si128(y0, _mm_slli_si128::<8>(y1));
+            let hi = _mm_srli_si128::<8>(y1);
+            let res = _mm_xor_si128(lo, _mm_clmulepi64_si128::<0x00>(hi, poly));
+            Self(core::mem::transmute::<__m128i, u128>(res))
         }
-        Self(acc)
     }
 }
 

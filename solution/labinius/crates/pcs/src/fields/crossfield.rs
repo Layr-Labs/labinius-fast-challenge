@@ -1472,11 +1472,63 @@ fn apply_images(images: &[F162], x: B128) -> F162 {
     acc
 }
 
+/// Products of the 128 GHASH basis monomials with d. Multiplication by
+/// x shifts once and folds the lost x^128 coefficient back with 0x87.
+fn ghash_scaled_basis(d: B128) -> [B128; PACK] {
+    let mut word = d.0;
+    core::array::from_fn(|i| {
+        if i != 0 {
+            let reduction = 0u128.wrapping_sub(word >> 127) & 0x87;
+            word = (word << 1) ^ reduction;
+        }
+        B128(word)
+    })
+}
+
+#[cfg(test)]
+mod scaled_basis_tests {
+    use super::*;
+    fn bit_serial(mut a: u128, mut b: u128) -> u128 {
+        let mut out = 0;
+        for _ in 0..128 {
+            if b & 1 != 0 { out ^= a; }
+            let carry = a >> 127;
+            a <<= 1;
+            if carry != 0 { a ^= 0x87; }
+            b >>= 1;
+        }
+        out
+    }
+    fn check(d: B128, independent: bool) {
+        let got = ghash_scaled_basis(d);
+        for i in 0..PACK {
+            assert_eq!(got[i], B128(1u128 << i) * d, "d={d:?}, basis={i}");
+            if independent { assert_eq!(got[i].0, bit_serial(1u128 << i, d.0)); }
+        }
+    }
+    #[test]
+    fn every_basis_multiplier_matches_both_references() {
+        for i in 0..PACK { check(B128(1u128 << i), true); }
+    }
+    #[test]
+    fn random_and_extreme_multipliers_match() {
+        for x in [0, 1, u128::MAX, 1u128 << 127, (u64::MAX as u128) << 64,
+                  0x87, 0xaaaa_aaaa_aaaa_aaaa_5555_5555_5555_5555] {
+            check(B128(x), true);
+        }
+        let mut s = 0x1234_5678_9abc_def0_fedc_ba98_7654_3210u128;
+        for i in 0..2048 {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            check(B128(s), i < 32);
+        }
+    }
+}
+
 /// `L o (x -> d x)` as images: `L'(e_i) = L(d e_i)`.
 fn compose_scale(images: &[F162], d: B128) -> Vec<F162> {
     // Apply the same tiled linear map used by the long passes to the 128 scaled
     // basis words. This avoids 128 unpredictable bit tests for every image.
-    let words: [B128; PACK] = core::array::from_fn(|i| B128(1u128 << i) * d);
+    let words = ghash_scaled_basis(d);
     let m = eq_matrices(images);
     let mut out = vec![F162::ZERO; PACK];
     unsafe {

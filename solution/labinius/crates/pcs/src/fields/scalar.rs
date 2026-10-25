@@ -100,14 +100,22 @@ impl Mul for F162 {
     fn mul(self, o: Self) -> Self {
         let a = self.0;
         let b = o.0;
-        let mut p = [0u64; 6];
-        for i in 0..3 {
-            for j in 0..3 {
-                let t = clmul(a[i], b[j]);
-                p[i + j] ^= t as u64;
-                p[i + j + 1] ^= (t >> 64) as u64;
-            }
-        }
+        // The same six-product Karatsuba decomposition as the word-sliced
+        // kernel. Recombine the complete 324-bit polynomial before reducing it.
+        let m0 = clmul(a[0], b[0]);
+        let m1 = clmul(a[1], b[1]);
+        let m2 = clmul(a[2], b[2]);
+        let d1 = clmul(a[0] ^ a[1], b[0] ^ b[1]) ^ m0 ^ m1;
+        let d2 = clmul(a[0] ^ a[2], b[0] ^ b[2]) ^ m0 ^ m2 ^ m1;
+        let d3 = clmul(a[1] ^ a[2], b[1] ^ b[2]) ^ m1 ^ m2;
+        let p = [
+            m0 as u64,
+            (m0 >> 64) as u64 ^ d1 as u64,
+            (d1 >> 64) as u64 ^ d2 as u64,
+            (d2 >> 64) as u64 ^ d3 as u64,
+            (d3 >> 64) as u64 ^ m2 as u64,
+            (m2 >> 64) as u64,
+        ];
         let h00 = (p[2] >> 34) | (p[3] << 30);
         let h01 = (p[3] >> 34) & ((1 << 17) - 1);
         let h10 = (p[3] >> 51) | (p[4] << 13);

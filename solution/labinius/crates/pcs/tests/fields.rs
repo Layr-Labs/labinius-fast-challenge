@@ -135,6 +135,21 @@ fn scalar_f162_matches_reference() {
     }
 }
 
+/// Every pair of basis monomials exercises the limb cross terms and all
+/// reduction boundaries; dense products are covered by the random test above.
+#[test]
+fn scalar_f162_basis_products_match_reference() {
+    for i in 0..162 {
+        let mut a = [0; 3];
+        a[i / 64] = 1u64 << (i % 64);
+        for j in 0..162 {
+            let mut b = [0; 3];
+            b[j / 64] = 1u64 << (j % 64);
+            assert_eq!((F162(a) * F162(b)).0, mul162(a, b), "basis {i}, {j}");
+        }
+    }
+}
+
 #[test]
 fn scalar_f162_order_243() {
     let x = F162([2, 0, 0]);

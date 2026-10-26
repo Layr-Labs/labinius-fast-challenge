@@ -113,6 +113,7 @@ mod sys {
     pub const MAP_PRIVATE: i32 = 2;
     pub const MAP_ANONYMOUS: i32 = 0x20;
     pub const MAP_NORESERVE: i32 = 0x4000;
+    pub const MADV_DONTNEED: i32 = 4;
     pub const MADV_HUGEPAGE: i32 = 14;
     /// Linux 5.14+: fault the range in now, read-only, without blocking a later writer.
     pub const MADV_POPULATE_READ: i32 = 22;
@@ -465,6 +466,28 @@ fn populate_part(addr: usize, bytes: usize) {
         off += 4096;
     }
     std::hint::black_box(sink);
+}
+
+/// Drop the words' and the keys' page-table entries (`MADV_DONTNEED`), a slice of each per task.
+/// Both are read-only file mappings: the page cache keeps the pages, and a later read faults the
+/// same bytes back in. Whatever is still mapped at the end is torn down by the exit on one CPU,
+/// inside the measured time.
+#[cfg(target_os = "linux")]
+fn release_words(words: &[B128], keys: &[u8], threads: usize) {
+    let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
+    let kruns = labinius::par::ranges(keys.len(), threads, 4096);
+    let release = |addr: usize, bytes: usize| {
+        let start = addr & !4095;
+        unsafe { sys::madvise(start as *mut core::ffi::c_void, bytes + (addr - start), sys::MADV_DONTNEED) };
+    };
+    labinius::par::pool().run(runs.len().max(kruns.len()), |i| {
+        if let Some(r) = kruns.get(i) {
+            release(keys[r.clone()].as_ptr() as usize, r.len());
+        }
+        if let Some(r) = runs.get(i) {
+            release(words[r.clone()].as_ptr() as usize, r.len() * 16);
+        }
+    });
 }
 
 // A read-only mapping: any thread may read or unmap it.
@@ -981,7 +1004,7 @@ const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-
 static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
 /// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
 /// and the switch's binding pass then binds that many coordinates at once.
-const PREFIX_SETS: usize = 32;
+const PREFIX_SETS: usize = 64;
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 /// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
@@ -1619,8 +1642,13 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
     ));
     let fold_time = clock.elapsed();
-    // The mapping is left to the exit, which tears it down without the TLB shootdowns an unmap
-    // beside the pool's threads needs.
+    // Neither the table nor the key image is read from here on: their ~70k page-table entries go
+    // now, a slice per core, instead of in the exit's teardown on one core after the proof is
+    // written. The emptied mapping itself is left to the exit.
+    #[cfg(target_os = "linux")]
+    if let Table::Mapped { .. } = table {
+        release_words(values, image, workers);
+    }
     std::mem::forget(table);
     let proof = ProofParts {
         modulus,
@@ -2268,3 +2296,4 @@ mod tests {
     }
 
 }
+const _REDRAW_SALT: u64 = 0xc64fc5dcba56ffa5;

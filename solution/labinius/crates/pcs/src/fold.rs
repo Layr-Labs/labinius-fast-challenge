@@ -2072,6 +2072,107 @@ mod bitsliced {
         assert!(overflow == 0, "integer fold overflow");
     }
 
+    // Direct full-accumulator output from PR162; valid only for the one-part path.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+    unsafe fn write_acc(
+        acc: *const __m512i,
+        bias: &[i32; SLOTS],
+        output: *mut RingElement,
+    ) {
+        for e in 0..LANES / 4 {
+            core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
+        }
+        let zero = _mm512_setzero_si512();
+        let perm = _mm512_load_si512(BACK.0.as_ptr() as *const __m512i);
+        let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
+        let idx0 = _mm512_load_si512(INTERLEAVE.0[0].as_ptr() as *const __m512i);
+        let idx1 = _mm512_load_si512(INTERLEAVE.0[1].as_ptr() as *const __m512i);
+        let mut overflow = 0u32;
+        for s0 in (0..OUT_SLOTS).step_by(8) {
+            let n = (OUT_SLOTS - s0).min(8);
+            let mask = ((1u32 << n) - 1) as __mmask8;
+            let mut s_lo = [[zero; 8]; 8];
+            let mut s_hi = [[zero; 8]; 8];
+            let mut t_lo = [[zero; 8]; 8];
+            let mut t_hi = [[zero; 8]; 8];
+            for ds in 0..8 {
+                let s = (s0 + ds).min(OUT_SLOTS - 1);
+                let t = if s < 81 { 162 + s } else { s + 81 };
+                let as_ptr = acc.add(s * BITS);
+                let at_ptr = acc.add(t * BITS);
+                s_lo[ds] = transpose8x8_q(core::array::from_fn(|b| _mm512_load_si512(as_ptr.add(b))));
+                s_hi[ds] = transpose8x8_q(core::array::from_fn(|b| {
+                    if b == 7 { zero } else { _mm512_load_si512(as_ptr.add(8 + b)) }
+                }));
+                t_lo[ds] = transpose8x8_q(core::array::from_fn(|b| _mm512_load_si512(at_ptr.add(b))));
+                t_hi[ds] = transpose8x8_q(core::array::from_fn(|b| {
+                    if b == 7 { zero } else { _mm512_load_si512(at_ptr.add(8 + b)) }
+                }));
+            }
+            for g in 0..LANES / 64 {
+                macro_rules! row {
+                    ($ds:literal) => {{
+                        let s = (s0 + $ds).min(OUT_SLOTS - 1);
+                        let below = s < 81;
+                        let t = if below { 162 + s } else { s + 81 };
+                        let bs = _mm512_set1_epi16(*bias.get_unchecked(s) as i16);
+                        let bt = _mm512_set1_epi16(*bias.get_unchecked(t) as i16);
+                        let sl = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, s_lo[$ds][g]));
+                        let sh = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, s_hi[$ds][g]));
+                        let tl = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, t_lo[$ds][g]));
+                        let th = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, t_hi[$ds][g]));
+                        let cs0 = _mm512_unpacklo_epi8(sl, sh);
+                        let cs1 = _mm512_unpackhi_epi8(sl, sh);
+                        let ct0 = _mm512_unpacklo_epi8(tl, th);
+                        let ct1 = _mm512_unpackhi_epi8(tl, th);
+
+                        let x0 = _mm512_sub_epi16(cs0, bs);
+                        let y0 = if below { _mm512_sub_epi16(bt, ct0) } else { _mm512_sub_epi16(ct0, bt) };
+                        let v0 = _mm512_add_epi16(x0, y0);
+                        overflow |= _mm512_cmpneq_epi16_mask(v0, _mm512_adds_epi16(x0, y0));
+
+                        let x1 = _mm512_sub_epi16(cs1, bs);
+                        let y1 = if below { _mm512_sub_epi16(bt, ct1) } else { _mm512_sub_epi16(ct1, bt) };
+                        let v1 = _mm512_add_epi16(x1, y1);
+                        overflow |= _mm512_cmpneq_epi16_mask(v1, _mm512_adds_epi16(x1, y1));
+
+                        (
+                            _mm512_permutex2var_epi16(v0, idx0, v1),
+                            _mm512_permutex2var_epi16(v0, idx1, v1),
+                        )
+                    }};
+                }
+                let (r0_0, r1_0) = row!(0);
+                let (r0_1, r1_1) = row!(1);
+                let (r0_2, r1_2) = row!(2);
+                let (r0_3, r1_3) = row!(3);
+                let (r0_4, r1_4) = row!(4);
+                let (r0_5, r1_5) = row!(5);
+                let (r0_6, r1_6) = row!(6);
+                let (r0_7, r1_7) = row!(7);
+                for (h, rows) in [
+                    [r0_0, r0_1, r0_2, r0_3, r0_4, r0_5, r0_6, r0_7],
+                    [r1_0, r1_1, r1_2, r1_3, r1_4, r1_5, r1_6, r1_7],
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let t = transpose8x8_q(rows);
+                    for j in 0..8 {
+                        let e = 16 * g + 8 * h + 7 - j;
+                        let dst = (core::ptr::addr_of_mut!((*output.add(e)).v) as *mut i16).add(4 * s0);
+                        if n == 8 {
+                            _mm512_storeu_si512(dst as *mut __m512i, t[j]);
+                        } else {
+                            _mm512_mask_storeu_epi64(dst as *mut i64, mask, t[j]);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(overflow == 0, "integer fold overflow");
+    }
+
     /// Allocate capacity for `SLOTS` counts; `unslice` initializes every lane before `set_len`.
     #[inline]
     fn uninit_counts() -> Vec<[i16; LANES]> {
@@ -2079,7 +2180,7 @@ mod bitsliced {
     }
 
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-    unsafe fn run_worker<const GROUP: usize>(
+    unsafe fn run_worker<const GROUP: usize, const FUSED: bool>(
         worker: usize,
         words: &[B128],
         column_words: usize,
@@ -2107,7 +2208,7 @@ mod bitsliced {
             planes.as_mut_ptr().add(GUARD + j * STRIDE + 128).write(zero);
         }
         let mut acc: Vec<__m512i> = Vec::with_capacity(2 * PAIRS * BITS);
-        let mut counts = uninit_counts();
+        let mut counts = if FUSED { Vec::new() } else { uninit_counts() };
         loop {
             let task = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if task >= tasks {
@@ -2152,6 +2253,13 @@ mod bitsliced {
             }
             #[cfg(test)]
             let start = profile.then(std::time::Instant::now);
+            if FUSED {
+                let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
+                write_acc(acc.as_ptr(), bias, output);
+                #[cfg(test)]
+                if let Some(start) = start { times[2] += start.elapsed(); }
+                continue;
+            }
             for s in 0..SLOTS {
                 unslice(acc.as_ptr().add(s * BITS), counts.as_mut_ptr().add(s).cast());
             }
@@ -2194,10 +2302,10 @@ mod bitsliced {
         column_words: usize,
         workers: usize,
     ) -> Vec<RingElement> {
-        fold_config::<COL_GROUP>(words, challenges, column_words, workers)
+        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers)
     }
 
-    fn fold_config<const GROUP: usize>(
+    fn fold_config<const GROUP: usize, const FUSED: bool>(
         words: &[B128],
         challenges: &[ShortChallenge],
         column_words: usize,
@@ -2222,11 +2330,11 @@ mod bitsliced {
         // shared core does fewer of them; the second part of a block to finish adds its counts
         // to the first's in `write_counts` (counts are additive and stay within the total weight)
         // and writes.
-        let parts = PARTS.min(groups.len().max(1));
+        let parts = if FUSED { 1 } else { PARTS.min(groups.len().max(1)) };
         let cuts: Vec<usize> = (0..=parts).map(|i| groups.len() * i / parts).collect();
         let tasks = blocks * parts;
         let pending: Vec<std::sync::Mutex<Option<Vec<[i16; LANES]>>>> =
-            (0..blocks).map(|_| std::sync::Mutex::new(None)).collect();
+            if FUSED { Vec::new() } else { (0..blocks).map(|_| std::sync::Mutex::new(None)).collect() };
         let free: std::sync::Mutex<Vec<Vec<[i16; LANES]>>> =
             std::sync::Mutex::new(Vec::new());
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -2234,7 +2342,7 @@ mod bitsliced {
         let out_addr = out.as_mut_ptr() as usize;
         let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
         crate::par::pool().run(workers.clamp(1, tasks), |worker| unsafe {
-            run_worker::<GROUP>(
+            run_worker::<GROUP, FUSED>(
                 worker,
                 words,
                 column_words,
@@ -2533,8 +2641,8 @@ mod bitsliced {
             for (group, workers) in [(16, 4), (31, 4), (31, 2), (16, 2)] {
                 let start = std::time::Instant::now();
                 let v = match group {
-                    16 => fold_config::<16>(&words, &cs, 1 << 14, workers),
-                    31 => fold_config::<31>(&words, &cs, 1 << 14, workers),
+                    16 => fold_config::<16, false>(&words, &cs, 1 << 14, workers),
+                    31 => fold_config::<31, false>(&words, &cs, 1 << 14, workers),
                     _ => unreachable!(),
                 };
                 eprintln!("bitfold group={} workers={} exact_us={}", group, workers, start.elapsed().as_micros());

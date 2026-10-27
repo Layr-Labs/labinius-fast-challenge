@@ -4,8 +4,10 @@
 //! nine accumulation streams that differ only in their public key:
 //!
 //! - stream 0: `A mod 9721`, accumulated over the whole column (the ordinary residue);
-//! - streams 1..=8: the balanced base-8 digits `L_d` of `A mod 2^22` (`L_0..L_6` in `[-4, 4)`,
-//!   `L_7` the remaining bit), so that `A ≡ sum_d 8^d L_d (mod 2^22)`.
+//! - streams 1..=7: the balanced mixed-radix digits `L_d` of `A mod 2^22` (`L_0..L_5` base 9 in
+//!   `[-4, 4]`, `L_6` base 8 in `[-4, 4)`), so that `A ≡ sum_d 9^d L_d (mod 2^22)`
+//!   (`9^6 * 8 >= 2^22`: seven digits instead of the eight base-8 ones, one accumulation stream
+//!   fewer for the same chunking).
 //!
 //! A digit stream's sum `X = sum_{j in chunk} L_{d,j} s_j` over a chunk of [`CHUNK_PAIRS`] pair
 //! batches is an integer whose mean `mu = (1/2) sum_j L_{d,j} U` (`U` the all-ones polynomial on
@@ -15,7 +17,7 @@
 //! computed from the public key ([`SmsKeys::build`] records the smallest margin `Z` over every
 //! chunk, digit and coefficient; at this shape it is above 12). Within that margin the residue of
 //! `X` modulo 9721 determines `X`: `X = mu + centered(X - mu mod 9721)`. The chunk's residues come
-//! out of one inverse transform per digit for two chunks at once, and `t mod 2^22 = sum_d 8^d X_d`
+//! out of one inverse transform per digit for two chunks at once, and `t mod 2^22 = sum_d 9^d X_d`
 //! accumulates in wrapping 32-bit lanes.
 //!
 //! Only public parameters are precomputed. Every invocation consumes its complete fresh table.
@@ -25,19 +27,44 @@ use crate::simd::ntt::gen_small;
 pub const P: u16 = 9721;
 pub const TAIL_BITS: u32 = 22;
 pub const MODULUS: u128 = (P as u128) << TAIL_BITS;
-/// Accumulation streams: the base residue and eight digits.
-pub const STREAMS: usize = 9;
+/// Accumulation streams: the base residue and seven digits.
+pub const STREAMS: usize = 8;
 pub const DIGITS: usize = STREAMS - 1;
-/// Bit position of digit `d`.
-pub const fn digit_shift(d: usize) -> u32 {
-    3 * d as u32
+/// Radix of digit `d`: base 9 below the last digit, base 8 for the last.
+pub const fn digit_radix(d: usize) -> i64 {
+    if d + 1 < DIGITS { 9 } else { 8 }
 }
+/// Weight of digit `d`, `9^d`.
+pub const fn digit_weight(d: usize) -> u32 {
+    let mut w = 1u32;
+    let mut i = 0;
+    while i < d {
+        w *= 9;
+        i += 1;
+    }
+    w
+}
+/// The balanced representatives cover `[-REP_LOW, 2^22 - REP_LOW)`, all of `Z / 2^22`.
+const REP_LOW: i64 = {
+    // sum over the base-9 digits of 4 * 9^d, plus 4 * 9^6 for the last digit's -4.
+    let mut low = 0i64;
+    let mut d = 0;
+    while d < DIGITS {
+        low += 4 * digit_weight(d) as i64;
+        d += 1;
+    }
+    low
+};
+const _: () = {
+    // The digits' range is contiguous and at least 2^22 wide.
+    let high = REP_LOW - 4 * digit_weight(DIGITS - 1) as i64 + 3 * digit_weight(DIGITS - 1) as i64;
+    assert!(REP_LOW + high + 1 >= 1 << TAIL_BITS);
+};
 /// Pair batches (two ring elements of each of 16 columns) per reconstruction chunk: 128 ring
 /// elements of a column.
 pub const CHUNK_PAIRS: usize = 128;
-/// Digits reconstructed per chunk; the last digit, a single bit with a tenth of the second moment,
-/// is reconstructed per half column (both halves in one inverse transform).
-pub const CHUNKED: usize = DIGITS - 1;
+/// Digits reconstructed per chunk: all of them.
+pub const CHUNKED: usize = DIGITS;
 /// Pair batches transformed in lockstep per accumulator read-modify-write.
 pub const LOCK: usize = 8;
 const TAIL_MASK: u32 = (1u32 << TAIL_BITS) - 1;
@@ -139,11 +166,10 @@ pub struct SmsKeys<'a> {
     /// stream's NTT-domain keys of ring elements `2 LOCK l + 2h` (low half) and `+ 1` (high half),
     /// centered.
     pub pairs: &'a [u32],
-    /// `mur[(d * chunks + c) * N + m]`: the chunk mean `mu'` of digit `d < CHUNKED`, chunk `c`,
-    /// coefficient `m`, as a centered residue modulo 9721; then the half-column means of the last
-    /// digit at `mur[(CHUNKED * chunks + h) * N + m]`, `h` the half.
+    /// `mur[(d * chunks + c) * N + m]`: the chunk mean `mu'` of digit `d`, chunk `c`,
+    /// coefficient `m`, as a centered residue modulo 9721 ([`mur_len`] entries).
     pub mur: &'a [i16],
-    /// `mu[m] = sum_{d, c} 8^d mu'_{d,c}[m]`, wrapping.
+    /// `mu[m] = sum_{d, c} 9^d mu'_{d,c}[m]`, wrapping.
     pub mu: &'a [u32],
     /// Ring elements per column.
     pub elements: usize,
@@ -167,16 +193,26 @@ impl SmsKeyData {
     }
 }
 
-/// The balanced digits of `x mod 2^22`: `x ≡ sum_d 8^d L_d`, `L_0..L_6 in [-4, 4)`, `L_7 in {0, 1}`.
+/// Entries of [`SmsKeys::mur`] for `elements` ring elements per column.
+pub const fn mur_len(elements: usize) -> usize {
+    CHUNKED * (elements / (2 * CHUNK_PAIRS)) * N
+}
+
+/// The balanced digits of `x mod 2^22`: `x ≡ sum_d 9^d L_d`, `L_0..L_5 in [-4, 4]`,
+/// `L_6 in [-4, 4)`.
 pub fn digits(x: u128) -> [i8; DIGITS] {
     let mut r = (x & TAIL_MASK as u128) as i64;
-    let mut out = [0i8; DIGITS];
-    for d in 0..DIGITS - 1 {
-        let v = ((r + 4) & 7) - 4;
-        out[d] = v as i8;
-        r = (r - v) >> 3;
+    if r >= (1 << TAIL_BITS) - REP_LOW {
+        r -= 1 << TAIL_BITS;
     }
-    out[DIGITS - 1] = (r & 1) as i8;
+    let mut out = [0i8; DIGITS];
+    for d in 0..DIGITS {
+        let b = digit_radix(d);
+        let v = (r + 4).rem_euclid(b) - 4;
+        out[d] = v as i8;
+        r = (r - v) / b;
+    }
+    debug_assert_eq!(r, 0);
     out
 }
 
@@ -249,13 +285,13 @@ impl SmsKeyData {
         }
         // Chunk moments: ring elements 2 CHUNK_PAIRS c .. of every column.
         let chunks = elements / (2 * CHUNK_PAIRS);
-        let mut mur = vec![0i16; (CHUNKED * chunks + 2) * N];
+        let mut mur = vec![0i16; mur_len(elements)];
         let mut mu = vec![0u32; N];
         let mut margin = f64::INFINITY;
         let mut margins = [(f64::INFINITY, 0usize, 0usize, 0i64); DIGITS];
         let half = ((P - 1) / 2) as f64;
         for d in 0..DIGITS {
-            let (per, nc, at) = if d < CHUNKED { (2 * CHUNK_PAIRS, chunks, d * chunks) } else { (elements / 2, 2, CHUNKED * chunks) };
+            let (per, nc, at) = (2 * CHUNK_PAIRS, chunks, d * chunks);
             for c in 0..nc {
                 let mut s1 = [0i64; N];
                 let mut s2 = [0i64; N];
@@ -276,7 +312,7 @@ impl SmsKeyData {
                     }
                     let r = mean.rem_euclid(P as i64);
                     mur[(at + c) * N + m] = if r > (P as i64 - 1) / 2 { (r - P as i64) as i16 } else { r as i16 };
-                    mu[m] = mu[m].wrapping_add((mean as u32).wrapping_shl(digit_shift(d)));
+                    mu[m] = mu[m].wrapping_add((mean as u32).wrapping_mul(digit_weight(d)));
                 }
             }
         }
@@ -313,9 +349,9 @@ static FOLD: Fold = Fold({
     f
 });
 
-/// One slot's nine streams, round by round: the nine accumulators are loaded, take the first
+/// One slot's eight streams, round by round: the eight accumulators are loaded, take the first
 /// lockstep product, then the second, ..., and are stored (folded back first in `reduce`), so at
-/// most nine dependent `vpdpwssd` wait at a time and every round's nine are independent.
+/// most eight dependent `vpdpwssd` wait at a time and every round's eight are independent.
 macro_rules! sms_slot {
     (plain) => { concat!(
             "vmovdqa64 zmm20, zmmword ptr [{a} + 0]\n",
@@ -326,7 +362,6 @@ macro_rules! sms_slot {
             "vmovdqa64 zmm25, zmmword ptr [{a} + 320]\n",
             "vmovdqa64 zmm26, zmmword ptr [{a} + 384]\n",
             "vmovdqa64 zmm27, zmmword ptr [{a} + 448]\n",
-            "vmovdqa64 zmm28, zmmword ptr [{a} + 512]\n",
             "vpdpwssd zmm20, {x0}, dword ptr [{k} + 0]{{1to16}}\n",
             "vpdpwssd zmm21, {x0}, dword ptr [{k} + 32]{{1to16}}\n",
             "vpdpwssd zmm22, {x0}, dword ptr [{k} + 64]{{1to16}}\n",
@@ -335,7 +370,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x0}, dword ptr [{k} + 160]{{1to16}}\n",
             "vpdpwssd zmm26, {x0}, dword ptr [{k} + 192]{{1to16}}\n",
             "vpdpwssd zmm27, {x0}, dword ptr [{k} + 224]{{1to16}}\n",
-            "vpdpwssd zmm28, {x0}, dword ptr [{k} + 256]{{1to16}}\n",
             "vpdpwssd zmm20, {x1}, dword ptr [{k} + 4]{{1to16}}\n",
             "vpdpwssd zmm21, {x1}, dword ptr [{k} + 36]{{1to16}}\n",
             "vpdpwssd zmm22, {x1}, dword ptr [{k} + 68]{{1to16}}\n",
@@ -344,7 +378,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x1}, dword ptr [{k} + 164]{{1to16}}\n",
             "vpdpwssd zmm26, {x1}, dword ptr [{k} + 196]{{1to16}}\n",
             "vpdpwssd zmm27, {x1}, dword ptr [{k} + 228]{{1to16}}\n",
-            "vpdpwssd zmm28, {x1}, dword ptr [{k} + 260]{{1to16}}\n",
             "vpdpwssd zmm20, {x2}, dword ptr [{k} + 8]{{1to16}}\n",
             "vpdpwssd zmm21, {x2}, dword ptr [{k} + 40]{{1to16}}\n",
             "vpdpwssd zmm22, {x2}, dword ptr [{k} + 72]{{1to16}}\n",
@@ -353,7 +386,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x2}, dword ptr [{k} + 168]{{1to16}}\n",
             "vpdpwssd zmm26, {x2}, dword ptr [{k} + 200]{{1to16}}\n",
             "vpdpwssd zmm27, {x2}, dword ptr [{k} + 232]{{1to16}}\n",
-            "vpdpwssd zmm28, {x2}, dword ptr [{k} + 264]{{1to16}}\n",
             "vpdpwssd zmm20, {x3}, dword ptr [{k} + 12]{{1to16}}\n",
             "vpdpwssd zmm21, {x3}, dword ptr [{k} + 44]{{1to16}}\n",
             "vpdpwssd zmm22, {x3}, dword ptr [{k} + 76]{{1to16}}\n",
@@ -362,7 +394,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x3}, dword ptr [{k} + 172]{{1to16}}\n",
             "vpdpwssd zmm26, {x3}, dword ptr [{k} + 204]{{1to16}}\n",
             "vpdpwssd zmm27, {x3}, dword ptr [{k} + 236]{{1to16}}\n",
-            "vpdpwssd zmm28, {x3}, dword ptr [{k} + 268]{{1to16}}\n",
             "vpdpwssd zmm20, {x4}, dword ptr [{k} + 16]{{1to16}}\n",
             "vpdpwssd zmm21, {x4}, dword ptr [{k} + 48]{{1to16}}\n",
             "vpdpwssd zmm22, {x4}, dword ptr [{k} + 80]{{1to16}}\n",
@@ -371,7 +402,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x4}, dword ptr [{k} + 176]{{1to16}}\n",
             "vpdpwssd zmm26, {x4}, dword ptr [{k} + 208]{{1to16}}\n",
             "vpdpwssd zmm27, {x4}, dword ptr [{k} + 240]{{1to16}}\n",
-            "vpdpwssd zmm28, {x4}, dword ptr [{k} + 272]{{1to16}}\n",
             "vpdpwssd zmm20, {x5}, dword ptr [{k} + 20]{{1to16}}\n",
             "vpdpwssd zmm21, {x5}, dword ptr [{k} + 52]{{1to16}}\n",
             "vpdpwssd zmm22, {x5}, dword ptr [{k} + 84]{{1to16}}\n",
@@ -380,7 +410,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x5}, dword ptr [{k} + 180]{{1to16}}\n",
             "vpdpwssd zmm26, {x5}, dword ptr [{k} + 212]{{1to16}}\n",
             "vpdpwssd zmm27, {x5}, dword ptr [{k} + 244]{{1to16}}\n",
-            "vpdpwssd zmm28, {x5}, dword ptr [{k} + 276]{{1to16}}\n",
             "vpdpwssd zmm20, {x6}, dword ptr [{k} + 24]{{1to16}}\n",
             "vpdpwssd zmm21, {x6}, dword ptr [{k} + 56]{{1to16}}\n",
             "vpdpwssd zmm22, {x6}, dword ptr [{k} + 88]{{1to16}}\n",
@@ -389,7 +418,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x6}, dword ptr [{k} + 184]{{1to16}}\n",
             "vpdpwssd zmm26, {x6}, dword ptr [{k} + 216]{{1to16}}\n",
             "vpdpwssd zmm27, {x6}, dword ptr [{k} + 248]{{1to16}}\n",
-            "vpdpwssd zmm28, {x6}, dword ptr [{k} + 280]{{1to16}}\n",
             "vpdpwssd zmm20, {x7}, dword ptr [{k} + 28]{{1to16}}\n",
             "vpdpwssd zmm21, {x7}, dword ptr [{k} + 60]{{1to16}}\n",
             "vpdpwssd zmm22, {x7}, dword ptr [{k} + 92]{{1to16}}\n",
@@ -398,7 +426,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x7}, dword ptr [{k} + 188]{{1to16}}\n",
             "vpdpwssd zmm26, {x7}, dword ptr [{k} + 220]{{1to16}}\n",
             "vpdpwssd zmm27, {x7}, dword ptr [{k} + 252]{{1to16}}\n",
-            "vpdpwssd zmm28, {x7}, dword ptr [{k} + 284]{{1to16}}\n",
             "vmovdqa64 zmmword ptr [{a} + 0], zmm20\n",
             "vmovdqa64 zmmword ptr [{a} + 64], zmm21\n",
             "vmovdqa64 zmmword ptr [{a} + 128], zmm22\n",
@@ -407,7 +434,6 @@ macro_rules! sms_slot {
             "vmovdqa64 zmmword ptr [{a} + 320], zmm25\n",
             "vmovdqa64 zmmword ptr [{a} + 384], zmm26\n",
             "vmovdqa64 zmmword ptr [{a} + 448], zmm27\n",
-            "vmovdqa64 zmmword ptr [{a} + 512], zmm28\n",
         )
     };
     (reduce) => { concat!(
@@ -419,7 +445,6 @@ macro_rules! sms_slot {
             "vmovdqa64 zmm25, zmmword ptr [{a} + 320]\n",
             "vmovdqa64 zmm26, zmmword ptr [{a} + 384]\n",
             "vmovdqa64 zmm27, zmmword ptr [{a} + 448]\n",
-            "vmovdqa64 zmm28, zmmword ptr [{a} + 512]\n",
             "vpdpwssd zmm20, {x0}, dword ptr [{k} + 0]{{1to16}}\n",
             "vpdpwssd zmm21, {x0}, dword ptr [{k} + 32]{{1to16}}\n",
             "vpdpwssd zmm22, {x0}, dword ptr [{k} + 64]{{1to16}}\n",
@@ -428,7 +453,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x0}, dword ptr [{k} + 160]{{1to16}}\n",
             "vpdpwssd zmm26, {x0}, dword ptr [{k} + 192]{{1to16}}\n",
             "vpdpwssd zmm27, {x0}, dword ptr [{k} + 224]{{1to16}}\n",
-            "vpdpwssd zmm28, {x0}, dword ptr [{k} + 256]{{1to16}}\n",
             "vpdpwssd zmm20, {x1}, dword ptr [{k} + 4]{{1to16}}\n",
             "vpdpwssd zmm21, {x1}, dword ptr [{k} + 36]{{1to16}}\n",
             "vpdpwssd zmm22, {x1}, dword ptr [{k} + 68]{{1to16}}\n",
@@ -437,7 +461,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x1}, dword ptr [{k} + 164]{{1to16}}\n",
             "vpdpwssd zmm26, {x1}, dword ptr [{k} + 196]{{1to16}}\n",
             "vpdpwssd zmm27, {x1}, dword ptr [{k} + 228]{{1to16}}\n",
-            "vpdpwssd zmm28, {x1}, dword ptr [{k} + 260]{{1to16}}\n",
             "vpdpwssd zmm20, {x2}, dword ptr [{k} + 8]{{1to16}}\n",
             "vpdpwssd zmm21, {x2}, dword ptr [{k} + 40]{{1to16}}\n",
             "vpdpwssd zmm22, {x2}, dword ptr [{k} + 72]{{1to16}}\n",
@@ -446,7 +469,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x2}, dword ptr [{k} + 168]{{1to16}}\n",
             "vpdpwssd zmm26, {x2}, dword ptr [{k} + 200]{{1to16}}\n",
             "vpdpwssd zmm27, {x2}, dword ptr [{k} + 232]{{1to16}}\n",
-            "vpdpwssd zmm28, {x2}, dword ptr [{k} + 264]{{1to16}}\n",
             "vpdpwssd zmm20, {x3}, dword ptr [{k} + 12]{{1to16}}\n",
             "vpdpwssd zmm21, {x3}, dword ptr [{k} + 44]{{1to16}}\n",
             "vpdpwssd zmm22, {x3}, dword ptr [{k} + 76]{{1to16}}\n",
@@ -455,7 +477,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x3}, dword ptr [{k} + 172]{{1to16}}\n",
             "vpdpwssd zmm26, {x3}, dword ptr [{k} + 204]{{1to16}}\n",
             "vpdpwssd zmm27, {x3}, dword ptr [{k} + 236]{{1to16}}\n",
-            "vpdpwssd zmm28, {x3}, dword ptr [{k} + 268]{{1to16}}\n",
             "vpdpwssd zmm20, {x4}, dword ptr [{k} + 16]{{1to16}}\n",
             "vpdpwssd zmm21, {x4}, dword ptr [{k} + 48]{{1to16}}\n",
             "vpdpwssd zmm22, {x4}, dword ptr [{k} + 80]{{1to16}}\n",
@@ -464,7 +485,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x4}, dword ptr [{k} + 176]{{1to16}}\n",
             "vpdpwssd zmm26, {x4}, dword ptr [{k} + 208]{{1to16}}\n",
             "vpdpwssd zmm27, {x4}, dword ptr [{k} + 240]{{1to16}}\n",
-            "vpdpwssd zmm28, {x4}, dword ptr [{k} + 272]{{1to16}}\n",
             "vpdpwssd zmm20, {x5}, dword ptr [{k} + 20]{{1to16}}\n",
             "vpdpwssd zmm21, {x5}, dword ptr [{k} + 52]{{1to16}}\n",
             "vpdpwssd zmm22, {x5}, dword ptr [{k} + 84]{{1to16}}\n",
@@ -473,7 +493,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x5}, dword ptr [{k} + 180]{{1to16}}\n",
             "vpdpwssd zmm26, {x5}, dword ptr [{k} + 212]{{1to16}}\n",
             "vpdpwssd zmm27, {x5}, dword ptr [{k} + 244]{{1to16}}\n",
-            "vpdpwssd zmm28, {x5}, dword ptr [{k} + 276]{{1to16}}\n",
             "vpdpwssd zmm20, {x6}, dword ptr [{k} + 24]{{1to16}}\n",
             "vpdpwssd zmm21, {x6}, dword ptr [{k} + 56]{{1to16}}\n",
             "vpdpwssd zmm22, {x6}, dword ptr [{k} + 88]{{1to16}}\n",
@@ -482,7 +501,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x6}, dword ptr [{k} + 184]{{1to16}}\n",
             "vpdpwssd zmm26, {x6}, dword ptr [{k} + 216]{{1to16}}\n",
             "vpdpwssd zmm27, {x6}, dword ptr [{k} + 248]{{1to16}}\n",
-            "vpdpwssd zmm28, {x6}, dword ptr [{k} + 280]{{1to16}}\n",
             "vpdpwssd zmm20, {x7}, dword ptr [{k} + 28]{{1to16}}\n",
             "vpdpwssd zmm21, {x7}, dword ptr [{k} + 60]{{1to16}}\n",
             "vpdpwssd zmm22, {x7}, dword ptr [{k} + 92]{{1to16}}\n",
@@ -491,7 +509,6 @@ macro_rules! sms_slot {
             "vpdpwssd zmm25, {x7}, dword ptr [{k} + 188]{{1to16}}\n",
             "vpdpwssd zmm26, {x7}, dword ptr [{k} + 220]{{1to16}}\n",
             "vpdpwssd zmm27, {x7}, dword ptr [{k} + 252]{{1to16}}\n",
-            "vpdpwssd zmm28, {x7}, dword ptr [{k} + 284]{{1to16}}\n",
             "vpmaddwd zmm29, zmm20, zmmword ptr [{f}]\n",
             "vptestmd k1, zmm20, zmmword ptr [{f} + 64]\n",
             "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
@@ -524,14 +541,10 @@ macro_rules! sms_slot {
             "vptestmd k1, zmm27, zmmword ptr [{f} + 64]\n",
             "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
             "vmovdqa64 zmmword ptr [{a} + 448], zmm29\n",
-            "vpmaddwd zmm29, zmm28, zmmword ptr [{f}]\n",
-            "vptestmd k1, zmm28, zmmword ptr [{f} + 64]\n",
-            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
-            "vmovdqa64 zmmword ptr [{a} + 512], zmm29\n",
         )
     };
 }
-const _: () = assert!(STREAMS == 9 && LOCK == 8);
+const _: () = assert!(STREAMS == 8 && LOCK == 8);
 
 /// The 4-batch lockstep sink: the batches' 27-slot blocks are staged in L1 and every slot's nine
 /// accumulators take all four products in one read-modify-write, folded back when `RED`.
@@ -567,12 +580,12 @@ impl<const RED: bool> Sink<RED> {
                 core::arch::asm!(sms_slot!(reduce), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
                     x0 = in(zmm_reg) x[0], x1 = in(zmm_reg) x[1], x2 = in(zmm_reg) x[2], x3 = in(zmm_reg) x[3], x4 = in(zmm_reg) x[4], x5 = in(zmm_reg) x[5], x6 = in(zmm_reg) x[6], x7 = in(zmm_reg) x[7],
                     out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
-                    out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags));
+                    out("zmm26") _, out("zmm27") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags));
             } else {
                 core::arch::asm!(concat!(sms_slot!(plain), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
                     x0 = in(zmm_reg) x[0], x1 = in(zmm_reg) x[1], x2 = in(zmm_reg) x[2], x3 = in(zmm_reg) x[3], x4 = in(zmm_reg) x[4], x5 = in(zmm_reg) x[5], x6 = in(zmm_reg) x[6], x7 = in(zmm_reg) x[7],
                     out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
-                    out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags));
+                    out("zmm26") _, out("zmm27") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags));
             }
         }
     }
@@ -609,25 +622,25 @@ struct Total {
 
 /// The digit `d` residues of two chunks (`c0` in lanes 0..16, `c0 + 1` in lanes 16..32 when
 /// `both`), inverse transformed and centered, reconstructed around their means and added to the
-/// total with weight `8^d`.
+/// total with weight `9^d`.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bool, total: &mut Total) {
     let chunks = keys.elements / (2 * CHUNK_PAIRS);
-    let at = if d < CHUNKED { d * chunks + c0 } else { CHUNKED * chunks + c0 };
+    let at = d * chunks + c0;
     let mlo = keys.mur.as_ptr().add(at * N);
     let mhi = if both { keys.mur.as_ptr().add((at + 1) * N) } else { mlo };
     let q = _mm512_set1_epi16(P as i16);
     let hq = _mm512_set1_epi16(((P - 1) / 2) as i16);
     let nhq = _mm512_set1_epi16(-(((P - 1) / 2) as i16));
-    let sh = _mm_cvtsi32_si128(digit_shift(d) as i32);
+    let wd = _mm512_set1_epi32(digit_weight(d) as i32);
     for m in 0..N {
         let x = _mm512_load_si512(b.v[m].as_ptr() as *const __m512i);
         let mu = _mm512_mask_blend_epi16(0xFFFF_0000, _mm512_set1_epi16(*mlo.add(m)), _mm512_set1_epi16(*mhi.add(m)));
         let mut y = _mm512_sub_epi16(x, mu);
         y = _mm512_mask_sub_epi16(y, _mm512_cmpgt_epi16_mask(y, hq), y, q);
         y = _mm512_mask_add_epi16(y, _mm512_cmplt_epi16_mask(y, nhq), y, q);
-        let lo = _mm512_sll_epi32(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(y)), sh);
-        let hi = _mm512_sll_epi32(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y)), sh);
+        let lo = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(y)), wd);
+        let hi = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y)), wd);
         let t = total.t[m].as_mut_ptr() as *mut __m512i;
         _mm512_store_si512(t, _mm512_add_epi32(_mm512_load_si512(t), lo));
         if both {
@@ -764,10 +777,6 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ws
         } else {
             vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<false> { k, acc });
         }
-        if (b + LOCK) % (np / 2) == 0 && mode != 3 {
-            let d = DIGITS - 1;
-            finish_stream(&mut ws.acc[0], 1 + d, &mut ws.pend[d], (b + LOCK) / (np / 2) - 1);
-        }
         if (b + LOCK) % CHUNK_PAIRS == 0 && mode != 3 {
             let chunk = (b + LOCK) / CHUNK_PAIRS - 1;
             for d in 0..CHUNKED {
@@ -786,13 +795,6 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ws
                 half = 1;
             }
         }
-    }
-    if bench_mode() != 3 {
-        let d = DIGITS - 1;
-        let pd = &mut ws.pend[d];
-        pd.representation = Representation::Ntt;
-        gen_small::intt_gen_batch32::<P>(pd);
-        reconstruct(pd, d, keys, 0, true, &mut ws.total[0]);
     }
     write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst);
 }
@@ -1015,14 +1017,13 @@ mod tests {
             let d = digits(x);
             let mut v = 0i64;
             for k in (0..DIGITS).rev() {
-                v = v * 8 + d[k] as i64;
+                v = v * digit_radix(k) + d[k] as i64;
             }
-            // L_7 has weight 2^21 = 8^7: the loop gives sum 8^d L_d
             assert_eq!((v.rem_euclid(1 << TAIL_BITS)) as u128, x % (1 << TAIL_BITS));
             for k in 0..DIGITS - 1 {
-                assert!((-4..4).contains(&d[k]));
+                assert!((-4..=4).contains(&d[k]));
             }
-            assert!((0..2).contains(&d[DIGITS - 1]));
+            assert!((-4..4).contains(&d[DIGITS - 1]));
         }
     }
 

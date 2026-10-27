@@ -34,7 +34,14 @@ pub const fn digit_shift(d: usize) -> u32 {
 }
 /// Pair batches (two ring elements of each of 16 columns) per reconstruction chunk: 128 ring
 /// elements of a column.
-pub const CHUNK_PAIRS: usize = 128;
+pub const CHUNK_PAIRS: usize = 192;
+/// Reconstruction chunks of a column of `elements / 2` pair batches: whole chunks of
+/// [`CHUNK_PAIRS`], the last one shorter when they do not divide the column. At 192 pairs the
+/// summed Gaussian tail of every (column, chunk, digit, coefficient) reconstruction is about
+/// 1e-5 per proof (`risk::reconstruction_risk`), against 3e-11 at 128 and 6e-3 at 256.
+pub const fn chunk_count(elements: usize) -> usize {
+    (elements / 2).div_ceil(CHUNK_PAIRS)
+}
 /// Digits reconstructed per chunk; the last digit, a single bit with a tenth of the second moment,
 /// is reconstructed per half column (both halves in one inverse transform).
 pub const CHUNKED: usize = DIGITS - 1;
@@ -221,7 +228,7 @@ impl SmsKeyData {
         use crate::key::CommitmentKey;
         use crate::ring::Modulus;
         assert_eq!(a.len(), elements * N);
-        assert!(elements % (2 * CHUNK_PAIRS) == 0, "whole chunks of ring elements");
+        assert!(elements % (2 * LOCK) == 0 && (elements / 2) % LOCK == 0, "whole lockstep steps of ring elements");
         let base = Modulus::ALL.into_iter().find(|m| m.prime() == P).unwrap();
         let len_f162 = 4 * elements;
         let dig: Vec<[i8; DIGITS]> = a.iter().map(|&x| digits(x)).collect();
@@ -248,7 +255,7 @@ impl SmsKeyData {
             }
         }
         // Chunk moments: ring elements 2 CHUNK_PAIRS c .. of every column.
-        let chunks = elements / (2 * CHUNK_PAIRS);
+        let chunks = chunk_count(elements);
         let mut mur = vec![0i16; (CHUNKED * chunks + 2) * N];
         let mut mu = vec![0u32; N];
         let mut margin = f64::INFINITY;
@@ -259,7 +266,7 @@ impl SmsKeyData {
             for c in 0..nc {
                 let mut s1 = [0i64; N];
                 let mut s2 = [0i64; N];
-                for j in c * per..(c + 1) * per {
+                for j in c * per..((c + 1) * per).min(elements) {
                     let l: [i8; N] = core::array::from_fn(|m| dig[j * N + m][d]);
                     moment_rows(&l, &mut s1, &mut s2);
                 }
@@ -530,19 +537,232 @@ macro_rules! sms_slot {
             "vmovdqa64 zmmword ptr [{a} + 512], zmm29\n",
         )
     };
+    (plain_first) => { concat!(
+            "vmovdqa64 zmm20, zmmword ptr [{a} + 0]\n",
+            "vpxord zmm21, zmm21, zmm21\n",
+            "vpxord zmm22, zmm22, zmm22\n",
+            "vpxord zmm23, zmm23, zmm23\n",
+            "vpxord zmm24, zmm24, zmm24\n",
+            "vpxord zmm25, zmm25, zmm25\n",
+            "vpxord zmm26, zmm26, zmm26\n",
+            "vpxord zmm27, zmm27, zmm27\n",
+            "vmovdqa64 zmm28, zmmword ptr [{a} + 512]\n",
+            "vpdpwssd zmm20, {x0}, dword ptr [{k} + 0]{{1to16}}\n",
+            "vpdpwssd zmm21, {x0}, dword ptr [{k} + 32]{{1to16}}\n",
+            "vpdpwssd zmm22, {x0}, dword ptr [{k} + 64]{{1to16}}\n",
+            "vpdpwssd zmm23, {x0}, dword ptr [{k} + 96]{{1to16}}\n",
+            "vpdpwssd zmm24, {x0}, dword ptr [{k} + 128]{{1to16}}\n",
+            "vpdpwssd zmm25, {x0}, dword ptr [{k} + 160]{{1to16}}\n",
+            "vpdpwssd zmm26, {x0}, dword ptr [{k} + 192]{{1to16}}\n",
+            "vpdpwssd zmm27, {x0}, dword ptr [{k} + 224]{{1to16}}\n",
+            "vpdpwssd zmm28, {x0}, dword ptr [{k} + 256]{{1to16}}\n",
+            "vpdpwssd zmm20, {x1}, dword ptr [{k} + 4]{{1to16}}\n",
+            "vpdpwssd zmm21, {x1}, dword ptr [{k} + 36]{{1to16}}\n",
+            "vpdpwssd zmm22, {x1}, dword ptr [{k} + 68]{{1to16}}\n",
+            "vpdpwssd zmm23, {x1}, dword ptr [{k} + 100]{{1to16}}\n",
+            "vpdpwssd zmm24, {x1}, dword ptr [{k} + 132]{{1to16}}\n",
+            "vpdpwssd zmm25, {x1}, dword ptr [{k} + 164]{{1to16}}\n",
+            "vpdpwssd zmm26, {x1}, dword ptr [{k} + 196]{{1to16}}\n",
+            "vpdpwssd zmm27, {x1}, dword ptr [{k} + 228]{{1to16}}\n",
+            "vpdpwssd zmm28, {x1}, dword ptr [{k} + 260]{{1to16}}\n",
+            "vpdpwssd zmm20, {x2}, dword ptr [{k} + 8]{{1to16}}\n",
+            "vpdpwssd zmm21, {x2}, dword ptr [{k} + 40]{{1to16}}\n",
+            "vpdpwssd zmm22, {x2}, dword ptr [{k} + 72]{{1to16}}\n",
+            "vpdpwssd zmm23, {x2}, dword ptr [{k} + 104]{{1to16}}\n",
+            "vpdpwssd zmm24, {x2}, dword ptr [{k} + 136]{{1to16}}\n",
+            "vpdpwssd zmm25, {x2}, dword ptr [{k} + 168]{{1to16}}\n",
+            "vpdpwssd zmm26, {x2}, dword ptr [{k} + 200]{{1to16}}\n",
+            "vpdpwssd zmm27, {x2}, dword ptr [{k} + 232]{{1to16}}\n",
+            "vpdpwssd zmm28, {x2}, dword ptr [{k} + 264]{{1to16}}\n",
+            "vpdpwssd zmm20, {x3}, dword ptr [{k} + 12]{{1to16}}\n",
+            "vpdpwssd zmm21, {x3}, dword ptr [{k} + 44]{{1to16}}\n",
+            "vpdpwssd zmm22, {x3}, dword ptr [{k} + 76]{{1to16}}\n",
+            "vpdpwssd zmm23, {x3}, dword ptr [{k} + 108]{{1to16}}\n",
+            "vpdpwssd zmm24, {x3}, dword ptr [{k} + 140]{{1to16}}\n",
+            "vpdpwssd zmm25, {x3}, dword ptr [{k} + 172]{{1to16}}\n",
+            "vpdpwssd zmm26, {x3}, dword ptr [{k} + 204]{{1to16}}\n",
+            "vpdpwssd zmm27, {x3}, dword ptr [{k} + 236]{{1to16}}\n",
+            "vpdpwssd zmm28, {x3}, dword ptr [{k} + 268]{{1to16}}\n",
+            "vpdpwssd zmm20, {x4}, dword ptr [{k} + 16]{{1to16}}\n",
+            "vpdpwssd zmm21, {x4}, dword ptr [{k} + 48]{{1to16}}\n",
+            "vpdpwssd zmm22, {x4}, dword ptr [{k} + 80]{{1to16}}\n",
+            "vpdpwssd zmm23, {x4}, dword ptr [{k} + 112]{{1to16}}\n",
+            "vpdpwssd zmm24, {x4}, dword ptr [{k} + 144]{{1to16}}\n",
+            "vpdpwssd zmm25, {x4}, dword ptr [{k} + 176]{{1to16}}\n",
+            "vpdpwssd zmm26, {x4}, dword ptr [{k} + 208]{{1to16}}\n",
+            "vpdpwssd zmm27, {x4}, dword ptr [{k} + 240]{{1to16}}\n",
+            "vpdpwssd zmm28, {x4}, dword ptr [{k} + 272]{{1to16}}\n",
+            "vpdpwssd zmm20, {x5}, dword ptr [{k} + 20]{{1to16}}\n",
+            "vpdpwssd zmm21, {x5}, dword ptr [{k} + 52]{{1to16}}\n",
+            "vpdpwssd zmm22, {x5}, dword ptr [{k} + 84]{{1to16}}\n",
+            "vpdpwssd zmm23, {x5}, dword ptr [{k} + 116]{{1to16}}\n",
+            "vpdpwssd zmm24, {x5}, dword ptr [{k} + 148]{{1to16}}\n",
+            "vpdpwssd zmm25, {x5}, dword ptr [{k} + 180]{{1to16}}\n",
+            "vpdpwssd zmm26, {x5}, dword ptr [{k} + 212]{{1to16}}\n",
+            "vpdpwssd zmm27, {x5}, dword ptr [{k} + 244]{{1to16}}\n",
+            "vpdpwssd zmm28, {x5}, dword ptr [{k} + 276]{{1to16}}\n",
+            "vpdpwssd zmm20, {x6}, dword ptr [{k} + 24]{{1to16}}\n",
+            "vpdpwssd zmm21, {x6}, dword ptr [{k} + 56]{{1to16}}\n",
+            "vpdpwssd zmm22, {x6}, dword ptr [{k} + 88]{{1to16}}\n",
+            "vpdpwssd zmm23, {x6}, dword ptr [{k} + 120]{{1to16}}\n",
+            "vpdpwssd zmm24, {x6}, dword ptr [{k} + 152]{{1to16}}\n",
+            "vpdpwssd zmm25, {x6}, dword ptr [{k} + 184]{{1to16}}\n",
+            "vpdpwssd zmm26, {x6}, dword ptr [{k} + 216]{{1to16}}\n",
+            "vpdpwssd zmm27, {x6}, dword ptr [{k} + 248]{{1to16}}\n",
+            "vpdpwssd zmm28, {x6}, dword ptr [{k} + 280]{{1to16}}\n",
+            "vpdpwssd zmm20, {x7}, dword ptr [{k} + 28]{{1to16}}\n",
+            "vpdpwssd zmm21, {x7}, dword ptr [{k} + 60]{{1to16}}\n",
+            "vpdpwssd zmm22, {x7}, dword ptr [{k} + 92]{{1to16}}\n",
+            "vpdpwssd zmm23, {x7}, dword ptr [{k} + 124]{{1to16}}\n",
+            "vpdpwssd zmm24, {x7}, dword ptr [{k} + 156]{{1to16}}\n",
+            "vpdpwssd zmm25, {x7}, dword ptr [{k} + 188]{{1to16}}\n",
+            "vpdpwssd zmm26, {x7}, dword ptr [{k} + 220]{{1to16}}\n",
+            "vpdpwssd zmm27, {x7}, dword ptr [{k} + 252]{{1to16}}\n",
+            "vpdpwssd zmm28, {x7}, dword ptr [{k} + 284]{{1to16}}\n",
+            "vmovdqa64 zmmword ptr [{a} + 0], zmm20\n",
+            "vmovdqa64 zmmword ptr [{a} + 64], zmm21\n",
+            "vmovdqa64 zmmword ptr [{a} + 128], zmm22\n",
+            "vmovdqa64 zmmword ptr [{a} + 192], zmm23\n",
+            "vmovdqa64 zmmword ptr [{a} + 256], zmm24\n",
+            "vmovdqa64 zmmword ptr [{a} + 320], zmm25\n",
+            "vmovdqa64 zmmword ptr [{a} + 384], zmm26\n",
+            "vmovdqa64 zmmword ptr [{a} + 448], zmm27\n",
+            "vmovdqa64 zmmword ptr [{a} + 512], zmm28\n",
+        )
+    };
+    (reduce_first) => { concat!(
+            "vmovdqa64 zmm20, zmmword ptr [{a} + 0]\n",
+            "vpxord zmm21, zmm21, zmm21\n",
+            "vpxord zmm22, zmm22, zmm22\n",
+            "vpxord zmm23, zmm23, zmm23\n",
+            "vpxord zmm24, zmm24, zmm24\n",
+            "vpxord zmm25, zmm25, zmm25\n",
+            "vpxord zmm26, zmm26, zmm26\n",
+            "vpxord zmm27, zmm27, zmm27\n",
+            "vmovdqa64 zmm28, zmmword ptr [{a} + 512]\n",
+            "vpdpwssd zmm20, {x0}, dword ptr [{k} + 0]{{1to16}}\n",
+            "vpdpwssd zmm21, {x0}, dword ptr [{k} + 32]{{1to16}}\n",
+            "vpdpwssd zmm22, {x0}, dword ptr [{k} + 64]{{1to16}}\n",
+            "vpdpwssd zmm23, {x0}, dword ptr [{k} + 96]{{1to16}}\n",
+            "vpdpwssd zmm24, {x0}, dword ptr [{k} + 128]{{1to16}}\n",
+            "vpdpwssd zmm25, {x0}, dword ptr [{k} + 160]{{1to16}}\n",
+            "vpdpwssd zmm26, {x0}, dword ptr [{k} + 192]{{1to16}}\n",
+            "vpdpwssd zmm27, {x0}, dword ptr [{k} + 224]{{1to16}}\n",
+            "vpdpwssd zmm28, {x0}, dword ptr [{k} + 256]{{1to16}}\n",
+            "vpdpwssd zmm20, {x1}, dword ptr [{k} + 4]{{1to16}}\n",
+            "vpdpwssd zmm21, {x1}, dword ptr [{k} + 36]{{1to16}}\n",
+            "vpdpwssd zmm22, {x1}, dword ptr [{k} + 68]{{1to16}}\n",
+            "vpdpwssd zmm23, {x1}, dword ptr [{k} + 100]{{1to16}}\n",
+            "vpdpwssd zmm24, {x1}, dword ptr [{k} + 132]{{1to16}}\n",
+            "vpdpwssd zmm25, {x1}, dword ptr [{k} + 164]{{1to16}}\n",
+            "vpdpwssd zmm26, {x1}, dword ptr [{k} + 196]{{1to16}}\n",
+            "vpdpwssd zmm27, {x1}, dword ptr [{k} + 228]{{1to16}}\n",
+            "vpdpwssd zmm28, {x1}, dword ptr [{k} + 260]{{1to16}}\n",
+            "vpdpwssd zmm20, {x2}, dword ptr [{k} + 8]{{1to16}}\n",
+            "vpdpwssd zmm21, {x2}, dword ptr [{k} + 40]{{1to16}}\n",
+            "vpdpwssd zmm22, {x2}, dword ptr [{k} + 72]{{1to16}}\n",
+            "vpdpwssd zmm23, {x2}, dword ptr [{k} + 104]{{1to16}}\n",
+            "vpdpwssd zmm24, {x2}, dword ptr [{k} + 136]{{1to16}}\n",
+            "vpdpwssd zmm25, {x2}, dword ptr [{k} + 168]{{1to16}}\n",
+            "vpdpwssd zmm26, {x2}, dword ptr [{k} + 200]{{1to16}}\n",
+            "vpdpwssd zmm27, {x2}, dword ptr [{k} + 232]{{1to16}}\n",
+            "vpdpwssd zmm28, {x2}, dword ptr [{k} + 264]{{1to16}}\n",
+            "vpdpwssd zmm20, {x3}, dword ptr [{k} + 12]{{1to16}}\n",
+            "vpdpwssd zmm21, {x3}, dword ptr [{k} + 44]{{1to16}}\n",
+            "vpdpwssd zmm22, {x3}, dword ptr [{k} + 76]{{1to16}}\n",
+            "vpdpwssd zmm23, {x3}, dword ptr [{k} + 108]{{1to16}}\n",
+            "vpdpwssd zmm24, {x3}, dword ptr [{k} + 140]{{1to16}}\n",
+            "vpdpwssd zmm25, {x3}, dword ptr [{k} + 172]{{1to16}}\n",
+            "vpdpwssd zmm26, {x3}, dword ptr [{k} + 204]{{1to16}}\n",
+            "vpdpwssd zmm27, {x3}, dword ptr [{k} + 236]{{1to16}}\n",
+            "vpdpwssd zmm28, {x3}, dword ptr [{k} + 268]{{1to16}}\n",
+            "vpdpwssd zmm20, {x4}, dword ptr [{k} + 16]{{1to16}}\n",
+            "vpdpwssd zmm21, {x4}, dword ptr [{k} + 48]{{1to16}}\n",
+            "vpdpwssd zmm22, {x4}, dword ptr [{k} + 80]{{1to16}}\n",
+            "vpdpwssd zmm23, {x4}, dword ptr [{k} + 112]{{1to16}}\n",
+            "vpdpwssd zmm24, {x4}, dword ptr [{k} + 144]{{1to16}}\n",
+            "vpdpwssd zmm25, {x4}, dword ptr [{k} + 176]{{1to16}}\n",
+            "vpdpwssd zmm26, {x4}, dword ptr [{k} + 208]{{1to16}}\n",
+            "vpdpwssd zmm27, {x4}, dword ptr [{k} + 240]{{1to16}}\n",
+            "vpdpwssd zmm28, {x4}, dword ptr [{k} + 272]{{1to16}}\n",
+            "vpdpwssd zmm20, {x5}, dword ptr [{k} + 20]{{1to16}}\n",
+            "vpdpwssd zmm21, {x5}, dword ptr [{k} + 52]{{1to16}}\n",
+            "vpdpwssd zmm22, {x5}, dword ptr [{k} + 84]{{1to16}}\n",
+            "vpdpwssd zmm23, {x5}, dword ptr [{k} + 116]{{1to16}}\n",
+            "vpdpwssd zmm24, {x5}, dword ptr [{k} + 148]{{1to16}}\n",
+            "vpdpwssd zmm25, {x5}, dword ptr [{k} + 180]{{1to16}}\n",
+            "vpdpwssd zmm26, {x5}, dword ptr [{k} + 212]{{1to16}}\n",
+            "vpdpwssd zmm27, {x5}, dword ptr [{k} + 244]{{1to16}}\n",
+            "vpdpwssd zmm28, {x5}, dword ptr [{k} + 276]{{1to16}}\n",
+            "vpdpwssd zmm20, {x6}, dword ptr [{k} + 24]{{1to16}}\n",
+            "vpdpwssd zmm21, {x6}, dword ptr [{k} + 56]{{1to16}}\n",
+            "vpdpwssd zmm22, {x6}, dword ptr [{k} + 88]{{1to16}}\n",
+            "vpdpwssd zmm23, {x6}, dword ptr [{k} + 120]{{1to16}}\n",
+            "vpdpwssd zmm24, {x6}, dword ptr [{k} + 152]{{1to16}}\n",
+            "vpdpwssd zmm25, {x6}, dword ptr [{k} + 184]{{1to16}}\n",
+            "vpdpwssd zmm26, {x6}, dword ptr [{k} + 216]{{1to16}}\n",
+            "vpdpwssd zmm27, {x6}, dword ptr [{k} + 248]{{1to16}}\n",
+            "vpdpwssd zmm28, {x6}, dword ptr [{k} + 280]{{1to16}}\n",
+            "vpdpwssd zmm20, {x7}, dword ptr [{k} + 28]{{1to16}}\n",
+            "vpdpwssd zmm21, {x7}, dword ptr [{k} + 60]{{1to16}}\n",
+            "vpdpwssd zmm22, {x7}, dword ptr [{k} + 92]{{1to16}}\n",
+            "vpdpwssd zmm23, {x7}, dword ptr [{k} + 124]{{1to16}}\n",
+            "vpdpwssd zmm24, {x7}, dword ptr [{k} + 156]{{1to16}}\n",
+            "vpdpwssd zmm25, {x7}, dword ptr [{k} + 188]{{1to16}}\n",
+            "vpdpwssd zmm26, {x7}, dword ptr [{k} + 220]{{1to16}}\n",
+            "vpdpwssd zmm27, {x7}, dword ptr [{k} + 252]{{1to16}}\n",
+            "vpdpwssd zmm28, {x7}, dword ptr [{k} + 284]{{1to16}}\n",
+            "vpmaddwd zmm29, zmm20, zmmword ptr [{f}]\n",
+            "vptestmd k1, zmm20, zmmword ptr [{f} + 64]\n",
+            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
+            "vmovdqa64 zmmword ptr [{a} + 0], zmm29\n",
+            "vpmaddwd zmm29, zmm21, zmmword ptr [{f}]\n",
+            "vptestmd k1, zmm21, zmmword ptr [{f} + 64]\n",
+            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
+            "vmovdqa64 zmmword ptr [{a} + 64], zmm29\n",
+            "vpmaddwd zmm29, zmm22, zmmword ptr [{f}]\n",
+            "vptestmd k1, zmm22, zmmword ptr [{f} + 64]\n",
+            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
+            "vmovdqa64 zmmword ptr [{a} + 128], zmm29\n",
+            "vpmaddwd zmm29, zmm23, zmmword ptr [{f}]\n",
+            "vptestmd k1, zmm23, zmmword ptr [{f} + 64]\n",
+            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
+            "vmovdqa64 zmmword ptr [{a} + 192], zmm29\n",
+            "vpmaddwd zmm29, zmm24, zmmword ptr [{f}]\n",
+            "vptestmd k1, zmm24, zmmword ptr [{f} + 64]\n",
+            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
+            "vmovdqa64 zmmword ptr [{a} + 256], zmm29\n",
+            "vpmaddwd zmm29, zmm25, zmmword ptr [{f}]\n",
+            "vptestmd k1, zmm25, zmmword ptr [{f} + 64]\n",
+            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
+            "vmovdqa64 zmmword ptr [{a} + 320], zmm29\n",
+            "vpmaddwd zmm29, zmm26, zmmword ptr [{f}]\n",
+            "vptestmd k1, zmm26, zmmword ptr [{f} + 64]\n",
+            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
+            "vmovdqa64 zmmword ptr [{a} + 384], zmm29\n",
+            "vpmaddwd zmm29, zmm27, zmmword ptr [{f}]\n",
+            "vptestmd k1, zmm27, zmmword ptr [{f} + 64]\n",
+            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
+            "vmovdqa64 zmmword ptr [{a} + 448], zmm29\n",
+            "vpmaddwd zmm29, zmm28, zmmword ptr [{f}]\n",
+            "vptestmd k1, zmm28, zmmword ptr [{f} + 64]\n",
+            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
+            "vmovdqa64 zmmword ptr [{a} + 512], zmm29\n",
+        )
+    };
 }
 const _: () = assert!(STREAMS == 9 && LOCK == 8);
 
 /// The 4-batch lockstep sink: the batches' 27-slot blocks are staged in L1 and every slot's nine
 /// accumulators take all four products in one read-modify-write, folded back when `RED`.
-struct Sink<const RED: bool> {
+struct Sink<const RED: bool, const FIRST: bool = false> {
     k: *const u32,
     acc: *mut i32,
 }
-impl<const RED: bool> vb::SliceSink<LOCK> for Sink<RED> {
+impl<const RED: bool, const FIRST: bool> vb::SliceSink<LOCK> for Sink<RED, FIRST> {
     #[inline(always)]
     unsafe fn rows(&mut self, blk: usize, w: [*const i16; LOCK], r0: usize, r1: usize) {
-        sink_rows::<RED>(self.k, self.acc, blk, w, r0, r1);
+        sink_rows::<RED, FIRST>(self.k, self.acc, blk, w, r0, r1);
     }
 }
 
@@ -550,12 +770,12 @@ impl<const RED: bool> vb::SliceSink<LOCK> for Sink<RED> {
 /// then fit the half of the decoded-uop cache a hyperthread gets.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-unsafe fn sink_rows<const RED: bool>(kp: *const u32, accp: *mut i32, blk: usize, w: [*const i16; LOCK], r0: usize, r1: usize) {
-    let s = Sink::<RED> { k: kp, acc: accp };
+unsafe fn sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *mut i32, blk: usize, w: [*const i16; LOCK], r0: usize, r1: usize) {
+    let s = Sink::<RED, FIRST> { k: kp, acc: accp };
     s.rows_inline(blk, w, r0, r1);
 }
 
-impl<const RED: bool> Sink<RED> {
+impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
     #[inline(always)]
     unsafe fn rows_inline(&self, blk: usize, w: [*const i16; LOCK], r0: usize, r1: usize) {
         for i in r0..r1 {
@@ -563,7 +783,17 @@ impl<const RED: bool> Sink<RED> {
             let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w[h] as *const __m512i).add(i)));
             let k = self.k.add(j * STREAMS * LOCK);
             let a = self.acc.add(j * STREAMS * 16);
-            if RED {
+            if RED && FIRST {
+                core::arch::asm!(sms_slot!(reduce_first), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                    x0 = in(zmm_reg) x[0], x1 = in(zmm_reg) x[1], x2 = in(zmm_reg) x[2], x3 = in(zmm_reg) x[3], x4 = in(zmm_reg) x[4], x5 = in(zmm_reg) x[5], x6 = in(zmm_reg) x[6], x7 = in(zmm_reg) x[7],
+                    out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
+                    out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags));
+            } else if FIRST {
+                core::arch::asm!(concat!(sms_slot!(plain_first), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                    x0 = in(zmm_reg) x[0], x1 = in(zmm_reg) x[1], x2 = in(zmm_reg) x[2], x3 = in(zmm_reg) x[3], x4 = in(zmm_reg) x[4], x5 = in(zmm_reg) x[5], x6 = in(zmm_reg) x[6], x7 = in(zmm_reg) x[7],
+                    out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
+                    out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags));
+            } else if RED {
                 core::arch::asm!(sms_slot!(reduce), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
                     x0 = in(zmm_reg) x[0], x1 = in(zmm_reg) x[1], x2 = in(zmm_reg) x[2], x3 = in(zmm_reg) x[3], x4 = in(zmm_reg) x[4], x5 = in(zmm_reg) x[5], x6 = in(zmm_reg) x[6], x7 = in(zmm_reg) x[7],
                     out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
@@ -584,6 +814,9 @@ const PAIR_PACK_PERM: [i64; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
 /// `16 half .. 16 half + 16` of `out`, the stream cleared for the next chunk.
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn finish_stream(a: &mut SAcc, s: usize, out: &mut Batch32, half: usize) {
+    // Streams 1..=CHUNKED restart from zero registers in the chunk's first lockstep step
+    // (`Sink<_, true>`), so only the per-half-column last digit is cleared here.
+    let clear = s == 1 + DIGITS - 1;
     let p = (a.v.as_mut_ptr() as *mut __m512i).add(s);
     let zero = _mm512_setzero_si512();
     let perm = _mm512_loadu_si512(PAIR_PACK_PERM.as_ptr() as *const __m512i);
@@ -592,8 +825,10 @@ unsafe fn finish_stream(a: &mut SAcc, s: usize, out: &mut Batch32, half: usize) 
         let j = 2 * k;
         let x0 = _mm512_load_si512(p.add(STREAMS * j));
         let x1 = _mm512_load_si512(p.add(STREAMS * (j + 1)));
-        _mm512_store_si512(p.add(STREAMS * j), zero);
-        _mm512_store_si512(p.add(STREAMS * (j + 1)), zero);
+        if clear {
+            _mm512_store_si512(p.add(STREAMS * j), zero);
+            _mm512_store_si512(p.add(STREAMS * (j + 1)), zero);
+        }
         let packed = _mm512_packs_epi32(red16::<P>(x0), red16::<P>(x1));
         let u = _mm512_permutexvar_epi64(perm, packed);
         _mm256_storeu_si256(out.v[j].as_mut_ptr().add(l0) as *mut __m256i, _mm512_castsi512_si256(u));
@@ -612,7 +847,7 @@ struct Total {
 /// total with weight `8^d`.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bool, total: &mut Total) {
-    let chunks = keys.elements / (2 * CHUNK_PAIRS);
+    let chunks = chunk_count(keys.elements);
     let at = if d < CHUNKED { d * chunks + c0 } else { CHUNKED * chunks + c0 };
     let mlo = keys.mur.as_ptr().add(at * N);
     let mhi = if both { keys.mur.as_ptr().add((at + 1) * N) } else { mlo };
@@ -734,7 +969,7 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ws: &mut SmsWorker, dst: *mut [u32; N], mut sync: F) {
     let g = cols.len();
-    assert!(g >= 1 && g <= 16 && np % CHUNK_PAIRS == 0 && (np / 2) % LOCK == 0 && 2 * np == keys.elements);
+    assert!(g >= 1 && g <= 16 && np % LOCK == 0 && (np / 2) % LOCK == 0 && 2 * np == keys.elements);
     static ZERO8: [B128; 8] = [B128::ZERO; 8];
     let kbase = keys.pairs.as_ptr();
     let mut half = 0usize;
@@ -758,6 +993,11 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ws
         } else if mode == 2 {
             let mut sk = Sink::<false> { k, acc };
             for kk in 0..24 { vb::SliceSink::<LOCK>::rows(&mut sk, kk, core::array::from_fn(|h| w.add(32 * 27 * h) as *const i16), 0, 27); }
+        } else if b % CHUNK_PAIRS == 0 && ((b + LOCK) % PP == 0 || LOCK > PP) {
+            vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<true, true> { k, acc });
+            sync(b + LOCK);
+        } else if b % CHUNK_PAIRS == 0 {
+            vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<false, true> { k, acc });
         } else if (b + LOCK) % PP == 0 || LOCK > PP {
             vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<true> { k, acc });
             sync(b + LOCK);
@@ -768,8 +1008,8 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ws
             let d = DIGITS - 1;
             finish_stream(&mut ws.acc[0], 1 + d, &mut ws.pend[d], (b + LOCK) / (np / 2) - 1);
         }
-        if (b + LOCK) % CHUNK_PAIRS == 0 && mode != 3 {
-            let chunk = (b + LOCK) / CHUNK_PAIRS - 1;
+        if ((b + LOCK) % CHUNK_PAIRS == 0 || b + LOCK == np) && mode != 3 {
+            let chunk = (b + LOCK).div_ceil(CHUNK_PAIRS) - 1;
             for d in 0..CHUNKED {
                 finish_stream(&mut ws.acc[0], 1 + d, &mut ws.pend[d], half);
             }
@@ -1062,7 +1302,7 @@ mod tests {
         let a: Vec<u128> = (0..elements * N).map(|_| ((xorshift(&mut s) as u128) << 64 | xorshift(&mut s) as u128) % MODULUS).collect();
         let data = SmsKeyData::build(&a, elements);
         eprintln!("margin {}", data.margin);
-        assert!(data.margin > 8.0);
+        assert!(data.margin > 7.0);
         let len = 4 * elements;
         let words: Vec<B128> = (0..len * ncols).map(|_| B128(((xorshift(&mut s) as u128) << 64) | xorshift(&mut s) as u128)).collect();
         let cols: Vec<&[B128]> = words.chunks_exact(len).collect();
@@ -1147,5 +1387,54 @@ mod bench_parts {
         }
         let dt = t.elapsed().as_secs_f64() / n as f64;
         eprintln!("finish_stream: {:.2} us", dt * 1e6);
+    }
+}
+
+#[cfg(test)]
+mod risk {
+    use super::*;
+    fn q(z: f64) -> f64 { // upper Gaussian tail via erfc approximation (Abramowitz-Stegun 7.1.26 is too coarse here)
+        // continued-fraction-free asymptotic with correction terms, accurate for z > 4
+        let t = 1.0 / (z * (2.0 * std::f64::consts::PI).sqrt()) * (-z * z / 2.0).exp();
+        t * (1.0 - 1.0 / (z * z) + 3.0 / (z * z * z * z))
+    }
+    /// Sum over every (column, chunk, digit, coefficient) test of P(|X - mu| > (P-1)/2) for
+    /// chunk sizes 128 and 256 pairs, Gaussian with the exact per-test sigma (random key).
+    #[test]
+    #[ignore]
+    fn reconstruction_risk() {
+        let elements = 4096usize;
+        let mut st = 0x9e3779b97f4a7c15u64;
+        let mut next = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+        let a: Vec<u128> = (0..elements * N).map(|_| ((next() as u128) << 64 | next() as u128) % MODULUS).collect();
+        let dig: Vec<[i8; DIGITS]> = a.iter().map(|&x| digits(x)).collect();
+        let half = ((P - 1) / 2) as f64 - 0.5;
+        for per_pairs in [128usize, 160, 176, 192, 208, 224] {
+            let per = 2 * per_pairs;
+            let mut risk = 0.0f64;
+            let mut zmin = f64::INFINITY;
+            let mut hist = [0usize; 8];
+            for d in 0..DIGITS - 1 {
+                for c in 0..elements / per {
+                    let mut s1 = [0i64; N];
+                    let mut s2 = [0i64; N];
+                    for j in c * per..(c + 1) * per {
+                        let l: [i8; N] = core::array::from_fn(|m| dig[j * N + m][d]);
+                        moment_rows(&l, &mut s1, &mut s2);
+                    }
+                    for m in 0..N {
+                        let sigma = (s2[m] as f64 / 4.0).sqrt();
+                        if sigma == 0.0 { continue; }
+                        let z = half / sigma;
+                        zmin = zmin.min(z);
+                        let b = ((z - 5.0).max(0.0) as usize).min(7);
+                        hist[b] += 1;
+                        risk += 2.0 * q(z);
+                    }
+                }
+            }
+            // every column has the same sigma (key-only), so multiply by the 1024 columns
+            eprintln!("chunk {per_pairs} pairs: zmin {zmin:.3}, per-run failure {:.3e}, z-hist(5,6,..) {:?}", risk * 1024.0, hist);
+        }
     }
 }

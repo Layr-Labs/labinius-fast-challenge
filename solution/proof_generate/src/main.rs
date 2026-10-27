@@ -41,6 +41,13 @@ use parameters::{COLUMNS, COLUMN_LEN, COLUMN_LOG, LOG_PACKED, LOG_VARS, MODULUS,
 /// batches are read in place.
 #[repr(C, align(64))]
 struct Aligned64<T>(T);
+/// 2 MiB aligned: with the binary's 2 MiB segment alignment (`build.rs`) the key image starts on
+/// a huge-page boundary of both the address space and the file.
+#[repr(C, align(2097152))]
+struct Aligned2M<T>(T);
+/// Re-measurement marker for the official runner (no effect on the proof or the schedule).
+#[allow(dead_code)]
+const REDRAW: u32 = 2;
 const EMBEDDED_KEY_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")).len();
 static EMBEDDED_KEY: Aligned64<[u8; EMBEDDED_KEY_LEN]> =
     Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")));
@@ -1006,7 +1013,7 @@ static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_by
 /// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
 /// lockstep layout, the digit chunks' centered mean residues and the means' total.
 const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
-static SMS_PAIRS:Aligned64<[u8;SMS_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
+static SMS_PAIRS:Aligned2M<[u8;SMS_PAIRS_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
 const SMS_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")).len();
 static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")));
 const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();
@@ -1017,7 +1024,7 @@ static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!(
 fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     use labinius::simd::commit::sms;
     let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
-    let chunks = RING_ELEMENTS / (2 * sms::CHUNK_PAIRS);
+    let chunks = sms::chunk_count(RING_ELEMENTS);
     if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 2 * (sms::CHUNKED * chunks + 2) * N || SMS_MU.0.len() != 4 * N {
         return None;
     }

@@ -113,6 +113,7 @@ mod sys {
     pub const MAP_PRIVATE: i32 = 2;
     pub const MAP_ANONYMOUS: i32 = 0x20;
     pub const MAP_NORESERVE: i32 = 0x4000;
+    pub const MADV_DONTNEED: i32 = 4;
     pub const MADV_HUGEPAGE: i32 = 14;
     /// Linux 5.14+: fault the range in now, read-only, without blocking a later writer.
     pub const MADV_POPULATE_READ: i32 = 22;
@@ -465,6 +466,28 @@ fn populate_part(addr: usize, bytes: usize) {
         off += 4096;
     }
     std::hint::black_box(sink);
+}
+
+/// Drop the words' and the keys' page-table entries (`MADV_DONTNEED`), a slice of each per task.
+/// Both are read-only file mappings: the page cache keeps the pages, and a later read faults the
+/// same bytes back in. Whatever is still mapped at the end is torn down by the exit on one CPU,
+/// inside the measured time.
+#[cfg(target_os = "linux")]
+fn release_words(words: &[B128], keys: &[u8], threads: usize) {
+    let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
+    let kruns = labinius::par::ranges(keys.len(), threads, 4096);
+    let release = |addr: usize, bytes: usize| {
+        let start = addr & !4095;
+        unsafe { sys::madvise(start as *mut core::ffi::c_void, bytes + (addr - start), sys::MADV_DONTNEED) };
+    };
+    labinius::par::pool().run(runs.len().max(kruns.len()), |i| {
+        if let Some(r) = kruns.get(i) {
+            release(keys[r.clone()].as_ptr() as usize, r.len());
+        }
+        if let Some(r) = runs.get(i) {
+            release(words[r.clone()].as_ptr() as usize, r.len() * 16);
+        }
+    });
 }
 
 // A read-only mapping: any thread may read or unmap it.
@@ -979,9 +1002,130 @@ const EMBEDDED_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/pair-key
 static EMBEDDED_PAIRS:Aligned64<[u8;EMBEDDED_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/pair-key.bin")));
 const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")).len();
 static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
+/// The single-transform modulus's public data (`labinius::simd::commit::sms`), precomputed by
+/// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
+/// lockstep layout, the digit chunks' centered mean residues and the means' total.
+const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
+static SMS_PAIRS:Aligned64<[u8;SMS_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
+const SMS_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")).len();
+static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")));
+const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();
+static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")));
+
+/// The embedded single-transform keys, read in place, if the build host made them for this
+/// shape.
+fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
+    use labinius::simd::commit::sms;
+    let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
+    let chunks = RING_ELEMENTS / (2 * sms::CHUNK_PAIRS);
+    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 2 * (sms::CHUNKED * chunks + 2) * N || SMS_MU.0.len() != 4 * N {
+        return None;
+    }
+    unsafe {
+        Some(sms::SmsKeys {
+            pairs: std::slice::from_raw_parts(SMS_PAIRS.0.as_ptr() as *const u32, words),
+            mur: std::slice::from_raw_parts(SMS_MUR.0.as_ptr() as *const i16, (sms::CHUNKED * chunks + 2) * N),
+            mu: std::slice::from_raw_parts(SMS_MU.0.as_ptr() as *const u32, N),
+            elements: RING_ELEMENTS,
+        })
+    }
+}
+
+/// The single-transform commitment's columns as coefficients modulo `9721 * 2^22`: `rows[2c]` is
+/// column `c` modulo 9721 in the NTT domain, `rows[2c + 1]` its coefficients modulo `2^22`. The
+/// first goes through the inverse transform 32 columns at a time; each coefficient is then
+/// `t + 2^22 ((r - t) 2^-22 mod 9721)`, packed into its 5 wire bytes.
+fn commitment_bytes_sms(rows: &[[u32; N]], columns: usize, workers: usize, buffer: Option<Vec<u8>>) -> Vec<u8> {
+    use labinius::simd::commit::sms;
+    assert_eq!(rows.len(), 2 * columns);
+    let width = rq::coefficient_bytes(sms::MODULUS);
+    assert_eq!(width, 5);
+    let mut out = match buffer {
+        Some(b) if b.len() == columns * N * width => b,
+        _ => vec![0u8; columns * N * width],
+    };
+    let blocks = columns.div_ceil(32);
+    let runs = labinius::par::ranges(blocks, workers, 1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out_addr = out.as_mut_ptr() as usize;
+    let placement = labinius::par::CorePlacement::for_logical(runs.len());
+    let p = sms::P as u64;
+    let inv = sms::inv_tail();
+    labinius::par::pool().run(runs.len(), |r| {
+        let _affinity = placement.as_ref().and_then(|p| p.pin(r));
+        let mut residues = vec![0i16; 32 * N];
+        loop {
+            let blk = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if blk >= blocks {
+                break;
+            }
+            let c0 = blk * 32;
+            let cols = (columns - c0).min(32);
+            let refs: [&[u32; N]; 32] = core::array::from_fn(|c| &rows[2 * (c0 + c.min(cols - 1))]);
+            labinius::bd::coefficients_from_rows(sms::P, &refs[..cols], &mut residues[..cols * N]);
+            // Block `blk` owns these disjoint, fixed-width wire coefficients.
+            let dst = unsafe { std::slice::from_raw_parts_mut((out_addr as *mut u8).add(c0 * N * width), cols * N * width) };
+            if lift_hybrid_wide_available() {
+                for c in 0..cols {
+                    // Column `c` owns its `5 N` bytes of `dst`.
+                    unsafe { lift_sms_column(&residues[c * N..(c + 1) * N], &rows[2 * (c0 + c) + 1], &mut dst[5 * c * N..5 * (c + 1) * N]) };
+                }
+            } else {
+                for (i, word) in dst.chunks_exact_mut(5).enumerate() {
+                    let r = (residues[i] as i64).rem_euclid(p as i64) as u64;
+                    let t = rows[2 * (c0 + i / N) + 1][i % N] as u64;
+                    let k = ((r + p - t % p) * inv) % p;
+                    let value = t + (k << sms::TAIL_BITS);
+                    word.copy_from_slice(&value.to_le_bytes()[..5]);
+                }
+            }
+        }
+    });
+    out
+}
+
+/// [`commitment_bytes_sms`]'s lift of one column, eight coefficients per step in 64-bit lanes:
+/// `r` brought into `[0, 9721)`, `d = r - t mod 9721` in `[0, 9721)` (the `t mod 9721` and the
+/// product's reduction by Barrett's `floor(x ceil(2^45 / 9721) / 2^45)`, exact for `x < 2^25`
+/// as in [`lift_hybrid_column`]), `value = t + 2^22 (d 2^-22 mod 9721)`, packed into 5-byte words.
+///
+/// # Safety
+/// AVX-512 F, BW and VBMI; `r` must hold `N` centered residues and `out` be `5 N` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+unsafe fn lift_sms_column(r: &[i16], tail: &[u32; N], out: &mut [u8]) {
+    use core::arch::x86_64::*;
+    use labinius::simd::commit::sms;
+    assert!(r.len() == N && out.len() == 5 * N && N % 8 == 0);
+    let q = _mm512_set1_epi64(sms::P as i64);
+    let inv = _mm512_set1_epi64(sms::inv_tail() as i64);
+    let magic = _mm512_set1_epi64(3_619_418_999);
+    let pick = _mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
+    let keep: __mmask64 = (1u64 << 40) - 1;
+    let modq = |x: __m512i| -> __m512i {
+        let qq = _mm512_srli_epi64::<45>(_mm512_mul_epu32(x, magic));
+        _mm512_sub_epi64(x, _mm512_mul_epu32(qq, q))
+    };
+    for j in 0..N / 8 {
+        let a = _mm512_cvtepi16_epi64(_mm_loadu_si128(r.as_ptr().add(8 * j) as *const __m128i));
+        let a = _mm512_add_epi64(a, _mm512_and_si512(_mm512_srai_epi64::<63>(a), q));
+        let t = _mm512_cvtepu32_epi64(_mm256_loadu_si256(tail.as_ptr().add(8 * j) as *const __m256i));
+        let d = _mm512_sub_epi64(a, modq(t));
+        let d = _mm512_add_epi64(d, _mm512_and_si512(_mm512_srai_epi64::<63>(d), q));
+        let k = modq(_mm512_mul_epu32(d, inv));
+        let value = _mm512_add_epi64(t, _mm512_slli_epi64::<22>(k));
+        _mm512_mask_storeu_epi8(out.as_mut_ptr().add(40 * j) as *mut i8, keep, _mm512_permutexvar_epi8(pick, value));
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn lift_sms_column(_: &[i16], _: &[u32; N], _: &mut [u8]) {
+    unreachable!("no wide lift off x86-64")
+}
+
 /// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
 /// and the switch's binding pass then binds that many coordinates at once.
-const PREFIX_SETS: usize = 32;
+const PREFIX_SETS: usize = 64;
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 /// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
@@ -1393,7 +1537,10 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // ... and so do the embedded pair/arranged keys' (otherwise a page-cache fault per 64 KB
     // inside the commitment, taken by all its workers at once as they reach the same batches:
     // measured 2 ms of commitment for 0.3-0.5 ms here).
-    let image: &[u8] = if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
+    let sms_keys = if modulus == modulus_choice::SMS_MODULUS && modulus == MODULUS { sms_embedded() } else { None };
+    let image: &[u8] = if sms_keys.is_some() {
+        &SMS_PAIRS.0
+    } else if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
         if !EMBEDDED_PAIRS.0.is_empty() {
             &EMBEDDED_PAIRS.0
         } else {
@@ -1423,7 +1570,17 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let setup_time = clock.elapsed();
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
-    let rows = if let Some(pairs) = pairs {
+    let sms_built;
+    let rows = if modulus == modulus_choice::SMS_MODULUS {
+        let keys = match sms_keys {
+            Some(k) => k,
+            None => {
+                sms_built = labinius::simd::commit::sms::SmsKeyData::build(&rq::ajtai_matrix(modulus, RING_ELEMENTS), RING_ELEMENTS);
+                sms_built.keys()
+            }
+        };
+        labinius::simd::commit::sms::commit_columns_rows(&keys, &columns, workers)
+    } else if let Some(pairs) = pairs {
         labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers)
     } else if let Some(keys) = arranged {
         labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,HYBRID_GROUP)
@@ -1557,7 +1714,11 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         }
     }
     let buffer = output.and_then(|o| o.commitment_buffer());
-    let commitment = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer);
+    let commitment = if modulus == modulus_choice::SMS_MODULUS {
+        commitment_bytes_sms(&rows, COLUMNS, workers, buffer)
+    } else {
+        commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer)
+    };
     let recombine_time = clock.elapsed();
     // Huge pages: a few page-table entries to drop. (A thread of its own to free it, as the
     // baseline did, is a ninth runnable thread beside eight busy ones.)
@@ -1619,8 +1780,13 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
     ));
     let fold_time = clock.elapsed();
-    // The mapping is left to the exit, which tears it down without the TLB shootdowns an unmap
-    // beside the pool's threads needs.
+    // Neither the table nor the key image is read from here on: their ~70k page-table entries go
+    // now, a slice per core, instead of in the exit's teardown on one core after the proof is
+    // written. The emptied mapping itself is left to the exit.
+    #[cfg(target_os = "linux")]
+    if let Table::Mapped { .. } = table {
+        release_words(values, image, workers);
+    }
     std::mem::forget(table);
     let proof = ProofParts {
         modulus,
@@ -1632,14 +1798,15 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         folded,
     };
     let encode_time = clock.elapsed();
-    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}\n",
+    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}\n",
         load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
         (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
         (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
         (row_time-switch_time).as_micros(), (challenge_time-row_time).as_micros(),
         (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
         encode_time.as_micros(), workers,
-        labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed)));
+        labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed),
+        labinius::simd::commit::sms::worker_report(workers)));
     proof
 }
 
@@ -1971,6 +2138,37 @@ mod tests {
     }
 
     /// The vectorised hybrid lift is the scalar one, word for word.
+    /// The single-transform modulus's vector lift against the scalar formula, on random
+    /// residues and tails, and the result is the unique value modulo `9721 * 2^22` with both.
+    #[test]
+    fn wide_sms_lift_is_the_scalar_lift() {
+        use labinius::simd::commit::sms;
+        if !lift_hybrid_wide_available() {
+            return;
+        }
+        let mut x = 0x5eed_1234_abcd_0001u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..64 {
+            let r: Vec<i16> = (0..N).map(|_| (next() % sms::P as u64) as i16 - (sms::P / 2) as i16).collect();
+            let tail: [u32; N] = core::array::from_fn(|_| (next() as u32) & ((1 << sms::TAIL_BITS) - 1));
+            let mut out = vec![0u8; 5 * N];
+            unsafe { lift_sms_column(&r, &tail, &mut out) };
+            for i in 0..N {
+                let mut b = [0u8; 8];
+                b[..5].copy_from_slice(&out[5 * i..5 * i + 5]);
+                let v = u64::from_le_bytes(b);
+                assert!((v as u128) < sms::MODULUS);
+                assert_eq!(v % (1 << sms::TAIL_BITS), tail[i] as u64);
+                assert_eq!((v % sms::P as u64) as i64, (r[i] as i64).rem_euclid(sms::P as i64));
+            }
+        }
+    }
+
     #[test]
     fn wide_hybrid_lift_is_the_scalar_lift() {
         if !lift_hybrid_wide_available() {

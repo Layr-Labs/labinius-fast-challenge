@@ -4,8 +4,10 @@
 //! nine accumulation streams that differ only in their public key:
 //!
 //! - stream 0: `A mod 9721`, accumulated over the whole column (the ordinary residue);
-//! - streams 1..=8: the balanced base-8 digits `L_d` of `A mod 2^22` (`L_0..L_6` in `[-4, 4)`,
-//!   `L_7` the remaining bit), so that `A ≡ sum_d 8^d L_d (mod 2^22)`.
+//! - streams 1..=7: the balanced mixed-radix digits `L_d` of `A mod 2^22` (`L_0..L_5` base 9 in
+//!   `[-4, 4]`, `L_6` base 8 in `[-4, 4)`), so that `A ≡ sum_d 9^d L_d (mod 2^22)`
+//!   (`9^6 * 8 >= 2^22`: seven digits instead of the eight base-8 ones, one accumulation stream
+//!   fewer for the same chunking).
 //!
 //! A digit stream's sum `X = sum_{j in chunk} L_{d,j} s_j` over a chunk of [`CHUNK_PAIRS`] pair
 //! batches is an integer whose mean `mu = (1/2) sum_j L_{d,j} U` (`U` the all-ones polynomial on
@@ -15,7 +17,7 @@
 //! computed from the public key ([`SmsKeys::build`] records the smallest margin `Z` over every
 //! chunk, digit and coefficient; at this shape it is above 12). Within that margin the residue of
 //! `X` modulo 9721 determines `X`: `X = mu + centered(X - mu mod 9721)`. The chunk's residues come
-//! out of one inverse transform per digit for two chunks at once, and `t mod 2^22 = sum_d 8^d X_d`
+//! out of one inverse transform per digit for two chunks at once, and `t mod 2^22 = sum_d 9^d X_d`
 //! accumulates in wrapping 32-bit lanes.
 //!
 //! Only public parameters are precomputed. Every invocation consumes its complete fresh table.
@@ -25,19 +27,63 @@ use crate::simd::ntt::gen_small;
 pub const P: u16 = 9721;
 pub const TAIL_BITS: u32 = 22;
 pub const MODULUS: u128 = (P as u128) << TAIL_BITS;
-/// Accumulation streams: the base residue and eight digits.
-pub const STREAMS: usize = 9;
+/// Accumulation streams: the base residue and seven digits.
+pub const STREAMS: usize = 8;
 pub const DIGITS: usize = STREAMS - 1;
-/// Bit position of digit `d`.
-pub const fn digit_shift(d: usize) -> u32 {
-    3 * d as u32
+/// Radix of digit `d`: base 9 below the last digit, base 8 for the last.
+pub const fn digit_radix(d: usize) -> i64 {
+    if d + 1 < DIGITS { 9 } else { 8 }
 }
-/// Pair batches (two ring elements of each of 16 columns) per reconstruction chunk: 128 ring
-/// elements of a column.
+/// Weight of digit `d`, `9^d`.
+pub const fn digit_weight(d: usize) -> u32 {
+    let mut w = 1u32;
+    let mut i = 0;
+    while i < d {
+        w *= 9;
+        i += 1;
+    }
+    w
+}
+/// The balanced representatives cover `[-REP_LOW, 2^22 - REP_LOW)`, all of `Z / 2^22`.
+const REP_LOW: i64 = {
+    // every digit at its least value, -4
+    let mut low = 0i64;
+    let mut d = 0;
+    while d < DIGITS {
+        low += 4 * digit_weight(d) as i64;
+        d += 1;
+    }
+    low
+};
+const _: () = {
+    // The digits' range is contiguous and at least 2^22 wide.
+    let high = REP_LOW - digit_weight(DIGITS - 1) as i64;
+    assert!(REP_LOW + high + 1 >= 1 << TAIL_BITS);
+};
+/// Pair batches (two ring elements of each of 16 columns) per reconstruction chunk: 256 ring
+/// elements of a column (the base-9 digits' margin, about 8.1 sigma, does not allow 192).
 pub const CHUNK_PAIRS: usize = 128;
-/// Digits reconstructed per chunk; the last digit, a single bit with a tenth of the second moment,
-/// is reconstructed per half column (both halves in one inverse transform).
-pub const CHUNKED: usize = DIGITS - 1;
+/// Chunks of each half column: [`CHUNK_PAIRS`] pair batches each and a shorter last one, so
+/// that every chunk lies in one half (the commitment's work units are halves).
+pub const fn chunks_per_half(np: usize) -> usize {
+    (np / 2).div_ceil(CHUNK_PAIRS)
+}
+/// Chunks of a column of `elements` ring elements.
+pub const fn chunk_count(elements: usize) -> usize {
+    2 * chunks_per_half(elements / 2)
+}
+/// The pair batches of chunk `c` of a column of `np` pair batches.
+pub fn chunk_range(np: usize, c: usize) -> core::ops::Range<usize> {
+    let (h, l) = (c / chunks_per_half(np), c % chunks_per_half(np));
+    let start = h * (np / 2) + l * CHUNK_PAIRS;
+    start..(start + CHUNK_PAIRS).min((h + 1) * (np / 2))
+}
+/// Digits reconstructed per chunk: all of them.
+pub const CHUNKED: usize = DIGITS;
+/// Entries of [`SmsKeys::mur`] for `elements` ring elements per column.
+pub const fn mur_len(elements: usize) -> usize {
+    CHUNKED * chunk_count(elements) * N
+}
 /// Pair batches transformed in lockstep per accumulator read-modify-write.
 pub const LOCK: usize = 8;
 const TAIL_MASK: u32 = (1u32 << TAIL_BITS) - 1;
@@ -139,7 +185,7 @@ pub struct SmsKeys<'a> {
     /// stream's NTT-domain keys of ring elements `2 LOCK l + 2h` (low half) and `+ 1` (high half),
     /// centered.
     pub pairs: &'a [u32],
-    /// `mur[(d * chunks + c) * N + m]`: the chunk mean `mu'` of digit `d < CHUNKED`, chunk `c`,
+    /// `mur[(d * chunks + c) * N + m]`: the chunk mean `mu'` of digit `d`, chunk `c`,
     /// coefficient `m`, as a centered residue modulo 9721; then the half-column means of the last
     /// digit at `mur[(CHUNKED * chunks + h) * N + m]`, `h` the half.
     pub mur: &'a [i16],
@@ -167,16 +213,21 @@ impl SmsKeyData {
     }
 }
 
-/// The balanced digits of `x mod 2^22`: `x ≡ sum_d 8^d L_d`, `L_0..L_6 in [-4, 4)`, `L_7 in {0, 1}`.
+/// The balanced digits of `x mod 2^22`: `x ≡ sum_d 9^d L_d`, `L_0..L_5 in [-4, 4]`,
+/// `L_6 in [-4, 4)`.
 pub fn digits(x: u128) -> [i8; DIGITS] {
     let mut r = (x & TAIL_MASK as u128) as i64;
-    let mut out = [0i8; DIGITS];
-    for d in 0..DIGITS - 1 {
-        let v = ((r + 4) & 7) - 4;
-        out[d] = v as i8;
-        r = (r - v) >> 3;
+    if r >= (1 << TAIL_BITS) - REP_LOW {
+        r -= 1 << TAIL_BITS;
     }
-    out[DIGITS - 1] = (r & 1) as i8;
+    let mut out = [0i8; DIGITS];
+    for d in 0..DIGITS {
+        let b = digit_radix(d);
+        let v = (r + 4).rem_euclid(b) - 4;
+        out[d] = v as i8;
+        r = (r - v) / b;
+    }
+    debug_assert_eq!(r, 0);
     out
 }
 
@@ -221,7 +272,7 @@ impl SmsKeyData {
         use crate::key::CommitmentKey;
         use crate::ring::Modulus;
         assert_eq!(a.len(), elements * N);
-        assert!(elements % (2 * CHUNK_PAIRS) == 0, "whole chunks of ring elements");
+        assert!((elements / 4) % LOCK == 0 && ((elements / 4) % CHUNK_PAIRS) % LOCK == 0, "whole lockstep steps per chunk");
         let base = Modulus::ALL.into_iter().find(|m| m.prime() == P).unwrap();
         let len_f162 = 4 * elements;
         let dig: Vec<[i8; DIGITS]> = a.iter().map(|&x| digits(x)).collect();
@@ -247,19 +298,23 @@ impl SmsKeyData {
                 }
             }
         }
-        // Chunk moments: ring elements 2 CHUNK_PAIRS c .. of every column.
-        let chunks = elements / (2 * CHUNK_PAIRS);
-        let mut mur = vec![0i16; (CHUNKED * chunks + 2) * N];
+        // Chunk moments: the ring elements of chunk `c` ([`chunk_range`]) of every column.
+        let chunks = chunk_count(elements);
+        let mut mur = vec![0i16; mur_len(elements)];
         let mut mu = vec![0u32; N];
         let mut margin = f64::INFINITY;
         let mut margins = [(f64::INFINITY, 0usize, 0usize, 0i64); DIGITS];
         let half = ((P - 1) / 2) as f64;
         for d in 0..DIGITS {
-            let (per, nc, at) = if d < CHUNKED { (2 * CHUNK_PAIRS, chunks, d * chunks) } else { (elements / 2, 2, CHUNKED * chunks) };
+            let (nc, at) = (chunks, d * chunks);
             for c in 0..nc {
                 let mut s1 = [0i64; N];
                 let mut s2 = [0i64; N];
-                for j in c * per..(c + 1) * per {
+                let ring = {
+                    let r = chunk_range(elements / 2, c);
+                    2 * r.start..2 * r.end
+                };
+                for j in ring {
                     let l: [i8; N] = core::array::from_fn(|m| dig[j * N + m][d]);
                     moment_rows(&l, &mut s1, &mut s2);
                 }
@@ -276,7 +331,7 @@ impl SmsKeyData {
                     }
                     let r = mean.rem_euclid(P as i64);
                     mur[(at + c) * N + m] = if r > (P as i64 - 1) / 2 { (r - P as i64) as i16 } else { r as i16 };
-                    mu[m] = mu[m].wrapping_add((mean as u32).wrapping_shl(digit_shift(d)));
+                    mu[m] = mu[m].wrapping_add((mean as u32).wrapping_mul(digit_weight(d)));
                 }
             }
         }
@@ -297,8 +352,14 @@ pub struct SAcc {
 #[repr(C, align(64))]
 struct Blk27([i16; 27 * 32]);
 
-/// Fold-back constants of [`reduce_vec_c`] as memory operands: the `vpmaddwd` weights, the sign
-/// test mask and the correction.
+/// Fold-back constants as memory operands: the `vpmaddwd` weights `(1, r16c)`, the low-word sign
+/// bit, and the old masked correction (unused by the two-uop fold).
+///
+/// The fold is `vpxord` with `0x8000` and `vpmaddwd` with `(1, r16c)`: flipping bit 15 makes the
+/// low word, read as signed, `l - 32768` for the unsigned low word `l`, so the result is
+/// `x - 32768 (mod q)` with the same bound as [`reduce_vec_c`] (`|r| <= 32768 (1 + |r16c|)`).
+/// Every fold therefore subtracts 32768 from every lane; [`fold_bias`] pre-loads each stream with
+/// the total of the folds it will take before its next reset, so the residues come out exact.
 #[repr(C, align(64))]
 struct Fold([i32; 48]);
 static FOLD: Fold = Fold({
@@ -316,222 +377,38 @@ static FOLD: Fold = Fold({
 /// One slot's nine streams, round by round: the nine accumulators are loaded, take the first
 /// lockstep product, then the second, ..., and are stored (folded back first in `reduce`), so at
 /// most nine dependent `vpdpwssd` wait at a time and every round's nine are independent.
-macro_rules! sms_slot {
-    (plain) => { concat!(
-            "vmovdqa64 zmm20, zmmword ptr [{a} + 0]\n",
-            "vmovdqa64 zmm21, zmmword ptr [{a} + 64]\n",
-            "vmovdqa64 zmm22, zmmword ptr [{a} + 128]\n",
-            "vmovdqa64 zmm23, zmmword ptr [{a} + 192]\n",
-            "vmovdqa64 zmm24, zmmword ptr [{a} + 256]\n",
-            "vmovdqa64 zmm25, zmmword ptr [{a} + 320]\n",
-            "vmovdqa64 zmm26, zmmword ptr [{a} + 384]\n",
-            "vmovdqa64 zmm27, zmmword ptr [{a} + 448]\n",
-            "vmovdqa64 zmm28, zmmword ptr [{a} + 512]\n",
-            "vpdpwssd zmm20, {x0}, dword ptr [{k} + 0]{{1to16}}\n",
-            "vpdpwssd zmm21, {x0}, dword ptr [{k} + 32]{{1to16}}\n",
-            "vpdpwssd zmm22, {x0}, dword ptr [{k} + 64]{{1to16}}\n",
-            "vpdpwssd zmm23, {x0}, dword ptr [{k} + 96]{{1to16}}\n",
-            "vpdpwssd zmm24, {x0}, dword ptr [{k} + 128]{{1to16}}\n",
-            "vpdpwssd zmm25, {x0}, dword ptr [{k} + 160]{{1to16}}\n",
-            "vpdpwssd zmm26, {x0}, dword ptr [{k} + 192]{{1to16}}\n",
-            "vpdpwssd zmm27, {x0}, dword ptr [{k} + 224]{{1to16}}\n",
-            "vpdpwssd zmm28, {x0}, dword ptr [{k} + 256]{{1to16}}\n",
-            "vpdpwssd zmm20, {x1}, dword ptr [{k} + 4]{{1to16}}\n",
-            "vpdpwssd zmm21, {x1}, dword ptr [{k} + 36]{{1to16}}\n",
-            "vpdpwssd zmm22, {x1}, dword ptr [{k} + 68]{{1to16}}\n",
-            "vpdpwssd zmm23, {x1}, dword ptr [{k} + 100]{{1to16}}\n",
-            "vpdpwssd zmm24, {x1}, dword ptr [{k} + 132]{{1to16}}\n",
-            "vpdpwssd zmm25, {x1}, dword ptr [{k} + 164]{{1to16}}\n",
-            "vpdpwssd zmm26, {x1}, dword ptr [{k} + 196]{{1to16}}\n",
-            "vpdpwssd zmm27, {x1}, dword ptr [{k} + 228]{{1to16}}\n",
-            "vpdpwssd zmm28, {x1}, dword ptr [{k} + 260]{{1to16}}\n",
-            "vpdpwssd zmm20, {x2}, dword ptr [{k} + 8]{{1to16}}\n",
-            "vpdpwssd zmm21, {x2}, dword ptr [{k} + 40]{{1to16}}\n",
-            "vpdpwssd zmm22, {x2}, dword ptr [{k} + 72]{{1to16}}\n",
-            "vpdpwssd zmm23, {x2}, dword ptr [{k} + 104]{{1to16}}\n",
-            "vpdpwssd zmm24, {x2}, dword ptr [{k} + 136]{{1to16}}\n",
-            "vpdpwssd zmm25, {x2}, dword ptr [{k} + 168]{{1to16}}\n",
-            "vpdpwssd zmm26, {x2}, dword ptr [{k} + 200]{{1to16}}\n",
-            "vpdpwssd zmm27, {x2}, dword ptr [{k} + 232]{{1to16}}\n",
-            "vpdpwssd zmm28, {x2}, dword ptr [{k} + 264]{{1to16}}\n",
-            "vpdpwssd zmm20, {x3}, dword ptr [{k} + 12]{{1to16}}\n",
-            "vpdpwssd zmm21, {x3}, dword ptr [{k} + 44]{{1to16}}\n",
-            "vpdpwssd zmm22, {x3}, dword ptr [{k} + 76]{{1to16}}\n",
-            "vpdpwssd zmm23, {x3}, dword ptr [{k} + 108]{{1to16}}\n",
-            "vpdpwssd zmm24, {x3}, dword ptr [{k} + 140]{{1to16}}\n",
-            "vpdpwssd zmm25, {x3}, dword ptr [{k} + 172]{{1to16}}\n",
-            "vpdpwssd zmm26, {x3}, dword ptr [{k} + 204]{{1to16}}\n",
-            "vpdpwssd zmm27, {x3}, dword ptr [{k} + 236]{{1to16}}\n",
-            "vpdpwssd zmm28, {x3}, dword ptr [{k} + 268]{{1to16}}\n",
-            "vpdpwssd zmm20, {x4}, dword ptr [{k} + 16]{{1to16}}\n",
-            "vpdpwssd zmm21, {x4}, dword ptr [{k} + 48]{{1to16}}\n",
-            "vpdpwssd zmm22, {x4}, dword ptr [{k} + 80]{{1to16}}\n",
-            "vpdpwssd zmm23, {x4}, dword ptr [{k} + 112]{{1to16}}\n",
-            "vpdpwssd zmm24, {x4}, dword ptr [{k} + 144]{{1to16}}\n",
-            "vpdpwssd zmm25, {x4}, dword ptr [{k} + 176]{{1to16}}\n",
-            "vpdpwssd zmm26, {x4}, dword ptr [{k} + 208]{{1to16}}\n",
-            "vpdpwssd zmm27, {x4}, dword ptr [{k} + 240]{{1to16}}\n",
-            "vpdpwssd zmm28, {x4}, dword ptr [{k} + 272]{{1to16}}\n",
-            "vpdpwssd zmm20, {x5}, dword ptr [{k} + 20]{{1to16}}\n",
-            "vpdpwssd zmm21, {x5}, dword ptr [{k} + 52]{{1to16}}\n",
-            "vpdpwssd zmm22, {x5}, dword ptr [{k} + 84]{{1to16}}\n",
-            "vpdpwssd zmm23, {x5}, dword ptr [{k} + 116]{{1to16}}\n",
-            "vpdpwssd zmm24, {x5}, dword ptr [{k} + 148]{{1to16}}\n",
-            "vpdpwssd zmm25, {x5}, dword ptr [{k} + 180]{{1to16}}\n",
-            "vpdpwssd zmm26, {x5}, dword ptr [{k} + 212]{{1to16}}\n",
-            "vpdpwssd zmm27, {x5}, dword ptr [{k} + 244]{{1to16}}\n",
-            "vpdpwssd zmm28, {x5}, dword ptr [{k} + 276]{{1to16}}\n",
-            "vpdpwssd zmm20, {x6}, dword ptr [{k} + 24]{{1to16}}\n",
-            "vpdpwssd zmm21, {x6}, dword ptr [{k} + 56]{{1to16}}\n",
-            "vpdpwssd zmm22, {x6}, dword ptr [{k} + 88]{{1to16}}\n",
-            "vpdpwssd zmm23, {x6}, dword ptr [{k} + 120]{{1to16}}\n",
-            "vpdpwssd zmm24, {x6}, dword ptr [{k} + 152]{{1to16}}\n",
-            "vpdpwssd zmm25, {x6}, dword ptr [{k} + 184]{{1to16}}\n",
-            "vpdpwssd zmm26, {x6}, dword ptr [{k} + 216]{{1to16}}\n",
-            "vpdpwssd zmm27, {x6}, dword ptr [{k} + 248]{{1to16}}\n",
-            "vpdpwssd zmm28, {x6}, dword ptr [{k} + 280]{{1to16}}\n",
-            "vpdpwssd zmm20, {x7}, dword ptr [{k} + 28]{{1to16}}\n",
-            "vpdpwssd zmm21, {x7}, dword ptr [{k} + 60]{{1to16}}\n",
-            "vpdpwssd zmm22, {x7}, dword ptr [{k} + 92]{{1to16}}\n",
-            "vpdpwssd zmm23, {x7}, dword ptr [{k} + 124]{{1to16}}\n",
-            "vpdpwssd zmm24, {x7}, dword ptr [{k} + 156]{{1to16}}\n",
-            "vpdpwssd zmm25, {x7}, dword ptr [{k} + 188]{{1to16}}\n",
-            "vpdpwssd zmm26, {x7}, dword ptr [{k} + 220]{{1to16}}\n",
-            "vpdpwssd zmm27, {x7}, dword ptr [{k} + 252]{{1to16}}\n",
-            "vpdpwssd zmm28, {x7}, dword ptr [{k} + 284]{{1to16}}\n",
-            "vmovdqa64 zmmword ptr [{a} + 0], zmm20\n",
-            "vmovdqa64 zmmword ptr [{a} + 64], zmm21\n",
-            "vmovdqa64 zmmword ptr [{a} + 128], zmm22\n",
-            "vmovdqa64 zmmword ptr [{a} + 192], zmm23\n",
-            "vmovdqa64 zmmword ptr [{a} + 256], zmm24\n",
-            "vmovdqa64 zmmword ptr [{a} + 320], zmm25\n",
-            "vmovdqa64 zmmword ptr [{a} + 384], zmm26\n",
-            "vmovdqa64 zmmword ptr [{a} + 448], zmm27\n",
-            "vmovdqa64 zmmword ptr [{a} + 512], zmm28\n",
-        )
-    };
-    (reduce) => { concat!(
-            "vmovdqa64 zmm20, zmmword ptr [{a} + 0]\n",
-            "vmovdqa64 zmm21, zmmword ptr [{a} + 64]\n",
-            "vmovdqa64 zmm22, zmmword ptr [{a} + 128]\n",
-            "vmovdqa64 zmm23, zmmword ptr [{a} + 192]\n",
-            "vmovdqa64 zmm24, zmmword ptr [{a} + 256]\n",
-            "vmovdqa64 zmm25, zmmword ptr [{a} + 320]\n",
-            "vmovdqa64 zmm26, zmmword ptr [{a} + 384]\n",
-            "vmovdqa64 zmm27, zmmword ptr [{a} + 448]\n",
-            "vmovdqa64 zmm28, zmmword ptr [{a} + 512]\n",
-            "vpdpwssd zmm20, {x0}, dword ptr [{k} + 0]{{1to16}}\n",
-            "vpdpwssd zmm21, {x0}, dword ptr [{k} + 32]{{1to16}}\n",
-            "vpdpwssd zmm22, {x0}, dword ptr [{k} + 64]{{1to16}}\n",
-            "vpdpwssd zmm23, {x0}, dword ptr [{k} + 96]{{1to16}}\n",
-            "vpdpwssd zmm24, {x0}, dword ptr [{k} + 128]{{1to16}}\n",
-            "vpdpwssd zmm25, {x0}, dword ptr [{k} + 160]{{1to16}}\n",
-            "vpdpwssd zmm26, {x0}, dword ptr [{k} + 192]{{1to16}}\n",
-            "vpdpwssd zmm27, {x0}, dword ptr [{k} + 224]{{1to16}}\n",
-            "vpdpwssd zmm28, {x0}, dword ptr [{k} + 256]{{1to16}}\n",
-            "vpdpwssd zmm20, {x1}, dword ptr [{k} + 4]{{1to16}}\n",
-            "vpdpwssd zmm21, {x1}, dword ptr [{k} + 36]{{1to16}}\n",
-            "vpdpwssd zmm22, {x1}, dword ptr [{k} + 68]{{1to16}}\n",
-            "vpdpwssd zmm23, {x1}, dword ptr [{k} + 100]{{1to16}}\n",
-            "vpdpwssd zmm24, {x1}, dword ptr [{k} + 132]{{1to16}}\n",
-            "vpdpwssd zmm25, {x1}, dword ptr [{k} + 164]{{1to16}}\n",
-            "vpdpwssd zmm26, {x1}, dword ptr [{k} + 196]{{1to16}}\n",
-            "vpdpwssd zmm27, {x1}, dword ptr [{k} + 228]{{1to16}}\n",
-            "vpdpwssd zmm28, {x1}, dword ptr [{k} + 260]{{1to16}}\n",
-            "vpdpwssd zmm20, {x2}, dword ptr [{k} + 8]{{1to16}}\n",
-            "vpdpwssd zmm21, {x2}, dword ptr [{k} + 40]{{1to16}}\n",
-            "vpdpwssd zmm22, {x2}, dword ptr [{k} + 72]{{1to16}}\n",
-            "vpdpwssd zmm23, {x2}, dword ptr [{k} + 104]{{1to16}}\n",
-            "vpdpwssd zmm24, {x2}, dword ptr [{k} + 136]{{1to16}}\n",
-            "vpdpwssd zmm25, {x2}, dword ptr [{k} + 168]{{1to16}}\n",
-            "vpdpwssd zmm26, {x2}, dword ptr [{k} + 200]{{1to16}}\n",
-            "vpdpwssd zmm27, {x2}, dword ptr [{k} + 232]{{1to16}}\n",
-            "vpdpwssd zmm28, {x2}, dword ptr [{k} + 264]{{1to16}}\n",
-            "vpdpwssd zmm20, {x3}, dword ptr [{k} + 12]{{1to16}}\n",
-            "vpdpwssd zmm21, {x3}, dword ptr [{k} + 44]{{1to16}}\n",
-            "vpdpwssd zmm22, {x3}, dword ptr [{k} + 76]{{1to16}}\n",
-            "vpdpwssd zmm23, {x3}, dword ptr [{k} + 108]{{1to16}}\n",
-            "vpdpwssd zmm24, {x3}, dword ptr [{k} + 140]{{1to16}}\n",
-            "vpdpwssd zmm25, {x3}, dword ptr [{k} + 172]{{1to16}}\n",
-            "vpdpwssd zmm26, {x3}, dword ptr [{k} + 204]{{1to16}}\n",
-            "vpdpwssd zmm27, {x3}, dword ptr [{k} + 236]{{1to16}}\n",
-            "vpdpwssd zmm28, {x3}, dword ptr [{k} + 268]{{1to16}}\n",
-            "vpdpwssd zmm20, {x4}, dword ptr [{k} + 16]{{1to16}}\n",
-            "vpdpwssd zmm21, {x4}, dword ptr [{k} + 48]{{1to16}}\n",
-            "vpdpwssd zmm22, {x4}, dword ptr [{k} + 80]{{1to16}}\n",
-            "vpdpwssd zmm23, {x4}, dword ptr [{k} + 112]{{1to16}}\n",
-            "vpdpwssd zmm24, {x4}, dword ptr [{k} + 144]{{1to16}}\n",
-            "vpdpwssd zmm25, {x4}, dword ptr [{k} + 176]{{1to16}}\n",
-            "vpdpwssd zmm26, {x4}, dword ptr [{k} + 208]{{1to16}}\n",
-            "vpdpwssd zmm27, {x4}, dword ptr [{k} + 240]{{1to16}}\n",
-            "vpdpwssd zmm28, {x4}, dword ptr [{k} + 272]{{1to16}}\n",
-            "vpdpwssd zmm20, {x5}, dword ptr [{k} + 20]{{1to16}}\n",
-            "vpdpwssd zmm21, {x5}, dword ptr [{k} + 52]{{1to16}}\n",
-            "vpdpwssd zmm22, {x5}, dword ptr [{k} + 84]{{1to16}}\n",
-            "vpdpwssd zmm23, {x5}, dword ptr [{k} + 116]{{1to16}}\n",
-            "vpdpwssd zmm24, {x5}, dword ptr [{k} + 148]{{1to16}}\n",
-            "vpdpwssd zmm25, {x5}, dword ptr [{k} + 180]{{1to16}}\n",
-            "vpdpwssd zmm26, {x5}, dword ptr [{k} + 212]{{1to16}}\n",
-            "vpdpwssd zmm27, {x5}, dword ptr [{k} + 244]{{1to16}}\n",
-            "vpdpwssd zmm28, {x5}, dword ptr [{k} + 276]{{1to16}}\n",
-            "vpdpwssd zmm20, {x6}, dword ptr [{k} + 24]{{1to16}}\n",
-            "vpdpwssd zmm21, {x6}, dword ptr [{k} + 56]{{1to16}}\n",
-            "vpdpwssd zmm22, {x6}, dword ptr [{k} + 88]{{1to16}}\n",
-            "vpdpwssd zmm23, {x6}, dword ptr [{k} + 120]{{1to16}}\n",
-            "vpdpwssd zmm24, {x6}, dword ptr [{k} + 152]{{1to16}}\n",
-            "vpdpwssd zmm25, {x6}, dword ptr [{k} + 184]{{1to16}}\n",
-            "vpdpwssd zmm26, {x6}, dword ptr [{k} + 216]{{1to16}}\n",
-            "vpdpwssd zmm27, {x6}, dword ptr [{k} + 248]{{1to16}}\n",
-            "vpdpwssd zmm28, {x6}, dword ptr [{k} + 280]{{1to16}}\n",
-            "vpdpwssd zmm20, {x7}, dword ptr [{k} + 28]{{1to16}}\n",
-            "vpdpwssd zmm21, {x7}, dword ptr [{k} + 60]{{1to16}}\n",
-            "vpdpwssd zmm22, {x7}, dword ptr [{k} + 92]{{1to16}}\n",
-            "vpdpwssd zmm23, {x7}, dword ptr [{k} + 124]{{1to16}}\n",
-            "vpdpwssd zmm24, {x7}, dword ptr [{k} + 156]{{1to16}}\n",
-            "vpdpwssd zmm25, {x7}, dword ptr [{k} + 188]{{1to16}}\n",
-            "vpdpwssd zmm26, {x7}, dword ptr [{k} + 220]{{1to16}}\n",
-            "vpdpwssd zmm27, {x7}, dword ptr [{k} + 252]{{1to16}}\n",
-            "vpdpwssd zmm28, {x7}, dword ptr [{k} + 284]{{1to16}}\n",
-            "vpmaddwd zmm29, zmm20, zmmword ptr [{f}]\n",
-            "vptestmd k1, zmm20, zmmword ptr [{f} + 64]\n",
-            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
-            "vmovdqa64 zmmword ptr [{a} + 0], zmm29\n",
-            "vpmaddwd zmm29, zmm21, zmmword ptr [{f}]\n",
-            "vptestmd k1, zmm21, zmmword ptr [{f} + 64]\n",
-            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
-            "vmovdqa64 zmmword ptr [{a} + 64], zmm29\n",
-            "vpmaddwd zmm29, zmm22, zmmword ptr [{f}]\n",
-            "vptestmd k1, zmm22, zmmword ptr [{f} + 64]\n",
-            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
-            "vmovdqa64 zmmword ptr [{a} + 128], zmm29\n",
-            "vpmaddwd zmm29, zmm23, zmmword ptr [{f}]\n",
-            "vptestmd k1, zmm23, zmmword ptr [{f} + 64]\n",
-            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
-            "vmovdqa64 zmmword ptr [{a} + 192], zmm29\n",
-            "vpmaddwd zmm29, zmm24, zmmword ptr [{f}]\n",
-            "vptestmd k1, zmm24, zmmword ptr [{f} + 64]\n",
-            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
-            "vmovdqa64 zmmword ptr [{a} + 256], zmm29\n",
-            "vpmaddwd zmm29, zmm25, zmmword ptr [{f}]\n",
-            "vptestmd k1, zmm25, zmmword ptr [{f} + 64]\n",
-            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
-            "vmovdqa64 zmmword ptr [{a} + 320], zmm29\n",
-            "vpmaddwd zmm29, zmm26, zmmword ptr [{f}]\n",
-            "vptestmd k1, zmm26, zmmword ptr [{f} + 64]\n",
-            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
-            "vmovdqa64 zmmword ptr [{a} + 384], zmm29\n",
-            "vpmaddwd zmm29, zmm27, zmmword ptr [{f}]\n",
-            "vptestmd k1, zmm27, zmmword ptr [{f} + 64]\n",
-            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
-            "vmovdqa64 zmmword ptr [{a} + 448], zmm29\n",
-            "vpmaddwd zmm29, zmm28, zmmword ptr [{f}]\n",
-            "vptestmd k1, zmm28, zmmword ptr [{f} + 64]\n",
-            "vpaddd zmm29 {{k1}}, zmm29, zmmword ptr [{f} + 128]\n",
-            "vmovdqa64 zmmword ptr [{a} + 512], zmm29\n",
-        )
-    };
+include!("sms_slot_gen.rs");
+const _: () = assert!(STREAMS == 8 && (LOCK == 8 || LOCK == 4 || LOCK == 16));
+
+/// Whether a group step prefetches the next step's witness words into L2.
+const INPUT_PREFETCH: bool = false;
+
+/// Slots ahead the sink prefetches its key and accumulator lines.
+const PREFETCH_SLOTS: usize = 3;
+
+/// Pair batches between two folds of the sink: every [`PP`] pair batches, at the end of a call
+/// (every `PP / LOCK` calls) or, for `LOCK > PP`, inside it as well (the slot macro folds after
+/// every eight lockstep products).
+const FOLD_EVERY: usize = PP;
+const _: () = assert!(LOCK <= PP || PP == 8);
+
+/// The value stream `s` starts from so that its two-uop folds cancel by its next reset: `32768`
+/// per fold, modulo `P`. Stream 0 runs over a whole column (`np` pair batches), the chunked digits
+/// over its chunk, the last digit over half a column: `span` is that run's pair batches.
+fn fold_bias(span: usize) -> i32 {
+    debug_assert!(span % FOLD_EVERY == 0);
+    ((span / FOLD_EVERY) as u64 * 32768 % P as u64) as i32
 }
-const _: () = assert!(STREAMS == 9 && LOCK == 8);
+
+/// Every slot of stream `s` set to `v`.
+#[target_feature(enable = "avx512f")]
+unsafe fn fill_stream(a: &mut SAcc, s: usize, v: i32) {
+    let p = (a.v.as_mut_ptr() as *mut __m512i).add(s);
+    let x = _mm512_set1_epi32(v);
+    for j in 0..N {
+        _mm512_store_si512(p.add(STREAMS * j), x);
+    }
+}
 
 /// The 4-batch lockstep sink: the batches' 27-slot blocks are staged in L1 and every slot's nine
 /// accumulators take all four products in one read-modify-write, folded back when `RED`.
@@ -563,16 +440,33 @@ impl<const RED: bool> Sink<RED> {
             let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w[h] as *const __m512i).add(i)));
             let k = self.k.add(j * STREAMS * LOCK);
             let a = self.acc.add(j * STREAMS * 16);
-            if RED {
-                core::arch::asm!(sms_slot!(reduce), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
-                    x0 = in(zmm_reg) x[0], x1 = in(zmm_reg) x[1], x2 = in(zmm_reg) x[2], x3 = in(zmm_reg) x[3], x4 = in(zmm_reg) x[4], x5 = in(zmm_reg) x[5], x6 = in(zmm_reg) x[6], x7 = in(zmm_reg) x[7],
-                    out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
-                    out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags));
+            if PREFETCH_SLOTS > 0 {
+                let kf = k.add(PREFETCH_SLOTS * STREAMS * LOCK) as *const i8;
+                let af = a.add(PREFETCH_SLOTS * STREAMS * 16) as *const i8;
+                for l in 0..(STREAMS * LOCK * 4).div_ceil(64) {
+                    _mm_prefetch::<_MM_HINT_T0>(kf.add(64 * l));
+                }
+                for l in 0..STREAMS {
+                    _mm_prefetch::<_MM_HINT_T0>(af.add(64 * l));
+                }
+            }
+            macro_rules! call {
+                ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
+                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                        $($xn = in(zmm_reg) x[$xi],)*
+                        out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
+                        out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
+                };
+            }
+            if LOCK == 8 {
+                if RED { call!(sms_slot8, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                else { call!(sms_slot8, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+            } else if LOCK == 16 {
+                call!(sms_slot16, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK,
+                    x8 = 8 % LOCK, x9 = 9 % LOCK, x10 = 10 % LOCK, x11 = 11 % LOCK, x12 = 12 % LOCK, x13 = 13 % LOCK, x14 = 14 % LOCK, x15 = 15 % LOCK)
             } else {
-                core::arch::asm!(concat!(sms_slot!(plain), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
-                    x0 = in(zmm_reg) x[0], x1 = in(zmm_reg) x[1], x2 = in(zmm_reg) x[2], x3 = in(zmm_reg) x[3], x4 = in(zmm_reg) x[4], x5 = in(zmm_reg) x[5], x6 = in(zmm_reg) x[6], x7 = in(zmm_reg) x[7],
-                    out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
-                    out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags));
+                if RED { call!(sms_slot4, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3) }
+                else { call!(sms_slot4, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3) }
             }
         }
     }
@@ -581,11 +475,12 @@ impl<const RED: bool> Sink<RED> {
 const PAIR_PACK_PERM: [i64; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
 
 /// Stream `s` of the accumulators modulo 9721 as `i16` representatives (`|r| < 2q`) into lanes
-/// `16 half .. 16 half + 16` of `out`, the stream cleared for the next chunk.
+/// `16 half .. 16 half + 16` of `out`, the stream reset to `reset` (its [`fold_bias`]) for the next
+/// chunk.
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn finish_stream(a: &mut SAcc, s: usize, out: &mut Batch32, half: usize) {
+unsafe fn finish_stream(a: &mut SAcc, s: usize, out: &mut Batch32, half: usize, reset: i32) {
     let p = (a.v.as_mut_ptr() as *mut __m512i).add(s);
-    let zero = _mm512_setzero_si512();
+    let zero = _mm512_set1_epi32(reset);
     let perm = _mm512_loadu_si512(PAIR_PACK_PERM.as_ptr() as *const __m512i);
     let l0 = 16 * half;
     for k in 0..N / 2 {
@@ -612,22 +507,22 @@ struct Total {
 /// total with weight `8^d`.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bool, total: &mut Total) {
-    let chunks = keys.elements / (2 * CHUNK_PAIRS);
-    let at = if d < CHUNKED { d * chunks + c0 } else { CHUNKED * chunks + c0 };
+    let chunks = chunk_count(keys.elements);
+    let at = d * chunks + c0;
     let mlo = keys.mur.as_ptr().add(at * N);
     let mhi = if both { keys.mur.as_ptr().add((at + 1) * N) } else { mlo };
     let q = _mm512_set1_epi16(P as i16);
     let hq = _mm512_set1_epi16(((P - 1) / 2) as i16);
     let nhq = _mm512_set1_epi16(-(((P - 1) / 2) as i16));
-    let sh = _mm_cvtsi32_si128(digit_shift(d) as i32);
+    let wd = _mm512_set1_epi32(digit_weight(d) as i32);
     for m in 0..N {
         let x = _mm512_load_si512(b.v[m].as_ptr() as *const __m512i);
         let mu = _mm512_mask_blend_epi16(0xFFFF_0000, _mm512_set1_epi16(*mlo.add(m)), _mm512_set1_epi16(*mhi.add(m)));
         let mut y = _mm512_sub_epi16(x, mu);
         y = _mm512_mask_sub_epi16(y, _mm512_cmpgt_epi16_mask(y, hq), y, q);
         y = _mm512_mask_add_epi16(y, _mm512_cmplt_epi16_mask(y, nhq), y, q);
-        let lo = _mm512_sll_epi32(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(y)), sh);
-        let hi = _mm512_sll_epi32(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y)), sh);
+        let lo = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(y)), wd);
+        let hi = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y)), wd);
         let t = total.t[m].as_mut_ptr() as *mut __m512i;
         _mm512_store_si512(t, _mm512_add_epi32(_mm512_load_si512(t), lo));
         if both {
@@ -692,12 +587,24 @@ unsafe fn transpose16x16_u32(r: &[__m512i; 16]) -> [__m512i; 16] {
     out
 }
 
+/// What [`write_rows`] writes: a whole column's rows, or one of the two halves of its
+/// ring-element range ([`HALVES`]). The first half to finish leaves its raw partial rows (the
+/// base residue canonical in `[0, 9721)`, the tail total without the means and unmasked); the
+/// second adds its own to them and writes the final rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowsMode {
+    Full,
+    First,
+    Second,
+}
+
 /// The group's two rows per column: the base stream canonical in `[0, 9721)` (NTT domain) and the
 /// tail `t mod 2^22` (coefficients); accumulators and total cleared for the next group.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usize, dst: *mut [u32; N]) {
+unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usize, dst: *mut [u32; N], mode: RowsMode) {
     let zero = _mm512_setzero_si512();
     let mask = _mm512_set1_epi32(TAIL_MASK as i32);
+    let q = _mm512_set1_epi32(P as i32);
     let pa = acc.v.as_mut_ptr() as *mut __m512i;
     let pt = total.t.as_mut_ptr() as *mut __m512i;
     let mut j0 = 0;
@@ -714,33 +621,73 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
             let b = _mm512_load_si512(pt.add(2 * j + 1));
             _mm512_store_si512(pt.add(2 * j), zero);
             _mm512_store_si512(pt.add(2 * j + 1), zero);
-            let t = _mm512_add_epi32(_mm512_add_epi32(a, b), _mm512_set1_epi32(keys.mu[j] as i32));
-            rt[s] = _mm512_and_si512(t, mask);
+            let mu = if mode == RowsMode::First { 0 } else { keys.mu[j] as i32 };
+            rt[s] = _mm512_add_epi32(_mm512_add_epi32(a, b), _mm512_set1_epi32(mu));
         }
         let c0 = transpose16x16_u32(&r0);
         let ct = transpose16x16_u32(&rt);
+        let m = if n == 16 { 0xFFFF } else { (1u16 << n) - 1 };
         for c in 0..gc {
-            let m = if n == 16 { 0xFFFF } else { (1u16 << n) - 1 };
-            _mm512_mask_storeu_epi32((dst.add(2 * c) as *mut i32).add(j0), m, c0[c]);
-            _mm512_mask_storeu_epi32((dst.add(2 * c + 1) as *mut i32).add(j0), m, ct[c]);
+            let (db, dt) = ((dst.add(2 * c) as *mut i32).add(j0), (dst.add(2 * c + 1) as *mut i32).add(j0));
+            let (mut b, mut t) = (c0[c], ct[c]);
+            if mode == RowsMode::Second {
+                b = _mm512_add_epi32(b, _mm512_maskz_loadu_epi32(m, db));
+                b = _mm512_mask_sub_epi32(b, _mm512_cmp_epi32_mask(b, q, _MM_CMPINT_NLT), b, q);
+                t = _mm512_add_epi32(t, _mm512_maskz_loadu_epi32(m, dt));
+            }
+            if mode != RowsMode::First {
+                t = _mm512_and_si512(t, mask);
+            }
+            _mm512_mask_storeu_epi32(db, m, b);
+            _mm512_mask_storeu_epi32(dt, m, t);
         }
         j0 += 16;
     }
+}
+
+/// Parts of a column's ring-element range committed as separate work units by
+/// [`commit_paired`]: the commitment's coarse units otherwise leave cores idle at its end. Each
+/// part is whole digit chunks and one half-column chunk of the last digit.
+const HALVES: usize = 2;
+
+/// Where a group writes its rows: in full, or as one half of the range under its group's lock
+/// (`state` counts the halves already written).
+enum RowsOut<'a> {
+    Full,
+    Half(&'a std::sync::Mutex<u8>),
 }
 
 /// Commits a group of up to 16 columns across all `np` pair batches and writes its `2 g` rows to
 /// `dst`. `sync(b_done)` is called at every [`PP`] boundary so hyperthread siblings can share the
 /// key stream in L2.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ws: &mut SmsWorker, dst: *mut [u32; N], mut sync: F) {
+unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, range: core::ops::Range<usize>, out: RowsOut, ws: &mut SmsWorker, dst: *mut [u32; N], mut sync: F) {
     let g = cols.len();
-    assert!(g >= 1 && g <= 16 && np % CHUNK_PAIRS == 0 && (np / 2) % LOCK == 0 && 2 * np == keys.elements);
+    assert!(g >= 1 && g <= 16 && (np / 2) % LOCK == 0 && ((np / 2) % CHUNK_PAIRS) % LOCK == 0 && 2 * np == keys.elements);
+    let hl = np / 2;
+    let span = range.end - range.start;
+    assert!(range.start % (np / 2) == 0 && (span == np || span == np / 2), "whole halves of the column");
     static ZERO8: [B128; 8] = [B128::ZERO; 8];
     let kbase = keys.pairs.as_ptr();
     let mut half = 0usize;
+    for s in 0..STREAMS {
+        // Stream 0 runs over the range; the digits' spans are whole chunks of it.
+        let b = if s == 0 { fold_bias(span) } else { fold_bias(CHUNK_PAIRS.min(hl)) };
+        fill_stream(&mut ws.acc[0], s, b);
+    }
     let acc = ws.acc[0].v.as_mut_ptr() as *mut i32;
     let w = ws.w.as_mut_ptr() as *mut i16;
-    for b in (0..np).step_by(LOCK) {
+    for b in range.clone().step_by(LOCK) {
+        // The next step's witness words (16 columns x 1 KB, 256 KB apart): the hardware
+        // prefetchers only follow some of the sixteen streams, and the table comes from DRAM.
+        if INPUT_PREFETCH && b + LOCK < range.end {
+            for l in 0..g {
+                let p = cols[l].as_ptr().add(8 * (b + LOCK)) as *const i8;
+                for line in 0..(8 * LOCK * 16) / 64 {
+                    _mm_prefetch::<_MM_HINT_T1>(p.add(64 * line));
+                }
+            }
+        }
         for h in 0..LOCK {
             let cols16: [*const B128; 16] = core::array::from_fn(|l| {
                 if l < g { cols[l].as_ptr().add(8 * (b + h)) } else { ZERO8.as_ptr() }
@@ -764,16 +711,17 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ws
         } else {
             vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<false> { k, acc });
         }
-        if (b + LOCK) % (np / 2) == 0 && mode != 3 {
-            let d = DIGITS - 1;
-            finish_stream(&mut ws.acc[0], 1 + d, &mut ws.pend[d], (b + LOCK) / (np / 2) - 1);
-        }
-        if (b + LOCK) % CHUNK_PAIRS == 0 && mode != 3 {
-            let chunk = (b + LOCK) / CHUNK_PAIRS - 1;
+        // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
+        let (e, cph) = (b + LOCK, chunks_per_half(np));
+        let (eh, local) = ((e - 1) / hl, e - (e - 1) / hl * hl);
+        if (local % CHUNK_PAIRS == 0 || local == hl) && mode != 3 {
+            let chunk = eh * cph + (local - 1) / CHUNK_PAIRS;
+            // The next chunk's length: the rest of this half, or the next half's first chunk.
+            let next = if local == hl { CHUNK_PAIRS.min(hl) } else { CHUNK_PAIRS.min(hl - local) };
             for d in 0..CHUNKED {
-                finish_stream(&mut ws.acc[0], 1 + d, &mut ws.pend[d], half);
+                finish_stream(&mut ws.acc[0], 1 + d, &mut ws.pend[d], half, fold_bias(next));
             }
-            if half == 1 || b + LOCK == np {
+            if half == 1 || b + LOCK == range.end {
                 let both = half == 1;
                 for d in 0..CHUNKED {
                     let pd = &mut ws.pend[d];
@@ -787,14 +735,15 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ws
             }
         }
     }
-    if bench_mode() != 3 {
-        let d = DIGITS - 1;
-        let pd = &mut ws.pend[d];
-        pd.representation = Representation::Ntt;
-        gen_small::intt_gen_batch32::<P>(pd);
-        reconstruct(pd, d, keys, 0, true, &mut ws.total[0]);
+    match out {
+        RowsOut::Full => write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, RowsMode::Full),
+        RowsOut::Half(state) => {
+            let mut done = state.lock().unwrap();
+            let mode = if *done == 0 { RowsMode::First } else { RowsMode::Second };
+            write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, mode);
+            *done += 1;
+        }
     }
-    write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst);
 }
 
 /// Benchmark-only phase isolation (`SMS_MODE`): 0 everything, 1 no accumulation, 2 accumulation
@@ -825,6 +774,9 @@ const PAIR_LEAD: usize = 2 * PP;
 pub static WORKER_END_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
 pub static WORKER_GROUPS: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
 pub static DECOUPLED_PAIRS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// When (microseconds into the commitment, shifted by 4) and by which waiting worker (low 4 bits)
+/// each pair decoupled.
+pub static DECOUPLED_AT: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
 
 /// The diagnostics above as ` sms_end_us=a/b/.. sms_groups=a/b/.. sms_decoupled=n`.
 pub fn worker_report(workers: usize) -> String {
@@ -832,50 +784,76 @@ pub fn worker_report(workers: usize) -> String {
     let w = workers.min(16);
     let ends: Vec<String> = (0..w).map(|i| WORKER_END_US[i].load(Relaxed).to_string()).collect();
     let groups: Vec<String> = (0..w).map(|i| WORKER_GROUPS[i].load(Relaxed).to_string()).collect();
-    format!(" sms_end_us={} sms_groups={} sms_decoupled={}", ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed))
+    let nd = (DECOUPLED_PAIRS.load(Relaxed) as usize).min(16);
+    let at: Vec<String> = (0..nd).map(|i| { let v = DECOUPLED_AT[i].load(Relaxed); format!("{}@{}", v & 15, v >> 4) }).collect();
+    format!(" sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={} sms_amx={}", ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"), amx::USED.load(Relaxed) as u8) + &if amx::USED.load(Relaxed) { amx::phase_report(workers) } else { String::new() }
 }
 
-/// Hyperthread siblings `2k`, `2k + 1` claim 32-column super-groups (16 columns each) and advance
-/// through the key within [`PAIR_LEAD`] pair batches of each other, so both read every key line from
-/// their core's L2.
-fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize, placement: Option<&crate::par::CorePlacement>, dst: usize) {
+/// The AMX-INT8 accumulation path (`sms_amx.rs`).
+pub mod amx {
+    include!("sms_amx.rs");
+}
+
+/// The commitment on sibling pairs: hyperthreads `2k`, `2k + 1` (placed on core `k`) take
+/// 16-column work units of one ring-element part ([`HALVES`]) each and advance through the key
+/// within [`PAIR_LEAD`] pair batches of each other, so both read every key line from their core's
+/// L2. Units are handed out dynamically, part-major: a coupled pair claims two adjacent units
+/// (two column groups, one part, one key range) at a time, the second for the sibling that asks
+/// next. A sibling kept waiting longer than [`SIBLING_WAIT`] (descheduled: the host's writeback
+/// of the freshly written table, an interrupt) ends the pair's coupling, and from then on each
+/// of the two claims units on its own, so a slowed CPU does less of the work instead of holding
+/// up the commitment's end. The two parts of a column group may run on different workers; the
+/// second to finish writes its rows.
+fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize, placement: Option<&crate::par::CorePlacement>, dst: usize, parts: core::ops::Range<usize>) {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let g = 16usize;
-    let sg = 2 * g;
     let pairs = workers / 2;
-    let super_groups = columns.len().div_ceil(sg);
-    let rounds = super_groups + 1;
+    let groups = columns.len().div_ceil(g);
+    let units = groups * parts.len();
+    let locks: Vec<std::sync::Mutex<u8>> = (0..groups).map(|_| std::sync::Mutex::new(0)).collect();
     let next = AtomicUsize::new(0);
-    let slots: Vec<std::sync::OnceLock<usize>> = (0..pairs * rounds).map(|_| std::sync::OnceLock::new()).collect();
+    // Per pair: the unit its last pair claim left for the other sibling.
+    let pending: Vec<std::sync::Mutex<Option<usize>>> = (0..pairs).map(|_| std::sync::Mutex::new(None)).collect();
     let done: Vec<Progress> = (0..2 * pairs).map(|_| Progress(AtomicUsize::new(0))).collect();
     let coupled: Vec<AtomicBool> = (0..pairs).map(|_| AtomicBool::new(true)).collect();
     let t0 = std::time::Instant::now();
     crate::par::pool().run(2 * pairs, |worker| {
         let _guard = placement.and_then(|p| p.pin(worker));
-        let (pair, s) = (worker / 2, worker % 2);
+        let pair = worker / 2;
         let mine = &done[worker].0;
         let other = &done[worker ^ 1].0;
         let coupled = &coupled[pair];
         let mut ws: Option<SmsWorker> = None;
         let mut ran = 0u32;
-        for r in 0..rounds {
-            let gi = *slots[pair * rounds + r].get_or_init(|| next.fetch_add(1, Ordering::Relaxed));
-            if gi >= super_groups {
-                break;
-            }
-            let c0 = gi * sg;
-            let gc = sg.min(columns.len() - c0);
-            let (lo, n) = if s == 0 { (c0, gc.min(g)) } else { (c0 + g, gc.saturating_sub(g)) };
-            let base = r * np;
-            if n == 0 {
-                mine.store(base + np, Ordering::Release);
-                continue;
-            }
+        // Pair batches of finished units: the siblings' common clock while they are coupled.
+        let mut progressed = 0usize;
+        loop {
+            let unit = {
+                let mut left = pending[pair].lock().unwrap();
+                match left.take() {
+                    Some(u) => Some(u),
+                    None => {
+                        let two = coupled.load(Ordering::Relaxed);
+                        let u = next.fetch_add(if two { 2 } else { 1 }, Ordering::Relaxed);
+                        if two && u + 1 < units {
+                            *left = Some(u + 1);
+                        }
+                        (u < units).then_some(u)
+                    }
+                }
+            };
+            let Some(u) = unit else { break };
+            let (part, gi) = (parts.start + u / groups, u % groups);
+            let range = part * np / HALVES..(part + 1) * np / HALVES;
+            let lo = gi * g;
+            let n = g.min(columns.len() - lo);
             let ws = ws.get_or_insert_with(SmsWorker::new);
             ran += 1;
+            let (from, base) = (range.start, progressed);
             unsafe {
-                group(&columns[lo..lo + n], keys, np, ws, (dst as *mut [u32; N]).add(2 * lo), |b_done| {
-                    let d = base + b_done;
+                let out = if HALVES == 1 { RowsOut::Full } else { RowsOut::Half(&locks[gi]) };
+                group(&columns[lo..lo + n], keys, np, range.clone(), out, ws, (dst as *mut [u32; N]).add(2 * lo), |b_done| {
+                    let d = base + (b_done - from);
                     mine.store(d, Ordering::Release);
                     if !coupled.load(Ordering::Relaxed) {
                         return;
@@ -890,12 +868,17 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
                         spins += 1;
                         if spins % 64 == 0 && start.elapsed() > SIBLING_WAIT {
                             coupled.store(false, Ordering::Relaxed);
-                            DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed);
+                            let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
+                            if k < 16 {
+                                DECOUPLED_AT[k].store(((t0.elapsed().as_micros() as u32) << 4) | worker as u32, Ordering::Relaxed);
+                            }
                             return;
                         }
                     }
                 })
             };
+            progressed += range.len();
+            mine.store(progressed, Ordering::Release);
         }
         mine.store(usize::MAX / 2, Ordering::Release);
         if worker < 16 {
@@ -923,7 +906,7 @@ pub fn commit_columns_rows(keys: &SmsKeys, columns: &[&[B128]], workers: usize) 
     let dst = rows.as_mut_ptr() as usize;
     let paired = if workers >= 2 && workers % 2 == 0 && groups > 1 { crate::par::CorePlacement::for_sibling_pairs(workers) } else { None };
     if let Some(placement) = paired {
-        commit_paired(keys, columns, np, workers, Some(&placement), dst);
+        commit_paired(keys, columns, np, workers, Some(&placement), dst, 0..HALVES);
     } else {
         let workers = workers.clamp(1, groups);
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -939,7 +922,7 @@ pub fn commit_columns_rows(keys: &SmsKeys, columns: &[&[B128]], workers: usize) 
                 let c0 = gi * g;
                 let gc = g.min(columns.len() - c0);
                 let ws = ws.get_or_insert_with(SmsWorker::new);
-                unsafe { group(&columns[c0..c0 + gc], keys, np, ws, (dst as *mut [u32; N]).add(2 * c0), |_| {}) };
+                unsafe { group(&columns[c0..c0 + gc], keys, np, 0..np, RowsOut::Full, ws, (dst as *mut [u32; N]).add(2 * c0), |_| {}) };
             }
         });
     }
@@ -1015,14 +998,13 @@ mod tests {
             let d = digits(x);
             let mut v = 0i64;
             for k in (0..DIGITS).rev() {
-                v = v * 8 + d[k] as i64;
+                v = v * digit_radix(k) + d[k] as i64;
             }
-            // L_7 has weight 2^21 = 8^7: the loop gives sum 8^d L_d
             assert_eq!((v.rem_euclid(1 << TAIL_BITS)) as u128, x % (1 << TAIL_BITS));
             for k in 0..DIGITS - 1 {
-                assert!((-4..4).contains(&d[k]));
+                assert!((-4..=4).contains(&d[k]));
             }
-            assert!((0..2).contains(&d[DIGITS - 1]));
+            assert!((-4..4).contains(&d[DIGITS - 1]));
         }
     }
 
@@ -1056,13 +1038,17 @@ mod tests {
 
     #[test]
     fn commitment_matches_reference() {
-        let elements = 512usize; // 4 chunks
+        commitment_matches_reference_at(512, 8.0); // one short chunk per half
+        commitment_matches_reference_at(1024, 7.0); // a full chunk and a 64-pair one per half
+    }
+
+    fn commitment_matches_reference_at(elements: usize, floor: f64) {
         let ncols = 37usize;
         let mut s = 0x9e3779b97f4a7c15u64;
         let a: Vec<u128> = (0..elements * N).map(|_| ((xorshift(&mut s) as u128) << 64 | xorshift(&mut s) as u128) % MODULUS).collect();
         let data = SmsKeyData::build(&a, elements);
         eprintln!("margin {}", data.margin);
-        assert!(data.margin > 8.0);
+        assert!(data.margin > floor);
         let len = 4 * elements;
         let words: Vec<B128> = (0..len * ncols).map(|_| B128(((xorshift(&mut s) as u128) << 64) | xorshift(&mut s) as u128)).collect();
         let cols: Vec<&[B128]> = words.chunks_exact(len).collect();
@@ -1143,7 +1129,7 @@ mod bench_parts {
         let mut acc = zeroed_slice::<SAcc>(1);
         let t = std::time::Instant::now();
         for _ in 0..n {
-            unsafe { finish_stream(&mut acc[0], 3, &mut b[0], 1) };
+            unsafe { finish_stream(&mut acc[0], 3, &mut b[0], 1, 0) };
         }
         let dt = t.elapsed().as_secs_f64() / n as f64;
         eprintln!("finish_stream: {:.2} us", dt * 1e6);

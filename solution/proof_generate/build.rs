@@ -27,25 +27,32 @@ fn main() {
     println!("cargo:rerun-if-changed=src/parameters.rs");
     println!("cargo:rerun-if-changed=src/rq.rs");
     println!("cargo:rerun-if-changed=build.rs");
+    // 2 MiB segment alignment, so the 2 MiB-aligned key image (main.rs) can be mapped with PMD
+    // entries instead of ~11.7k 4 KiB ones (e-man07, submission 721d445d).
+    println!("cargo:rustc-link-arg-bins=-Wl,-z,max-page-size=0x200000");
     println!("cargo:rerun-if-changed=../native_diagnostics");
     let (image, tail, hybrid, pairs) = images();
     std::fs::write(dir.join("pair-key.bin"), pairs).expect("write the column-pair key image");
     std::fs::write(dir.join("key.bin"), image).expect("write the key image");
     std::fs::write(dir.join("tail-key.bin"), tail).expect("write the auxiliary key image");
     std::fs::write(dir.join("hybrid-key.bin"), hybrid).expect("write the arranged hybrid key image");
-    let (pairs, mur, mu) = sms_images();
+    let (pairs, mur, mu, amx) = sms_images();
+    let (tiles, amx_mur, corr0) = amx;
+    std::fs::write(dir.join("sms-amx-tiles.bin"), tiles).expect("write the AMX tile image");
+    std::fs::write(dir.join("sms-amx-mur.bin"), amx_mur).expect("write the AMX chunk mean image");
+    std::fs::write(dir.join("sms-amx-corr0.bin"), corr0).expect("write the AMX stream-0 bias image");
     std::fs::write(dir.join("sms-pairs.bin"), pairs).expect("write the single-transform key image");
     std::fs::write(dir.join("sms-mur.bin"), mur).expect("write the chunk mean image");
     std::fs::write(dir.join("sms-mu.bin"), mu).expect("write the mean total image");
 }
 
-/// For the single-transform modulus: the nine streams' keys in the lockstep layout, the digit
+/// For the single-transform modulus: the eight streams' keys in the lockstep layout, the digit
 /// chunks' mean residues and the means' total (`labinius::simd::commit::sms::SmsKeyData`), with
 /// the reconstruction margin checked here, at build time, from the public matrix alone.
 #[cfg(target_arch = "x86_64")]
-fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>, (Vec<u8>, Vec<u8>, Vec<u8>)) {
     if !host_can_run() || parameters::MODULUS != modulus_choice::SMS_MODULUS {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), (Vec::new(), Vec::new(), Vec::new()));
     }
     let matrix = rq::ajtai_matrix(parameters::MODULUS, parameters::RING_ELEMENTS);
     let data = labinius::simd::commit::sms::SmsKeyData::build(&matrix, parameters::RING_ELEMENTS);
@@ -53,17 +60,26 @@ fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     for (d, m) in data.margins.iter().enumerate() {
         println!("cargo:warning=digit {d}: margin {:.3} at chunk {} coefficient {} |mean| {}", m.0, m.1, m.2, m.3);
     }
-    assert!(data.margin >= 8.5, "the public matrix leaves too small a reconstruction margin");
+    // Base-9 digits over 128-pair chunks: the smallest margin is about 8.1 sigma on the real
+    // matrix, a Hoeffding union bound of about 1e-6 failures per proof over every reconstruction.
+    assert!(data.margin >= 7.5, "the public matrix leaves too small a reconstruction margin");
+    // The AMX path's tile image and bias-corrected means, derived from the same keys.
+    let amx = labinius::simd::commit::sms::amx::AmxKeyData::build(&data.keys());
     (
         data.pairs.iter().flat_map(|w| w.to_le_bytes()).collect(),
         data.mur.iter().flat_map(|w| w.to_le_bytes()).collect(),
         data.mu.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        (
+            amx.tiles.iter().map(|&b| b as u8).collect(),
+            amx.mur.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            amx.corr0.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        ),
     )
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    (Vec::new(), Vec::new(), Vec::new())
+fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>, (Vec<u8>, Vec<u8>, Vec<u8>)) {
+    (Vec::new(), Vec::new(), Vec::new(), (Vec::new(), Vec::new(), Vec::new()))
 }
 
 #[cfg(target_arch = "x86_64")]

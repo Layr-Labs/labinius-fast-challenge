@@ -2710,6 +2710,7 @@ mod lean_tests {
         for threads in [1usize, 3, 8] {
             run::<32>(&mut x, 18, threads);
             run::<64>(&mut x, 19, threads);
+            run::<128>(&mut x, 19, threads);
             run::<8>(&mut x, 18, threads);
         }
     }

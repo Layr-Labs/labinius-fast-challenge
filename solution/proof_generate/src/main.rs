@@ -1006,9 +1006,14 @@ static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_by
 /// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
 /// lockstep layout, the digit chunks' centered mean residues and the means' total.
 const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
-static SMS_PAIRS:Aligned64<[u8;SMS_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
+// Align the public key image for file-backed huge pages on supported kernels.
+#[repr(C, align(2097152))]
+struct Aligned2MiB<T>(T);
+static SMS_PAIRS:Aligned2MiB<[u8;SMS_PAIRS_LEN]>=Aligned2MiB(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
 const SMS_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")).len();
 static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")));
+const SMS_BIASES_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-biases.bin")).len();
+static SMS_BIASES:Aligned64<[u8;SMS_BIASES_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-biases.bin")));
 const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();
 static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")));
 
@@ -1018,13 +1023,14 @@ fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     use labinius::simd::commit::sms;
     let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
     let chunks = RING_ELEMENTS / (2 * sms::CHUNK_PAIRS);
-    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 2 * (sms::CHUNKED * chunks + 2) * N || SMS_MU.0.len() != 4 * N {
+    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 2 * (sms::CHUNKED * chunks + 2) * N || SMS_BIASES.0.len() != SMS_MUR.0.len() || SMS_MU.0.len() != 4 * N {
         return None;
     }
     unsafe {
         Some(sms::SmsKeys {
             pairs: std::slice::from_raw_parts(SMS_PAIRS.0.as_ptr() as *const u32, words),
             mur: std::slice::from_raw_parts(SMS_MUR.0.as_ptr() as *const i16, (sms::CHUNKED * chunks + 2) * N),
+            biases: std::slice::from_raw_parts(SMS_BIASES.0.as_ptr() as *const i16, (sms::CHUNKED * chunks + 2) * N),
             mu: std::slice::from_raw_parts(SMS_MU.0.as_ptr() as *const u32, N),
             elements: RING_ELEMENTS,
         })
@@ -1125,7 +1131,7 @@ unsafe fn lift_sms_column(_: &[i16], _: &[u32; N], _: &mut [u8]) {
 
 /// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
 /// and the switch's binding pass then binds that many coordinates at once.
-const PREFIX_SETS: usize = 64;
+const PREFIX_SETS: usize = 128;
 const COMMIT_GROUP: usize = 8;
 const COMMIT_WORKERS: usize = 4;
 /// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On

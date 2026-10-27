@@ -21,6 +21,10 @@ mod parameters;
 mod rq;
 
 fn main() {
+    // A matching file offset and address alignment lets the public key use huge pages.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-z,max-page-size=0x200000");
+    }
     let dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed=src/keygen.rs");
     println!("cargo:rerun-if-changed=src/modulus_choice.rs");
@@ -33,9 +37,10 @@ fn main() {
     std::fs::write(dir.join("key.bin"), image).expect("write the key image");
     std::fs::write(dir.join("tail-key.bin"), tail).expect("write the auxiliary key image");
     std::fs::write(dir.join("hybrid-key.bin"), hybrid).expect("write the arranged hybrid key image");
-    let (pairs, mur, mu) = sms_images();
+    let (pairs, mur, biases, mu) = sms_images();
     std::fs::write(dir.join("sms-pairs.bin"), pairs).expect("write the single-transform key image");
     std::fs::write(dir.join("sms-mur.bin"), mur).expect("write the chunk mean image");
+    std::fs::write(dir.join("sms-biases.bin"), biases).expect("write the inverse offset image");
     std::fs::write(dir.join("sms-mu.bin"), mu).expect("write the mean total image");
 }
 
@@ -43,9 +48,9 @@ fn main() {
 /// chunks' mean residues and the means' total (`labinius::simd::commit::sms::SmsKeyData`), with
 /// the reconstruction margin checked here, at build time, from the public matrix alone.
 #[cfg(target_arch = "x86_64")]
-fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     if !host_can_run() || parameters::MODULUS != modulus_choice::SMS_MODULUS {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let matrix = rq::ajtai_matrix(parameters::MODULUS, parameters::RING_ELEMENTS);
     let data = labinius::simd::commit::sms::SmsKeyData::build(&matrix, parameters::RING_ELEMENTS);
@@ -54,16 +59,21 @@ fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         println!("cargo:warning=digit {d}: margin {:.3} at chunk {} coefficient {} |mean| {}", m.0, m.1, m.2, m.3);
     }
     assert!(data.margin >= 8.5, "the public matrix leaves too small a reconstruction margin");
+    let diagnostic = unsafe { labinius::simd::commit::sms::affine_inverse_diagnostics(&data) };
+    println!("cargo:warning={diagnostic}");
+    let paired_commit = unsafe { labinius::simd::commit::sms::commit_affine_diagnostics(&data) };
+    println!("cargo:warning={paired_commit}");
     (
         data.pairs.iter().flat_map(|w| w.to_le_bytes()).collect(),
         data.mur.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        data.biases.iter().flat_map(|w| w.to_le_bytes()).collect(),
         data.mu.iter().flat_map(|w| w.to_le_bytes()).collect(),
     )
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    (Vec::new(), Vec::new(), Vec::new())
+fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
 }
 
 #[cfg(target_arch = "x86_64")]

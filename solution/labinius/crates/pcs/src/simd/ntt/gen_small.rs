@@ -1033,3 +1033,7 @@ mod hybrid_inverse_tests {
         }
     }
 }
+
+#[path = "gen_small_sms.rs"]
+mod sms_inverse;
+pub use sms_inverse::{intt_sms_accumulate, sms_inverse_biases, sms_affine_scalar_check};

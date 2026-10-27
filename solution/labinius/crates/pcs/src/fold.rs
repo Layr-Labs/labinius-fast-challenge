@@ -1364,11 +1364,10 @@ mod bitsliced {
     const LANES: usize = 512;
     const SLOTS: usize = 243;
     const BITS: usize = 15;
-    /// Columns per group: 32 * 129 planes, 264 KB per worker (two hyperthread siblings fit
-    /// comfortably inside one 2 MB L2 cache, while halving the outer group loops, partial CSA
-    /// trees, and 16-entry padding waste vs 16 columns). The planes of a group
-    /// (`GUARD + COL_GROUP * STRIDE`) keep the qword offsets in u16 (`33040 <= 65535`).
-    const COL_GROUP: usize = 32;
+    /// Columns per group: 16 * 129 planes, about 132 KB per worker. The smaller
+    /// working set trades more group loops for less cache pressure while folding.
+    /// (`GUARD + COL_GROUP * STRIDE`) keeps the qword offsets in u16.
+    const COL_GROUP: usize = 16;
     /// Parts of the column groups per block in the fold's dynamic task hand-out.
     const PARTS: usize = 2;
     /// Planes per column: the 128 direct planes and a zero guard, which is also the next

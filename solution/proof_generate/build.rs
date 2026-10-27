@@ -21,6 +21,10 @@ mod parameters;
 mod rq;
 
 fn main() {
+    // A matching file offset and address alignment lets the public key use huge pages.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-z,max-page-size=0x200000");
+    }
     let dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed=src/keygen.rs");
     println!("cargo:rerun-if-changed=src/modulus_choice.rs");

@@ -1798,7 +1798,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         folded,
     };
     let encode_time = clock.elapsed();
-    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}\n",
+    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}{}\n",
         load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
         (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
         (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
@@ -1806,7 +1806,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
         encode_time.as_micros(), workers,
         labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed),
-        labinius::simd::commit::sms::worker_report(workers)));
+        labinius::simd::commit::sms::worker_report(workers), labinius::fold::fold_report(workers)));
     proof
 }
 

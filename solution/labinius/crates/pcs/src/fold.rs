@@ -1325,6 +1325,20 @@ fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
 /// Shapes without whole 512-word blocks or with more than 32767 challenge terms retain the
 /// NTT implementation. For honest challenge instances the exact coefficients equal its
 /// centered residues; this path performs no modular reconstruction.
+/// Diagnostics of the last bitsliced fold, for the profile line only: per worker, the
+/// microseconds from the fold's dispatch to the end of its last task, and the tasks it ran.
+pub static FOLD_END_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+pub static FOLD_TASKS: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+
+/// The diagnostics above as ` fold_end_us=a/b/.. fold_tasks=a/b/..`.
+pub fn fold_report(workers: usize) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let w = workers.min(16);
+    let ends: Vec<String> = (0..w).map(|i| FOLD_END_US[i].load(Relaxed).to_string()).collect();
+    let tasks: Vec<String> = (0..w).map(|i| FOLD_TASKS[i].load(Relaxed).to_string()).collect();
+    format!(" fold_end_us={} fold_tasks={}", ends.join("/"), tasks.join("/"))
+}
+
 pub fn fold_witness_bitsliced(
     words: &[B128],
     columns: usize,
@@ -1363,6 +1377,9 @@ mod bitsliced {
 
     const LANES: usize = 512;
     const SLOTS: usize = 243;
+    /// Schedule entries ahead of use that the accumulation prefetches the planes of: the planes
+    /// (264 KB per worker) live in L2, and each entry's two vectors are otherwise demand misses.
+    const PF_AHEAD: usize = 0;
     const BITS: usize = 15;
     /// Columns per group: 32 * 129 planes, 264 KB per worker (two hyperthread siblings fit
     /// comfortably inside one 2 MB L2 cache, while halving the outer group loops, partial CSA
@@ -1408,7 +1425,7 @@ mod bitsliced {
 
     /// The schedule of column group `g` (columns `cs`), and per slot pair the number of its
     /// negative entries (padding included): each adds one to the bias of both slots.
-    fn plan_group<const GROUP: usize>(g: usize, cs: &[ShortChallenge]) -> (Group, [i32; PAIRS]) {
+    fn plan_group<const GROUP: usize>(g: usize, cs: &[ShortChallenge]) -> (Group, [i32; PAIRS]) { unsafe {
         // A term's run `[m, end)` of slots meets slot pair `q` when `2q <= end - 1` and
         // `2q + 1 >= m`, i.e. `q` in `[m / 2, (end - 1) / 2]`; the wrapped run `[0, wrap)`
         // meets pairs `[0, (wrap - 1) / 2]`, with the opposite sign (`Y^243 = -1`).
@@ -1453,7 +1470,9 @@ mod bitsliced {
         // Only the last entry of a non-empty sign range can be padding (at most 1 entry for
         // even alignment); presetting that slot to 0 avoids zeroing the whole schedule vector.
         let total_terms = group.offsets[PAIRS];
-        group.terms = Vec::with_capacity(total_terms);
+        // [`PF_AHEAD`] trailing zero offsets: the accumulation's look-ahead reads them.
+        group.terms = Vec::with_capacity(total_terms + PF_AHEAD);
+        core::ptr::write_bytes(group.terms.as_mut_ptr().add(total_terms), 0, PF_AHEAD);
         unsafe {
             let terms_ptr = group.terms.as_mut_ptr();
             for q in 0..PAIRS {
@@ -1505,10 +1524,10 @@ mod bitsliced {
                     }
                 }
             }
-            group.terms.set_len(total_terms);
+            group.terms.set_len(total_terms + PF_AHEAD);
         }
         (group, negatives)
-    }
+    } }
 
     fn plan<const GROUP: usize>(challenges: &[ShortChallenge], workers: usize) -> (Vec<Group>, [i32; SLOTS]) {
         let jobs = challenges.len().div_ceil(GROUP);
@@ -1794,6 +1813,14 @@ mod bitsliced {
         let mut t: *const u16;
         macro_rules! two {
             ($off:expr, $leaf:ident) => {{
+                if PF_AHEAD > 0 {
+                    let fa = planes.add(*t.add($off + PF_AHEAD) as usize) as *const i8;
+                    let fb = planes.add(*t.add($off + 1 + PF_AHEAD) as usize) as *const i8;
+                    _mm_prefetch::<_MM_HINT_T0>(fa);
+                    _mm_prefetch::<_MM_HINT_T0>(fa.add(64));
+                    _mm_prefetch::<_MM_HINT_T0>(fb);
+                    _mm_prefetch::<_MM_HINT_T0>(fb.add(64));
+                }
                 let pa = planes.add(*t.add($off) as usize);
                 let pb = planes.add(*t.add($off + 1) as usize);
                 let a0 = _mm512_load_si512(pa as *const __m512i);
@@ -2194,7 +2221,8 @@ mod bitsliced {
         next: &std::sync::atomic::AtomicUsize,
         out_addr: usize,
         #[cfg(test)] profile: bool,
-    ) {
+    ) -> u32 {
+        let mut ran = 0u32;
         #[cfg(test)]
         let mut times = [std::time::Duration::ZERO; 3];
         #[cfg(not(test))]
@@ -2214,6 +2242,7 @@ mod bitsliced {
             if task >= tasks {
                 break;
             }
+            ran += 1;
             let (block, part) = (task / parts, task % parts);
             for p in 0..2 * PAIRS * BITS {
                 _mm512_store_si512(acc.as_mut_ptr().add(p), zero);
@@ -2294,6 +2323,7 @@ mod bitsliced {
             eprintln!("bitfold worker={} slice_us={} add_us={} output_us={}",
                 worker, times[0].as_micros(), times[1].as_micros(), times[2].as_micros());
         }
+        ran
     }
 
     pub(super) fn fold_words(
@@ -2340,9 +2370,10 @@ mod bitsliced {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let mut out: Vec<RingElement> = Vec::with_capacity(len);
         let out_addr = out.as_mut_ptr() as usize;
+        let t0 = std::time::Instant::now();
         let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
         crate::par::pool().run(workers.clamp(1, tasks), |worker| unsafe {
-            run_worker::<GROUP, FUSED>(
+            let ran = run_worker::<GROUP, FUSED>(
                 worker,
                 words,
                 column_words,
@@ -2358,6 +2389,11 @@ mod bitsliced {
                 #[cfg(test)]
                 profile,
             );
+            if worker < 16 {
+                use std::sync::atomic::Ordering::Relaxed;
+                super::FOLD_END_US[worker].store(t0.elapsed().as_micros() as u32, Relaxed);
+                super::FOLD_TASKS[worker].store(ran, Relaxed);
+            }
         });
         // Every task wrote its whole range.
         unsafe { out.set_len(len) };

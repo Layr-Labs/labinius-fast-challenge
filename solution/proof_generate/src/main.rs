@@ -41,6 +41,10 @@ use parameters::{COLUMNS, COLUMN_LEN, COLUMN_LOG, LOG_PACKED, LOG_VARS, MODULUS,
 /// batches are read in place.
 #[repr(C, align(64))]
 struct Aligned64<T>(T);
+/// 2 MiB aligned: with the binary's 2 MiB segment alignment (`build.rs`) the key image starts on
+/// a huge-page boundary of both the address space and the file (e-man07, submission 721d445d).
+#[repr(C, align(2097152))]
+struct Aligned2M<T>(T);
 const EMBEDDED_KEY_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")).len();
 static EMBEDDED_KEY: Aligned64<[u8; EMBEDDED_KEY_LEN]> =
     Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")));
@@ -1006,27 +1010,51 @@ static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_by
 /// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
 /// lockstep layout, the digit chunks' centered mean residues and the means' total.
 const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
-static SMS_PAIRS:Aligned64<[u8;SMS_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
+static SMS_PAIRS:Aligned2M<[u8;SMS_PAIRS_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
 const SMS_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")).len();
 static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")));
 const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();
 static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")));
+/// The AMX path's tile image, bias-corrected chunk means and stream-0 bias terms
+/// (`labinius::simd::commit::sms::amx`), from the same build-time keys (empty when the build host
+/// could not run the kernels).
+const SMS_AMX_TILES_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-amx-tiles.bin")).len();
+static SMS_AMX_TILES:Aligned2M<[u8;SMS_AMX_TILES_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-amx-tiles.bin")));
+const SMS_AMX_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-amx-mur.bin")).len();
+static SMS_AMX_MUR:Aligned64<[u8;SMS_AMX_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-amx-mur.bin")));
+const SMS_AMX_CORR0_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-amx-corr0.bin")).len();
+static SMS_AMX_CORR0:Aligned64<[u8;SMS_AMX_CORR0_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-amx-corr0.bin")));
 
 /// The embedded single-transform keys, read in place, if the build host made them for this
 /// shape.
 fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     use labinius::simd::commit::sms;
     let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
-    let chunks = RING_ELEMENTS / (2 * sms::CHUNK_PAIRS);
-    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 2 * (sms::CHUNKED * chunks + 2) * N || SMS_MU.0.len() != 4 * N {
+    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 2 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N {
         return None;
     }
     unsafe {
         Some(sms::SmsKeys {
             pairs: std::slice::from_raw_parts(SMS_PAIRS.0.as_ptr() as *const u32, words),
-            mur: std::slice::from_raw_parts(SMS_MUR.0.as_ptr() as *const i16, (sms::CHUNKED * chunks + 2) * N),
+            mur: std::slice::from_raw_parts(SMS_MUR.0.as_ptr() as *const i16, sms::mur_len(RING_ELEMENTS)),
             mu: std::slice::from_raw_parts(SMS_MU.0.as_ptr() as *const u32, N),
             elements: RING_ELEMENTS,
+        })
+    }
+}
+
+/// The embedded AMX keys, read in place, if the build host made them for this shape.
+fn sms_amx_embedded() -> Option<labinius::simd::commit::sms::amx::AmxKeys<'static>> {
+    use labinius::simd::commit::sms;
+    let tiles = sms::amx::AmxKeyData::tiles_len(RING_ELEMENTS);
+    if !cfg!(target_endian = "little") || SMS_AMX_TILES.0.len() != tiles || SMS_AMX_MUR.0.len() != 2 * sms::mur_len(RING_ELEMENTS) || SMS_AMX_CORR0.0.len() != 4 * N {
+        return None;
+    }
+    unsafe {
+        Some(sms::amx::AmxKeys {
+            tiles: std::slice::from_raw_parts(SMS_AMX_TILES.0.as_ptr() as *const i8, tiles),
+            mur: std::slice::from_raw_parts(SMS_AMX_MUR.0.as_ptr() as *const i16, sms::mur_len(RING_ELEMENTS)),
+            corr0: std::slice::from_raw_parts(SMS_AMX_CORR0.0.as_ptr() as *const i16, 2 * N),
         })
     }
 }
@@ -1538,7 +1566,13 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // inside the commitment, taken by all its workers at once as they reach the same batches:
     // measured 2 ms of commitment for 0.3-0.5 ms here).
     let sms_keys = if modulus == modulus_choice::SMS_MODULUS && modulus == MODULUS { sms_embedded() } else { None };
-    let image: &[u8] = if sms_keys.is_some() {
+    // AMX-INT8 takes the commitment's multiply-accumulate when the CPU and kernel allow it; the
+    // VNNI path (and its key image) otherwise.
+    let use_amx = modulus == modulus_choice::SMS_MODULUS && labinius::simd::commit::sms::amx::available();
+    let amx_keys = if use_amx && sms_keys.is_some() { sms_amx_embedded() } else { None };
+    let image: &[u8] = if amx_keys.is_some() {
+        &SMS_AMX_TILES.0
+    } else if sms_keys.is_some() {
         &SMS_PAIRS.0
     } else if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
         if !EMBEDDED_PAIRS.0.is_empty() {
@@ -1571,6 +1605,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
     let sms_built;
+    let amx_built;
     let rows = if modulus == modulus_choice::SMS_MODULUS {
         let keys = match sms_keys {
             Some(k) => k,
@@ -1579,7 +1614,18 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
                 sms_built.keys()
             }
         };
-        labinius::simd::commit::sms::commit_columns_rows(&keys, &columns, workers)
+        if use_amx {
+            let ak = match amx_keys {
+                Some(k) => k,
+                None => {
+                    amx_built = labinius::simd::commit::sms::amx::AmxKeyData::build(&keys);
+                    amx_built.keys()
+                }
+            };
+            labinius::simd::commit::sms::amx::commit_columns_rows(&keys, &ak, &columns, workers)
+        } else {
+            labinius::simd::commit::sms::commit_columns_rows(&keys, &columns, workers)
+        }
     } else if let Some(pairs) = pairs {
         labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers)
     } else if let Some(keys) = arranged {
@@ -1798,7 +1844,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         folded,
     };
     let encode_time = clock.elapsed();
-    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}\n",
+    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}{}\n",
         load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
         (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
         (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
@@ -1806,7 +1852,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
         encode_time.as_micros(), workers,
         labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed),
-        labinius::simd::commit::sms::worker_report(workers)));
+        labinius::simd::commit::sms::worker_report(workers), labinius::fold::fold_report(workers)));
     proof
 }
 

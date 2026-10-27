@@ -41,6 +41,10 @@ use parameters::{COLUMNS, COLUMN_LEN, COLUMN_LOG, LOG_PACKED, LOG_VARS, MODULUS,
 /// batches are read in place.
 #[repr(C, align(64))]
 struct Aligned64<T>(T);
+/// 2 MiB aligned: with the binary's 2 MiB segment alignment (`build.rs`) the key image starts on
+/// a huge-page boundary of both the address space and the file (e-man07, submission 721d445d).
+#[repr(C, align(2097152))]
+struct Aligned2M<T>(T);
 const EMBEDDED_KEY_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")).len();
 static EMBEDDED_KEY: Aligned64<[u8; EMBEDDED_KEY_LEN]> =
     Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")));
@@ -1006,7 +1010,7 @@ static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_by
 /// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
 /// lockstep layout, the digit chunks' centered mean residues and the means' total.
 const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
-static SMS_PAIRS:Aligned64<[u8;SMS_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
+static SMS_PAIRS:Aligned2M<[u8;SMS_PAIRS_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
 const SMS_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")).len();
 static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")));
 const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();
@@ -1017,7 +1021,7 @@ static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!(
 fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     use labinius::simd::commit::sms;
     let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
-    let chunks = RING_ELEMENTS / (2 * sms::CHUNK_PAIRS);
+    let chunks = sms::chunk_count(RING_ELEMENTS);
     if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 2 * (sms::CHUNKED * chunks + 2) * N || SMS_MU.0.len() != 4 * N {
         return None;
     }
@@ -1798,7 +1802,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         folded,
     };
     let encode_time = clock.elapsed();
-    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}\n",
+    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}{}\n",
         load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
         (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
         (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
@@ -1806,7 +1810,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
         encode_time.as_micros(), workers,
         labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed),
-        labinius::simd::commit::sms::worker_report(workers)));
+        labinius::simd::commit::sms::worker_report(workers), labinius::fold::fold_report(workers)));
     proof
 }
 

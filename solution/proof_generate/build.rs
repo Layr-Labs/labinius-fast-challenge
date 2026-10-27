@@ -27,6 +27,9 @@ fn main() {
     println!("cargo:rerun-if-changed=src/parameters.rs");
     println!("cargo:rerun-if-changed=src/rq.rs");
     println!("cargo:rerun-if-changed=build.rs");
+    // 2 MiB segment alignment, so the 2 MiB-aligned key image below can be mapped with PMD
+    // entries instead of ~11.7k 4 KiB ones.
+    println!("cargo:rustc-link-arg-bins=-Wl,-z,max-page-size=0x200000");
     println!("cargo:rerun-if-changed=../native_diagnostics");
     let (image, tail, hybrid, pairs) = images();
     std::fs::write(dir.join("pair-key.bin"), pairs).expect("write the column-pair key image");

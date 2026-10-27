@@ -12,4 +12,4 @@ pub const COLUMN_LEN: usize = 1 << (LOG_PACKED - COLUMN_LOG as usize);
 pub const RING_ELEMENTS: usize = COLUMN_LEN / 4;
 /// Two NTT primes plus a 1024 residue. The latter reuses the witness transforms
 /// through a certified exact-integer lift of the fixed public matrix.
-pub const MODULUS:u128=38_712_288_256;
+pub const MODULUS:u128=40_772_829_184;

@@ -7,6 +7,10 @@
 
 /// The primes the library has opening arithmetic for.
 pub const HYBRID_MODULUS:u128=3889u128*9721*1024;
+/// The single-transform modulus 9721 * 2^22: one witness NTT modulo 9721 whose nine
+/// accumulation streams give the 9721 residue and, digit by digit, the 2^22 residue
+/// (`labinius::simd::commit::sms`).
+pub const SMS_MODULUS:u128=labinius::simd::commit::sms::MODULUS;
 
 pub const SUPPORTED_PRIMES: [u16; 7] = [2917, 3889, 4861, 9721, 12637, 17497, 19441];
 
@@ -37,6 +41,7 @@ const _: () = {
 pub fn limbs(modulus: u128) -> Result<Vec<u16>, &'static str> {
     // These are the witness transform primes; the 1024 residue reuses both transforms.
     if modulus == HYBRID_MODULUS { return Ok(vec![3889,9721]); }
+    if modulus == SMS_MODULUS { return Ok(vec![9721]); }
     if modulus < 2 {
         return Err("a modulus is at least 2");
     }

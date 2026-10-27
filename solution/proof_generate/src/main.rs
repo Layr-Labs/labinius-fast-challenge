@@ -1006,7 +1006,10 @@ static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_by
 /// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
 /// lockstep layout, the digit chunks' centered mean residues and the means' total.
 const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
-static SMS_PAIRS:Aligned64<[u8;SMS_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
+// Align the public key image for file-backed huge pages on supported kernels.
+#[repr(C, align(2097152))]
+struct Aligned2MiB<T>(T);
+static SMS_PAIRS:Aligned2MiB<[u8;SMS_PAIRS_LEN]>=Aligned2MiB(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
 const SMS_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")).len();
 static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")));
 const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();

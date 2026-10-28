@@ -785,7 +785,9 @@ pub fn sample_short_challenges_parallel(
     let threads = threads.clamp(1, n.max(1));
     let mut out = vec![ShortChallenge::zero(); n];
     if n > 0 {
-        let runs = crate::par::ranges(n, threads, 1);
+        // Eight runs per thread, handed out by the pool as runners arrive: a runner that starts
+        // late takes fewer of them instead of holding up the dispatch by a whole eighth.
+        let runs = crate::par::ranges(n, 8 * threads, 1);
         let t_ref = &*t;
         let out_addr = out.as_mut_ptr() as usize;
         crate::par::pool().run(runs.len(), |w| {

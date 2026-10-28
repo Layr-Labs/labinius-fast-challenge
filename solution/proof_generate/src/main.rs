@@ -1142,8 +1142,8 @@ const HYBRID_GROUP: usize = 16;
 // the proof file
 // =============================================================================================
 
-/// What [`prove`] produces: the proof's fields, the folded witness still as ring elements (its
-/// wire form is written straight into the proof file).
+/// What [`prove`] produces: the proof's fields, the folded witness either as ring elements (its
+/// wire form is written straight into the proof file) or already written there by the fold.
 struct ProofParts {
     modulus: u128,
     commitment: Vec<u8>,
@@ -1151,15 +1151,34 @@ struct ProofParts {
     rounds: Vec<[[u64; 3]; 2]>,
     opened: [u64; 3],
     row: Vec<u8>,
-    folded: FoldedWitness,
+    folded: Folded,
+}
+
+/// The folded witness: ring elements still to encode, or `elements` of them that the fold wrote
+/// in their encoding into the mapped proof file ([`Output::folded_target`]).
+enum Folded {
+    Elements(FoldedWitness),
+    Written { elements: usize },
+}
+
+impl Folded {
+    fn len(&self) -> usize {
+        match self {
+            Folded::Elements(f) => f.elements().len(),
+            Folded::Written { elements } => *elements,
+        }
+    }
 }
 
 impl ProofParts {
     fn into_proof(self) -> Proof {
+        let Folded::Elements(folded) = &self.folded else {
+            panic!("the folded witness is only in the mapped proof file");
+        };
         Proof {
             version: 1,
             modulus: self.modulus,
-            folded: pack_folded(&self.folded),
+            folded: pack_folded(folded),
             commitment: self.commitment,
             partials: self.partials,
             rounds: self.rounds,
@@ -1198,7 +1217,7 @@ impl ProofLayout {
         ProofLayout {
             commitment_bytes: parts.commitment.len(),
             row_bytes: parts.row.len(),
-            folded_bytes: FOLDED_BYTES * N * parts.folded.elements().len(),
+            folded_bytes: FOLDED_BYTES * N * parts.folded.len(),
             partials: parts.partials.len(),
             rounds: parts.rounds.len(),
         }
@@ -1264,7 +1283,10 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
     debug_assert_eq!(middle.len(), layout.middle());
     put(&mut at, &middle);
     debug_assert_eq!(at, layout.folded_at());
-    let elements = parts.folded.elements();
+    let elements = match &parts.folded {
+        Folded::Elements(f) => f.elements(),
+        Folded::Written { .. } => &[],
+    };
     assert!(
         elements
             .iter()
@@ -1489,6 +1511,19 @@ impl Output {
             None => worker_state.chunk(i - first.len() + 1),
         });
         let _ = self.populate.set(job);
+    }
+
+    /// Where the fold may write the encoding of `elements` folded ring elements: their place in
+    /// the mapped proof file, when it is mapped and its layout holds exactly that many.
+    fn folded_target(&self, elements: usize) -> Option<*mut u8> {
+        let layout = self.state.layout;
+        if layout.folded_bytes != FOLDED_BYTES * N * elements
+            || labinius::fold::FOLD_ENCODED_BYTES != FOLDED_BYTES * N
+        {
+            return None;
+        }
+        let m = self.state.mapped()?;
+        Some((m.addr + layout.folded_at()) as *mut u8)
     }
 
     /// Write the proof: encoded into the mapping when it has the expected layout, else through
@@ -1779,9 +1814,19 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let row_time = clock.elapsed();
     let challenges = folding_challenges(&mut t, &row);
     let challenge_time = clock.elapsed();
-    let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
-        values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
-    ));
+    // Into the mapped proof file when there is one: no element buffer, and no encoding pass
+    // over it after the fold.
+    let target = output.and_then(|o| o.folded_target(COLUMN_LEN / 4));
+    let written = target.is_some_and(|out| unsafe {
+        labinius::fold::fold_witness_bitsliced_encoded(values, COLUMNS, &challenges, COLUMN_LEN / 128, workers, out)
+    });
+    let folded = if written {
+        Folded::Written { elements: COLUMN_LEN / 4 }
+    } else {
+        Folded::Elements(FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
+            values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
+        )))
+    };
     let fold_time = clock.elapsed();
     // Neither the table nor the key image is read from here on: their ~70k page-table entries go
     // now, a slice per core, instead of in the exit's teardown on one core after the proof is
@@ -2120,7 +2165,7 @@ mod tests {
                 rounds: (0..24).map(|_| [[next(), next(), next()], [next(), next(), next()]]).collect(),
                 opened: [next(), next(), next()],
                 row: (0..row_bytes).map(|_| next() as u8).collect(),
-                folded: FoldedWitness::of(
+                folded: Folded::Elements(FoldedWitness::of(
                     (0..elements)
                         .map(|_| {
                             let mut e = labinius::RingElement648::zero(Representation::Coefficients);
@@ -2130,7 +2175,7 @@ mod tests {
                             e
                         })
                         .collect(),
-                ),
+                )),
             };
             let layout = ProofLayout::of_parts(&parts);
             let mut out = vec![0xA5u8; layout.len()];

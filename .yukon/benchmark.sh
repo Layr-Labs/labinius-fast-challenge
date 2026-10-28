@@ -114,7 +114,9 @@ cmd = [
     table,
 ]
 start = time.perf_counter()
-subprocess.run(cmd, timeout=900, check=True)
+# Python's timeout wait polls at up to 50 ms intervals on these Linux hosts.
+# Keep the hard deadline in GNU timeout and wait for process exit directly.
+subprocess.run(["/usr/bin/timeout", "--signal=KILL", "900s", *cmd], check=True)
 print((time.perf_counter() - start) * 1000)
 PY
 )

@@ -353,7 +353,7 @@ pub struct SAcc {
 struct Blk27([i16; 27 * 32]);
 
 /// Fold-back constants as memory operands: the `vpmaddwd` weights `(1, r16c)`, the low-word sign
-/// bit, and the old masked correction (unused by the two-uop fold).
+/// bit, and the five vector constants for the last step's [`red16`].
 ///
 /// The fold is `vpxord` with `0x8000` and `vpmaddwd` with `(1, r16c)`: flipping bit 15 makes the
 /// low word, read as signed, `l - 32768` for the unsigned low word `l`, so the result is
@@ -361,14 +361,19 @@ struct Blk27([i16; 27 * 32]);
 /// Every fold therefore subtracts 32768 from every lane; [`fold_bias`] pre-loads each stream with
 /// the total of the folds it will take before its next reset, so the residues come out exact.
 #[repr(C, align(64))]
-struct Fold([i32; 48]);
+struct Fold([i32; 112]);
 static FOLD: Fold = Fold({
-    let mut f = [0i32; 48];
+    let mut f = [0i32; 112];
+    let (w, wp) = red16_w(P);
     let mut i = 0;
     while i < 16 {
         f[i] = 1 | ((r16c(P) as u16 as i32) << 16);
         f[16 + i] = 0x8000;
-        f[32 + i] = r16c(P);
+        f[32 + i] = bias(P) as i32;
+        f[48 + i] = w;
+        f[64 + i] = wp;
+        f[80 + i] = P as i32 | ((P as i32) << 16);
+        f[96 + i] = 1 | (1 << 16);
         i += 1;
     }
     f
@@ -401,6 +406,11 @@ fn fold_bias(span: usize) -> i32 {
     ((span / FOLD_EVERY) as u64 * 32768 % P as u64) as i32
 }
 
+/// Digit chunks on the last-step route omit one fold, including a one-step chunk.
+fn last_fold_bias(span: usize) -> i32 {
+    fold_bias(span - FOLD_EVERY)
+}
+
 /// Every slot of stream `s` set to `v`.
 #[target_feature(enable = "avx512f")]
 unsafe fn fill_stream(a: &mut SAcc, s: usize, v: i32) {
@@ -415,17 +425,18 @@ unsafe fn fill_stream(a: &mut SAcc, s: usize, v: i32) {
 /// accumulators take all four products in one read-modify-write, folded back when `RED`.
 ///
 /// `FIRST` marks a chunk's first lockstep step: the digit streams then start from their fold bias
-/// broadcast out of `b` instead of being loaded from memory, because [`finish_stream`] left that
-/// value there and no longer writes it into all 648 accumulator rows.
-struct Sink<const RED: bool, const FIRST: bool = false> {
+/// broadcast out of `b` instead of being loaded from memory. `LAST` writes the reduced digits
+/// directly to `p`, with the [`Batch32`] stride, and leaves stream 0's fold and store unchanged.
+struct Sink<const RED: bool, const FIRST: bool = false, const LAST: bool = false> {
     k: *const u32,
     acc: *mut i32,
     b: *const i32,
+    p: *mut i16,
 }
-impl<const RED: bool, const FIRST: bool> vb::SliceSink<LOCK> for Sink<RED, FIRST> {
+impl<const RED: bool, const FIRST: bool, const LAST: bool> vb::SliceSink<LOCK> for Sink<RED, FIRST, LAST> {
     #[inline(always)]
     unsafe fn rows(&mut self, blk: usize, w: [*const i16; LOCK], r0: usize, r1: usize) {
-        sink_rows::<RED, FIRST>(self.k, self.acc, self.b, blk, w, r0, r1);
+        sink_rows::<RED, FIRST, LAST>(self.k, self.acc, self.b, self.p, blk, w, r0, r1);
     }
 }
 
@@ -433,12 +444,12 @@ impl<const RED: bool, const FIRST: bool> vb::SliceSink<LOCK> for Sink<RED, FIRST
 /// then fit the half of the decoded-uop cache a hyperthread gets.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-unsafe fn sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *mut i32, bias: *const i32, blk: usize, w: [*const i16; LOCK], r0: usize, r1: usize) {
-    let s = Sink::<RED, FIRST> { k: kp, acc: accp, b: bias };
+unsafe fn sink_rows<const RED: bool, const FIRST: bool, const LAST: bool>(kp: *const u32, accp: *mut i32, bias: *const i32, pend: *mut i16, blk: usize, w: [*const i16; LOCK], r0: usize, r1: usize) {
+    let s = Sink::<RED, FIRST, LAST> { k: kp, acc: accp, b: bias, p: pend };
     s.rows_inline(blk, w, r0, r1);
 }
 
-impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
+impl<const RED: bool, const FIRST: bool, const LAST: bool> Sink<RED, FIRST, LAST> {
     #[inline(always)]
     unsafe fn rows_inline(&self, blk: usize, w: [*const i16; LOCK], r0: usize, r1: usize) {
         for i in r0..r1 {
@@ -469,8 +480,20 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
                         out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
                 };
             }
+            macro_rules! call_last {
+                ($mode:ident $(, $bn:ident = $bv:expr)?; $($xn:ident = $xi:expr),*) => {
+                    core::arch::asm!(sms_slot8_last!($mode), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                        $($bn = in(reg) $bv,)?
+                        p = in(reg) self.p.add(32 * j), stride = const core::mem::size_of::<Batch32>(),
+                        $($xn = in(zmm_reg) x[$xi],)*
+                        out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
+                        out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
+                };
+            }
             if LOCK == 8 {
-                if RED && FIRST { call_first!(sms_slot8, reduce_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                if LAST && FIRST { call_last!(first_last, b = self.b; x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                else if LAST { call_last!(last; x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                else if RED && FIRST { call_first!(sms_slot8, reduce_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
                 else if FIRST { call_first!(sms_slot8, plain_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
                 else if RED { call!(sms_slot8, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
                 else { call!(sms_slot8, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
@@ -683,13 +706,15 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     static ZERO8: [B128; 8] = [B128::ZERO; 8];
     let kbase = keys.pairs.as_ptr();
     let mut half = 0usize;
-    for s in 0..STREAMS {
+    let last_sink = LOCK == 8 && PP == LOCK && bench_mode() == 0;
+    let initial_streams = if last_sink { 1 } else { STREAMS };
+    for s in 0..initial_streams {
         // Stream 0 runs over the range; the digits' spans are whole chunks of it.
         let b = if s == 0 { fold_bias(span) } else { fold_bias(CHUNK_PAIRS.min(hl)) };
         fill_stream(&mut ws.acc[0], s, b);
     }
     // The range's first chunk starts from the same value; every later chunk end rewrites it.
-    ws.bias[0] = fold_bias(CHUNK_PAIRS.min(hl));
+    ws.bias[0] = if last_sink { last_fold_bias(CHUNK_PAIRS.min(hl)) } else { fold_bias(CHUNK_PAIRS.min(hl)) };
     let acc = ws.acc[0].v.as_mut_ptr() as *mut i32;
     let w = ws.w.as_mut_ptr() as *mut i16;
     for b in range.clone().step_by(LOCK) {
@@ -715,6 +740,9 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         // A chunk's first step: the digit streams start from `ws.bias`, the value the last chunk
         // end left there, instead of loading 648 accumulator rows each.
         let first = (b - b / hl * hl) % CHUNK_PAIRS == 0;
+        let (e, cph) = (b + LOCK, chunks_per_half(np));
+        let (eh, local) = ((e - 1) / hl, e - (e - 1) / hl * hl);
+        let last = local % CHUNK_PAIRS == 0 || local == hl;
         let mode = bench_mode();
         if mode == 4 { continue; }
         if mode == 1 {
@@ -722,29 +750,37 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
             impl vb::SliceSink<LOCK> for Nop { unsafe fn rows(&mut self, _: usize, w: [*const i16; LOCK], _: usize, _: usize) { core::hint::black_box(w); } }
             vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Nop);
         } else if mode == 2 {
-            let mut sk = Sink::<false> { k, acc, b: bias };
+            let mut sk = Sink::<false> { k, acc, b: bias, p: core::ptr::null_mut() };
             for kk in 0..24 { vb::SliceSink::<LOCK>::rows(&mut sk, kk, core::array::from_fn(|h| w.add(32 * 27 * h) as *const i16), 0, 27); }
+        } else if last_sink && last {
+            let p = (ws.pend[0].v.as_mut_ptr() as *mut i16).add(16 * half);
+            if first {
+                vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<true, true, true> { k, acc, b: bias, p });
+            } else {
+                vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<true, false, true> { k, acc, b: bias, p });
+            }
+            sync(b + LOCK);
         } else if first && ((b + LOCK) % PP == 0 || LOCK > PP) {
-            vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<true, true> { k, acc, b: bias });
+            vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<true, true> { k, acc, b: bias, p: core::ptr::null_mut() });
             sync(b + LOCK);
         } else if first {
-            vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<false, true> { k, acc, b: bias });
+            vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<false, true> { k, acc, b: bias, p: core::ptr::null_mut() });
         } else if (b + LOCK) % PP == 0 || LOCK > PP {
-            vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<true> { k, acc, b: bias });
+            vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<true> { k, acc, b: bias, p: core::ptr::null_mut() });
             sync(b + LOCK);
         } else {
-            vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<false> { k, acc, b: bias });
+            vb::ntt_bin_batch32_pipelined::<P, LOCK, _>(ins, w, &mut Sink::<false> { k, acc, b: bias, p: core::ptr::null_mut() });
         }
         // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
-        let (e, cph) = (b + LOCK, chunks_per_half(np));
-        let (eh, local) = ((e - 1) / hl, e - (e - 1) / hl * hl);
-        if (local % CHUNK_PAIRS == 0 || local == hl) && mode != 3 {
+        if last && mode != 3 {
             let chunk = eh * cph + (local - 1) / CHUNK_PAIRS;
             // The next chunk's length: the rest of this half, or the next half's first chunk.
             let next = if local == hl { CHUNK_PAIRS.min(hl) } else { CHUNK_PAIRS.min(hl - local) };
-            ws.bias[0] = fold_bias(next);
-            for d in 0..CHUNKED {
-                finish_stream(&mut ws.acc[0], 1 + d, &mut ws.pend[d], half);
+            ws.bias[0] = if last_sink { last_fold_bias(next) } else { fold_bias(next) };
+            if !last_sink {
+                for d in 0..CHUNKED {
+                    finish_stream(&mut ws.acc[0], 1 + d, &mut ws.pend[d], half);
+                }
             }
             if half == 1 || b + LOCK == range.end {
                 let both = half == 1;

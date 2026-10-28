@@ -708,6 +708,40 @@ const fn inv_bounds<const Q: u16, const AUX: bool>() -> ([i32; 7], i32) {
     (lm, peak)
 }
 
+/// The forward lookup correction, shared by all inverse passes modulo 9721.
+#[repr(C, align(64))]
+struct InverseLut([i16; 32]);
+
+static INVERSE_LUT_9721: InverseLut = {
+    let mut t = [0i16; 32];
+    let mut s = 0;
+    while s < 32 {
+        t[s] = super::bin_asm::barrett_lut_corr(s, 9721);
+        s += 1;
+    }
+    InverseLut(t)
+};
+
+#[inline(always)]
+unsafe fn inverse_reduction_constant<const Q: u16>() -> __m512i {
+    if Q == 9721 {
+        _mm512_load_si512(INVERSE_LUT_9721.0.as_ptr() as *const __m512i)
+    } else {
+        _mm512_set1_epi32(Tw::<Q>::BV as i32)
+    }
+}
+
+/// Lookup reduction for 9721; the old 7864 bound and all inverse flags still apply.
+#[inline(always)]
+unsafe fn inverse_barrett<const Q: u16>(a: __m512i, v: __m512i, q: __m512i) -> __m512i {
+    if Q == 9721 {
+        let s = _mm512_srli_epi16::<11>(a);
+        _mm512_add_epi16(a, _mm512_permutexvar_epi16(s, v))
+    } else {
+        barrett(a, v, q)
+    }
+}
+
 /// Inverse radix-3 (Gentleman-Sande) butterfly, the exact transpose of [`r3`] with the level's
 /// normalisation deferred: `u = omega (y2 - y1)`, `(y0+y1+y2, (y0-y1+u) zeta^-1,
 /// (y0-y2-u) zeta^-2)` = `3 * (a0, a1, a2)`. 9 multiply uops + 7 adds, like the forward one; the
@@ -752,7 +786,7 @@ unsafe fn center(x: __m512i, q: __m512i, half: __m512i, nhalf: __m512i) -> __m51
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn ipass_d<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
-    let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
+    let bv = inverse_reduction_constant::<Q>();
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
     let t6 = TwI::<Q, AUX>::IL6.as_ptr().add(36 * k4);
@@ -761,13 +795,13 @@ unsafe fn ipass_d<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
         let b = base + 3 * g;
         let (mut y0, mut y1, mut y2) = (ld(p, b), ld(p, b + 1), ld(p, b + 2));
         if TwI::<Q, AUX>::BAR_IN {
-            y0 = barrett(y0, bv, q);
-            y1 = barrett(y1, bv, q);
-            y2 = barrett(y2, bv, q);
+            y0 = inverse_barrett::<Q>(y0, bv, q);
+            y1 = inverse_barrett::<Q>(y1, bv, q);
+            y2 = inverse_barrett::<Q>(y2, bv, q);
         }
         let (mut s, a1, a2) = ir3(y0, y1, y2, t6.add(4 * g), omp, om, q);
         if TwI::<Q, AUX>::BAR_S6 {
-            s = barrett(s, bv, q);
+            s = inverse_barrett::<Q>(s, bv, q);
         }
         st(p, b, s);
         st(p, b + 1, a1);
@@ -781,7 +815,7 @@ unsafe fn ipass_d<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn ipass_c5<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
-    let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
+    let bv = inverse_reduction_constant::<Q>();
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
     let t5 = TwI::<Q, AUX>::IL5.as_ptr().add(12 * k4);
@@ -800,7 +834,7 @@ unsafe fn ipass_c5<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
                     q,
                 );
                 if TwI::<Q, AUX>::BAR_S5[$j] {
-                    s = barrett(s, bv, q);
+                    s = inverse_barrett::<Q>(s, bv, q);
                 }
                 st(p, b, s);
                 st(p, b + 3, a1);
@@ -817,7 +851,7 @@ unsafe fn ipass_c5<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn ipass_c4<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
-    let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
+    let bv = inverse_reduction_constant::<Q>();
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
     let t4 = TwI::<Q, AUX>::IL4.as_ptr().add(4 * k4);
@@ -829,7 +863,7 @@ unsafe fn ipass_c4<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
             let b = base + $i;
             let (mut s, a1, a2) = ir3(ld(p, b), ld(p, b + 9), ld(p, b + 18), t4, omp, om, q);
             if TwI::<Q, AUX>::BAR_S4[$i] {
-                s = barrett(s, bv, q);
+                s = inverse_barrett::<Q>(s, bv, q);
             }
             st(p, b, s);
             st(p, b + 9, a1);
@@ -852,7 +886,7 @@ unsafe fn ipass_c4<const Q: u16, const AUX: bool>(p: *mut __m512i, k4: usize) {
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn ipass_b<const Q: u16, const AUX: bool>(p: *mut __m512i, blk: usize) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
-    let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
+    let bv = inverse_reduction_constant::<Q>();
     let omp = bc(Tw::<Q>::OM.as_ptr());
     let om = bc(Tw::<Q>::OM.as_ptr().add(1));
     let l2 = TwI::<Q, AUX>::IL2.as_ptr().add(2 * blk);
@@ -873,20 +907,20 @@ unsafe fn ipass_b<const Q: u16, const AUX: bool>(p: *mut __m512i, blk: usize) {
             q,
         );
         if TwI::<Q, AUX>::BAR_S3 {
-            n0 = barrett(n0, bv, q);
-            m0 = barrett(m0, bv, q);
+            n0 = inverse_barrett::<Q>(n0, bv, q);
+            m0 = inverse_barrett::<Q>(m0, bv, q);
         }
         let (mut s0, t0) = ir2(n0, m0, zp, z, q);
         let (mut s1, t1) = ir2(n1, m1, zp, z, q);
         let (mut s2, t2) = ir2(n2, m2, zp, z, q);
         if TwI::<Q, AUX>::BAR_S2[0] {
-            s0 = barrett(s0, bv, q);
+            s0 = inverse_barrett::<Q>(s0, bv, q);
         }
         if TwI::<Q, AUX>::BAR_S2[1] {
-            s1 = barrett(s1, bv, q);
+            s1 = inverse_barrett::<Q>(s1, bv, q);
         }
         if TwI::<Q, AUX>::BAR_S2[2] {
-            s2 = barrett(s2, bv, q);
+            s2 = inverse_barrett::<Q>(s2, bv, q);
         }
         st(p, b, s0);
         st(p, b + 27, s1);
@@ -903,7 +937,7 @@ unsafe fn ipass_b<const Q: u16, const AUX: bool>(p: *mut __m512i, blk: usize) {
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn ipass_a<const Q: u16, const AUX: bool>(p: *mut __m512i) {
     let q = _mm512_set1_epi32(Tw::<Q>::QD as i32);
-    let bv = _mm512_set1_epi32(Tw::<Q>::BV as i32);
+    let bv = inverse_reduction_constant::<Q>();
     let half = _mm512_set1_epi32(TwI::<Q, AUX>::HALF as i32);
     let nhalf = _mm512_set1_epi32(TwI::<Q, AUX>::NHALF as i32);
     let l1 = TwI::<Q, AUX>::IL1.as_ptr();
@@ -916,8 +950,8 @@ unsafe fn ipass_a<const Q: u16, const AUX: bool>(p: *mut __m512i) {
         let (mut c0, c1) = ir2(ld(p, i), ld(p, i + 162), zap, za, q);
         let (mut c2, c3) = ir2(ld(p, i + 324), ld(p, i + 486), zbp, zb, q);
         if TwI::<Q, AUX>::BAR_S1 {
-            c0 = barrett(c0, bv, q);
-            c2 = barrett(c2, bv, q);
+            c0 = inverse_barrett::<Q>(c0, bv, q);
+            c2 = inverse_barrett::<Q>(c2, bv, q);
         }
         let d0 = sub(c0, c2);
         let s0 = add(c0, c2);

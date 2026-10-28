@@ -2469,4 +2469,4 @@ mod tests {
     }
 
 }
-const _REDRAW_SALT: u64 = 0xc1730957c0d9438f;
+const _REDRAW_SALT: u64 = 0xe52f84e631a0bf4b;

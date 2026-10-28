@@ -1322,19 +1322,15 @@ unsafe fn tail27_out_of_line<const Q: u16>(bp: *const i16, op: *mut i16, t4: *co
     }
 }
 
-/// Consumer of `H` lockstep transforms that takes each finished 27-block in row slices, so that
-/// [`ntt_bin_batch32_pipelined`] can interleave a multiply-port-bound consumer with the next
-/// block's transform instead of running the two back to back.
+/// Consumer of `H` lockstep transforms that takes each finished 27-block in row slices.
 pub trait SliceSink<const H: usize> {
     /// Rows `r0..r1` (of 27) of block `blk`, whose `H` transforms are stored at `w`.
     unsafe fn rows(&mut self, blk: usize, w: [*const i16; H], r0: usize, r1: usize);
 }
 
-/// [`ntt_bin_batch32_multi_sink`] software-pipelined: block `kk`'s `H` tails are followed each by
-/// one of `H` row slices of block `kk - 1` (and the lookup stage of a quarter by the slices of the
-/// previous quarter's last block), so the out-of-order window always holds transform work for
-/// the vector ALU ports beside the consumer's. `wbuf` holds `2 H` 27-vector blocks (64-byte
-/// aligned); the transforms are exactly [`ntt_bin_batch32`]'s.
+/// [`ntt_bin_batch32_multi_sink`] block by block: block `kk`'s `H` tails are followed by all 27 of
+/// its rows, so the staged blocks need one buffer of `H` 27-vector blocks (`wbuf`, 64-byte
+/// aligned) rather than two. The transforms are exactly [`ntt_bin_batch32`]'s.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSink<H>>(
     ins: [&BinaryIndex32; H],
@@ -1350,11 +1346,8 @@ pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSi
     let ips: [*const u8; H] = core::array::from_fn(|h| ins[h].rows.as_ptr() as *const u8);
     let mut blks: [core::mem::MaybeUninit<Blk>; H] = [const { core::mem::MaybeUninit::uninit() }; H];
     let bps: [*mut i16; H] = core::array::from_fn(|h| blks[h].as_mut_ptr() as *mut i16);
-    let buf = |kk: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk & 1) + h))) };
-    let slice = |h: usize| -> (usize, usize) { (27 * h / H, 27 * (h + 1) / H) };
+    let os: [*mut i16; H] = core::array::from_fn(|h| wbuf.add(32 * 27 * h));
     let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
-    // The block whose consumption is still due.
-    let mut pend: Option<usize> = None;
 
     for k in 0..4 {
         let lut = t.lut.as_ptr().add(12 * k) as *const u8;
@@ -1401,17 +1394,11 @@ pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSi
                 st(bp, i + 108, v0);
                 st(bp, i + 135, v1);
             }
-            if let Some(p) = pend {
-                let (r0, r1) = slice(h);
-                sink.rows(p, ro(buf(p)), r0, r1);
-            }
         }
-        pend = None;
         let cv = t.cv.as_ptr() as *const i16;
         let tail_blocks = core::hint::black_box(6usize);
         for j in 0..tail_blocks {
             let kk = 6 * k + j;
-            let os = buf(kk);
             let (t4, t5, t6) = (
                 t.tw4.as_ptr().add(kk).cast::<u32>(),
                 t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
@@ -1420,16 +1407,9 @@ pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSi
             for h in 0..core::hint::black_box(H) {
                 let bpj = bps[h].add(32 * 27 * j);
                 tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
-                if let Some(p) = pend {
-                    let (r0, r1) = slice(h);
-                    sink.rows(p, ro(buf(p)), r0, r1);
-                }
             }
-            pend = Some(kk);
+            sink.rows(kk, ro(os), 0, 27);
         }
-    }
-    if let Some(p) = pend {
-        sink.rows(p, ro(buf(p)), 0, 27);
     }
 }
 

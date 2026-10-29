@@ -1355,6 +1355,33 @@ pub fn fold_witness_bitsliced(
     bitsliced::fold_words(words, challenges, 128 * bpc, workers)
 }
 
+/// Bytes per element of [`fold_witness_bitsliced_encoded`]'s output.
+pub const FOLD_ENCODED_BYTES: usize = bitsliced::ENCODED_BYTES;
+
+/// [`fold_witness_bitsliced`] written straight in the proof's encoding of the folded witness:
+/// element by element, one little-endian `i32` per coefficient ([`FOLD_ENCODED_BYTES`] per
+/// element), `32 bpc` elements from `out`. `false`, with nothing written, where the bit-sliced
+/// path does not apply.
+///
+/// # Safety
+/// `out` must be valid for writes of `32 bpc * FOLD_ENCODED_BYTES` bytes.
+pub unsafe fn fold_witness_bitsliced_encoded(
+    words: &[B128],
+    columns: usize,
+    challenges: &[ShortChallenge],
+    bpc: usize,
+    workers: usize,
+    out: *mut u8,
+) -> bool {
+    assert_eq!(challenges.len(), columns, "one challenge per column");
+    assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
+    if bpc % 4 != 0 || !bitsliced::fits(challenges) {
+        return false;
+    }
+    bitsliced::fold_words_encoded(words, challenges, 128 * bpc, workers, out);
+    true
+}
+
 // Exact fold of the binary witness, independent of commitment-modulus arithmetic.
 mod bitsliced {
     //! Integer convolution in Z[Y]/(Y^243 + 1), followed by reduction modulo
@@ -1377,15 +1404,11 @@ mod bitsliced {
 
     const LANES: usize = 512;
     const SLOTS: usize = 243;
-    /// Schedule entries ahead of use that the accumulation prefetches the planes of: the planes
-    /// (264 KB per worker) live in L2, and each entry's two vectors are otherwise demand misses.
-    const PF_AHEAD: usize = 0;
     const BITS: usize = 15;
     /// Columns per group: 16 * 129 planes, 132 KB per worker. 32 columns (264 KB) halve the
     /// outer group loops and partial CSA trees, but on the scored 8488C the smaller planes'
     /// cache footprint wins: full-shape fold 22.0 vs 23.0 ms (three alternating 7-rep medians;
-    /// 8 columns 23.1). The planes of a group (`GUARD + COL_GROUP * STRIDE`) keep the qword
-    /// offsets in u16 (`(2 + 32 * 129) * 8 <= 65535` at most).
+    /// 8 columns 23.1). A group's entry offsets fit an i16 ([`fits_offsets`]).
     const COL_GROUP: usize = 16;
     /// Parts of the column groups per block in the fold's dynamic task hand-out.
     const PARTS: usize = 2;
@@ -1399,11 +1422,21 @@ mod bitsliced {
     const GUARD: usize = 2;
     /// Slot pairs `(2q, 2q + 1)`; the odd slot of the last pair (243) is a dummy.
     const PAIRS: usize = SLOTS.div_ceil(2);
-    /// Entries a group's schedule may add to a slot pair beyond one per term: padding of its
-    /// positive and of its negative entries to multiples of 2.
+    /// Inputs a group may add to a slot pair beyond one per term: an odd window of either sign
+    /// takes the zero planes as its last input.
     const PAD_PER_GROUP: usize = 2;
-    // The offsets use x86's scale-8 addressing directly, avoiding a shift per input.
-    const _: () = assert!((GUARD + COL_GROUP * STRIDE) * 8 <= u16::MAX as usize);
+    /// An entry's key is its run's start slot plus `KEY0`: `m` for a direct run (`m < 162`),
+    /// `m - 243` for the wrapped part of a run with `m + 128 > 243` (`m - 243 >= -127`).
+    const KEY0: usize = 127;
+    const KEYS: usize = KEY0 + 162;
+
+    /// Whether the entry offsets of `GROUP` columns, `8 (column - m_eff)` with `m_eff` down to
+    /// `-KEY0`, fit an i16. The offsets use x86's scale-8 addressing directly, avoiding a shift
+    /// per input.
+    const fn fits_offsets(group: usize) -> bool {
+        8 * (GUARD + (group - 1) * STRIDE + KEY0) <= i16::MAX as usize
+    }
+    const _: () = assert!(fits_offsets(COL_GROUP));
 
     /// Whether the counters cannot overflow: a slot's counter adds at most one entry per
     /// challenge term and the padding of every group.
@@ -1415,120 +1448,61 @@ mod bitsliced {
     struct Group {
         first: usize,
         columns: usize,
-        /// `terms[offsets[q] .. mid[q]]` and `terms[mid[q] .. offsets[q + 1]]` are the
-        /// positive and the negative entries of slot pair `q`, each padded to a multiple of 2
-        /// with offset 0 (planes 0 and 1 are zero): whole 64-input chunks, then binary tail
-        /// trees of sizes 32, 16, 8, 4, 2.
-        offsets: [usize; PAIRS + 1],
-        mid: [usize; PAIRS],
-        terms: Vec<u16>,
+        /// Per sign (positive, negative), every entry's offset `8 (column - m_eff)`, in key
+        /// order. Slot pair `q` reads an entry's planes at its offset plus `16 q` (the run's
+        /// plane for slot `2q`, or a zero guard next to the run), and its entries are those with
+        /// `m_eff` in `[2q - 127, 2q + 1]`: `bases[s][win[s][q][0] .. win[s][q][1]]`, whole
+        /// 64-input chunks, then binary tail trees of sizes 32, 16, 8, 4, 2 and 1.
+        bases: [Vec<i16>; 2],
+        win: [[[u16; 2]; PAIRS]; 2],
     }
 
-    /// The schedule of column group `g` (columns `cs`), and per slot pair the number of its
-    /// negative entries (padding included): each adds one to the bias of both slots.
-    fn plan_group<const GROUP: usize>(g: usize, cs: &[ShortChallenge]) -> (Group, [i32; PAIRS]) { unsafe {
-        // A term's run `[m, end)` of slots meets slot pair `q` when `2q <= end - 1` and
-        // `2q + 1 >= m`, i.e. `q` in `[m / 2, (end - 1) / 2]`; the wrapped run `[0, wrap)`
-        // meets pairs `[0, (wrap - 1) / 2]`, with the opposite sign (`Y^243 = -1`).
-        // `count_diff[negative]`: the entries of each sign per pair, as range differences.
-        let mut count_diff = [[0i32; PAIRS + 1]; 2];
-        for c in cs.iter() {
+    /// Every schedule entry of the columns `cs`: its sign (1 negative), key and offset. A term's
+    /// run `[m, end)` of slots meets slot pair `q` when `2q + 1 >= m` and `2q <= end - 1`; the
+    /// wrapped run `[0, wrap)` (when `m + 128 > 243`) meets the pairs below `(wrap + 1) / 2`
+    /// with the opposite sign (`Y^243 = -1`), which is the same window for `m_eff = m - 243`.
+    fn each_entry(cs: &[ShortChallenge], mut f: impl FnMut(usize, usize, i16)) {
+        for (j, c) in cs.iter().enumerate() {
             assert!(c.weight <= c.positions.len());
+            let column = (GUARD + j * STRIDE) as isize;
             for t in 0..c.weight {
                 let m = c.positions[t] as usize;
                 assert!(m < 162);
                 let negative = ((c.signs >> t) & 1 != 0) ^ (m % 2 != 0);
-                let end = (m + 128).min(SLOTS);
-                count_diff[negative as usize][m / 2] += 1;
-                count_diff[negative as usize][(end + 1) / 2] -= 1;
-                let wrap = (m + 128).saturating_sub(SLOTS);
-                if wrap != 0 {
-                    count_diff[!negative as usize][0] += 1;
-                    count_diff[!negative as usize][(wrap + 1) / 2] -= 1;
+                f(negative as usize, m + KEY0, (8 * (column - m as isize)) as i16);
+                if m + 128 > SLOTS {
+                    let m_eff = m as isize - SLOTS as isize;
+                    f(!negative as usize, (m_eff + KEY0 as isize) as usize, (8 * (column - m_eff)) as i16);
                 }
             }
         }
-        let mut group = Group {
-            first: g * GROUP,
-            columns: cs.len(),
-            offsets: [0; PAIRS + 1],
-            mid: [0; PAIRS],
-            terms: Vec::new(),
-        };
-        let mut negatives = [0i32; PAIRS];
-        let mut count = [0i32; 2];
-        for q in 0..PAIRS {
-            for (c, diff) in count.iter_mut().zip(&count_diff) {
-                *c += diff[q];
-                debug_assert!(*c >= 0);
+    }
+
+    /// The schedule of column group `g` (columns `cs`): its entries counting-sorted by key, and
+    /// per slot pair the number of its negative inputs, the zero planes of an odd window
+    /// included: each adds one to the bias of both slots.
+    fn plan_group<const GROUP: usize>(g: usize, cs: &[ShortChallenge]) -> (Group, [i32; PAIRS]) {
+        // `start[s][k]`: the entries of sign `s` with a key below `k`.
+        let mut start = [[0u16; KEYS + 1]; 2];
+        each_entry(cs, |s, key, _| start[s][key + 1] += 1);
+        for s in &mut start {
+            for k in 0..KEYS {
+                s[k + 1] += s[k];
             }
-            let (pos, neg) = ((count[0] as usize + 1) & !1, (count[1] as usize + 1) & !1);
-            group.mid[q] = group.offsets[q] + pos;
-            group.offsets[q + 1] = group.mid[q] + neg;
-            negatives[q] = neg as i32;
         }
-        // Offset 0 is the padding pair (planes 0 and 1 are zero), not a column's plane.
-        // Only the last entry of a non-empty sign range can be padding (at most 1 entry for
-        // even alignment); presetting that slot to 0 avoids zeroing the whole schedule vector.
-        let total_terms = group.offsets[PAIRS];
-        // [`PF_AHEAD`] trailing zero offsets: the accumulation's look-ahead reads them.
-        group.terms = Vec::with_capacity(total_terms + PF_AHEAD);
-        core::ptr::write_bytes(group.terms.as_mut_ptr().add(total_terms), 0, PF_AHEAD);
-        unsafe {
-            let terms_ptr = group.terms.as_mut_ptr();
-            for q in 0..PAIRS {
-                if group.mid[q] > group.offsets[q] {
-                    *terms_ptr.add(group.mid[q] - 1) = 0;
-                }
-                if group.offsets[q + 1] > group.mid[q] {
-                    *terms_ptr.add(group.offsets[q + 1] - 1) = 0;
-                }
-            }
-            let mut at: [[u32; PAIRS]; 2] = [
-                core::array::from_fn(|q| group.offsets[q] as u32),
-                core::array::from_fn(|q| group.mid[q] as u32),
-            ];
-            for (j, c) in cs.iter().enumerate() {
-                let column = GUARD + j * STRIDE;
-                for t in 0..c.weight {
-                    let m = c.positions[t] as usize;
-                    let negative = ((c.signs >> t) & 1 != 0) ^ (m % 2 != 0);
-                    let end = (m + 128).min(SLOTS);
-                    // The plane of slot `2q` for the run starting at slot `m`: `column + 2q - m`, which
-                    // is the guard before the run when `2q = m - 1`; the odd slot reads one plane
-                    // further, the guard after the run when `2q + 1 = end`.
-                    let q0 = m / 2;
-                    let q1 = (end + 1) / 2;
-                    let at_ptr = at[negative as usize].as_mut_ptr();
-                    let mut val = (8 * (column + 2 * q0).wrapping_sub(m)) as u16;
-                    for q in q0..q1 {
-                        let p = at_ptr.add(q);
-                        let idx = *p as usize;
-                        debug_assert!(idx < if negative { group.offsets[q + 1] } else { group.mid[q] });
-                        *p = idx as u32 + 1;
-                        *terms_ptr.add(idx) = val;
-                        val = val.wrapping_add(16);
-                    }
-                    let wrap = (m + 128).saturating_sub(SLOTS);
-                    if wrap != 0 {
-                        let q1 = (wrap + 1) / 2;
-                        let at_ptr = at[!negative as usize].as_mut_ptr();
-                        let mut val = (8 * (column + (end - m))) as u16;
-                        for q in 0..q1 {
-                            let p = at_ptr.add(q);
-                            let idx = *p as usize;
-                            debug_assert!(idx < if !negative { group.offsets[q + 1] } else { group.mid[q] });
-                            *p = idx as u32 + 1;
-                            *terms_ptr.add(idx) = val;
-                            val = val.wrapping_add(16);
-                        }
-                    }
-                }
-            }
-            group.terms.set_len(total_terms + PF_AHEAD);
-        }
-        (group, negatives)
-    } }
+        let mut at = start;
+        let mut bases = start.map(|s| vec![0i16; s[KEYS] as usize]);
+        each_entry(cs, |s, key, offset| {
+            bases[s][at[s][key] as usize] = offset;
+            at[s][key] += 1;
+        });
+        let win: [[[u16; 2]; PAIRS]; 2] = start.map(|s| core::array::from_fn(|q| [s[2 * q], s[(2 * q + 129).min(KEYS)]]));
+        let negatives: [i32; PAIRS] = core::array::from_fn(|q| {
+            let n = (win[1][q][1] - win[1][q][0]) as i32;
+            n + (n & 1)
+        });
+        (Group { first: g * GROUP, columns: cs.len(), bases, win }, negatives)
+    }
 
     fn plan<const GROUP: usize>(challenges: &[ShortChallenge], workers: usize) -> (Vec<Group>, [i32; SLOTS]) {
         let jobs = challenges.len().div_ceil(GROUP);
@@ -1772,11 +1746,14 @@ mod bitsliced {
     /// slot keeps the six low counter bits of a 64-input tree in registers, plus a three-bit
     /// counter of the trees' weight-64 carries; every seventh chunk that counter is added into
     /// the nine upper counter bits in memory. The `pos` entries add their planes, the `neg`
-    /// entries their complements (leaf full adders by [`csa_neg`]).
+    /// entries their complements (leaf full adders by [`csa_neg`]). An entry's planes are at
+    /// `planes` plus its offset; the last entry of an odd list is paired with the two planes
+    /// at `pad`, which must be zero.
     #[target_feature(enable = "avx512f")]
     #[inline(never)]
-    unsafe fn accumulate_pair(planes: *const __m512i, pos: &[u16], neg: &[u16], acc: *mut __m512i) {
+    unsafe fn accumulate_pair(planes: *const __m512i, pos: &[i16], neg: &[i16], pad: *const __m512i, acc: *mut __m512i) {
         let planes = planes as *const u64;
+        let pad = pad as *const u64;
         let (even, odd) = (acc, acc.add(BITS));
         let mut s0: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(even.add(b)));
         let mut s1: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(odd.add(b)));
@@ -1811,25 +1788,21 @@ mod bitsliced {
                 _mm512_store_si512(p, _mm512_xor_si512(_mm512_load_si512(p), carry));
             }};
         }
-        let mut t: *const u16;
-        macro_rules! two {
-            ($off:expr, $leaf:ident) => {{
-                if PF_AHEAD > 0 {
-                    let fa = planes.add(*t.add($off + PF_AHEAD) as usize) as *const i8;
-                    let fb = planes.add(*t.add($off + 1 + PF_AHEAD) as usize) as *const i8;
-                    _mm_prefetch::<_MM_HINT_T0>(fa);
-                    _mm_prefetch::<_MM_HINT_T0>(fa.add(64));
-                    _mm_prefetch::<_MM_HINT_T0>(fb);
-                    _mm_prefetch::<_MM_HINT_T0>(fb.add(64));
-                }
-                let pa = planes.add(*t.add($off) as usize);
-                let pb = planes.add(*t.add($off + 1) as usize);
+        let mut t: *const i16;
+        macro_rules! leaf {
+            ($pa:expr, $pb:expr, $leaf:ident) => {{
+                let (pa, pb) = ($pa, $pb);
                 let a0 = _mm512_load_si512(pa as *const __m512i);
                 let b0 = _mm512_load_si512(pb as *const __m512i);
                 let a1 = _mm512_load_si512(pa.add(8) as *const __m512i);
                 let b1 = _mm512_load_si512(pb.add(8) as *const __m512i);
                 ($leaf(&mut s0[0], a0, b0), $leaf(&mut s1[0], a1, b1))
             }};
+        }
+        macro_rules! two {
+            ($off:expr, $leaf:ident) => {
+                leaf!(planes.offset(*t.add($off) as isize), planes.offset(*t.add($off + 1) as isize), $leaf)
+            };
         }
         macro_rules! level {
             ($bit:literal, $lower:ident, $off:expr, $leaf:ident) => {{
@@ -1872,8 +1845,8 @@ mod bitsliced {
         }
         // A carry of weight `2^$bit` from a partial tree, through half adders at that level and
         // above: what leaves level 5 is a weight-64 carry like a whole chunk's. Because the
-        // partial trees of a remainder total at most 62 < 64 inputs and `s0[0..6] <= 63`,
-        // `63 + 62 = 125 < 128`, so across the entire remainder `s0[0..6]` wraps modulo 64 at
+        // partial trees of a remainder total at most 63 < 64 inputs and `s0[0..6] <= 63`,
+        // `63 + 63 = 126 < 128`, so across the entire remainder `s0[0..6]` wraps modulo 64 at
         // most once per lane (`pending` advances by 1 for the whole non-empty remainder).
         macro_rules! half_adders {
             ($c0:expr, $c1:expr, $($bit:literal),+) => {{
@@ -1889,17 +1862,16 @@ mod bitsliced {
         }
         macro_rules! entries {
             ($terms:expr, $leaf:ident) => {{
-                let terms: &[u16] = $terms;
+                let terms: &[i16] = $terms;
                 for input in terms.chunks_exact(64) {
                     t = input.as_ptr();
                     let (c0, c1) = level!(5, thirty_two, 0, $leaf);
                     add_carry64!(c0, c1);
                     step_pending!();
                 }
-                // The schedule pads each sign of a slot pair to a multiple of 2: the remainder
-                // (at most 62 inputs) decomposes into binary partial trees of sizes 32, 16, 8, 4, 2.
+                // The remainder (at most 63 inputs) decomposes into binary partial trees of
+                // sizes 32, 16, 8, 4, 2, and a last input paired with the zero planes.
                 let rest = terms.chunks_exact(64).remainder();
-                debug_assert!(rest.len() % 2 == 0);
                 if !rest.is_empty() {
                     t = rest.as_ptr();
                     let n = rest.len();
@@ -1925,6 +1897,11 @@ mod bitsliced {
                     }
                     if n & 2 != 0 {
                         let (c0, c1) = two!(0, $leaf);
+                        half_adders!(c0, c1, 1, 2, 3, 4, 5);
+                        t = t.add(2);
+                    }
+                    if n & 1 != 0 {
+                        let (c0, c1) = leaf!(planes.offset(*t as isize), pad, $leaf);
                         half_adders!(c0, c1, 1, 2, 3, 4, 5);
                     }
                     step_pending!();
@@ -2100,15 +2077,23 @@ mod bitsliced {
         assert!(overflow == 0, "integer fold overflow");
     }
 
-    // Direct full-accumulator output from PR162; valid only for the one-part path.
+    /// Bytes of one element in the proof's encoding of the fold: a little-endian `i32` per
+    /// coefficient.
+    pub(super) const ENCODED_BYTES: usize = 4 * 4 * OUT_SLOTS;
+
+    // Direct full-accumulator output from PR162; valid only for the one-part path. `ENCODED`
+    // writes the block's elements at `encoded` in the proof's encoding instead of at `output`.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-    unsafe fn write_acc(
+    unsafe fn write_acc<const ENCODED: bool>(
         acc: *const __m512i,
         bias: &[i32; SLOTS],
         output: *mut RingElement,
+        encoded: *mut u8,
     ) {
-        for e in 0..LANES / 4 {
-            core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
+        if !ENCODED {
+            for e in 0..LANES / 4 {
+                core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
+            }
         }
         let zero = _mm512_setzero_si512();
         let perm = _mm512_load_si512(BACK.0.as_ptr() as *const __m512i);
@@ -2188,6 +2173,21 @@ mod bitsliced {
                     let t = transpose8x8_q(rows);
                     for j in 0..8 {
                         let e = 16 * g + 8 * h + 7 - j;
+                        if ENCODED {
+                            // Coefficients `4 s0 ..` of element `e`, sign-extended: `2 n` qwords.
+                            let dst = encoded.add(ENCODED_BYTES * e + 16 * s0);
+                            let lo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(t[j]));
+                            let hi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(t[j]));
+                            if n == 8 {
+                                _mm512_storeu_si512(dst as *mut __m512i, lo);
+                                _mm512_storeu_si512(dst.add(64) as *mut __m512i, hi);
+                            } else {
+                                let m = (1u32 << (2 * n)) - 1;
+                                _mm512_mask_storeu_epi64(dst as *mut i64, m as __mmask8, lo);
+                                _mm512_mask_storeu_epi64(dst.add(64) as *mut i64, (m >> 8) as __mmask8, hi);
+                            }
+                            continue;
+                        }
                         let dst = (core::ptr::addr_of_mut!((*output.add(e)).v) as *mut i16).add(4 * s0);
                         if n == 8 {
                             _mm512_storeu_si512(dst as *mut __m512i, t[j]);
@@ -2221,6 +2221,7 @@ mod bitsliced {
         free: &std::sync::Mutex<Vec<Vec<[i16; LANES]>>>,
         next: &std::sync::atomic::AtomicUsize,
         out_addr: usize,
+        encoded: usize,
         #[cfg(test)] profile: bool,
     ) -> u32 {
         let mut ran = 0u32;
@@ -2271,10 +2272,12 @@ mod bitsliced {
                 #[cfg(test)]
                 let start = profile.then(std::time::Instant::now);
                 for q in 0..PAIRS {
+                    let ([p0, p1], [n0, n1]) = (group.win[0][q], group.win[1][q]);
                     accumulate_pair(
+                        planes.as_ptr().add(2 * q),
+                        &group.bases[0][p0 as usize..p1 as usize],
+                        &group.bases[1][n0 as usize..n1 as usize],
                         planes.as_ptr(),
-                        &group.terms[group.offsets[q]..group.mid[q]],
-                        &group.terms[group.mid[q]..group.offsets[q + 1]],
                         acc.as_mut_ptr().add(2 * q * BITS),
                     );
                 }
@@ -2284,8 +2287,13 @@ mod bitsliced {
             #[cfg(test)]
             let start = profile.then(std::time::Instant::now);
             if FUSED {
-                let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
-                write_acc(acc.as_ptr(), bias, output);
+                if encoded != 0 {
+                    let at = (encoded as *mut u8).add(block * (LANES / 4) * ENCODED_BYTES);
+                    write_acc::<true>(acc.as_ptr(), bias, core::ptr::null_mut(), at);
+                } else {
+                    let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
+                    write_acc::<false>(acc.as_ptr(), bias, output, core::ptr::null_mut());
+                }
                 #[cfg(test)]
                 if let Some(start) = start { times[2] += start.elapsed(); }
                 continue;
@@ -2333,16 +2341,35 @@ mod bitsliced {
         column_words: usize,
         workers: usize,
     ) -> Vec<RingElement> {
-        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers)
+        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers, 0)
     }
 
+    /// [`fold_words`] in the proof's encoding at `out` ([`ENCODED_BYTES`] per element) instead.
+    ///
+    /// # Safety
+    /// `out` must be valid for writes of `column_words / 4 * ENCODED_BYTES` bytes.
+    pub(super) unsafe fn fold_words_encoded(
+        words: &[B128],
+        challenges: &[ShortChallenge],
+        column_words: usize,
+        workers: usize,
+        out: *mut u8,
+    ) {
+        assert!(!out.is_null());
+        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers, out as usize);
+    }
+
+    /// The fold as ring elements, or, with `encoded` nonzero (the fused path only), written at
+    /// that address in the proof's encoding and an empty vector returned.
     fn fold_config<const GROUP: usize, const FUSED: bool>(
         words: &[B128],
         challenges: &[ShortChallenge],
         column_words: usize,
         workers: usize,
+        encoded: usize,
     ) -> Vec<RingElement> {
-        assert!(GROUP > 0 && (GUARD + GROUP * STRIDE) * 8 <= u16::MAX as usize);
+        assert!(FUSED || encoded == 0, "only the fused path writes the encoding");
+        assert!(GROUP > 0 && fits_offsets(GROUP));
         #[cfg(test)]
         let profile = std::env::var_os("LABINIUS_BITFOLD_PROFILE").is_some();
         #[cfg(test)]
@@ -2369,7 +2396,7 @@ mod bitsliced {
         let free: std::sync::Mutex<Vec<Vec<[i16; LANES]>>> =
             std::sync::Mutex::new(Vec::new());
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let mut out: Vec<RingElement> = Vec::with_capacity(len);
+        let mut out: Vec<RingElement> = Vec::with_capacity(if encoded == 0 { len } else { 0 });
         let out_addr = out.as_mut_ptr() as usize;
         let t0 = std::time::Instant::now();
         let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
@@ -2387,6 +2414,7 @@ mod bitsliced {
                 free,
                 next,
                 out_addr,
+                encoded,
                 #[cfg(test)]
                 profile,
             );
@@ -2397,7 +2425,9 @@ mod bitsliced {
             }
         });
         // Every task wrote its whole range.
-        unsafe { out.set_len(len) };
+        if encoded == 0 {
+            unsafe { out.set_len(len) };
+        }
         out
     }
 
@@ -2457,9 +2487,9 @@ mod bitsliced {
             }
         }
 
-        /// The slot-pair kernel on schedules of every length class the plan pads to (whole
-        /// chunks plus a 16-, 32- or 48-input tail), in pieces as a block's groups call it, and
-        /// up to the top of the counter range.
+        /// The slot-pair kernel on schedules of every length class (whole chunks plus any tail,
+        /// odd ones included), with offsets of both signs around a shifted plane pointer, in
+        /// pieces as a block's groups call it, and up to the top of the counter range.
         #[test]
         fn bitfold_pair_kernel_partial_chunks() {
             let mut x = 0x0123_4567_89AB_CDEFu64;
@@ -2490,28 +2520,39 @@ mod bitsliced {
                     vec![16; 40],
                     vec![16000, 752, 15232],
                     vec![0, 64],
+                    vec![1, 3, 17, 33, 63, 65, 127, 4097],
+                    vec![1],
                 ] {
                     let mut acc = vec![zero; 2 * BITS];
                     let mut want = [[0usize; LANES]; 2];
                     for (i, &n) in lens.iter().enumerate() {
                         let m = lens[(i + 1) % lens.len()];
-                        let mut terms = |n: usize| -> Vec<u16> {
+                        // Offsets from plane `BASE`, so that some are negative, as a slot pair's are.
+                        const BASE: isize = 32;
+                        let mut terms = |n: usize| -> Vec<i16> {
                             (0..n).map(|i| {
-                                // a sprinkling of padding entries (offset 0: two zero planes)
-                                if i % 13 == 5 { 0 } else { (8 * (2 + next() % 63)) as u16 }
+                                // a sprinkling of entries on the zero planes 0 and 1
+                                let p = (if i % 13 == 5 { 0 } else { 2 + next() % 63 }) as isize;
+                                (8 * (p - BASE)) as i16
                             }).collect()
                         };
                         let (pos, neg) = (terms(n), terms(m));
                         for (list, complement) in [(&pos, 0), (&neg, 1)] {
                             for &o in list {
-                                let p = o as usize / 8;
+                                let p = (BASE + o as isize / 8) as usize;
                                 for l in 0..LANES {
                                     want[0][l] += bit(p, l) ^ complement;
                                     want[1][l] += bit(p + 1, l) ^ complement;
                                 }
                             }
+                            // An odd list's last input is paired with the zero planes.
+                            if list.len() % 2 == 1 {
+                                for w in &mut want {
+                                    w.iter_mut().for_each(|c| *c += complement);
+                                }
+                            }
                         }
-                        accumulate_pair(planes.as_ptr(), &pos, &neg, acc.as_mut_ptr());
+                        accumulate_pair(planes.as_ptr().offset(BASE), &pos, &neg, planes.as_ptr(), acc.as_mut_ptr());
                     }
                     for slot in 0..2 {
                         let mut got = [0i16; LANES];
@@ -2678,8 +2719,8 @@ mod bitsliced {
             for (group, workers) in [(16, 4), (31, 4), (31, 2), (16, 2)] {
                 let start = std::time::Instant::now();
                 let v = match group {
-                    16 => fold_config::<16, false>(&words, &cs, 1 << 14, workers),
-                    31 => fold_config::<31, false>(&words, &cs, 1 << 14, workers),
+                    16 => fold_config::<16, false>(&words, &cs, 1 << 14, workers, 0),
+                    31 => fold_config::<31, false>(&words, &cs, 1 << 14, workers, 0),
                     _ => unreachable!(),
                 };
                 eprintln!("bitfold group={} workers={} exact_us={}", group, workers, start.elapsed().as_micros());

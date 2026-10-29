@@ -40,6 +40,8 @@ fn main() {
     std::fs::write(dir.join("sms-pairs.bin"), pairs).expect("write the single-transform key image");
     std::fs::write(dir.join("sms-mur.bin"), mur).expect("write the chunk mean image");
     std::fs::write(dir.join("sms-mu.bin"), mu).expect("write the mean total image");
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    native_diagnostics(&dir);
 }
 
 /// For the single-transform modulus: the eight streams' keys in the lockstep layout, the digit
@@ -114,35 +116,38 @@ fn native_diagnostics(dir: &std::path::Path) {
     use std::process::Command;
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let helper = manifest.parent().unwrap().join("native_diagnostics");
-    let target = dir.join("native-diagnostics-target");
-    let native = dir.join("native-diagnostics-labrador");
+    let target = dir.join("candidate-b-performance-target");
+    assert!(!target.exists(), "fresh helper target");
+    let native = dir.join("candidate-b-performance-labrador");
     copy_native_source(&manifest.join("../labinius/crates/pcs/labrador"), &native);
     let host = env::var("HOST").unwrap();
-    let build = Command::new(env::var_os("CARGO").unwrap())
-        .args(["build", "--locked", "--offline", "--release", "--jobs", "1", "--target", &host, "-vv", "--manifest-path"])
+    let cargo = env::var_os("CARGO").unwrap();
+    let flags = env::var("RUSTFLAGS").unwrap_or_default();
+    let encoded = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    let build = Command::new(&cargo)
+        .args(["build", "--locked", "--offline", "--release", "--jobs", "1", "--target", &host, "-vv", "--bins", "--manifest-path"])
         .arg(helper.join("Cargo.toml"))
         .env("CARGO_TARGET_DIR", &target)
         .env("LABINIUS_LABRADOR_DIR", &native)
-        .env("LABINIUS_DIAGNOSTIC_PAIR_KEY", dir.join("pair-key.bin"))
-        .env("LABINIUS_DIAGNOSTIC_RUSTFLAGS", env::var("RUSTFLAGS").unwrap_or_default())
-        .env("LABINIUS_DIAGNOSTIC_ENCODED_RUSTFLAGS", env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default())
-        .env_remove("CARGO_MAKEFLAGS")
-        .env_remove("MAKEFLAGS")
-        .env_remove("MFLAGS")
-        .output().expect("build the separate native diagnostic offline");
-    let log = String::from_utf8_lossy(&build.stderr);
-    for line in log.lines().filter(|line| line.contains("Running `") &&
-        (line.contains("--crate-name labinius_native_diagnostics ") || line.contains("--crate-name labinius "))) {
-        println!("cargo:warning=native-diag compiler={line}");
+        .env("LABINIUS_DIAGNOSTIC_KEYDIR", dir)
+        .env_remove("CARGO_MAKEFLAGS").env_remove("MAKEFLAGS").env_remove("MFLAGS")
+        .output().expect("build fresh whole-process helpers offline");
+    std::fs::write(dir.join("candidate-b-build.stdout"), &build.stdout).unwrap();
+    std::fs::write(dir.join("candidate-b-build.stderr"), &build.stderr).unwrap();
+    for line in String::from_utf8_lossy(&build.stderr).lines().filter(|line| line.contains("Running `")) {
+        println!("cargo:warning=candidate-b-compiler {line}");
     }
-    assert!(build.status.success(), "native diagnostic build failed:\n{}\n{}", String::from_utf8_lossy(&build.stdout), log);
-    let run = Command::new(target.join(host).join("release/labinius-native-diagnostics"))
-        .arg(dir.join("native-diagnostics-input.bin"))
-        .output().expect("run the separate native diagnostic");
-    for line in String::from_utf8_lossy(&run.stdout).lines() {
-        println!("cargo:warning={line}");
-    }
-    assert!(run.status.success(), "native diagnostic failed:\n{}", String::from_utf8_lossy(&run.stderr));
+    assert!(build.status.success(), "helper build failed:\n{}\n{}", String::from_utf8_lossy(&build.stdout), String::from_utf8_lossy(&build.stderr));
+    let run = Command::new(target.join(&host).join("release/labinius-native-diagnostics"))
+        .arg(dir)
+        .env("LABINIUS_DIAGNOSTIC_CARGO", &cargo)
+        .env("LABINIUS_DIAGNOSTIC_HOST", &host)
+        .env("LABINIUS_DIAGNOSTIC_RUSTFLAGS", &flags)
+        .env("LABINIUS_DIAGNOSTIC_ENCODED_RUSTFLAGS", &encoded)
+        .env_remove("SMS_MODE").env_remove("LABINIUS_NORMAL_SCHED")
+        .output().expect("run fresh helper driver");
+    for line in String::from_utf8_lossy(&run.stdout).lines() { println!("cargo:warning={line}"); }
+    assert!(run.status.success(), "helper failed:\n{}", String::from_utf8_lossy(&run.stderr));
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

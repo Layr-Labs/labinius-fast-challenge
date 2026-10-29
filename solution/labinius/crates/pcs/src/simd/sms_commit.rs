@@ -516,7 +516,7 @@ struct Total {
 /// `both`), inverse transformed and centered, reconstructed around their means and added to the
 /// total with weight `8^d`.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bool, total: &mut Total) {
+unsafe fn reconstruct<const CANONICAL: bool>(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bool, total: &mut Total) {
     let chunks = chunk_count(keys.elements);
     let at = d * chunks + c0;
     let mlo = keys.mur.as_ptr().add(at * N);
@@ -529,7 +529,9 @@ unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bo
         let x = _mm512_load_si512(b.v[m].as_ptr() as *const __m512i);
         let mu = _mm512_mask_blend_epi16(0xFFFF_0000, _mm512_set1_epi16(*mlo.add(m)), _mm512_set1_epi16(*mhi.add(m)));
         let mut y = _mm512_sub_epi16(x, mu);
-        y = _mm512_mask_sub_epi16(y, _mm512_cmpgt_epi16_mask(y, hq), y, q);
+        if !CANONICAL {
+            y = _mm512_mask_sub_epi16(y, _mm512_cmpgt_epi16_mask(y, hq), y, q);
+        }
         y = _mm512_mask_add_epi16(y, _mm512_cmplt_epi16_mask(y, nhq), y, q);
         let lo = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(y)), wd);
         let hi = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y)), wd);
@@ -540,6 +542,8 @@ unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bo
         }
     }
 }
+
+type Reconstruct = unsafe fn(&Batch32, usize, &SmsKeys<'_>, usize, bool, &mut Total);
 
 /// Per-worker scratch, allocated once and reused by every group the worker takes.
 struct SmsWorker {
@@ -674,7 +678,7 @@ enum RowsOut<'a> {
 /// `dst`. `sync(b_done)` is called at every [`PP`] boundary so hyperthread siblings can share the
 /// key stream in L2.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, range: core::ops::Range<usize>, out: RowsOut, ws: &mut SmsWorker, dst: *mut [u32; N], mut sync: F) {
+unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, range: core::ops::Range<usize>, out: RowsOut, ws: &mut SmsWorker, dst: *mut [u32; N], reconstruct: Reconstruct, mut sync: F) {
     let g = cols.len();
     assert!(g >= 1 && g <= 16 && (np / 2) % LOCK == 0 && ((np / 2) % CHUNK_PAIRS) % LOCK == 0 && 2 * np == keys.elements);
     let hl = np / 2;
@@ -824,7 +828,7 @@ pub fn worker_report(workers: usize) -> String {
 /// of the two claims units on its own, so a slowed CPU does less of the work instead of holding
 /// up the commitment's end. The two parts of a column group may run on different workers; the
 /// second to finish writes its rows.
-fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize, placement: Option<&crate::par::CorePlacement>, dst: usize) {
+fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize, placement: Option<&crate::par::CorePlacement>, dst: usize, reconstruct: Reconstruct) {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let g = 16usize;
     let pairs = workers / 2;
@@ -872,7 +876,7 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
             let (from, base) = (range.start, progressed);
             unsafe {
                 let out = if HALVES == 1 { RowsOut::Full } else { RowsOut::Half(&locks[gi]) };
-                group(&columns[lo..lo + n], keys, np, range.clone(), out, ws, (dst as *mut [u32; N]).add(2 * lo), |b_done| {
+                group(&columns[lo..lo + n], keys, np, range.clone(), out, ws, (dst as *mut [u32; N]).add(2 * lo), reconstruct, |b_done| {
                     let d = base + (b_done - from);
                     mine.store(d, Ordering::Release);
                     if !coupled.load(Ordering::Relaxed) {
@@ -911,6 +915,16 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
 /// The commitment's rows: `rows[2c]` is column `c` modulo 9721 in the NTT domain (canonical),
 /// `rows[2c + 1]` its coefficients modulo `2^22`.
 pub fn commit_columns_rows(keys: &SmsKeys, columns: &[&[B128]], workers: usize) -> Vec<[u32; N]> {
+    commit_columns_rows_impl(keys, columns, workers, reconstruct::<false>)
+}
+
+/// The same rows, with `keys.mur` supplied as canonical residues in `[0, P)` instead of the
+/// centered residues required by [`SmsKeys`] and [`commit_columns_rows`].
+pub fn commit_columns_rows_canonical_means(keys: &SmsKeys, columns: &[&[B128]], workers: usize) -> Vec<[u32; N]> {
+    commit_columns_rows_impl(keys, columns, workers, reconstruct::<true>)
+}
+
+fn commit_columns_rows_impl(keys: &SmsKeys, columns: &[&[B128]], workers: usize, reconstruct: Reconstruct) -> Vec<[u32; N]> {
     assert!(!columns.is_empty(), "at least one witness column");
     let len = columns[0].len();
     for c in columns {
@@ -926,7 +940,7 @@ pub fn commit_columns_rows(keys: &SmsKeys, columns: &[&[B128]], workers: usize) 
     let dst = rows.as_mut_ptr() as usize;
     let paired = if workers >= 2 && workers % 2 == 0 && groups > 1 { crate::par::CorePlacement::for_sibling_pairs(workers) } else { None };
     if let Some(placement) = paired {
-        commit_paired(keys, columns, np, workers, Some(&placement), dst);
+        commit_paired(keys, columns, np, workers, Some(&placement), dst, reconstruct);
     } else {
         let workers = workers.clamp(1, groups);
         let next = std::sync::atomic::AtomicUsize::new(0);
@@ -942,7 +956,7 @@ pub fn commit_columns_rows(keys: &SmsKeys, columns: &[&[B128]], workers: usize) 
                 let c0 = gi * g;
                 let gc = g.min(columns.len() - c0);
                 let ws = ws.get_or_insert_with(SmsWorker::new);
-                unsafe { group(&columns[c0..c0 + gc], keys, np, 0..np, RowsOut::Full, ws, (dst as *mut [u32; N]).add(2 * c0), |_| {}) };
+                unsafe { group(&columns[c0..c0 + gc], keys, np, 0..np, RowsOut::Full, ws, (dst as *mut [u32; N]).add(2 * c0), reconstruct, |_| {}) };
             }
         });
     }

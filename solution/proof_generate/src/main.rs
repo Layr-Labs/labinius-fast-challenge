@@ -1008,17 +1008,31 @@ const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-
 static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
 /// The single-transform modulus's public data (`labinius::simd::commit::sms`), precomputed by
 /// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
-/// lockstep layout, the digit chunks' centered mean residues and the means' total.
+/// lockstep layout, the digit chunks' mean residues and the means' total.
 const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
 static SMS_PAIRS:Aligned2M<[u8;SMS_PAIRS_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
+/// Convert the centered little-endian image in the static initializer; the file stays centered.
+const fn sms_canonical_means<const LEN: usize>(mut bytes: [u8; LEN]) -> [u8; LEN] {
+    let mut at = 0;
+    while at < LEN {
+        let x = i16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        if x < 0 {
+            let b = (x + labinius::simd::commit::sms::P as i16).to_le_bytes();
+            bytes[at] = b[0];
+            bytes[at + 1] = b[1];
+        }
+        at += 2;
+    }
+    bytes
+}
 const SMS_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")).len();
-static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")));
+static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(sms_canonical_means(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin"))));
 const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();
 static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")));
 
-/// The embedded single-transform keys, read in place, if the build host made them for this
-/// shape.
-fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
+/// The embedded single-transform keys with canonical means, read in place, if the build host
+/// made them for this shape.
+fn sms_embedded_canonical() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     use labinius::simd::commit::sms;
     let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
     if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 2 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N {
@@ -1540,7 +1554,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // ... and so do the embedded pair/arranged keys' (otherwise a page-cache fault per 64 KB
     // inside the commitment, taken by all its workers at once as they reach the same batches:
     // measured 2 ms of commitment for 0.3-0.5 ms here).
-    let sms_keys = if modulus == modulus_choice::SMS_MODULUS && modulus == MODULUS { sms_embedded() } else { None };
+    let sms_keys = if modulus == modulus_choice::SMS_MODULUS && modulus == MODULUS { sms_embedded_canonical() } else { None };
     let image: &[u8] = if sms_keys.is_some() {
         &SMS_PAIRS.0
     } else if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
@@ -1575,14 +1589,13 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
     let sms_built;
     let rows = if modulus == modulus_choice::SMS_MODULUS {
-        let keys = match sms_keys {
-            Some(k) => k,
+        match sms_keys {
+            Some(keys) => labinius::simd::commit::sms::commit_columns_rows_canonical_means(&keys, &columns, workers),
             None => {
                 sms_built = labinius::simd::commit::sms::SmsKeyData::build(&rq::ajtai_matrix(modulus, RING_ELEMENTS), RING_ELEMENTS);
-                sms_built.keys()
+                labinius::simd::commit::sms::commit_columns_rows(&sms_built.keys(), &columns, workers)
             }
-        };
-        labinius::simd::commit::sms::commit_columns_rows(&keys, &columns, workers)
+        }
     } else if let Some(pairs) = pairs {
         labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers)
     } else if let Some(keys) = arranged {

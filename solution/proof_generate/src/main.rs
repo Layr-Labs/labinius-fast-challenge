@@ -233,23 +233,30 @@ mod huge {
         end: UnsafeCell::new(0),
     };
 
-    /// A medium block for `size` bytes at `align`, and whether it is fresh (still zero).
+    /// A medium block for `size` bytes at `align`, and whether it is fresh (still zero). A free
+    /// block of the size's own class is taken first, else one of the next four (at most twice
+    /// the size): the commitment's freed per-worker blocks then serve the fold's, whose fresh
+    /// carves would be cleared 2 MB at a time by their first writers at the fold's start.
     unsafe fn medium_alloc(size: usize, align: usize) -> (*mut u8, bool) {
         let (bytes, i) = class(size);
-        let list = &FREE[i];
-        list.lock.lock();
-        let head = *list.head.get();
-        if !head.is_null() && head as usize % align == 0 {
-            *list.head.get() = *(head as *mut *mut u8);
+        for list in &FREE[i..(i + 5).min(LISTS)] {
+            list.lock.lock();
+            let head = *list.head.get();
+            if !head.is_null() && head as usize % align == 0 {
+                *list.head.get() = *(head as *mut *mut u8);
+                list.lock.unlock();
+                return (head, false);
+            }
             list.lock.unlock();
-            return (head, false);
         }
-        list.lock.unlock();
         let align = align.max(GAP);
         CARVE.lock.lock();
         let mut at = (*CARVE.at.get() + align - 1) & !(align - 1);
         if *CARVE.end.get() == 0 || at + bytes > *CARVE.end.get() {
-            let chunk = map(HUGE) as usize;
+            let chunk = match spare_take() {
+                0 => map(HUGE) as usize,
+                spare => spare,
+            };
             if chunk == 0 {
                 CARVE.lock.unlock();
                 return (core::ptr::null_mut(), false);
@@ -273,6 +280,115 @@ mod huge {
     #[inline]
     fn span(size: usize) -> usize {
         (size + HUGE - 1) & !(HUGE - 1)
+    }
+
+    /// Freed large blocks of at most [`KEEP_SPAN`] stay mapped, [`KEEP`] at a time, for the next
+    /// uninitialised allocation of the same span: the commitment's rows (5.3 MB) are freed before
+    /// the fold allocates its 5.3 MB output, whose first writers would otherwise each clear a
+    /// fresh 2 MB page at the end of their first task.
+    const KEEP: usize = 4;
+    const KEEP_SPAN: usize = 8 * HUGE;
+
+    /// The kept blocks as `(address, span)`, address 0 for an empty slot.
+    struct Kept {
+        lock: SpinLock,
+        blocks: UnsafeCell<[(usize, usize); KEEP]>,
+    }
+
+    // Guarded by its lock.
+    unsafe impl Sync for Kept {}
+
+    static KEPT: Kept = Kept {
+        lock: SpinLock(AtomicBool::new(false)),
+        blocks: UnsafeCell::new([(0, 0); KEEP]),
+    };
+
+    /// A kept block of `span` bytes, or null.
+    unsafe fn kept_take(span: usize) -> *mut u8 {
+        KEPT.lock.lock();
+        let mut p = core::ptr::null_mut();
+        for slot in (*KEPT.blocks.get()).iter_mut() {
+            if slot.0 != 0 && slot.1 == span {
+                p = slot.0 as *mut u8;
+                *slot = (0, 0);
+                break;
+            }
+        }
+        KEPT.lock.unlock();
+        p
+    }
+
+    /// Zeroed 2 MB chunks already faulted in, carved before fresh mappings: the commitment's
+    /// per-worker blocks are carved at its start, where all its workers would otherwise fault
+    /// fresh chunks at once.
+    const SPARES: usize = 8;
+
+    struct Spares {
+        lock: SpinLock,
+        chunks: UnsafeCell<[usize; SPARES]>,
+    }
+
+    // Guarded by its lock.
+    unsafe impl Sync for Spares {}
+
+    static SPARE: Spares = Spares {
+        lock: SpinLock(AtomicBool::new(false)),
+        chunks: UnsafeCell::new([0; SPARES]),
+    };
+
+    /// Up to `n` fresh 2 MB chunks as `(address, bytes)`, for the caller to fault in and then
+    /// hand to [`give_spares`]; nothing else touches them meanwhile.
+    pub fn new_spares(n: usize) -> Vec<(usize, usize)> {
+        (0..n.min(SPARES))
+            .map(|_| unsafe { map(HUGE) as usize })
+            .filter(|&p| p != 0)
+            .map(|p| (p, HUGE))
+            .collect()
+    }
+
+    /// Chunks from [`new_spares`], faulted in and still all zero, for the medium blocks to come.
+    pub fn give_spares(chunks: &[(usize, usize)]) {
+        SPARE.lock.lock();
+        let slots = unsafe { &mut *SPARE.chunks.get() };
+        for &(p, _) in chunks {
+            if let Some(slot) = slots.iter_mut().find(|s| **s == 0) {
+                *slot = p;
+            }
+        }
+        SPARE.lock.unlock();
+    }
+
+    /// A spare chunk's address, or 0.
+    unsafe fn spare_take() -> usize {
+        SPARE.lock.lock();
+        let mut p = 0;
+        for slot in (*SPARE.chunks.get()).iter_mut() {
+            if *slot != 0 {
+                p = *slot;
+                *slot = 0;
+                break;
+            }
+        }
+        SPARE.lock.unlock();
+        p
+    }
+
+    /// Keep the block at `p` of `span` bytes; false when it is too large or every slot is taken.
+    unsafe fn kept_put(p: *mut u8, span: usize) -> bool {
+        if span > KEEP_SPAN {
+            return false;
+        }
+        KEPT.lock.lock();
+        let mut kept = false;
+        for slot in (*KEPT.blocks.get()).iter_mut() {
+            if slot.0 == 0 {
+                *slot = (p as usize, span);
+                kept = true;
+                break;
+            }
+        }
+        KEPT.lock.unlock();
+        kept
     }
 
     /// A fresh (zeroed) 2 MB-aligned mapping of `span(size)` bytes, or null.
@@ -307,7 +423,8 @@ mod huge {
         #[inline]
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
             if large(l.size(), l.align()) {
-                map(l.size())
+                let p = kept_take(span(l.size()));
+                if p.is_null() { map(l.size()) } else { p }
             } else if medium(l.size(), l.align()) {
                 medium_alloc(l.size(), l.align()).0
             } else {
@@ -333,7 +450,9 @@ mod huge {
         #[inline]
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
             if large(l.size(), l.align()) {
-                sys::munmap(p as *mut _, span(l.size()));
+                if !kept_put(p, span(l.size())) {
+                    sys::munmap(p as *mut _, span(l.size()));
+                }
             } else if medium(l.size(), l.align()) {
                 medium_free(p, l.size())
             } else {
@@ -437,11 +556,23 @@ impl Table {
 /// Fault the words' pages in, page-cache pages into page tables: `MADV_POPULATE_READ` where the
 /// kernel has it (older kernels refuse it, harmlessly), one read per page otherwise (the
 /// fault-around maps a run of pages per fault). A read-only touch, so it runs on another thread
-/// while the key is built.
-fn populate_words(words: &[B128], keys: &[u8], threads: usize) {
+/// while the key is built. The first tasks fault in the anonymous blocks `warm` (address, bytes),
+/// a huge page each, by writing a zero byte per 4 KB of them.
+fn populate_words(words: &[B128], keys: &[u8], warm: &[(usize, usize)], threads: usize) {
     let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
     let kruns = labinius::par::ranges(keys.len(), threads, 4096);
-    labinius::par::pool().run(runs.len().max(kruns.len()), |i| {
+    let wruns: Vec<(usize, usize)> = warm
+        .iter()
+        .flat_map(|&(addr, bytes)| labinius::par::ranges(bytes, bytes.div_ceil(2 << 20), 2 << 20).into_iter().map(move |r| (addr + r.start, r.len())))
+        .collect();
+    labinius::par::pool().run(wruns.len() + runs.len().max(kruns.len()), |i| {
+        if let Some(&(addr, bytes)) = wruns.get(i) {
+            for off in (0..bytes).step_by(4096) {
+                unsafe { core::ptr::write_volatile((addr + off) as *mut u8, 0) };
+            }
+            return;
+        }
+        let i = i - wruns.len();
         if let Some(r) = kruns.get(i) {
             populate_part(keys[r.clone()].as_ptr() as usize, r.len());
         }
@@ -1142,8 +1273,8 @@ const HYBRID_GROUP: usize = 16;
 // the proof file
 // =============================================================================================
 
-/// What [`prove`] produces: the proof's fields, the folded witness still as ring elements (its
-/// wire form is written straight into the proof file).
+/// What [`prove`] produces: the proof's fields, the folded witness either as ring elements (its
+/// wire form is written straight into the proof file) or already written there by the fold.
 struct ProofParts {
     modulus: u128,
     commitment: Vec<u8>,
@@ -1151,15 +1282,34 @@ struct ProofParts {
     rounds: Vec<[[u64; 3]; 2]>,
     opened: [u64; 3],
     row: Vec<u8>,
-    folded: FoldedWitness,
+    folded: Folded,
+}
+
+/// The folded witness: ring elements still to encode, or `elements` of them that the fold wrote
+/// in their encoding into the mapped proof file ([`Output::folded_target`]).
+enum Folded {
+    Elements(FoldedWitness),
+    Written { elements: usize },
+}
+
+impl Folded {
+    fn len(&self) -> usize {
+        match self {
+            Folded::Elements(f) => f.elements().len(),
+            Folded::Written { elements } => *elements,
+        }
+    }
 }
 
 impl ProofParts {
     fn into_proof(self) -> Proof {
+        let Folded::Elements(folded) = &self.folded else {
+            panic!("the folded witness is only in the mapped proof file");
+        };
         Proof {
             version: 1,
             modulus: self.modulus,
-            folded: pack_folded(&self.folded),
+            folded: pack_folded(folded),
             commitment: self.commitment,
             partials: self.partials,
             rounds: self.rounds,
@@ -1198,7 +1348,7 @@ impl ProofLayout {
         ProofLayout {
             commitment_bytes: parts.commitment.len(),
             row_bytes: parts.row.len(),
-            folded_bytes: FOLDED_BYTES * N * parts.folded.elements().len(),
+            folded_bytes: FOLDED_BYTES * N * parts.folded.len(),
             partials: parts.partials.len(),
             rounds: parts.rounds.len(),
         }
@@ -1264,7 +1414,10 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
     debug_assert_eq!(middle.len(), layout.middle());
     put(&mut at, &middle);
     debug_assert_eq!(at, layout.folded_at());
-    let elements = parts.folded.elements();
+    let elements = match &parts.folded {
+        Folded::Elements(f) => f.elements(),
+        Folded::Written { .. } => &[],
+    };
     assert!(
         elements
             .iter()
@@ -1436,24 +1589,15 @@ impl Output {
             populate_failed: std::sync::atomic::AtomicBool::new(false),
         });
         // Idle work for the workers while the key is set up: create and map the file, build
-        // the challenge sampler's tables (needed ~290 ms in, by the folding challenges), read
-        // the CPU topology the commitment's placement asks for, and fault in the commitment's
-        // buffer, a huge page per chunk.
-        let mut commitment = vec![0u8; layout.commitment_bytes];
-        let (addr, bytes) = (commitment.as_mut_ptr() as usize, commitment.len());
-        let pages = bytes.div_ceil(POPULATE_CHUNK);
+        // the challenge sampler's tables (needed ~290 ms in, by the folding challenges) and read
+        // the CPU topology the commitment's placement asks for. The commitment's buffer is
+        // faulted in by the matrix phase's tasks ([`Output::commitment_region`]).
+        let commitment = vec![0u8; layout.commitment_bytes];
         let worker_state = state.clone();
-        let job = labinius::par::pool().idle(3 + pages, move |i| match i {
+        let job = labinius::par::pool().idle(3, move |i| match i {
             0 => worker_state.chunk(0),
             1 => labinius::challenge::warm(),
-            2 => labinius::par::warm_topology(),
-            // The buffer is not touched by anyone else before `write` or `commitment_buffer`
-            // quiesces this job; writing a zero where the fresh mapping already reads zero.
-            _ => unsafe {
-                let at = (i - 3) * POPULATE_CHUNK;
-                core::ptr::write_volatile((addr + at) as *mut u8, 0);
-                core::ptr::write_volatile((addr + (at + POPULATE_CHUNK).min(bytes) - 1) as *mut u8, 0);
-            },
+            _ => labinius::par::warm_topology(),
         });
         Output {
             state,
@@ -1461,6 +1605,13 @@ impl Output {
             populate: std::sync::OnceLock::new(),
             commitment: std::sync::Mutex::new(Some(commitment)),
         }
+    }
+
+    /// The commitment buffer's `(address, bytes)`, for the matrix phase to fault in: nothing
+    /// else touches it before [`commitment_buffer`](Self::commitment_buffer) hands it out, and a
+    /// zero written where the fresh mapping reads zero changes nothing.
+    fn commitment_region(&self) -> Option<(usize, usize)> {
+        self.commitment.lock().unwrap().as_mut().map(|v| (v.as_mut_ptr() as usize, v.len()))
     }
 
     /// The commitment's buffer, once the setup's idle work is over (stopped if it is not).
@@ -1489,6 +1640,19 @@ impl Output {
             None => worker_state.chunk(i - first.len() + 1),
         });
         let _ = self.populate.set(job);
+    }
+
+    /// Where the fold may write the encoding of `elements` folded ring elements: their place in
+    /// the mapped proof file, when it is mapped and its layout holds exactly that many.
+    fn folded_target(&self, elements: usize) -> Option<*mut u8> {
+        let layout = self.state.layout;
+        if layout.folded_bytes != FOLDED_BYTES * N * elements
+            || labinius::fold::FOLD_ENCODED_BYTES != FOLDED_BYTES * N
+        {
+            return None;
+        }
+        let m = self.state.mapped()?;
+        Some((m.addr + layout.folded_at()) as *mut u8)
     }
 
     /// Write the proof: encoded into the mapping when it has the expected layout, else through
@@ -1552,7 +1716,27 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     } else {
         &[]
     };
-    populate_words(values, image, workers);
+    // The commitment's rows are allocated by the commit: a block of their span faulted in here
+    // is kept by the allocator when it is dropped and taken by the commit's allocation, whose
+    // first writers would otherwise each clear a fresh 2 MB page as their groups end. Five spare
+    // chunks faulted in beside it hold the commitment's per-worker blocks (8 x 0.9 MB).
+    let mut warm: Vec<u8> = Vec::with_capacity(2 * COLUMNS * N * 4);
+    #[cfg(target_os = "linux")]
+    let spares = huge::new_spares(5);
+    #[cfg(not(target_os = "linux"))]
+    let spares: Vec<(usize, usize)> = Vec::new();
+    let mut regions = vec![(warm.as_mut_ptr() as usize, warm.capacity())];
+    regions.extend_from_slice(&spares);
+    regions.extend(output.and_then(|o| o.commitment_region()));
+    // The planes' pages the switch's binding pass writes first (written ~10 ms after the
+    // commitment; faulting them in there stalls the pass's runners). Uninitialised buffers:
+    // the zeros written here are overwritten before anything reads them.
+    let bound = ((1usize << LOG_PACKED) / PREFIX_SETS * 8).min(planes[0].len() * 8);
+    regions.extend(planes.iter().map(|p| (p.region().0, bound)));
+    populate_words(values, image, &regions, workers);
+    drop(warm);
+    #[cfg(target_os = "linux")]
+    huge::give_spares(&spares);
     let matrix_time = clock.elapsed();
     // The hybrid modulus commits against the embedded arranged keys when the build host made
     // them; otherwise the key (and the tail key) come from their images or are built.
@@ -1727,14 +1911,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // baseline did, is a ninth runnable thread beside eight busy ones.)
     drop(rows);
     if let Some(output) = output {
-        // The pages of the switch's binding pass first: they are written ~10 ms from here,
-        // and faulting them in there stalls the pass's runners.
-        let bound = ((1usize << LOG_PACKED) / PREFIX_SETS * 8).min(planes[0].len() * 8);
-        let first = planes.iter().flat_map(|p| {
-            let (addr, _) = p.region();
-            (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
-        });
-        output.populate(first.collect());
+        output.populate(Vec::new());
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
@@ -1779,9 +1956,19 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let row_time = clock.elapsed();
     let challenges = folding_challenges(&mut t, &row);
     let challenge_time = clock.elapsed();
-    let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
-        values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
-    ));
+    // Into the mapped proof file when there is one: no element buffer, and no encoding pass
+    // over it after the fold.
+    let target = output.and_then(|o| o.folded_target(COLUMN_LEN / 4));
+    let written = target.is_some_and(|out| unsafe {
+        labinius::fold::fold_witness_bitsliced_encoded(values, COLUMNS, &challenges, COLUMN_LEN / 128, workers, out)
+    });
+    let folded = if written {
+        Folded::Written { elements: COLUMN_LEN / 4 }
+    } else {
+        Folded::Elements(FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
+            values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
+        )))
+    };
     let fold_time = clock.elapsed();
     // Neither the table nor the key image is read from here on: their ~70k page-table entries go
     // now, a slice per core, instead of in the exit's teardown on one core after the proof is
@@ -2120,7 +2307,7 @@ mod tests {
                 rounds: (0..24).map(|_| [[next(), next(), next()], [next(), next(), next()]]).collect(),
                 opened: [next(), next(), next()],
                 row: (0..row_bytes).map(|_| next() as u8).collect(),
-                folded: FoldedWitness::of(
+                folded: Folded::Elements(FoldedWitness::of(
                     (0..elements)
                         .map(|_| {
                             let mut e = labinius::RingElement648::zero(Representation::Coefficients);
@@ -2130,7 +2317,7 @@ mod tests {
                             e
                         })
                         .collect(),
-                ),
+                )),
             };
             let layout = ProofLayout::of_parts(&parts);
             let mut out = vec![0xA5u8; layout.len()];
@@ -2469,4 +2656,4 @@ mod tests {
     }
 
 }
-const _REDRAW_SALT: u64 = 0xc1730957c0d9438f;
+const _REDRAW_SALT: u64 = 0x4b1363b8f29c5eb8;

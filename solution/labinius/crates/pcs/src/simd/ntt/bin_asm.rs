@@ -1322,19 +1322,19 @@ unsafe fn tail27_out_of_line<const Q: u16>(bp: *const i16, op: *mut i16, t4: *co
     }
 }
 
-/// Consumer of `H` lockstep transforms that takes each finished 27-block in row slices, so that
-/// [`ntt_bin_batch32_pipelined`] can interleave a multiply-port-bound consumer with the next
-/// block's transform instead of running the two back to back.
+/// Consumer of `H` lockstep transforms that takes each finished 27-block in row slices.
 pub trait SliceSink<const H: usize> {
     /// Rows `r0..r1` (of 27) of block `blk`, whose `H` transforms are stored at `w`.
     unsafe fn rows(&mut self, blk: usize, w: [*const i16; H], r0: usize, r1: usize);
 }
 
-/// [`ntt_bin_batch32_multi_sink`] software-pipelined: block `kk`'s `H` tails are followed each by
-/// one of `H` row slices of block `kk - 1` (and the lookup stage of a quarter by the slices of the
-/// previous quarter's last block), so the out-of-order window always holds transform work for
-/// the vector ALU ports beside the consumer's. `wbuf` holds `2 H` 27-vector blocks (64-byte
-/// aligned); the transforms are exactly [`ntt_bin_batch32`]'s.
+/// The `H` lockstep transforms of [`ntt_bin_batch32_multi_sink`], batch by batch within each
+/// 162-slot quarter: one batch's lookup stage writes a single 162-vector block that stays in L1
+/// and its six tails read it back at once, so the stage stores no longer miss L1 (the batches'
+/// eight blocks, 83 KB, did). The tails write the quarter's `6 H` 27-vector blocks to `wbuf`
+/// (64-byte aligned, block `j` of batch `h` at `32 * 27 * (H * j + h)`), and the sink then takes
+/// each of the quarter's six staged blocks whole, in the order the quarter's tails wrote them.
+/// The transforms are exactly [`ntt_bin_batch32`]'s.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSink<H>>(
     ins: [&BinaryIndex32; H],
@@ -1348,27 +1348,24 @@ pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSi
         omp: bc(&t.om[1]),
     };
     let ips: [*const u8; H] = core::array::from_fn(|h| ins[h].rows.as_ptr() as *const u8);
-    let mut blks: [core::mem::MaybeUninit<Blk>; H] = [const { core::mem::MaybeUninit::uninit() }; H];
-    let bps: [*mut i16; H] = core::array::from_fn(|h| blks[h].as_mut_ptr() as *mut i16);
-    let buf = |kk: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk & 1) + h))) };
-    let slice = |h: usize| -> (usize, usize) { (27 * h / H, 27 * (h + 1) / H) };
-    let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
-    // The block whose consumption is still due.
-    let mut pend: Option<usize> = None;
+    let mut blk: core::mem::MaybeUninit<Blk> = core::mem::MaybeUninit::uninit();
+    let bp = blk.as_mut_ptr() as *mut i16;
+    let out = |j: usize, h: usize| -> *mut i16 { wbuf.add(32 * 27 * (H * j + h)) };
 
     for k in 0..4 {
         let lut = t.lut.as_ptr().add(12 * k) as *const u8;
-        let l = |s2: usize, r: usize, ab: usize| -> __m512i {
-            _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
-        };
-        let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
-        let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
-        let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
-        // Opaque trip counts keep one copy of each loop body: unrolled, the eight inlined tails
-        // and prefixes outgrow the instruction cache and the decoded-uop cache.
+        let cv = t.cv.as_ptr() as *const i16;
+        // Opaque trip counts keep one copy of each loop body: unrolled, the eight inlined
+        // prefixes and the tail calls outgrow the instruction cache and the decoded-uop cache.
         let hs = core::hint::black_box(H);
         for h in 0..hs {
-            let (ip, bp) = (ips[h], bps[h]);
+            let l = |s2: usize, r: usize, ab: usize| -> __m512i {
+                _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
+            };
+            let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
+            let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
+            let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
+            let ip = ips[h];
             for i in 0..27 {
                 let n0 = ldb(ip, i);
                 let n0h = ldb(ip, i + 81);
@@ -1401,35 +1398,20 @@ pub unsafe fn ntt_bin_batch32_pipelined<const Q: u16, const H: usize, S: SliceSi
                 st(bp, i + 108, v0);
                 st(bp, i + 135, v1);
             }
-            if let Some(p) = pend {
-                let (r0, r1) = slice(h);
-                sink.rows(p, ro(buf(p)), r0, r1);
+            for j in 0..core::hint::black_box(6usize) {
+                let kk = 6 * k + j;
+                let (t4, t5, t6) = (
+                    t.tw4.as_ptr().add(kk).cast::<u32>(),
+                    t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
+                    t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
+                );
+                tail27_out_of_line::<Q>(bp.add(32 * 27 * j), out(j, h), t4, t5, t6, cv);
             }
         }
-        pend = None;
-        let cv = t.cv.as_ptr() as *const i16;
-        let tail_blocks = core::hint::black_box(6usize);
-        for j in 0..tail_blocks {
-            let kk = 6 * k + j;
-            let os = buf(kk);
-            let (t4, t5, t6) = (
-                t.tw4.as_ptr().add(kk).cast::<u32>(),
-                t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
-                t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
-            );
-            for h in 0..core::hint::black_box(H) {
-                let bpj = bps[h].add(32 * 27 * j);
-                tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
-                if let Some(p) = pend {
-                    let (r0, r1) = slice(h);
-                    sink.rows(p, ro(buf(p)), r0, r1);
-                }
-            }
-            pend = Some(kk);
+        for j in 0..6 {
+            let w: [*const i16; H] = core::array::from_fn(|h| out(j, h) as *const i16);
+            sink.rows(6 * k + j, w, 0, 27);
         }
-    }
-    if let Some(p) = pend {
-        sink.rows(p, ro(buf(p)), 0, 27);
     }
 }
 

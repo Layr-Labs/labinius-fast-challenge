@@ -383,9 +383,11 @@ const _: () = assert!(STREAMS == 8 && (LOCK == 8 || LOCK == 4 || LOCK == 16));
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-/// Slots ahead the sink prefetches its key lines. The accumulator lines are L1-resident already,
-/// so prefetching them only spends issue slots.
-const PREFETCH_SLOTS: usize = 3;
+/// Slots ahead the sink prefetches its key lines. The quarter's six blocks are consumed back to
+/// back after its last tail, so a deeper distance only competes with the tails for L1; the key
+/// stream is contiguous across blocks and the hardware prefetcher follows it once the first rows
+/// of a block have started it.
+const PREFETCH_SLOTS: usize = 6;
 
 /// Pair batches between two folds of the sink: every [`PP`] pair batches, at the end of a call
 /// (every `PP / LOCK` calls) or, for `LOCK > PP`, inside it as well (the slot macro folds after
@@ -558,7 +560,7 @@ impl SmsWorker {
             pend: zeroed_slice(DIGITS),
             total: zeroed_slice(1),
             idx: zeroed_slice(LOCK),
-            w: zeroed_slice(2 * LOCK),
+            w: zeroed_slice(6 * LOCK),
             bias: Box::new([0i32; 1]),
         }
     }
@@ -612,7 +614,8 @@ enum RowsMode {
 }
 
 /// The group's two rows per column: the base stream canonical in `[0, 9721)` (NTT domain) and the
-/// tail `t mod 2^22` (coefficients); accumulators and total cleared for the next group.
+/// tail `t mod 2^22` (coefficients); the total cleared for the next group, whose [`group`] refills
+/// stream 0 of the accumulators itself.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usize, dst: *mut [u32; N], mode: RowsMode) {
     let zero = _mm512_setzero_si512();
@@ -628,7 +631,6 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
         for s in 0..n {
             let j = j0 + s;
             let v0 = _mm512_load_si512(pa.add(STREAMS * j));
-            _mm512_store_si512(pa.add(STREAMS * j), zero);
             r0[s] = canon_red16::<P>(v0);
             let a = _mm512_load_si512(pt.add(2 * j));
             let b = _mm512_load_si512(pt.add(2 * j + 1));
@@ -683,8 +685,10 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     static ZERO8: [B128; 8] = [B128::ZERO; 8];
     let kbase = keys.pairs.as_ptr();
     let mut half = 0usize;
-    for s in 0..STREAMS {
-        // Stream 0 runs over the range; the digits' spans are whole chunks of it.
+    // Stream 0 runs over the range; the digits' spans are whole chunks of it. The range starts a
+    // chunk, and at `LOCK == 8` a chunk's first step starts the digit streams from `ws.bias`
+    // without loading them, so only stream 0 is filled there.
+    for s in 0..if LOCK == 8 { 1 } else { STREAMS } {
         let b = if s == 0 { fold_bias(span) } else { fold_bias(CHUNK_PAIRS.min(hl)) };
         fill_stream(&mut ws.acc[0], s, b);
     }

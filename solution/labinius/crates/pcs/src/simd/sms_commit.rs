@@ -531,8 +531,13 @@ unsafe fn reconstruct(b: &Batch32, d: usize, keys: &SmsKeys, c0: usize, both: bo
         let mut y = _mm512_sub_epi16(x, mu);
         y = _mm512_mask_sub_epi16(y, _mm512_cmpgt_epi16_mask(y, hq), y, q);
         y = _mm512_mask_add_epi16(y, _mm512_cmplt_epi16_mask(y, nhq), y, q);
-        let lo = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_castsi512_si256(y)), wd);
-        let hi = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y)), wd);
+        let y_lo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(y));
+        let y_hi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(y));
+        let (lo, hi) = if d == 0 {
+            (y_lo, y_hi)
+        } else {
+            (_mm512_mullo_epi32(y_lo, wd), _mm512_mullo_epi32(y_hi, wd))
+        };
         let t = total.t[m].as_mut_ptr() as *mut __m512i;
         _mm512_store_si512(t, _mm512_add_epi32(_mm512_load_si512(t), lo));
         if both {
@@ -791,7 +796,7 @@ fn bench_mode() -> u32 {
 struct Progress(std::sync::atomic::AtomicUsize);
 const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(500);
 /// Maximum lead (in pair batches) between two hyperthread siblings on one physical core.
-const PAIR_LEAD: usize = 2 * PP;
+const PAIR_LEAD: usize = 4 * PP;
 
 /// Diagnostics of the last [`commit_paired`], for the profile line only: per worker, the
 /// microseconds from the commitment's start to the end of its last group, and the 16-column

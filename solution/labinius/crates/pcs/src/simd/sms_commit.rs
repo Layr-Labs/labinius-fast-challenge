@@ -866,7 +866,7 @@ fn bench_mode() -> u32 {
 struct Progress(std::sync::atomic::AtomicUsize);
 const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(500);
 /// Maximum lead (in pair batches) between two hyperthread siblings on one physical core.
-const PAIR_LEAD: usize = 2 * PP;
+const PAIR_LEAD: usize = 1 * PP;
 
 /// Diagnostics of the last [`commit_paired`], for the profile line only: per worker, the
 /// microseconds from the commitment's start to the end of its last group, and the 16-column

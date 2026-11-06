@@ -94,15 +94,28 @@ const EXPAND_TOP: usize = 8;
 /// final table. The blocks are expanded on the workers with the same per-entry operations as
 /// the single-threaded doubling, so the table is identical.
 pub fn eq_expand_b128_into(r: &[B128], t: &mut [B128]) {
+    eq_expand_b128_scaled_into(r, t, B128::ONE)
+}
+
+/// `scale * eq_expand_b128(r)`: the doubling started from `scale` instead of one, so the
+/// scaling costs no pass of its own (field products are exact, so the entries are the same).
+pub fn eq_expand_b128_scaled(r: &[B128], scale: B128) -> Vec<B128> {
+    let mut t = vec![B128::ZERO; 1 << r.len()];
+    eq_expand_b128_scaled_into(r, &mut t, scale);
+    t
+}
+
+/// [`eq_expand_b128_into`] from the root value `scale`.
+pub fn eq_expand_b128_scaled_into(r: &[B128], t: &mut [B128], scale: B128) {
     assert_eq!(t.len(), 1 << r.len());
     let parts = par::workers(t.len(), 1 << 16);
     if parts <= 1 || r.len() <= EXPAND_TOP {
-        expand_from(r, t, B128::ONE);
+        expand_from(r, t, scale);
         return;
     }
     let (top, low) = r.split_at(EXPAND_TOP);
     let mut prefix = [B128::ZERO; 1 << EXPAND_TOP];
-    expand_from(top, &mut prefix, B128::ONE);
+    expand_from(top, &mut prefix, scale);
     let size = 1usize << low.len();
     let edges: Vec<(usize, usize)> = (0..parts)
         .map(|w| par::block(1 << EXPAND_TOP, parts, w, 1))

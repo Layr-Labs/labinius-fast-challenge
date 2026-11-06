@@ -388,6 +388,67 @@ pub mod sve {
         }
     }
 
+    #[inline]
+    #[target_feature(enable = "sve")]
+    unsafe fn dot2(
+        acc: *mut int64x2_t,
+        a0: &[int16x8_t; 4],
+        b0: &[int16x8_t; 4],
+        key0: int16x8_t,
+        a1: &[int16x8_t; 4],
+        b1: &[int16x8_t; 4],
+        key1: int16x8_t,
+    ) {
+        let halves = |k: int16x8_t| {
+            let k = vnegq_s16(k);
+            (
+                vreinterpretq_s16_s64(vdupq_laneq_s64::<0>(vreinterpretq_s64_s16(k))),
+                vreinterpretq_s16_s64(vdupq_laneq_s64::<1>(vreinterpretq_s64_s16(k))),
+            )
+        };
+        let (k0, k1) = halves(key0);
+        let (k2, k3) = halves(key1);
+        let (mut s0, mut s1, mut s2, mut s3) = (*acc, *acc.add(1), *acc.add(2), *acc.add(3));
+        core::arch::asm!(
+            "sdot z0.d, z4.h, z12.h", "sdot z1.d, z5.h, z12.h",
+            "sdot z2.d, z6.h, z12.h", "sdot z3.d, z7.h, z12.h",
+            "sdot z0.d, z8.h, z13.h", "sdot z1.d, z9.h, z13.h",
+            "sdot z2.d, z10.h, z13.h", "sdot z3.d, z11.h, z13.h",
+            "sdot z0.d, z14.h, z22.h", "sdot z1.d, z15.h, z22.h",
+            "sdot z2.d, z16.h, z22.h", "sdot z3.d, z17.h, z22.h",
+            "sdot z0.d, z18.h, z23.h", "sdot z1.d, z19.h, z23.h",
+            "sdot z2.d, z20.h, z23.h", "sdot z3.d, z21.h, z23.h",
+            inout("v0") s0, inout("v1") s1, inout("v2") s2, inout("v3") s3,
+            in("v4") a0[0], in("v5") a0[1], in("v6") a0[2], in("v7") a0[3],
+            in("v8") b0[0], in("v9") b0[1], in("v10") b0[2], in("v11") b0[3],
+            in("v12") k0, in("v13") k1,
+            in("v14") a1[0], in("v15") a1[1], in("v16") a1[2], in("v17") a1[3],
+            in("v18") b1[0], in("v19") b1[1], in("v20") b1[2], in("v21") b1[3],
+            in("v22") k2, in("v23") k3,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        *acc = s0;
+        *acc.add(1) = s1;
+        *acc.add(2) = s2;
+        *acc.add(3) = s3;
+    }
+
+    #[target_feature(enable = "sve")]
+    pub(super) unsafe fn mac2(xs: &[[int16x8_t; N]; 2 * GROUP], keys0: *const i16, keys1: *const i16, acc: &mut [int64x2_t]) {
+        debug_assert!(acc.len() == ROWS * 4 * N);
+        let accp = acc.as_mut_ptr();
+        for j in 0..N {
+            let a0 = pack(xs[0][j], xs[1][j], xs[2][j], xs[3][j]);
+            let b0 = pack(xs[4][j], xs[5][j], xs[6][j], xs[7][j]);
+            let a1 = pack(xs[8][j], xs[9][j], xs[10][j], xs[11][j]);
+            let b1 = pack(xs[12][j], xs[13][j], xs[14][j], xs[15][j]);
+            for r in 0..ROWS {
+                let at = (j * ROWS + r) * GROUP;
+                dot2(accp.add(4 * (j * ROWS + r)), &a0, &b0, vld1q_s16(keys0.add(at)), &a1, &b1, vld1q_s16(keys1.add(at)));
+            }
+        }
+    }
+
     /// `v mod 9721` in `[-4860, 4860]` for `|v| < 2^41`: the double-precision quotient is off by
     /// less than `1 / (2 p)`, so its rounding is the nearest integer quotient.
     #[inline(always)]
@@ -461,7 +522,7 @@ unsafe fn sums(
     words: &[(*const u8, usize); LANES],
     a: &SmsMatrix,
     ix: &mut [uint8x16_t; 162],
-    xs: &mut [[int16x8_t; N]; GROUP],
+    xs: &mut [[int16x8_t; N]; 2 * GROUP],
     acc: &mut [int32x4_t],
     mut acc64: Option<&mut [int64x2_t]>,
     y: &mut [int16x8_t; N],
@@ -478,9 +539,13 @@ unsafe fn sums(
     }
     // elements summed since the last reduction, never above `s.accumulate`
     let mut since = 0usize;
-    for g in 0..a.elements.div_ceil(GROUP) {
+    let groups = a.elements.div_ceil(GROUP);
+    let mut g = 0;
+    while g < groups {
         let e0 = GROUP * g;
-        let here = (a.elements - e0).min(GROUP);
+        let pair = acc64.is_some() && g + 1 < groups && (e0 + GROUP) % CHUNK != 0;
+        let width = if pair { 2 * GROUP } else { GROUP };
+        let here = (a.elements - e0).min(width);
         for i in 0..here {
             let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add((e0 + i) * words[c].1));
             indices(&at, ix);
@@ -490,12 +555,15 @@ unsafe fn sums(
             pass_d::<FRONT, false>(x, kern, &[], &mut []);
         }
         // a missing element's keys are zero; its stale transform contributes nothing
+        let first: &[[int16x8_t; N]; GROUP] = (&xs[..GROUP]).try_into().unwrap();
         match acc64.as_deref_mut() {
-            Some(w) => sve::mac(xs, a.group(g), w),
-            None => mac(xs, a.group(g), acc),
+            Some(w) if pair => sve::mac2(xs, a.group(g), a.group(g + 1), w),
+            Some(w) => sve::mac(first, a.group(g), w),
+            None => mac(first, a.group(g), acc),
         }
+        g += width / GROUP;
         let e = e0 + here;
-        since += GROUP;
+        since += width;
         let end = e % CHUNK == 0 || e == a.elements;
         if end {
             if acc64.is_none() {
@@ -570,7 +638,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
         let mut ix = Box::new([vdupq_n_u8(0); 162]);
-        let mut xs = Box::new([[vdupq_n_s16(0); N]; GROUP]);
+        let mut xs = Box::new([[vdupq_n_s16(0); N]; 2 * GROUP]);
         let mut acc64 = if sve::available() { Some(vec![vdupq_n_s64(0); ROWS * 4 * N]) } else { None };
         let mut y = Box::new([vdupq_n_s16(0); N]);
         let mut acc = vec![vdupq_n_s32(0); ROWS * 2 * N];

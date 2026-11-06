@@ -37,7 +37,7 @@ pub const DIGITS: usize = 6;
 /// Rows per element: `A mod 9721`, then the six digit rows, all transformed modulo 9721.
 pub const ROWS: usize = 1 + DIGITS;
 /// Elements per statistically recombined digit chunk.
-pub const CHUNK: usize = 224;
+pub const CHUNK: usize = 216;
 const _: () = assert!(CHUNK % LOCK == 0);
 /// Nodes of the encoder's closest-vector search, the x86 build's setting: it runs at build time
 /// only, and the smaller digit spread (rms 3.55 against Babai's 3.88) allows longer chunks.
@@ -313,7 +313,7 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
 const LOCK: usize = 8;
 /// Elements transformed per pass over the accumulators: two tiles, so that each accumulator is
 /// read and written once per two tiles.
-const PASS: usize = 2 * LOCK;
+const PASS: usize = 3 * LOCK;
 const _: () = assert!(CHUNK % PASS == 0);
 
 /// The accumulators of slot `s`, row `r`: `acc[idx..idx + 4]`, two columns per `i64` pair.
@@ -381,12 +381,70 @@ unsafe fn dot2(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], c: &
     (*acc, *acc.add(1), *acc.add(2), *acc.add(3)) = (s0, s1, s2, s3);
 }
 
+/// [`dot`] for three tiles, each accumulator loaded and stored once. Indexed operands must be in
+/// `z0` to `z15`.
+#[cfg(target_feature = "sve")]
+#[inline(always)]
+unsafe fn dot3(acc: *mut int64x2_t, y: &[int16x8_t; 24], k0: int16x8_t, k1: int16x8_t, k2: int16x8_t) {
+    let (mut s0, mut s1, mut s2, mut s3) = (*acc, *acc.add(1), *acc.add(2), *acc.add(3));
+    core::arch::asm!(
+        "sdot z0.d, z4.h, z12.h[0]", "sdot z1.d, z5.h, z12.h[0]",
+        "sdot z2.d, z6.h, z12.h[0]", "sdot z3.d, z7.h, z12.h[0]",
+        "sdot z0.d, z8.h, z12.h[1]", "sdot z1.d, z9.h, z12.h[1]",
+        "sdot z2.d, z10.h, z12.h[1]", "sdot z3.d, z11.h, z12.h[1]",
+        "sdot z0.d, z15.h, z13.h[0]", "sdot z1.d, z16.h, z13.h[0]",
+        "sdot z2.d, z17.h, z13.h[0]", "sdot z3.d, z18.h, z13.h[0]",
+        "sdot z0.d, z19.h, z13.h[1]", "sdot z1.d, z20.h, z13.h[1]",
+        "sdot z2.d, z21.h, z13.h[1]", "sdot z3.d, z22.h, z13.h[1]",
+        "sdot z0.d, z23.h, z14.h[0]", "sdot z1.d, z24.h, z14.h[0]",
+        "sdot z2.d, z25.h, z14.h[0]", "sdot z3.d, z26.h, z14.h[0]",
+        "sdot z0.d, z27.h, z14.h[1]", "sdot z1.d, z28.h, z14.h[1]",
+        "sdot z2.d, z29.h, z14.h[1]", "sdot z3.d, z30.h, z14.h[1]",
+        inout("v0") s0, inout("v1") s1, inout("v2") s2, inout("v3") s3,
+        in("v4") y[0], in("v5") y[1], in("v6") y[2], in("v7") y[3],
+        in("v8") y[4], in("v9") y[5], in("v10") y[6], in("v11") y[7],
+        in("v12") k0, in("v13") k1, in("v14") k2,
+        in("v15") y[8], in("v16") y[9], in("v17") y[10], in("v18") y[11],
+        in("v19") y[12], in("v20") y[13], in("v21") y[14], in("v22") y[15],
+        in("v23") y[16], in("v24") y[17], in("v25") y[18], in("v26") y[19],
+        in("v27") y[20], in("v28") y[21], in("v29") y[22], in("v30") y[23],
+        options(pure, nomem, nostack, preserves_flags)
+    );
+    (*acc, *acc.add(1), *acc.add(2), *acc.add(3)) = (s0, s1, s2, s3);
+}
+
+/// The same sums without SVE.
+#[cfg(not(target_feature = "sve"))]
+#[inline(always)]
+unsafe fn dot3(acc: *mut int64x2_t, y: &[int16x8_t; 24], k0: int16x8_t, k1: int16x8_t, k2: int16x8_t) {
+    let p = y.as_ptr();
+    dot(acc, &*(p as *const _), &*(p.add(4) as *const _), k0);
+    dot(acc, &*(p.add(8) as *const _), &*(p.add(12) as *const _), k1);
+    dot(acc, &*(p.add(16) as *const _), &*(p.add(20) as *const _), k2);
+}
+
 /// The same sums without SVE.
 #[cfg(not(target_feature = "sve"))]
 #[inline(always)]
 unsafe fn dot2(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], c: &[int16x8_t; 4], d: &[int16x8_t; 4], k0: int16x8_t, k1: int16x8_t) {
     dot(acc, a, b, k0);
     dot(acc, c, d, k1);
+}
+
+/// [`tile`] for three consecutive tiles, the 24 transforms of `xs`.
+#[inline(never)]
+unsafe fn tile3(xs: &[[int16x8_t; N]; PASS], keys: *const i16, acc: &mut [int64x2_t]) {
+    debug_assert!(acc.len() == ROWS * 4 * N);
+    let accp = acc.as_mut_ptr();
+    let second = keys.add(N * ROWS * LOCK);
+    let third = second.add(N * ROWS * LOCK);
+    for s in 0..N {
+        let y: [int16x8_t; PASS] = core::array::from_fn(|i| *xs[i].get_unchecked(s));
+        for r in 0..ROWS {
+            let at = (s * ROWS + r) * LOCK;
+            dot3(accp.add(idx(s, r)), &y, vld1q_s16(keys.add(at)), vld1q_s16(second.add(at)), vld1q_s16(third.add(at)));
+        }
+    }
 }
 
 /// [`tile`] for two consecutive tiles, the sixteen transforms of `xs`.
@@ -494,7 +552,7 @@ unsafe fn sums(
             // A short tile only occurs at the end of the column, where the missing elements' key
             // lanes are zero, so the stale transforms of those lanes contribute nothing.
             let l = PASS.min(end - e);
-            let count = if l > LOCK { PASS } else { LOCK };
+            let count = l.div_ceil(LOCK) * LOCK;
             for i in 0..count {
                 let at = pass_words(words, a.elements, e, i);
                 indices(&at, nib);
@@ -504,7 +562,9 @@ unsafe fn sums(
                 pass_d::<PB, false>(x, kern, &[], &mut []);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-            if l > LOCK {
+            if l > 2 * LOCK {
+                tile3(xs, keys, acc);
+            } else if l > LOCK {
                 tile2(xs, keys, acc);
             } else {
                 tile(xs, keys, acc);

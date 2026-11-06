@@ -312,21 +312,7 @@ pub fn commit_binary_column(matrix: &[u128], column: &[F162], q: u128) -> Vec<u1
 /// index order and with no header: the shape comes from the parameters the verifier holds.
 pub fn pack_ring_elements(coefficients: &[u128], q: u128) -> Vec<u8> {
     let width = coefficient_bytes(q);
-    let len = width * coefficients.len();
-    // room for one whole word past the last coefficient
-    let mut out: Vec<u8> = Vec::with_capacity(len + 8);
-    if width <= 8 {
-        let p = out.as_mut_ptr();
-        for (i, &x) in coefficients.iter().enumerate() {
-            debug_assert!(x < q, "a coefficient is not reduced");
-            // SAFETY: `i width + 8 <= len + 8`, the capacity. Each write leaves the bytes above
-            // `width` zero and the next coefficient overwrites them.
-            unsafe { (p.add(i * width) as *mut u64).write_unaligned((x as u64).to_le()) };
-        }
-        // SAFETY: the first `len` bytes were written above.
-        unsafe { out.set_len(len) };
-        return out;
-    }
+    let mut out = Vec::with_capacity(width * coefficients.len());
     for &x in coefficients {
         debug_assert!(x < q, "a coefficient is not reduced");
         out.extend_from_slice(&x.to_le_bytes()[..width]);

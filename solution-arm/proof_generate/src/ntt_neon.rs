@@ -369,21 +369,21 @@ unsafe fn nibbles(m: &[int16x8_t; BITS], out: &mut [uint8x16_t; GROUPS]) {
     }
 }
 
-/// Byte rows of [`indices`] per word. The absent fourth pattern bit is omitted below, so every
-/// load names a real coefficient below 512 and no padded rows are needed.
-const BYTE_ROWS: usize = 16;
+/// Byte rows of [`indices`] per word: the 16 bytes of the word and zeros up to the furthest byte
+/// a coefficient `j + 486` (`j < 162`, so below 648) can name.
+const BYTE_ROWS: usize = 21;
 
 /// `idx` of position `32 b + JJ` from `row = bytes[0][b]`: coefficient `c = 32 b + JJ + 162 t`
 /// is bit `(c / 4) % 8` of byte `c / 32` of word `c % 4`, and goes to bits `t + 1` and `t + 9`.
 #[inline(always)]
-unsafe fn index_one<const JJ: usize, const FOUR: bool>(
+unsafe fn index_one<const JJ: usize>(
     row: *const uint16x8_t,
     bit: &[uint16x8_t; 8],
     field: &[uint16x8_t; 4],
     base: uint16x8_t,
 ) -> uint8x16_t {
     let mut x = base;
-    for t in 0..if FOUR { 4 } else { 3 } {
+    for t in 0..4 {
         let c = JJ + 162 * t;
         let l = *row.add((c % 4) * BYTE_ROWS + c / 32);
         // `cmtst` and `bit` as written: from the intrinsics LLVM builds and/cmeq/bic/orr.
@@ -407,7 +407,7 @@ unsafe fn index_one<const JJ: usize, const FOUR: bool>(
 /// none is set from 512 on).
 #[inline(always)]
 unsafe fn indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; 162]) {
-    // bytes[k][b], lane c: byte b < 16 of word k of column c
+    // bytes[k][b], lane c: byte b of word k of column c, zero from 16 on
     let mut bytes = [[vdupq_n_u16(0); BYTE_ROWS]; 4];
     for (k, row) in bytes.iter_mut().enumerate() {
         let r: [uint8x16_t; 8] = core::array::from_fn(|c| vld1q_u8(words[c].add(16 * k)));
@@ -438,17 +438,14 @@ unsafe fn indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; 162]) {
     let base = vdupq_n_u16(0x0100);
     let rows = bytes.as_ptr() as *const uint16x8_t;
     macro_rules! one {
-        ($b:expr, $four:literal, $($jj:literal)*) => {$(
-            *idx.get_unchecked_mut(32 * $b + $jj) = index_one::<$jj, $four>(rows.add($b), &bit, &field, base);
+        ($b:expr, $($jj:literal)*) => {$(
+            *idx.get_unchecked_mut(32 * $b + $jj) = index_one::<$jj>(rows.add($b), &bit, &field, base);
         )*};
     }
-    // j + 486 exists only for j < 26; its bit is identically zero elsewhere.
-    one!(0, true, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25);
-    one!(0, false, 26 27 28 29 30 31);
-    for b in 1..5 {
-        one!(b, false, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31);
+    for b in 0..5 {
+        one!(b, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31);
     }
-    one!(5, false, 0 1);
+    one!(5, 0 1);
 }
 
 /// The 16-entry `i16` table `t` as the two registers `vqtbl2q_u8` reads.

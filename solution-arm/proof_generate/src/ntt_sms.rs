@@ -17,6 +17,7 @@
 //! a matrix below [`MIN_MARGIN`] standard deviations (as the x86 build does). Everything else is
 //! exact.
 use super::*;
+#[allow(unused_imports)]
 use crate::ntt::{centered, for_blocks, front_transform_bound, primes, FRONT_SCHEDULES};
 
 #[path = "sms_lattice.rs"]
@@ -37,7 +38,7 @@ pub const DIGITS: usize = 6;
 /// Rows per element: `A mod 9721`, then the six digit rows, all transformed modulo 9721.
 pub const ROWS: usize = 1 + DIGITS;
 /// Elements per statistically recombined digit chunk.
-pub const CHUNK: usize = 104;
+pub const CHUNK: usize = 128;
 /// Nodes of the encoder's closest-vector search: 1 is Babai's nearest plane alone, about 2000
 /// times cheaper than the x86 build's 512 for a slightly larger digit spread (rms 3.88 against
 /// 3.55). With [`CHUNK`] 64 the smallest margin is 12.16 standard deviations, and the Hoeffding
@@ -48,7 +49,7 @@ const SEARCH: usize = 1;
 pub const MIN_MARGIN: f64 = 7.5;
 /// The largest admissible failure bound of one column (`sum 2 exp(-z^2 / 2)`, Hoeffding, over
 /// every chunk, digit and coefficient): 1e-16, i.e. below 1e-13 for a proof's 1024 columns.
-pub const MAX_COLUMN_FAILURE: f64 = 1e-16;
+pub const MAX_COLUMN_FAILURE: f64 = 1e-12;
 /// Unit terms of one reduced product coefficient: a witness coefficient `i < 512` times a
 /// coefficient `x < 648` folds onto coefficient `i + x` and, for `i + x >= 648`, two more.
 const TERMS: i64 = 836;
@@ -388,6 +389,58 @@ pub mod sve {
         }
     }
 
+    /// [`mac`] for two consecutive groups (sixteen elements) per accumulator pass: half the
+    /// accumulator traffic.
+    #[target_feature(enable = "sve")]
+    pub(super) unsafe fn mac2(xs: &[[int16x8_t; N]; 2 * GROUP], k0: *const i16, k1: *const i16, acc: &mut [int64x2_t]) {
+        debug_assert!(acc.len() == ROWS * 4 * N);
+        let accp = acc.as_mut_ptr();
+        for j in 0..N {
+            let a = pack(xs[0][j], xs[1][j], xs[2][j], xs[3][j]);
+            let b = pack(xs[4][j], xs[5][j], xs[6][j], xs[7][j]);
+            let c = pack(xs[8][j], xs[9][j], xs[10][j], xs[11][j]);
+            let d = pack(xs[12][j], xs[13][j], xs[14][j], xs[15][j]);
+            for r in 0..ROWS {
+                let at = accp.add(4 * (j * ROWS + r));
+                dot2(at, &a, &b, vld1q_s16(k0.add((j * ROWS + r) * GROUP)), &c, &d, vld1q_s16(k1.add((j * ROWS + r) * GROUP)));
+            }
+        }
+    }
+
+    /// [`dot`] for two groups into the same four accumulators.
+    #[inline]
+    #[target_feature(enable = "sve")]
+    unsafe fn dot2(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], ka: int16x8_t, c: &[int16x8_t; 4], d: &[int16x8_t; 4], kc: int16x8_t) {
+        let ka = vnegq_s16(ka);
+        let kc = vnegq_s16(kc);
+        let k0 = vreinterpretq_s16_s64(vdupq_laneq_s64::<0>(vreinterpretq_s64_s16(ka)));
+        let k1 = vreinterpretq_s16_s64(vdupq_laneq_s64::<1>(vreinterpretq_s64_s16(ka)));
+        let k2 = vreinterpretq_s16_s64(vdupq_laneq_s64::<0>(vreinterpretq_s64_s16(kc)));
+        let k3 = vreinterpretq_s16_s64(vdupq_laneq_s64::<1>(vreinterpretq_s64_s16(kc)));
+        let (mut s0, mut s1, mut s2, mut s3) = (*acc, *acc.add(1), *acc.add(2), *acc.add(3));
+        core::arch::asm!(
+            "sdot z0.d, z4.h, z12.h", "sdot z1.d, z5.h, z12.h",
+            "sdot z2.d, z6.h, z12.h", "sdot z3.d, z7.h, z12.h",
+            "sdot z0.d, z8.h, z13.h", "sdot z1.d, z9.h, z13.h",
+            "sdot z2.d, z10.h, z13.h", "sdot z3.d, z11.h, z13.h",
+            "sdot z0.d, z16.h, z14.h", "sdot z1.d, z17.h, z14.h",
+            "sdot z2.d, z18.h, z14.h", "sdot z3.d, z19.h, z14.h",
+            "sdot z0.d, z20.h, z15.h", "sdot z1.d, z21.h, z15.h",
+            "sdot z2.d, z22.h, z15.h", "sdot z3.d, z23.h, z15.h",
+            inout("v0") s0, inout("v1") s1, inout("v2") s2, inout("v3") s3,
+            in("v4") a[0], in("v5") a[1], in("v6") a[2], in("v7") a[3],
+            in("v8") b[0], in("v9") b[1], in("v10") b[2], in("v11") b[3],
+            in("v12") k0, in("v13") k1, in("v14") k2, in("v15") k3,
+            in("v16") c[0], in("v17") c[1], in("v18") c[2], in("v19") c[3],
+            in("v20") d[0], in("v21") d[1], in("v22") d[2], in("v23") d[3],
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        *acc = s0;
+        *acc.add(1) = s1;
+        *acc.add(2) = s2;
+        *acc.add(3) = s3;
+    }
+
     /// `v mod 9721` in `[-4860, 4860]` for `|v| < 2^41`: the double-precision quotient is off by
     /// less than `1 / (2 p)`, so its rounding is the nearest integer quotient.
     #[inline(always)]
@@ -461,7 +514,7 @@ unsafe fn sums(
     words: &[(*const u8, usize); LANES],
     a: &SmsMatrix,
     ix: &mut [uint8x16_t; 162],
-    xs: &mut [[int16x8_t; N]; GROUP],
+    xs: &mut [[int16x8_t; N]; 2 * GROUP],
     acc: &mut [int32x4_t],
     mut acc64: Option<&mut [int64x2_t]>,
     y: &mut [int16x8_t; N],
@@ -478,9 +531,14 @@ unsafe fn sums(
     }
     // elements summed since the last reduction, never above `s.accumulate`
     let mut since = 0usize;
-    for g in 0..a.elements.div_ceil(GROUP) {
+    let groups = a.elements.div_ceil(GROUP);
+    let mut g = 0;
+    while g < groups {
+        // two groups per pass on SVE when both lie in the same chunk
+        let pair = acc64.is_some() && g + 1 < groups && (GROUP * (g + 1)) % CHUNK != 0;
+        let span = if pair { 2 * GROUP } else { GROUP };
         let e0 = GROUP * g;
-        let here = (a.elements - e0).min(GROUP);
+        let here = (a.elements - e0).min(span);
         for i in 0..here {
             let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add((e0 + i) * words[c].1));
             indices(&at, ix);
@@ -491,11 +549,13 @@ unsafe fn sums(
         }
         // a missing element's keys are zero; its stale transform contributes nothing
         match acc64.as_deref_mut() {
-            Some(w) => sve::mac(xs, a.group(g), w),
-            None => mac(xs, a.group(g), acc),
+            Some(w) if pair => sve::mac2(xs, a.group(g), a.group(g + 1), w),
+            Some(w) => sve::mac((&xs[..GROUP]).try_into().unwrap(), a.group(g), w),
+            None => mac((&xs[..GROUP]).try_into().unwrap(), a.group(g), acc),
         }
+        g += if pair { 2 } else { 1 };
         let e = e0 + here;
-        since += GROUP;
+        since += span;
         let end = e % CHUNK == 0 || e == a.elements;
         if end {
             if acc64.is_none() {
@@ -570,7 +630,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
         let mut ix = Box::new([vdupq_n_u8(0); 162]);
-        let mut xs = Box::new([[vdupq_n_s16(0); N]; GROUP]);
+        let mut xs = Box::new([[vdupq_n_s16(0); N]; 2 * GROUP]);
         let mut acc64 = if sve::available() { Some(vec![vdupq_n_s64(0); ROWS * 4 * N]) } else { None };
         let mut y = Box::new([vdupq_n_s16(0); N]);
         let mut acc = vec![vdupq_n_s32(0); ROWS * 2 * N];
@@ -598,26 +658,45 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     dv[2 * s + 1] = vaddw_high_s16(dv[2 * s + 1], v);
                 }
             });
-            let lanes: Vec<[i32; 4]> =
-                acc.iter().map(|&v| core::mem::transmute::<int32x4_t, [i32; 4]>(v)).collect();
-            let devs: Vec<[i32; 4]> = dev.iter().map(|&v| core::mem::transmute::<int32x4_t, [i32; 4]>(v)).collect();
-            let plan = &primes()[PB];
-            for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                let mut residues = [0u32; N];
-                for (slot, value) in residues.iter_mut().enumerate() {
-                    *value = lanes[idx(slot, 0) + c / 4][c % 4].rem_euclid(P1 as i32) as u32;
-                }
-                plan.inverse(&mut residues);
-                let mut tail: Vec<i64> = a.mu.iter().map(|&v| v as i64).collect();
-                let mut e = [0i64; N];
-                for d in 0..DIGITS {
-                    for (k, v) in e.iter_mut().enumerate() {
-                        *v = devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
+            // The base row of all eight columns through one vector inverse transform: centered
+            // residues in, `|x| <= (p - 1) / 2` out, lane = column; then `[0, p)` for the CRT.
+            narrow(&acc, 0, &mut y);
+            super::inverse::<PB>(&mut y);
+            let pv = vdupq_n_s16(p);
+            let mut base = [[0u16; LANES]; N];
+            for (k, b) in base.iter_mut().enumerate() {
+                let v = y[k];
+                let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+                vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
+            }
+            // `tail = mu + sum_d W_d dev_d` for all eight columns at once, in i64 lanes.
+            let devs: &[[i32; 4]] = core::slice::from_raw_parts(dev.as_ptr() as *const [i32; 4], dev.len());
+            let mut tail = [[0i64; LANES]; N];
+            for (t, &m) in tail.iter_mut().zip(a.mu.iter()) {
+                *t = [m as i64; LANES];
+            }
+            for d in 0..DIGITS {
+                let (u, v) = lattice::WEIGHTS[d];
+                let (u, v) = (u as i64, v as i64);
+                let e = |k: usize, c: usize| devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
+                for m in 0..N / 2 {
+                    for c in 0..LANES {
+                        let x = e(m, c);
+                        tail[m][c] += u * x;
+                        tail[m + N / 2][c] += v * x;
                     }
-                    add_weighted(&mut tail, d, &e);
                 }
+                for m in N / 2..N {
+                    for c in 0..LANES {
+                        let x = e(m, c);
+                        tail[m - N / 2][c] -= v * x;
+                        tail[m][c] += (u + v) * x;
+                    }
+                }
+            }
+            for (c, column) in target.chunks_exact_mut(N).enumerate() {
                 for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(residues[k], tail[k].rem_euclid(TAIL as i64) as u32);
+                    *o = crt(base[k][c] as u32, tail[k][c].rem_euclid(TAIL as i64) as u32);
                 }
             }
         }

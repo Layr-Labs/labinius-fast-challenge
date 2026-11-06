@@ -18,3 +18,7 @@ pub mod sumcheck;
 
 #[cfg(target_arch = "aarch64")]
 pub mod lean;
+#[cfg(target_arch = "aarch64")]
+mod neon34;
+#[cfg(target_arch = "aarch64")]
+pub mod lean34;

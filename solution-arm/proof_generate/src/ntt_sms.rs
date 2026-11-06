@@ -696,16 +696,14 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     dv[2 * s + 1] = vaddw_high_s16(dv[2 * s + 1], v);
                 }
             });
-            let lanes: Vec<[i32; 4]> =
-                acc.iter().map(|&v| core::mem::transmute::<int32x4_t, [i32; 4]>(v)).collect();
+            // Finish all eight main-stream columns with the same lane-wise inverse
+            // already used for the digit streams. Both accumulation paths leave
+            // signed residues bounded by p, so narrowing to i16 is exact.
+            narrow(&acc, 0, &mut y);
+            super::inverse::<PB>(&mut y);
+            let main: [[i16; LANES]; N] = core::array::from_fn(|s| core::mem::transmute(y[s]));
             let devs: Vec<[i32; 4]> = dev.iter().map(|&v| core::mem::transmute::<int32x4_t, [i32; 4]>(v)).collect();
-            let plan = &primes()[PB];
             for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                let mut residues = [0u32; N];
-                for (slot, value) in residues.iter_mut().enumerate() {
-                    *value = lanes[idx(slot, 0) + c / 4][c % 4].rem_euclid(P1 as i32) as u32;
-                }
-                plan.inverse(&mut residues);
                 let mut tail: Vec<i64> = a.mu.iter().map(|&v| v as i64).collect();
                 let mut e = [0i64; N];
                 for d in 0..DIGITS {
@@ -715,7 +713,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     add_weighted(&mut tail, d, &e);
                 }
                 for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(residues[k], tail[k].rem_euclid(TAIL as i64) as u32);
+                    *o = crt((main[k][c] as i32).rem_euclid(P1 as i32) as u32, tail[k].rem_euclid(TAIL as i64) as u32);
                 }
             }
         }
@@ -726,6 +724,41 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_vector_inverse_matches_scalar() { unsafe {
+        let mut seed = 0x9a35_f72b_c01d_684eu64;
+        let plan = &primes()[PB];
+        for case in 0..32 {
+            let mut acc = vec![vdupq_n_s32(0); ROWS * 2 * N];
+            let mut scalar = [[0u32; N]; LANES];
+            for s in 0..N {
+                let lanes: [i32; LANES] = core::array::from_fn(|c| {
+                    let x = match case {
+                        0 => 0,
+                        1 => P1 as i32,
+                        2 => -(P1 as i32),
+                        3 => if (s+c)%2 == 0 {4860} else {-4860},
+                        _ => (crate::ntt::tests::xorshift(&mut seed) % (2*P1+1) as u64) as i32 - P1 as i32,
+                    };
+                    scalar[c][s] = x.rem_euclid(P1 as i32) as u32;
+                    x
+                });
+                acc[idx(s,0)] = vld1q_s32(lanes.as_ptr());
+                acc[idx(s,0)+1] = vld1q_s32(lanes.as_ptr().add(4));
+            }
+            let mut y = [vdupq_n_s16(0); N];
+            narrow(&acc,0,&mut y);
+            super::super::inverse::<PB>(&mut y);
+            for c in 0..LANES { plan.inverse(&mut scalar[c]); }
+            for s in 0..N {
+                let got: [i16; LANES] = core::mem::transmute(y[s]);
+                for c in 0..LANES {
+                    assert_eq!((got[c] as i32).rem_euclid(P1 as i32) as u32, scalar[c][s], "case{case} slot{s} column{c}");
+                }
+            }
+        }
+    }}
 
     /// `sum_d W_d L_d = A (mod M)` on random matrix elements, coefficient by coefficient.
     #[test]

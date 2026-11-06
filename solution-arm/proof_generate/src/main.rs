@@ -969,7 +969,7 @@ mod tests {
 
     /// The direct encoding is byte for byte bincode's under the proof codec.
     /// The SMS commitment agrees with the schoolbook commitment at full size on random columns
-    /// (its digit recombination is statistical: random witnesses), one and three workers.
+    /// (its digit recombination is statistical: random witnesses), requested workers one, three and eight.
     #[test]
     fn sms_commit_matches_reference() {
         // the embedded images are the runtime matrix, byte for byte
@@ -979,7 +979,8 @@ mod tests {
             let embedded = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
                 .expect("the build embeds the SMS images");
             assert!(built.data == embedded.data && built.mean_residues == embedded.mean_residues && built.mu == embedded.mu);
-            assert_eq!(built.margin, embedded.margin);
+            assert_eq!(built.margin.to_bits(), embedded.margin.to_bits());
+            assert_eq!(built.column_failure.to_bits(), embedded.column_failure.to_bits());
         }
         use ntt::neon::sms;
         let q = sms::MODULUS;
@@ -987,17 +988,18 @@ mod tests {
         let matrix = rq::ajtai_matrix(q, RING_ELEMENTS);
         let want = commit_reference(&values, &matrix, q);
         let a = sms::matrix(RING_ELEMENTS, 8);
-        eprintln!("sms margin {}", a.margin);
-        for workers in [1, 3] {
+        eprintln!("sms margin {}, SVE-128 {}", a.margin, sms::sve::available());
+        for workers in [1, 3, 8] {
             assert!(sms::commit(&values, &a, workers) == want, "workers {workers}");
         }
         // a short last chunk and a short last lockstep group, partial batches
-        let elements = 301;
-        let values: Vec<B128> = (0..11).flat_map(|s| column(200 + s)).take(11 * 4 * elements).collect();
-        let matrix = rq::ajtai_matrix(q, elements);
-        let want = commit_reference(&values, &matrix, q);
-        let a = sms::matrix(elements, 3);
-        assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
+        for elements in [sms::CHUNK - 1, sms::CHUNK, sms::CHUNK + 1, 2 * sms::CHUNK - 1, 2 * sms::CHUNK + 1, 301] {
+            let values: Vec<B128> = (0..11).flat_map(|s| column(200 + s)).take(11 * 4 * elements).collect();
+            let matrix = rq::ajtai_matrix(q, elements);
+            let want = commit_reference(&values, &matrix, q);
+            let a = sms::matrix(elements, 3);
+            assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
+        }
     }
     #[test]
     fn encoding_matches_bincode() {

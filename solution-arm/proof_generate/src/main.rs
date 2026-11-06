@@ -353,8 +353,11 @@ fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
         use ntt::neon::sms;
-        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
+        let mut matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+        if let std::borrow::Cow::Borrowed(image) = matrix.data {
+            matrix.data = std::borrow::Cow::Owned(huge_copy(image));
+        }
         return sms::commit(values, &matrix, threads());
     }
     #[cfg(target_arch = "aarch64")]
@@ -400,6 +403,19 @@ fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
                     target.copy_from_slice(&reduce(&acc[..RAW], q));
                 }
             });
+        }
+    });
+    out
+}
+
+///
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+fn huge_copy(src: &[i16]) -> Vec<i16> {
+    let mut out = vec![0i16; src.len()];
+    let per = src.len().div_ceil(threads()).next_multiple_of(4096).max(1);
+    std::thread::scope(|scope| {
+        for (dst, from) in out.chunks_mut(per).zip(src.chunks(per)) {
+            scope.spawn(move || dst.copy_from_slice(from));
         }
     });
     out

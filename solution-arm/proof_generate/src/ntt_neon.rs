@@ -24,7 +24,6 @@ const BITS: usize = 512;
 /// One prime's constants in the order the passes read them. A twiddle `w` is stored as the pair
 /// `(w, round(w 2^15 / p))`, both centered.
 pub struct Kernel {
-    /// `[p, round(2^26 / p), eps, eps', 0, 0, 0, 0]`, `eps = zeta^648`.
     k: [i16; 8],
     /// Levels 0 and 1: `[zeta^324, zeta^1620, zeta^162, zeta^486, zeta^810, zeta^486, 0, 0]`.
     a: [i16; 8],
@@ -63,7 +62,7 @@ impl Kernel {
         };
         let eps = tw(648);
         let v = (((1u64 << 27) / p as u64 + 1) / 2) as i16;
-        let k = [p as i16, v, eps[0], eps[1], 0, 0, 0, 0];
+        let k = [p as i16, v, eps[0], eps[1], -(p as i16), 0, 0, 0];
         let c = |e: usize| super::centered(plan.root(e) as i64, p);
         let a = [c(324), c(1620), c(162), c(486), c(810), c(486), 0, 0];
         let mut g = [0i16; 8];
@@ -109,18 +108,9 @@ pub fn kernels() -> &'static [Kernel; 3] {
 /// lane 0. `|result| <= product_bound(p, |a|)`.
 #[inline(always)]
 unsafe fn mulc<const W: i32, const T: i32>(a: int16x8_t, t: int16x8_t, k: int16x8_t) -> int16x8_t {
-    let mut lo = vmulq_laneq_s16::<W>(a, t);
+    let lo = vmulq_laneq_s16::<W>(a, t);
     let hi = vqrdmulhq_laneq_s16::<T>(a, t);
-    // `lo - hi p` as one `mls`: written as the intrinsic, LLVM turns the two products into
-    // `mul`, `neg`, `mla`, one instruction more.
-    core::arch::asm!(
-        "mls {lo:v}.8h, {hi:v}.8h, {k:v}.h[0]",
-        lo = inout(vreg) lo,
-        hi = in(vreg) hi,
-        k = in(vreg_low16) k,
-        options(pure, nomem, nostack, preserves_flags)
-    );
-    lo
+    vmlaq_laneq_s16::<4>(lo, hi, k)
 }
 
 /// Barrett reduction of any `i16` lanes to `|result| <= reduced_bound(p)`, congruent mod `p`.

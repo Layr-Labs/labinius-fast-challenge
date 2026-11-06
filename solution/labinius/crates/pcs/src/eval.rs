@@ -479,7 +479,7 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     out
 }
 
-const TAIL_PARTS: usize = 4;
+const TAIL_PARTS: usize = 5;
 
 #[cfg(test)]
 mod word_tests {

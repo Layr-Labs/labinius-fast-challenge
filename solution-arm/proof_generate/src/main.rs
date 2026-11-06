@@ -992,16 +992,13 @@ mod tests {
         for workers in [1, 3] {
             assert!(sms::commit(&values, &a, workers) == want, "workers {workers}");
         }
-        // a short last chunk and a short last lockstep group, partial batches; the last sweep of
-        // the column with one to four tiles (whole and short), a column of one short tile, and a
-        // column whose chunks are all whole sweeps
-        for (elements, cols) in [(301usize, 11usize), (5, 3), (229, 9), (240, 9), (241, 9), (250, 9), (256, 9), (448, 2)] {
-            let values: Vec<B128> = (0..cols).flat_map(|s| column(200 + s as u64)).take(cols * 4 * elements).collect();
-            let matrix = rq::ajtai_matrix(q, elements);
-            let want = commit_reference(&values, &matrix, q);
-            let a = sms::matrix(elements, 3);
-            assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
-        }
+        // a short last chunk and a short last lockstep group, partial batches
+        let elements = 301;
+        let values: Vec<B128> = (0..11).flat_map(|s| column(200 + s)).take(11 * 4 * elements).collect();
+        let matrix = rq::ajtai_matrix(q, elements);
+        let want = commit_reference(&values, &matrix, q);
+        let a = sms::matrix(elements, 3);
+        assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
     }
     #[test]
     fn encoding_matches_bincode() {

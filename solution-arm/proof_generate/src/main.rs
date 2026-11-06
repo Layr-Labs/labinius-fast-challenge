@@ -721,14 +721,14 @@ impl Proof {
 
 fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
     #[cfg(target_arch = "aarch64")]
-    if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
-        let partials = prepared.partials();
+    {
+        let (mut switch, partials) = labinius::fields::lean34::LeanSwitch::partials(values, hi);
         let value = partials.iter().zip(cf::eq_expand_b128(lo))
             .fold(B128::ZERO, |a, (&v, e)| a + v * e);
         t.absorb_b128(&[value]);
         t.absorb_b128(&partials);
         let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-        let mut switch = labinius::fields::lean::Switch::new(values, prepared, &batch);
+        switch.start(&batch);
         let mut rounds = Vec::with_capacity(LOG_PACKED);
         let mut coords = Vec::with_capacity(LOG_PACKED);
         for _ in 0..LOG_PACKED {
@@ -741,6 +741,7 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
         }
         return (partials, rounds, coords, switch.final_eval());
     }
+    #[allow(unreachable_code)]
     let mut ws = cf::Workspace::new(LOG_PACKED, 1);
     let partials = ws.partial_evals(0, values, hi);
     let value = partials

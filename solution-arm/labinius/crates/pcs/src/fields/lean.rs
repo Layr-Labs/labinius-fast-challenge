@@ -1,4 +1,4 @@
-use super::crossfield::{eq_expand_b128, eq_expand_f162};
+use super::crossfield::eq_expand_f162;
 use super::neon::{self, ByteTables};
 use super::scalar::{B128, F162};
 use crate::par;
@@ -52,18 +52,8 @@ impl Prepared {
         let inverses: Vec<_> = r.iter().map(|&x| inverse(B128::ONE + x)).collect();
         let ratios = r.iter().zip(&inverses).map(|(&x, &d)| x * d).collect();
         let scale = r[..PREFIX].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
-        let mut eq = eq_expand_b128(&r[PREFIX..]);
+        let eq = super::crossfield::eq_expand_b128_scaled(&r[PREFIX..], scale);
         let parts = par::workers(eq.len(), 1 << 13);
-        let per = eq.len().div_ceil(parts);
-        std::thread::scope(|scope| {
-            for chunk in eq.chunks_mut(per) {
-                scope.spawn(move || {
-                    for e in chunk {
-                        *e = *e * scale;
-                    }
-                });
-            }
-        });
         let parts = par::map_blocks(eq.len(), parts, 64, |_, start, end| {
             neon::partial_evals_sets(words, &eq, start, end)
         });
@@ -151,18 +141,16 @@ impl<'a> Switch<'a> {
         if self.round < PREFIX {
             return self.prefix_message();
         }
-        let l = ByteTables::new(&self.l);
-        let lp = ByteTables::new(&self.lp);
+        let t = neon::NibblePair::new(&self.l, &self.lp);
         let p = &self.planes;
         let half = self.half;
         let parts = par::workers(half, 1 << 12);
         let sums = par::map_blocks(half, parts, 2, |_, start, end| unsafe {
-            neon::linear_message(
+            neon::linear_message_pair(
                 &self.prepared.eq[start..end],
                 core::array::from_fn(|k| &p[k][start..end]),
                 core::array::from_fn(|k| &p[k][half + start..half + end]),
-                &l,
-                &lp,
+                &t,
             )
         });
         sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])

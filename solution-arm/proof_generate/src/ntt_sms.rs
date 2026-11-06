@@ -17,7 +17,7 @@
 //! a matrix below [`MIN_MARGIN`] standard deviations (as the x86 build does). Everything else is
 //! exact.
 use super::*;
-use crate::ntt::{centered, for_blocks, front_transform_bound, primes, FRONT_SCHEDULES};
+use crate::ntt::{centered, for_blocks};
 
 #[path = "sms_lattice.rs"]
 #[allow(dead_code)]
@@ -37,18 +37,22 @@ pub const DIGITS: usize = 6;
 /// Rows per element: `A mod 9721`, then the six digit rows, all transformed modulo 9721.
 pub const ROWS: usize = 1 + DIGITS;
 /// Elements per statistically recombined digit chunk.
-pub const CHUNK: usize = 144;
+pub const CHUNK: usize = 176;
 /// Nodes of the encoder's closest-vector search: 1 is Babai's nearest plane alone, about 2000
 /// times cheaper than the x86 build's 512 for a slightly larger digit spread (rms 3.88 against
-/// 3.55). With [`CHUNK`] 64 the smallest margin is 12.16 standard deviations, and the Hoeffding
-/// union bound over every chunk, digit and coefficient of a column is 9.8e-30 (1.0e-26 per proof of
-/// 1024 columns); [`matrix`] computes both from the public matrix and refuses a weaker one.
+/// 3.55). With [`CHUNK`] 128 the smallest margin is 8.62 standard deviations, and the Hoeffding
+/// union bound over every chunk, digit and coefficient of a column is about 3e-13 (3.1e-10 per
+/// proof of 1024 columns); [`matrix`] computes both from the public matrix and refuses a weaker one.
 const SEARCH: usize = 512;
+// SEARCH 512 is the x86 build's full search (digit rms 3.55 vs Babai's 3.88), build-time only since
+// the matrix is embedded. Per-proof Hoeffding bound from the public matrix (arm-port's sweep):
+//   CHUNK 128: Babai 3.1e-10, search 512 3.7e-17;  CHUNK 160: 6.2e-7 / 2.7e-12;
+//   CHUNK 176: search 512 1.6e-10 (used);  CHUNK 192: 4.6e-9;  CHUNK 208: 7.7e-8.
 /// The smallest admissible reconstruction margin, in standard deviations.
 pub const MIN_MARGIN: f64 = 7.5;
 /// The largest admissible failure bound of one column (`sum 2 exp(-z^2 / 2)`, Hoeffding, over
-/// every chunk, digit and coefficient): 1e-16, i.e. below 1e-13 for a proof's 1024 columns.
-pub const MAX_COLUMN_FAILURE: f64 = 1e-16;
+/// every chunk, digit and coefficient): 1e-12, i.e. below 1.1e-9 for a proof's 1024 columns.
+pub const MAX_COLUMN_FAILURE: f64 = 1e-12;
 /// Unit terms of one reduced product coefficient: a witness coefficient `i < 512` times a
 /// coefficient `x < 648` folds onto coefficient `i + x` and, for `i + x >= 648`, two more.
 const TERMS: i64 = 836;
@@ -267,18 +271,13 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
     SmsMatrix { elements, data: Owned(data), mean_residues: Owned(mean_residues), mu: Owned(mu), margin, column_failure }
 }
 
-/// The schedule of the binary transforms: the table front end of prime [`PB`]
-/// ([`super::pass_ab`], `FRONT_SCHEDULES[PB]`).
-const FRONT: usize = 4 + PB;
-/// The largest product of a key slot (a centered residue) and a transform slot.
-const PRODUCT: u64 = (P1 as u64 - 1) / 2 * front_transform_bound(P1, FRONT_SCHEDULES[PB]) as u64;
-/// Elements whose products the SVE `i64` sums take below the `2^41` that [`sve::narrow`]'s
-/// residues need (the main-stream sum runs over every element).
-pub const MAX_ELEMENTS: usize = (((1u64 << 41) - 1) / PRODUCT) as usize;
-const _: () = assert!(MAX_ELEMENTS >= 4096);
-
 /// Elements per key group, transformed together and multiplied in one pass over the accumulators.
 pub const GROUP: usize = 8;
+/// The most elements whose SVE main-stream sum stays below `2^41` (`sve::residue`): every element
+/// adds a centered key (`<= (p - 1) / 2`) times a transform slot (`<= lut_transform_bound`).
+const MAX_ELEMENTS: usize =
+    ((1u64 << 41) / ((P1 as u64 - 1) / 2 * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64)) as usize;
+const _: () = assert!(MAX_ELEMENTS >= 4096);
 const _: () = assert!(CHUNK % GROUP == 0);
 
 /// The accumulator pair of slot `s`, row `r`: `acc[idx..idx + 2]`, columns 0..4 then 4..8.
@@ -388,81 +387,14 @@ pub mod sve {
         }
     }
 
-    /// [`mac`] for transforms of `+s` in the dot-product lane order: `xs[4 h + q]`, lane `4 l + k`,
-    /// is column `2 q + l` of the group's element `4 h + k`. A 64-bit lane then holds one column's
-    /// four elements, and the halves of the key vector (elements 0..4, 4..8) are the indexed
-    /// operands of `sdot`: no packing, no duplicated or negated keys.
-    #[target_feature(enable = "sve")]
-    pub(super) unsafe fn mac_lanes(xs: &[[int16x8_t; N]; GROUP], keys: *const i16, acc: &mut [int64x2_t]) {
-        debug_assert!(acc.len() == ROWS * 4 * N);
-        let accp = acc.as_mut_ptr();
-        for j in 0..N {
-            let y: [int16x8_t; GROUP] = core::array::from_fn(|t| *xs[t].get_unchecked(j));
-            for r in 0..ROWS {
-                let k = vld1q_s16(keys.add((j * ROWS + r) * GROUP));
-                let p = accp.add(4 * (j * ROWS + r));
-                let (mut s0, mut s1, mut s2, mut s3) = (*p, *p.add(1), *p.add(2), *p.add(3));
-                core::arch::asm!(
-                    "sdot z0.d, z4.h, z12.h[0]", "sdot z1.d, z5.h, z12.h[0]",
-                    "sdot z2.d, z6.h, z12.h[0]", "sdot z3.d, z7.h, z12.h[0]",
-                    "sdot z0.d, z8.h, z12.h[1]", "sdot z1.d, z9.h, z12.h[1]",
-                    "sdot z2.d, z10.h, z12.h[1]", "sdot z3.d, z11.h, z12.h[1]",
-                    inout("v0") s0, inout("v1") s1, inout("v2") s2, inout("v3") s3,
-                    in("v4") y[0], in("v5") y[1], in("v6") y[2], in("v7") y[3],
-                    in("v8") y[4], in("v9") y[5], in("v10") y[6], in("v11") y[7],
-                    in("v12") k,
-                    options(pure, nomem, nostack, preserves_flags)
-                );
-                *p = s0;
-                *p.add(1) = s1;
-                *p.add(2) = s2;
-                *p.add(3) = s3;
-            }
-        }
-    }
-
-    /// [`mac_lanes`] for two key groups (`xs[..8]` with `keys0`, `xs[8..]` with `keys1`): each
-    /// sum loaded and stored once for sixteen elements.
-    #[target_feature(enable = "sve")]
-    pub(super) unsafe fn mac_lanes2(xs: &[[int16x8_t; N]; 2 * GROUP], keys0: *const i16, keys1: *const i16, acc: &mut [int64x2_t]) {
-        debug_assert!(acc.len() == ROWS * 4 * N);
-        let accp = acc.as_mut_ptr();
-        for j in 0..N {
-            let y: [int16x8_t; 2 * GROUP] = core::array::from_fn(|t| *xs[t].get_unchecked(j));
-            for r in 0..ROWS {
-                let k0 = vld1q_s16(keys0.add((j * ROWS + r) * GROUP));
-                let k1 = vld1q_s16(keys1.add((j * ROWS + r) * GROUP));
-                let p = accp.add(4 * (j * ROWS + r));
-                let (mut s0, mut s1, mut s2, mut s3) = (*p, *p.add(1), *p.add(2), *p.add(3));
-                core::arch::asm!(
-                    "sdot z0.d, z4.h, z12.h[0]", "sdot z1.d, z5.h, z12.h[0]",
-                    "sdot z2.d, z6.h, z12.h[0]", "sdot z3.d, z7.h, z12.h[0]",
-                    "sdot z0.d, z8.h, z12.h[1]", "sdot z1.d, z9.h, z12.h[1]",
-                    "sdot z2.d, z10.h, z12.h[1]", "sdot z3.d, z11.h, z12.h[1]",
-                    "sdot z0.d, z14.h, z13.h[0]", "sdot z1.d, z15.h, z13.h[0]",
-                    "sdot z2.d, z16.h, z13.h[0]", "sdot z3.d, z17.h, z13.h[0]",
-                    "sdot z0.d, z18.h, z13.h[1]", "sdot z1.d, z19.h, z13.h[1]",
-                    "sdot z2.d, z20.h, z13.h[1]", "sdot z3.d, z21.h, z13.h[1]",
-                    inout("v0") s0, inout("v1") s1, inout("v2") s2, inout("v3") s3,
-                    in("v4") y[0], in("v5") y[1], in("v6") y[2], in("v7") y[3],
-                    in("v8") y[4], in("v9") y[5], in("v10") y[6], in("v11") y[7],
-                    in("v14") y[8], in("v15") y[9], in("v16") y[10], in("v17") y[11],
-                    in("v18") y[12], in("v19") y[13], in("v20") y[14], in("v21") y[15],
-                    in("v12") k0, in("v13") k1,
-                    options(pure, nomem, nostack, preserves_flags)
-                );
-                *p = s0;
-                *p.add(1) = s1;
-                *p.add(2) = s2;
-                *p.add(3) = s3;
-            }
-        }
-    }
-
     /// `v mod 9721` in `[-4860, 4860]` for `|v| < 2^41`: the double-precision quotient is off by
     /// less than `1 / (2 p)`, so its rounding is the nearest integer quotient.
     #[inline(always)]
     unsafe fn residue(v: int64x2_t) -> int32x2_t {
+        // compiled for SVE, every SVE accumulation goes through `slot_sink`, whose unnegated keys
+        // leave minus the sums in the accumulators
+        #[cfg(target_feature = "sve")]
+        let v = vnegq_s64(v);
         let q = vcvtnq_s64_f64(vmulq_n_f64(vcvtq_f64_s64(v), 1.0 / 9721.0));
         vmovn_s64(vsubq_s64(v, vmull_n_s32(vmovn_s64(q), 9721)))
     }
@@ -498,7 +430,9 @@ pub mod sve {
             }
             for v in [-(1i64 << 41) + 1, -9722, -4861, -4860, -1, 0, 1, 4860, 4861, 9722, (1 << 41) - 1, 123456789012] {
                 let r: [i32; 2] = unsafe { core::mem::transmute(residue(vdupq_n_s64(v))) };
-                assert_eq!((r[0] as i64 - v).rem_euclid(9721), 0);
+                // compiled for SVE the sink's accumulators hold minus the sums, which residue undoes
+                let want = if cfg!(target_feature = "sve") { -v } else { v };
+                assert_eq!((r[0] as i64 - want).rem_euclid(9721), 0);
                 assert!((r[0] as i64).abs() <= 4860);
             }
         }
@@ -524,6 +458,174 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
     vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
 }
 
+/// Elements transformed before each sweep of the register-resident sink: four key groups.
+#[cfg(target_feature = "sve")]
+const SUB: usize = 4 * GROUP;
+/// Byte stride between two elements' transforms in `xs`.
+#[cfg(target_feature = "sve")]
+const XS: usize = N * 16;
+/// Byte stride between two key groups' vectors of one slot.
+#[cfg(target_feature = "sve")]
+const KS: usize = N * ROWS * GROUP * 2;
+/// Transform buffers per worker: [`SUB`] for the SVE sink's sweep, one key group otherwise.
+#[cfg(target_feature = "sve")]
+const XS_BUFFERS: usize = SUB;
+#[cfg(not(target_feature = "sve"))]
+const XS_BUFFERS: usize = GROUP;
+
+/// The register-resident sink for one slot (arm-port, after arm-big's `slot_chunk` in
+/// candidates/11): `acc(s, r) += key(e, s, r) y_e[s]` summed over `groups` key groups (8 elements
+/// each) of transforms starting at `z` (element stride [`XS`]), with keys starting at `k` (group
+/// stride [`KS`], rows contiguous, 8 elements per row vector). Rows 0-3 and then rows 4-6 keep
+/// their accumulators in v16-v31 across all groups: one load and one store per accumulator per
+/// call instead of per group. Each quad's four transform vectors are zipped in registers (no
+/// separate packing pass). The keys enter unnegated: the accumulators hold minus the sums, and
+/// [`narrow_sum`] negates on the way out.
+#[cfg(target_feature = "sve")]
+#[inline(always)]
+unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
+    core::arch::asm!(
+        ".arch_extension sve",
+        // ---- rows 0..4: accumulators v16..v31, keys q0..q3 (rows 0..3, eight elements each)
+        "ldp q16, q17, [{a}, #0]",
+        "ldp q18, q19, [{a}, #32]",
+        "ldp q20, q21, [{a}, #64]",
+        "ldp q22, q23, [{a}, #96]",
+        "ldp q24, q25, [{a}, #128]",
+        "ldp q26, q27, [{a}, #160]",
+        "ldp q28, q29, [{a}, #192]",
+        "ldp q30, q31, [{a}, #224]",
+        "mov {zp}, {z}",
+        "mov {kp}, {k}",
+        "mov {n}, {g}",
+        "2:",
+        "ldp q0, q1, [{kp}]",
+        "ldp q2, q3, [{kp}, #32]",
+        // quad 0 (elements 0..4 of the group): key halves [0]
+        "ldr q8, [{zp}]",
+        "ldr q9, [{zp}, #{xs1}]",
+        "ldr q10, [{zp}, #{xs2}]",
+        "ldr q11, [{zp}, #{xs3}]",
+        "zip1 v12.8h, v8.8h, v9.8h",
+        "zip2 v13.8h, v8.8h, v9.8h",
+        "zip1 v14.8h, v10.8h, v11.8h",
+        "zip2 v15.8h, v10.8h, v11.8h",
+        "zip1 v4.4s, v12.4s, v14.4s",
+        "zip2 v5.4s, v12.4s, v14.4s",
+        "zip1 v6.4s, v13.4s, v15.4s",
+        "zip2 v7.4s, v13.4s, v15.4s",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        // quad 1 (elements 4..8): key halves [1]
+        "ldr q8, [{zp}]",
+        "ldr q9, [{zp}, #{xs1}]",
+        "ldr q10, [{zp}, #{xs2}]",
+        "ldr q11, [{zp}, #{xs3}]",
+        "zip1 v12.8h, v8.8h, v9.8h",
+        "zip2 v13.8h, v8.8h, v9.8h",
+        "zip1 v14.8h, v10.8h, v11.8h",
+        "zip2 v15.8h, v10.8h, v11.8h",
+        "zip1 v4.4s, v12.4s, v14.4s",
+        "zip2 v5.4s, v12.4s, v14.4s",
+        "zip1 v6.4s, v13.4s, v15.4s",
+        "zip2 v7.4s, v13.4s, v15.4s",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        "subs {n}, {n}, #1",
+        "b.ne 2b",
+        "stp q16, q17, [{a}, #0]",
+        "stp q18, q19, [{a}, #32]",
+        "stp q20, q21, [{a}, #64]",
+        "stp q22, q23, [{a}, #96]",
+        "stp q24, q25, [{a}, #128]",
+        "stp q26, q27, [{a}, #160]",
+        "stp q28, q29, [{a}, #192]",
+        "stp q30, q31, [{a}, #224]",
+        // ---- rows 4..7: accumulators v16..v27, keys q0..q2 (rows 4..6)
+        "ldp q16, q17, [{a}, #256]",
+        "ldp q18, q19, [{a}, #288]",
+        "ldp q20, q21, [{a}, #320]",
+        "ldp q22, q23, [{a}, #352]",
+        "ldp q24, q25, [{a}, #384]",
+        "ldp q26, q27, [{a}, #416]",
+        "mov {zp}, {z}",
+        "mov {kp}, {k}",
+        "mov {n}, {g}",
+        "3:",
+        "ldp q0, q1, [{kp}, #64]",
+        "ldr q2, [{kp}, #96]",
+        "ldr q8, [{zp}]",
+        "ldr q9, [{zp}, #{xs1}]",
+        "ldr q10, [{zp}, #{xs2}]",
+        "ldr q11, [{zp}, #{xs3}]",
+        "zip1 v12.8h, v8.8h, v9.8h",
+        "zip2 v13.8h, v8.8h, v9.8h",
+        "zip1 v14.8h, v10.8h, v11.8h",
+        "zip2 v15.8h, v10.8h, v11.8h",
+        "zip1 v4.4s, v12.4s, v14.4s",
+        "zip2 v5.4s, v12.4s, v14.4s",
+        "zip1 v6.4s, v13.4s, v15.4s",
+        "zip2 v7.4s, v13.4s, v15.4s",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "ldr q8, [{zp}]",
+        "ldr q9, [{zp}, #{xs1}]",
+        "ldr q10, [{zp}, #{xs2}]",
+        "ldr q11, [{zp}, #{xs3}]",
+        "zip1 v12.8h, v8.8h, v9.8h",
+        "zip2 v13.8h, v8.8h, v9.8h",
+        "zip1 v14.8h, v10.8h, v11.8h",
+        "zip2 v15.8h, v10.8h, v11.8h",
+        "zip1 v4.4s, v12.4s, v14.4s",
+        "zip2 v5.4s, v12.4s, v14.4s",
+        "zip1 v6.4s, v13.4s, v15.4s",
+        "zip2 v7.4s, v13.4s, v15.4s",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "subs {n}, {n}, #1",
+        "b.ne 3b",
+        "stp q16, q17, [{a}, #256]",
+        "stp q18, q19, [{a}, #288]",
+        "stp q20, q21, [{a}, #320]",
+        "stp q22, q23, [{a}, #352]",
+        "stp q24, q25, [{a}, #384]",
+        "stp q26, q27, [{a}, #416]",
+        a = in(reg) acc,
+        z = in(reg) z,
+        k = in(reg) k,
+        g = in(reg) groups,
+        xs4 = in(reg) 4 * XS,
+        ks = in(reg) KS,
+        xs1 = const XS,
+        xs2 = const 2 * XS,
+        xs3 = const 3 * XS,
+        zp = out(reg) _,
+        kp = out(reg) _,
+        n = out(reg) _,
+        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+        out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+        out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+        out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+        out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+        out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+        out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+        options(nostack)
+    );
+}
+
 /// The batch's pass: the base slot sums (row 0 of `acc`, reduced, `|v| <= p`), and each chunk's
 /// digit sums inverted to canonical coefficients, handed to `chunk(c, d, coefficients)`. With
 /// `acc64` (SVE available) the products go into its `i64` lanes instead.
@@ -531,18 +633,21 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
 unsafe fn sums(
     words: &[(*const u8, usize); LANES],
     a: &SmsMatrix,
-    ix: &mut [uint8x16_t; 162],
-    xs: &mut [[int16x8_t; N]; 2 * GROUP],
+    m: &mut [int16x8_t; BITS],
+    nib: &mut [uint8x16_t; GROUPS],
+    xs: &mut [[int16x8_t; N]; XS_BUFFERS],
     acc: &mut [int32x4_t],
     mut acc64: Option<&mut [int64x2_t]>,
     y: &mut [int16x8_t; N],
     mut chunk: impl FnMut(usize, usize, &mut [int16x8_t; N]),
 ) {
     let kern = &kernels()[PB];
-    let front = &fronts()[PB];
-    let front_plus = &fronts_plus()[PB];
-    let s: Schedule = schedule(FRONT);
-    const { assert!(GROUP <= FRONT_SCHEDULES[PB].accumulate) };
+    let s: Schedule = SCHEDULES[PB];
+    const { assert!(GROUP <= SCHEDULES[PB].accumulate) };
+    // the NEON slot sums of the table-fed transform's outputs stay inside i32 between reductions
+    const { assert!(crate::ntt::lut_accumulator_bound(P1, SCHEDULES[PB]) <= i32::MAX as u64) };
+    // the SVE main-stream sum over every element stays below 2^41 (`sve::residue`)
+    assert!(a.elements <= MAX_ELEMENTS);
     let p = P1 as i32;
     acc.fill(vdupq_n_s32(0));
     if let Some(w) = acc64.as_deref_mut() {
@@ -553,47 +658,44 @@ unsafe fn sums(
     let groups = a.elements.div_ceil(GROUP);
     let mut g = 0;
     while g < groups {
+        // the SVE sink sweeps up to four key groups per pass, never across a chunk end
+        let sink = cfg!(target_feature = "sve") && acc64.is_some();
+        let span = if sink {
+            let to_end = (CHUNK - (GROUP * g) % CHUNK) / GROUP;
+            (XS_BUFFERS / GROUP).min(groups - g).min(to_end)
+        } else {
+            1
+        };
         let e0 = GROUP * g;
-        // SVE: two key groups per pass over the sums when the chunk does not end after the first
-        let two = acc64.is_some() && g + 1 < groups && (e0 + GROUP) % CHUNK != 0;
-        let here = (a.elements - e0).min(if two { 2 * GROUP } else { GROUP });
-        match acc64.as_deref_mut() {
-            Some(w) => {
-                // the dot-product lane order ([`sve::mac_lanes`]): transform `4 h + q`, lane
-                // `4 l + k` is column `2 q + l` of element `e0 + 4 h + k`; missing elements read
-                // zeros (their keys are zero as well)
-                for (t, x) in xs.iter_mut().enumerate().take(if two { 2 * GROUP } else { GROUP }) {
-                    let at: [*const u8; LANES] = core::array::from_fn(|lane| {
-                        let (c, e) = (2 * (t % 4) + lane / 4, e0 + 4 * (t / 4) + lane % 4);
-                        if e < a.elements { words[c].0.add(e * words[c].1) } else { ZERO_WORDS.as_ptr() as *const u8 }
-                    });
-                    indices(&at, ix);
-                    pass_ab::<FRONT>(ix, x, kern, front_plus);
-                    pass_c2::<FRONT>(x, kern);
-                    pass_d::<FRONT, false>(x, kern, &[], &mut []);
-                }
-                if two {
-                    sve::mac_lanes2(xs, a.group(g), a.group(g + 1), w);
-                } else {
-                    sve::mac_lanes((&xs[..GROUP]).try_into().unwrap(), a.group(g), w);
-                }
-            }
-            None => {
-                for i in 0..here {
-                    let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add((e0 + i) * words[c].1));
-                    indices(&at, ix);
-                    let x = &mut xs[i];
-                    pass_ab::<FRONT>(ix, x, kern, front);
-                    pass_c2::<FRONT>(x, kern);
-                    pass_d::<FRONT, false>(x, kern, &[], &mut []);
-                }
-                // a missing element's keys are zero; its stale transform contributes nothing
-                mac((&xs[..GROUP]).try_into().unwrap(), a.group(g), acc);
+        let here = (a.elements - e0).min(GROUP * span);
+        for i in 0..here {
+            let at: [*const u8; LANES] = core::array::from_fn(|c| words[c].0.add((e0 + i) * words[c].1));
+            masks(&at, m);
+            let x = &mut xs[i];
+            nibbles(m, nib);
+            pass_lut::<PB>(nib, x, kern);
+            pass_c::<PB>(x, kern);
+            pass_d::<PB, false>(x, kern, &[], &mut []);
+        }
+        // a missing element's keys are zero; its stale transform contributes nothing
+        #[cfg(target_feature = "sve")]
+        if sink {
+            let w = acc64.as_deref_mut().unwrap();
+            let (zb, keys, ap) = (xs.as_ptr() as *const int16x8_t, a.group(g), w.as_mut_ptr());
+            for sl in 0..N {
+                slot_sink(zb.add(sl), keys.add(sl * ROWS * GROUP), ap.add(4 * sl * ROWS), span);
             }
         }
-        g += if two { 2 } else { 1 };
+        if !sink {
+            let x8: &[[int16x8_t; N]; GROUP] = (&xs[..GROUP]).try_into().unwrap();
+            match acc64.as_deref_mut() {
+                Some(w) => sve::mac(x8, a.group(g), w),
+                None => mac(x8, a.group(g), acc),
+            }
+        }
+        g += span;
         let e = e0 + here;
-        since += GROUP;
+        since += GROUP * span;
         let end = e % CHUNK == 0 || e == a.elements;
         if end {
             if acc64.is_none() {
@@ -663,22 +765,38 @@ fn crt(r: u32, t: u32) -> u128 {
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
-    assert!(a.elements <= MAX_ELEMENTS, "the i64 slot sums need |sum| < 2^41");
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
-    for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
-        let mut ix = Box::new([vdupq_n_u8(0); 162]);
-        let mut xs = Box::new([[vdupq_n_s16(0); N]; 2 * GROUP]);
+    // Dynamic scheduling: the 8-column batches are claimed one at a time from a shared counter,
+    // so a worker slowed by an interrupt, a busy neighbour or memory contention does fewer
+    // batches instead of holding up the end of the commitment (static blocks of 16 did).
+    let batches = columns.div_ceil(LANES);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    struct Out(*mut u128);
+    unsafe impl Sync for Out {}
+    let dst = Out(out.as_mut_ptr());
+    let (dst, next) = (&dst, &next);
+    std::thread::scope(|scope| {
+    for _ in 0..workers.clamp(1, batches.max(1)) {
+    scope.spawn(move || unsafe {
+        let mut m = Box::new([vdupq_n_s16(0); BITS]);
+        let mut nib = Box::new([vdupq_n_u8(0); GROUPS]);
+        let mut xs = Box::new([[vdupq_n_s16(0); N]; XS_BUFFERS]);
         let mut acc64 = if sve::available() { Some(vec![vdupq_n_s64(0); ROWS * 4 * N]) } else { None };
         let mut y = Box::new([vdupq_n_s16(0); N]);
         let mut acc = vec![vdupq_n_s32(0); ROWS * 2 * N];
         // per digit, the chunk deviations S - mean summed over the chunks
         let mut dev = vec![vdupq_n_s32(0); DIGITS * 2 * N];
         let p = P1 as i16;
-        let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
-            let col0 = first + LANES * b;
-            let here = (count - LANES * b).min(LANES);
+        loop {
+            let b = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if b >= batches {
+                break;
+            }
+            let col0 = LANES * b;
+            let here = (columns - col0).min(LANES);
+            // SAFETY: batch `b` owns columns `col0..col0 + here` of `out`, claimed exactly once.
+            let target = core::slice::from_raw_parts_mut(dst.0.add(col0 * N), here * N);
             let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
                 if c < here {
                     (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
@@ -687,7 +805,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             });
             dev.fill(vdupq_n_s32(0));
-            sums(&words, a, &mut ix, &mut xs, &mut acc, acc64.as_deref_mut(), &mut y, |c, d, r| {
+            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, acc64.as_deref_mut(), &mut y, |c, d, r| {
                 let mr = a.mean_residues(c, d);
                 let dv = &mut dev[d * 2 * N..][..2 * N];
                 for s in 0..N {
@@ -696,29 +814,50 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     dv[2 * s + 1] = vaddw_high_s16(dv[2 * s + 1], v);
                 }
             });
-            let lanes: Vec<[i32; 4]> =
-                acc.iter().map(|&v| core::mem::transmute::<int32x4_t, [i32; 4]>(v)).collect();
-            let devs: Vec<[i32; 4]> = dev.iter().map(|&v| core::mem::transmute::<int32x4_t, [i32; 4]>(v)).collect();
-            let plan = &primes()[PB];
-            for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                let mut residues = [0u32; N];
-                for (slot, value) in residues.iter_mut().enumerate() {
-                    *value = lanes[idx(slot, 0) + c / 4][c % 4].rem_euclid(P1 as i32) as u32;
-                }
-                plan.inverse(&mut residues);
-                let mut tail: Vec<i64> = a.mu.iter().map(|&v| v as i64).collect();
-                let mut e = [0i64; N];
-                for d in 0..DIGITS {
-                    for (k, v) in e.iter_mut().enumerate() {
-                        *v = devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
+            // The base row of all eight columns through one vector inverse transform: centered
+            // residues in, `|x| <= (p - 1) / 2` out, lane = column; then `[0, p)` for the CRT.
+            narrow(&acc, 0, &mut y);
+            super::inverse::<PB>(&mut y);
+            let pv = vdupq_n_s16(p);
+            let mut base = [[0u16; LANES]; N];
+            for (k, b) in base.iter_mut().enumerate() {
+                let v = y[k];
+                let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+                vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
+            }
+            // `tail = mu + sum_d W_d dev_d` for all eight columns at once, in i64 lanes.
+            let devs: &[[i32; 4]] = core::slice::from_raw_parts(dev.as_ptr() as *const [i32; 4], dev.len());
+            let mut tail = [[0i64; LANES]; N];
+            for (t, &m) in tail.iter_mut().zip(a.mu.iter()) {
+                *t = [m as i64; LANES];
+            }
+            for d in 0..DIGITS {
+                let (u, v) = lattice::WEIGHTS[d];
+                let (u, v) = (u as i64, v as i64);
+                let e = |k: usize, c: usize| devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
+                for m in 0..N / 2 {
+                    for c in 0..LANES {
+                        let x = e(m, c);
+                        tail[m][c] += u * x;
+                        tail[m + N / 2][c] += v * x;
                     }
-                    add_weighted(&mut tail, d, &e);
                 }
+                for m in N / 2..N {
+                    for c in 0..LANES {
+                        let x = e(m, c);
+                        tail[m - N / 2][c] -= v * x;
+                        tail[m][c] += (u + v) * x;
+                    }
+                }
+            }
+            for (c, column) in target.chunks_exact_mut(N).enumerate() {
                 for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(residues[k], tail[k].rem_euclid(TAIL as i64) as u32);
+                    *o = crt(base[k][c] as u32, tail[k][c].rem_euclid(TAIL as i64) as u32);
                 }
             }
         }
+    });
+    }
     });
     out
 }

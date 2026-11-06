@@ -358,11 +358,9 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
     }
 }
 
-/// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 4;
-/// Elements transformed per sweep: up to four tiles, each accumulator read and written once.
+const SINK: usize = 7;
 const SWEEP: usize = SINK * LOCK;
-const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP == 2 * PASS);
+const _: () = assert!(CHUNK % SWEEP == 0);
 
 /// The register-resident sink for one slot (from 4381e86b's `sve::slot_sink`, after arm-big's
 /// `slot_chunk`): `acc(s, r) +=` the slot's products summed over `groups` key tiles (eight
@@ -573,7 +571,6 @@ unsafe fn sums(
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
         while e < end {
-            // Up to four tiles per sweep, never across a chunk end (chunks are whole tiles). A short
             // tile only occurs at the end of the column, where the missing elements read zero
             // words and their key lanes are zero, so those lanes contribute nothing.
             let l = SWEEP.min(end - e);

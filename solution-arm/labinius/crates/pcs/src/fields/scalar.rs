@@ -44,23 +44,60 @@ impl Mul for B128 {
     type Output = Self;
     #[inline]
     fn mul(self, o: Self) -> Self {
-        let (a0, a1) = (self.0 as u64, (self.0 >> 64) as u64);
-        let (b0, b1) = (o.0 as u64, (o.0 >> 64) as u64);
-        let lo = clmul(a0, b0);
-        let hi = clmul(a1, b1);
-        let mid = clmul(a0 ^ a1, b0 ^ b1) ^ lo ^ hi;
-        let p_lo = lo ^ (mid << 64);
-        let p_hi = hi ^ (mid >> 64);
-        let mut acc = p_lo;
-        let mut h = p_hi;
-        for _ in 0..2 {
-            let c = clmul(h as u64, GHASH_MOD as u64)
-                ^ ((clmul((h >> 64) as u64, GHASH_MOD as u64)) << 64);
-            let carry = clmul((h >> 64) as u64, GHASH_MOD as u64) >> 64;
-            acc ^= c;
-            h = carry;
+        #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+        {
+            Self(mul_pmull(self.0, o.0))
         }
-        Self(acc)
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+        {
+            let (a0, a1) = (self.0 as u64, (self.0 >> 64) as u64);
+            let (b0, b1) = (o.0 as u64, (o.0 >> 64) as u64);
+            let lo = clmul(a0, b0);
+            let hi = clmul(a1, b1);
+            let mid = clmul(a0 ^ a1, b0 ^ b1) ^ lo ^ hi;
+            let p_lo = lo ^ (mid << 64);
+            let p_hi = hi ^ (mid >> 64);
+            let mut acc = p_lo;
+            let mut h = p_hi;
+            for _ in 0..2 {
+                let c = clmul(h as u64, GHASH_MOD as u64)
+                    ^ ((clmul((h >> 64) as u64, GHASH_MOD as u64)) << 64);
+                let carry = clmul((h >> 64) as u64, GHASH_MOD as u64) >> 64;
+                acc ^= c;
+                h = carry;
+            }
+            Self(acc)
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[inline(always)]
+fn mul_pmull(a: u128, b: u128) -> u128 {
+    use core::arch::aarch64::*;
+    unsafe {
+        let a: uint64x2_t = core::mem::transmute(a);
+        let b: uint64x2_t = core::mem::transmute(b);
+        let pl = |x: uint64x2_t, y: uint64x2_t| {
+            vreinterpretq_u64_p128(vmull_p64(vgetq_lane_u64::<0>(x), vgetq_lane_u64::<0>(y)))
+        };
+        let ph = |x: uint64x2_t, y: uint64x2_t| {
+            vreinterpretq_u64_p128(vmull_high_p64(vreinterpretq_p64_u64(x), vreinterpretq_p64_u64(y)))
+        };
+        let zero = vdupq_n_u64(0);
+        let r = vdupq_n_u64(GHASH_MOD as u64);
+        let lo = pl(a, b);
+        let hi = ph(a, b);
+        let ta = veorq_u64(a, vextq_u64::<1>(a, a));
+        let tb = veorq_u64(b, vextq_u64::<1>(b, b));
+        let mid = veorq_u64(veorq_u64(pl(ta, tb), lo), hi);
+        let l = veorq_u64(lo, vextq_u64::<1>(zero, mid));
+        let h = veorq_u64(hi, vextq_u64::<1>(mid, zero));
+        let r0 = pl(h, r);
+        let r1 = ph(h, r);
+        let r2 = ph(r1, r);
+        let out = veorq_u64(veorq_u64(l, r0), veorq_u64(vextq_u64::<1>(zero, r1), r2));
+        core::mem::transmute(out)
     }
 }
 

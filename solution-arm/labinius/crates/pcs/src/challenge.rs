@@ -83,6 +83,11 @@ impl Transcript {
         self.state.update(bytes);
     }
 
+    pub fn absorb_bytes_parallel(&mut self, bytes: &[u8]) {
+        self.state.update(&(bytes.len() as u64).to_le_bytes());
+        self.state.update_rayon(bytes);
+    }
+
     /// Absorb an integer (little-endian).
     pub fn absorb_u64(&mut self, x: u64) {
         self.state.update(&x.to_le_bytes());

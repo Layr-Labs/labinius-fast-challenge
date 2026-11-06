@@ -60,7 +60,7 @@ const PAD_PER_GROUP: usize = 2;
 /// Output slots: coefficients of `R_162` per component.
 const OUT_SLOTS: usize = 162;
 /// Columns ahead whose words the transpose prefetches.
-const PF_COLUMNS: usize = 2;
+const PF_COLUMNS: usize = 8;
 
 const _: () = assert!(GUARD + COL_GROUP * STRIDE <= u16::MAX as usize);
 

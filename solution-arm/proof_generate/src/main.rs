@@ -123,80 +123,17 @@ fn threads() -> usize {
     labinius::par::threads()
 }
 
-/// The read-only file mapping avoids a 256 MiB copy. Other platforms retain the owned path.
-enum Table {
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
-    Mapped { ptr: *mut u8, len: usize },
-    Owned(Vec<B128>),
-}
-
-#[cfg(all(target_os = "linux", target_endian = "little"))]
-mod table_sys {
-    extern "C" {
-        pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-        pub fn munmap(addr: *mut u8, len: usize) -> i32;
-        pub fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    }
-}
-
-impl std::ops::Deref for Table {
-    type Target = [B128];
-
-    fn deref(&self) -> &[B128] {
-        match self {
-            #[cfg(all(target_os = "linux", target_endian = "little"))]
-            Self::Mapped { ptr, len } => {
-                // SAFETY: this mapping is read-only, alive until Drop, page aligned, and contains
-                // exactly len little-endian words. B128 is transparent over u128.
-                unsafe { std::slice::from_raw_parts(*ptr as *const B128, *len) }
-            }
-            Self::Owned(words) => words,
-        }
-    }
-}
-
-impl Drop for Table {
-    fn drop(&mut self) {
-        #[cfg(all(target_os = "linux", target_endian = "little"))]
-        if let Self::Mapped { ptr, len } = self {
-            unsafe { table_sys::munmap(*ptr, 16 * *len) };
-        }
-    }
-}
-
-fn read_table(path: &str) -> Table {
-    load_table(path, 1 << LOG_PACKED)
-}
-
-fn load_table(path: &str, n: usize) -> Table {
+/// The witness table, read by the workers in contiguous slices straight into the words it is
+/// used as (little-endian `u128`, the file's encoding), so the pages are filled in parallel and
+/// the bytes are copied once.
+fn read_table(path: &str) -> Vec<B128> {
     use std::os::unix::fs::FileExt;
     let file = std::fs::File::open(path).expect("read witness table");
     let len = file.metadata().expect("read witness table").len();
-    assert_eq!(len, 16 * n as u64, "witness table has the wrong length");
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
-    if n != 0 {
-        use std::os::fd::AsRawFd;
-        // PROT_READ | MAP_PRIVATE: the trusted input is never writable.
-        let ptr = unsafe { table_sys::mmap(std::ptr::null_mut(), 16 * n, 1, 2, file.as_raw_fd(), 0) };
-        if ptr as isize != -1 {
-            let base = ptr as usize;
-            // The range boundaries are 2 MiB aligned, also valid on 4/16/64 KiB kernels.
-            labinius::par::map_blocks(n, threads(), (2 << 20) / 16, |_, s, e| {
-                if s < e {
-                    let addr = (base + 16 * s) as *mut u8;
-                    // Linux 5.14+: install the page-cache pages in parallel. Older kernels
-                    // simply fault on access. MADV_HUGEPAGE is a best-effort hint for the file.
-                    unsafe {
-                        table_sys::madvise(addr, 16 * (e - s), 14);
-                        table_sys::madvise(addr, 16 * (e - s), 22);
-                    }
-                }
-            });
-            return Table::Mapped { ptr, len: n };
-        }
-    }
+    assert_eq!(len, (1u64 << LOG_VARS) / 8, "witness table has the wrong length");
+    let n = (1usize << LOG_VARS) / 128;
     let mut words = vec![0u128; n];
-    let per = n.div_ceil(threads()).max(1);
+    let per = n.div_ceil(threads());
     std::thread::scope(|scope| {
         for (i, chunk) in words.chunks_mut(per).enumerate() {
             let file = &file;
@@ -216,9 +153,7 @@ fn load_table(path: &str, n: usize) -> Table {
     }
     let mut words = std::mem::ManuallyDrop::new(words);
     // SAFETY: `B128` is `repr(transparent)` over `u128`: same size, alignment and validity.
-    Table::Owned(unsafe {
-        Vec::from_raw_parts(words.as_mut_ptr() as *mut B128, words.len(), words.capacity())
-    })
+    unsafe { Vec::from_raw_parts(words.as_mut_ptr() as *mut B128, words.len(), words.capacity()) }
 }
 
 fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
@@ -599,11 +534,6 @@ fn expand_mask(words: &[B128], mask: &mut [i8; WITNESS_COEFFICIENTS]) {
 }
 
 fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
-    // The NEON bit-sliced fold's 16-plane counters hold sums below 2^15.
-    #[cfg(target_arch = "aarch64")]
-    if challenges.iter().map(|c| c.weight).sum::<usize>() < 1 << 15 {
-        return fold_neon(values, challenges);
-    }
     // The scheduled bit-sliced fold's 15-bit counters hold the total weight plus its padding.
     if let Some(out) = fold_scheduled(values, challenges) {
         return out;
@@ -613,25 +543,6 @@ fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
         return fold_bitsliced(values, challenges);
     }
     fold_bytes(values, challenges)
-}
-
-/// The NEON bit-sliced fold (`fold_bits::neon`): 128-lane blocks, negacyclic slot pairs,
-/// plain-op full adders, the elements written in place.
-#[cfg(target_arch = "aarch64")]
-fn fold_neon(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
-    use labinius::fold_bits as fb;
-    const _: () = assert!(COLUMN_LEN % fb::neon::LANES == 0 && fb::N == rq::N);
-    let cs: Vec<fb::Challenge> = challenges
-        .iter()
-        .map(|c| fb::Challenge {
-            positions: c.positions,
-            signs: c.signs,
-            weight: c.weight,
-        })
-        .collect();
-    // SAFETY: `B128` is `repr(transparent)` over `u128`.
-    let words = unsafe { core::slice::from_raw_parts(values.as_ptr() as *const u128, values.len()) };
-    fb::neon::fold(words, COLUMN_LEN, &cs, threads())
 }
 
 /// The x86 track's scheduled bit-sliced fold (`fold_bits2`) on NEON, written straight into the
@@ -920,36 +831,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn table_load_matches_little_endian_words() {
-        let path = std::env::temp_dir().join(format!("labinius-tail-table-{}", std::process::id()));
-        for n in [0, 1, 17, 4097] {
-            let words: Vec<_> = (0..n)
-                .map(|i| B128((i as u128 * 0x0102030405060708) ^ u128::MAX))
-                .collect();
-            let bytes: Vec<_> = words.iter().flat_map(|w| w.0.to_le_bytes()).collect();
-            std::fs::write(&path, &bytes).unwrap();
-            let table = load_table(path.to_str().unwrap(), n);
-            assert_eq!(&*table, &words);
-            assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        }
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    #[should_panic(expected = "witness table has the wrong length")]
-    fn table_load_rejects_wrong_length() {
-        let path = std::env::temp_dir().join(format!("labinius-tail-short-{}", std::process::id()));
-        std::fs::write(&path, [0u8; 15]).unwrap();
-        // Remove the temporary file before resuming the expected assertion.
-        let result = std::panic::catch_unwind(|| load_table(path.to_str().unwrap(), 1));
-        std::fs::remove_file(path).unwrap();
-        match result {
-            Ok(_) => panic!("wrong length was accepted"),
-            Err(e) => std::panic::resume_unwind(e),
-        }
-    }
 
     fn column(seed: u64) -> Vec<B128> {
         let mut state = seed;

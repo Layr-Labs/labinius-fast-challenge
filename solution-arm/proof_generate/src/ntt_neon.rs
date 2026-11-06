@@ -567,6 +567,79 @@ unsafe fn pass_lut<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_
     }
 }
 
+/// SVE2 with 128-bit vectors, read once: then [`pass_lut_sve2`] replaces [`pass_lut`] in the SMS
+/// commitment. `LABINIUS_NO_SVE` turns it off.
+pub fn sve2_tbl() -> bool {
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        if std::env::var_os("LABINIUS_NO_SVE").is_some() || !std::arch::is_aarch64_feature_detected!("sve2") {
+            return false;
+        }
+        let bytes: usize;
+        // SAFETY: `cntb` only reads the vector length; SVE is present (SVE2 implies it).
+        unsafe { core::arch::asm!(".arch_extension sve", "cntb {x}", x = out(reg) bytes, options(pure, nomem, nostack)) };
+        bytes == 16
+    })
+}
+
+/// [`pass_lut`] with the SVE2 two-register `tbl z.b`: at a vector length of 128 bits it is
+/// `vqtbl2q_u8` exactly (32-byte table, byte indices, zero from 32 on), so the indices and the
+/// tables are the same, but it issues on any of the four vector pipes instead of V0/V1 only
+/// (Neoverse V2 SWOG: ASIMD TBL 1-2 regs V01 throughput 2; SVE TBL V throughput 4). One asm block
+/// per `j` does the six index loads and the six lookups; the six tables sit in `v20..v31`, as
+/// consecutive pairs, and the sums, differences and butterflies stay with the compiler, as in
+/// [`pass_lut`]. Only when [`sve2_tbl`] holds.
+#[inline(always)]
+unsafe fn pass_lut_sve2<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_t; N], kern: &Kernel) {
+    let s: Schedule = schedule(S);
+    const { assert!(S < 3 && super::lut_transform_bound(PRIMES[S], SCHEDULES[S]) <= i16::MAX as u32) };
+    let k = vld1q_s16(kern.k.as_ptr());
+    for n in 0..4 {
+        let l = &kern.lut[n];
+        let t: [uint8x16x2_t; 6] = core::array::from_fn(|i| table(&l[i]));
+        let base = 162 * n;
+        for j in 0..27 {
+            // the indices at j, j + 81, j + 27, j + 108, j + 54, j + 135: byte offsets 0, 1296,
+            // 432, 1728, 864, 2160 from idx[j]
+            let p = idx.as_ptr().add(j) as *const u8;
+            let (x0, y0, x1, y1, x2, y2): (int16x8_t, int16x8_t, int16x8_t, int16x8_t, int16x8_t, int16x8_t);
+            core::arch::asm!(
+                ".arch_extension sve2",
+                "ldr q0, [{p}]", "ldr q1, [{p}, #1296]",
+                "ldr q2, [{p}, #432]", "ldr q3, [{p}, #1728]",
+                "ldr q4, [{p}, #864]", "ldr q5, [{p}, #2160]",
+                "tbl z0.b, {{z20.b, z21.b}}, z0.b", "tbl z1.b, {{z22.b, z23.b}}, z1.b",
+                "tbl z2.b, {{z24.b, z25.b}}, z2.b", "tbl z3.b, {{z26.b, z27.b}}, z3.b",
+                "tbl z4.b, {{z28.b, z29.b}}, z4.b", "tbl z5.b, {{z30.b, z31.b}}, z5.b",
+                p = in(reg) p,
+                in("v20") t[0].0, in("v21") t[0].1,
+                in("v22") t[1].0, in("v23") t[1].1,
+                in("v24") t[2].0, in("v25") t[2].1,
+                in("v26") t[3].0, in("v27") t[3].1,
+                in("v28") t[4].0, in("v29") t[4].1,
+                in("v30") t[5].0, in("v31") t[5].1,
+                out("v0") x0, out("v1") y0, out("v2") x1, out("v3") y1, out("v4") x2, out("v5") y2,
+                options(pure, readonly, nostack, preserves_flags)
+            );
+            let (a0, b0) = (vaddq_s16(x0, y0), vsubq_s16(x0, y0));
+            let (a1, b1) = (vaddq_s16(x1, y1), vsubq_s16(x1, y1));
+            let (a2, b2) = (vaddq_s16(x2, y2), vsubq_s16(x2, y2));
+            let (u, v) = match (s.reduce_d, s.cheap) {
+                (false, _) => (radix3_twiddled::<0>(a0, a1, a2, k), radix3_sixth::<0>(b0, b1, b2, k)),
+                (true, false) => (radix3_twiddled::<1>(a0, a1, a2, k), radix3_sixth::<1>(b0, b1, b2, k)),
+                (true, true) => (radix3_twiddled::<2>(a0, a1, a2, k), radix3_sixth::<2>(b0, b1, b2, k)),
+            };
+            let at = base + j;
+            store(x, at, u.0);
+            store(x, at + 27, u.1);
+            store(x, at + 54, u.2);
+            store(x, at + 81, v.0);
+            store(x, at + 108, v.1);
+            store(x, at + 135, v.2);
+        }
+    }
+}
+
 /// Levels 2 and 3: per level-1 node (162 slots) and `j < 27`, the six slots `j + 27 i`. Three
 /// `j` per step, loaded before any is stored (arm-big): the loads of a step do not wait on the
 /// previous group's stores, and the eighteen values give the scheduler independent butterflies.
@@ -1500,6 +1573,54 @@ mod tests {
                 }
             }
             len = sub;
+        }
+    }
+
+    /// [`pass_lut_sve2`] equals [`pass_lut`] bit for bit, for primes 3889 and 9721 (the ones
+    /// whose bound admits the tables): on the indices of edge and random words from [`indices`]
+    /// (the SMS commitment's) and [`nibbles`], and on arbitrary index bytes (lookups from 32 on
+    /// are zero in both). Skipped without SVE2 at 128 bits.
+    #[test]
+    fn pass_lut_sve2_matches_neon() {
+        if !sve2_tbl() {
+            eprintln!("no SVE2 with 128-bit vectors; skipped");
+            return;
+        }
+        let mut state = 41u64;
+        for seed in 0..768 {
+            let mut idx = [unsafe { vdupq_n_u8(0) }; GROUPS];
+            let words = case_words(seed % 12, &mut state);
+            let ptrs: [*const u8; 8] = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
+            match seed % 3 {
+                0 => unsafe { indices(&ptrs, &mut idx) },
+                1 => unsafe {
+                    let mut m = [vdupq_n_s16(0); BITS];
+                    masks(&ptrs, &mut m);
+                    nibbles(&m, &mut idx);
+                },
+                _ => {
+                    for v in idx.iter_mut() {
+                        let b: [u8; 16] = core::array::from_fn(|_| xorshift(&mut state) as u8);
+                        *v = unsafe { vld1q_u8(b.as_ptr()) };
+                    }
+                }
+            }
+            for prime in 0..2 {
+                let fill = unsafe { vdupq_n_s16(0x5a5a) };
+                let (mut a, mut b) = ([fill; N], [fill; N]);
+                unsafe {
+                    if prime == 0 {
+                        pass_lut::<0>(&idx, &mut a, &kernels()[0]);
+                        pass_lut_sve2::<0>(&idx, &mut b, &kernels()[0]);
+                    } else {
+                        pass_lut::<1>(&idx, &mut a, &kernels()[1]);
+                        pass_lut_sve2::<1>(&idx, &mut b, &kernels()[1]);
+                    }
+                }
+                for slot in 0..N {
+                    assert_eq!(lanes(a[slot]), lanes(b[slot]), "seed {seed} prime {prime} slot {slot}");
+                }
+            }
         }
     }
 

@@ -1080,10 +1080,11 @@ mod tests {
 /// register counter that is added to the ten upper counter bits in memory every seven trees.
 ///
 /// A negative term adds the complement of its plane, `!b = 1 - b`, and its pair's *bias*
-/// takes one. The complement is never formed: a full adder of complemented inputs `!a`, `!b`
-/// has the same sum, and the complement of its carry is `BSL(t, s', a)` (with `s' = s ^ t`),
-/// three ops again, so a negative tree runs on the stored planes and passes complemented
-/// carries up; its top carry is complemented once.
+/// takes one. The complement is never formed: the negative trees run on the complemented low
+/// counter bits `S = !s`, and then a full adder of complemented inputs `!a`, `!b` is exactly
+/// the positive one (`S ^= t`, and `BIT(a, S, t)` is the complement of its carry). So a negative
+/// tree runs on the stored planes with the positive adder, whose carry does not wait for the new
+/// sum, and passes complemented carries up; its top carry is complemented once.
 #[cfg(target_arch = "aarch64")]
 pub mod neon {
     use super::{Challenge, N, Q162, WORD_BITS};
@@ -1354,31 +1355,21 @@ pub mod neon {
         t
     }
 
-    /// A full adder of `s` and two planes: the new sum in `s`, the carry returned. With `NEG`
-    /// the planes stand for their complements and the *complement* of the carry is returned.
+    /// A full adder of `s` and two planes: the new sum in `s`, the carry returned. On
+    /// complemented planes and a complemented `s` it returns the complement of the carry.
     ///
     /// Three plain ops in an asm block: `t = a ^ b` (into `b`), the carry `BIT(a, s, t)` (into
     /// `a`, so no register copies) and `s ^= t`. Written as intrinsics, LLVM reassociates the
     /// chain of `s ^= t` into `EOR3`s, which Neoverse V2 issues on one pipe only.
     #[inline(always)]
-    unsafe fn fa<const NEG: bool>(s: &mut V, mut a: V, b: V) -> V {
-        if NEG {
-            core::arch::asm!(
-                "eor {b:v}.16b, {a:v}.16b, {b:v}.16b",
-                "eor {s:v}.16b, {s:v}.16b, {b:v}.16b",
-                "bit {a:v}.16b, {s:v}.16b, {b:v}.16b",
-                a = inout(vreg) a, b = inout(vreg) b => _, s = inout(vreg) *s,
-                options(pure, nomem, nostack, preserves_flags)
-            );
-        } else {
-            core::arch::asm!(
-                "eor {b:v}.16b, {a:v}.16b, {b:v}.16b",
-                "bit {a:v}.16b, {s:v}.16b, {b:v}.16b",
-                "eor {s:v}.16b, {s:v}.16b, {b:v}.16b",
-                a = inout(vreg) a, b = inout(vreg) b => _, s = inout(vreg) *s,
-                options(pure, nomem, nostack, preserves_flags)
-            );
-        }
+    unsafe fn fa(s: &mut V, mut a: V, b: V) -> V {
+        core::arch::asm!(
+            "eor {b:v}.16b, {a:v}.16b, {b:v}.16b",
+            "bit {a:v}.16b, {s:v}.16b, {b:v}.16b",
+            "eor {s:v}.16b, {s:v}.16b, {b:v}.16b",
+            a = inout(vreg) a, b = inout(vreg) b => _, s = inout(vreg) *s,
+            options(pure, nomem, nostack, preserves_flags)
+        );
         a
     }
 
@@ -1448,14 +1439,14 @@ pub mod neon {
                 let a1 = vld1q_u8(bo.add(o0));
                 let b0 = vld1q_u8(be.add(o1));
                 let b1 = vld1q_u8(bo.add(o1));
-                (fa::<$neg>(&mut s0[0], a0, b0), fa::<$neg>(&mut s1[0], a1, b1))
+                (fa(&mut s0[0], a0, b0), fa(&mut s1[0], a1, b1))
             }};
         }
         macro_rules! level {
             ($bit:literal, $lower:ident, $off:expr, $neg:literal) => {{
                 let (x0, x1) = $lower!($off, $neg);
                 let (y0, y1) = $lower!($off + (1 << $bit), $neg);
-                (fa::<$neg>(&mut s0[$bit], x0, y0), fa::<$neg>(&mut s1[$bit], x1, y1))
+                (fa(&mut s0[$bit], x0, y0), fa(&mut s1[$bit], x1, y1))
             }};
         }
         macro_rules! four { ($off:expr, $neg:literal) => { level!(1, two, $off, $neg) }; }
@@ -1468,13 +1459,18 @@ pub mod neon {
                 if $neg { vmvnq_u8($c) } else { $c }
             };
         }
-        // A carry of weight `2^$bit` through half adders up to weight 32, then into `h`.
+        // A carry of weight `2^$bit` through half adders up to weight 32, then into `h`. With
+        // `$neg` the counter bits are complemented (`S = !s`): `S ^= c` still, carry `c & !S`.
         macro_rules! up {
-            ($c0:expr, $c1:expr $(, $bit:literal)*) => {{
+            ($neg:literal, $c0:expr, $c1:expr $(, $bit:literal)*) => {{
                 #[allow(unused_mut)]
                 let (mut c0, mut c1) = ($c0, $c1);
                 $(
-                    let (u0, u1) = (vandq_u8(s0[$bit], c0), vandq_u8(s1[$bit], c1));
+                    let (u0, u1) = if $neg {
+                        (vbicq_u8(c0, s0[$bit]), vbicq_u8(c1, s1[$bit]))
+                    } else {
+                        (vandq_u8(s0[$bit], c0), vandq_u8(s1[$bit], c1))
+                    };
                     s0[$bit] = veorq_u8(s0[$bit], c0);
                     s1[$bit] = veorq_u8(s1[$bit], c1);
                     (c0, c1) = (u0, u1);
@@ -1486,6 +1482,14 @@ pub mod neon {
             ($list:expr, $neg:literal) => {{
                 let list: &[u16] = $list;
                 t = list.as_ptr();
+                // The trees of a negative list run on the complemented low counter bits.
+                let flip = $neg && list.len() >= 2;
+                if flip {
+                    for b in 0..LO {
+                        s0[b] = vmvnq_u8(s0[b]);
+                        s1[b] = vmvnq_u8(s1[b]);
+                    }
+                }
                 for _ in 0..list.len() / 32 {
                     let (c0, c1) = thirty_two!(0, $neg);
                     add_h!(fix!(c0, $neg), fix!(c1, $neg));
@@ -1494,23 +1498,29 @@ pub mod neon {
                 let r = list.len() % 32;
                 if r & 16 != 0 {
                     let (c0, c1) = sixteen!(0, $neg);
-                    up!(fix!(c0, $neg), fix!(c1, $neg), 4);
+                    up!($neg, fix!(c0, $neg), fix!(c1, $neg), 4);
                     t = t.add(16);
                 }
                 if r & 8 != 0 {
                     let (c0, c1) = eight!(0, $neg);
-                    up!(fix!(c0, $neg), fix!(c1, $neg), 3, 4);
+                    up!($neg, fix!(c0, $neg), fix!(c1, $neg), 3, 4);
                     t = t.add(8);
                 }
                 if r & 4 != 0 {
                     let (c0, c1) = four!(0, $neg);
-                    up!(fix!(c0, $neg), fix!(c1, $neg), 2, 3, 4);
+                    up!($neg, fix!(c0, $neg), fix!(c1, $neg), 2, 3, 4);
                     t = t.add(4);
                 }
                 if r & 2 != 0 {
                     let (c0, c1) = two!(0, $neg);
-                    up!(fix!(c0, $neg), fix!(c1, $neg), 1, 2, 3, 4);
+                    up!($neg, fix!(c0, $neg), fix!(c1, $neg), 1, 2, 3, 4);
                     t = t.add(2);
+                }
+                if flip {
+                    for b in 0..LO {
+                        s0[b] = vmvnq_u8(s0[b]);
+                        s1[b] = vmvnq_u8(s1[b]);
+                    }
                 }
                 if r & 1 != 0 {
                     let o = *t as usize;
@@ -1527,7 +1537,7 @@ pub mod neon {
                         s1[0] = veorq_u8(s1[0], a1);
                         c
                     };
-                    up!(c0, c1, 1, 2, 3, 4);
+                    up!(false, c0, c1, 1, 2, 3, 4);
                 }
             }};
         }
@@ -1816,6 +1826,215 @@ pub mod neon {
             // 1024 columns of weight 28, one block, dense and all-ones words.
             check(1024, 128, |_| 28, 0, 7);
             check(1024, 128, |_| 28, 1, 8);
+        }
+
+        /// The full adder before the complemented negative state (test reference).
+        ///
+        /// A full adder of `s` and two planes: the new sum in `s`, the carry returned. With `NEG`
+        /// the planes stand for their complements and the *complement* of the carry is returned.
+        ///
+        /// Three plain ops in an asm block: `t = a ^ b` (into `b`), the carry `BIT(a, s, t)` (into
+        /// `a`, so no register copies) and `s ^= t`. Written as intrinsics, LLVM reassociates the
+        /// chain of `s ^= t` into `EOR3`s, which Neoverse V2 issues on one pipe only.
+        #[inline(always)]
+        unsafe fn fa_ref<const NEG: bool>(s: &mut V, mut a: V, b: V) -> V {
+            if NEG {
+                core::arch::asm!(
+                    "eor {b:v}.16b, {a:v}.16b, {b:v}.16b",
+                    "eor {s:v}.16b, {s:v}.16b, {b:v}.16b",
+                    "bit {a:v}.16b, {s:v}.16b, {b:v}.16b",
+                    a = inout(vreg) a, b = inout(vreg) b => _, s = inout(vreg) *s,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+            } else {
+                core::arch::asm!(
+                    "eor {b:v}.16b, {a:v}.16b, {b:v}.16b",
+                    "bit {a:v}.16b, {s:v}.16b, {b:v}.16b",
+                    "eor {s:v}.16b, {s:v}.16b, {b:v}.16b",
+                    a = inout(vreg) a, b = inout(vreg) b => _, s = inout(vreg) *s,
+                    options(pure, nomem, nostack, preserves_flags)
+                );
+            }
+            a
+        }
+
+        /// [`pass`] before the complemented negative state: the reference for the regression test.
+        ///
+        /// One pair's pass over one group: the positive then the negative entries.
+        ///
+        /// # Safety
+        /// `be + o` and `be + o + 16` are readable planes for every offset `o` of the lists; `lo`
+        /// and `hi` address the pair's `2 LO` and `2 HI` counter planes.
+        #[inline(always)]
+        unsafe fn pass_ref(be: *const u8, pos: &[u16], neg: &[u16], lo: *mut V, hi: *mut V) {
+            let bo = be.add(16);
+            let z = vdupq_n_u8(0);
+            let mut s0: [V; LO] = core::array::from_fn(|b| *lo.add(b));
+            let mut s1: [V; LO] = core::array::from_fn(|b| *lo.add(LO + b));
+            let mut h0 = [z; 3];
+            let mut h1 = [z; 3];
+            let mut hn = 0u32;
+            let mut t: *const u16;
+            macro_rules! add_h {
+                ($c0:expr, $c1:expr) => {{
+                    let (c0, c1) = ($c0, $c1);
+                    let u0 = vandq_u8(h0[0], c0);
+                    h0[0] = veorq_u8(h0[0], c0);
+                    let v0 = vandq_u8(h0[1], u0);
+                    h0[1] = veorq_u8(h0[1], u0);
+                    h0[2] = veorq_u8(h0[2], v0);
+                    let u1 = vandq_u8(h1[0], c1);
+                    h1[0] = veorq_u8(h1[0], c1);
+                    let v1 = vandq_u8(h1[1], u1);
+                    h1[1] = veorq_u8(h1[1], u1);
+                    h1[2] = veorq_u8(h1[2], v1);
+                    hn += 1;
+                    if hn == 7 {
+                        flush(hi, &h0);
+                        flush(hi.add(HI), &h1);
+                        h0 = [z; 3];
+                        h1 = [z; 3];
+                        hn = 0;
+                    }
+                }};
+            }
+            macro_rules! two {
+                ($off:expr, $neg:literal) => {{
+                    let o0 = *t.add($off) as usize;
+                    let o1 = *t.add($off + 1) as usize;
+                    let a0 = vld1q_u8(be.add(o0));
+                    let a1 = vld1q_u8(bo.add(o0));
+                    let b0 = vld1q_u8(be.add(o1));
+                    let b1 = vld1q_u8(bo.add(o1));
+                    (fa_ref::<$neg>(&mut s0[0], a0, b0), fa_ref::<$neg>(&mut s1[0], a1, b1))
+                }};
+            }
+            macro_rules! level {
+                ($bit:literal, $lower:ident, $off:expr, $neg:literal) => {{
+                    let (x0, x1) = $lower!($off, $neg);
+                    let (y0, y1) = $lower!($off + (1 << $bit), $neg);
+                    (fa_ref::<$neg>(&mut s0[$bit], x0, y0), fa_ref::<$neg>(&mut s1[$bit], x1, y1))
+                }};
+            }
+            macro_rules! four { ($off:expr, $neg:literal) => { level!(1, two, $off, $neg) }; }
+            macro_rules! eight { ($off:expr, $neg:literal) => { level!(2, four, $off, $neg) }; }
+            macro_rules! sixteen { ($off:expr, $neg:literal) => { level!(3, eight, $off, $neg) }; }
+            macro_rules! thirty_two { ($off:expr, $neg:literal) => { level!(4, sixteen, $off, $neg) }; }
+            // The true carry of a tree.
+            macro_rules! fix {
+                ($c:expr, $neg:literal) => {
+                    if $neg { vmvnq_u8($c) } else { $c }
+                };
+            }
+            // A carry of weight `2^$bit` through half adders up to weight 32, then into `h`.
+            macro_rules! up {
+                ($c0:expr, $c1:expr $(, $bit:literal)*) => {{
+                    #[allow(unused_mut)]
+                    let (mut c0, mut c1) = ($c0, $c1);
+                    $(
+                        let (u0, u1) = (vandq_u8(s0[$bit], c0), vandq_u8(s1[$bit], c1));
+                        s0[$bit] = veorq_u8(s0[$bit], c0);
+                        s1[$bit] = veorq_u8(s1[$bit], c1);
+                        (c0, c1) = (u0, u1);
+                    )*
+                    add_h!(c0, c1);
+                }};
+            }
+            macro_rules! entries {
+                ($list:expr, $neg:literal) => {{
+                    let list: &[u16] = $list;
+                    t = list.as_ptr();
+                    for _ in 0..list.len() / 32 {
+                        let (c0, c1) = thirty_two!(0, $neg);
+                        add_h!(fix!(c0, $neg), fix!(c1, $neg));
+                        t = t.add(32);
+                    }
+                    let r = list.len() % 32;
+                    if r & 16 != 0 {
+                        let (c0, c1) = sixteen!(0, $neg);
+                        up!(fix!(c0, $neg), fix!(c1, $neg), 4);
+                        t = t.add(16);
+                    }
+                    if r & 8 != 0 {
+                        let (c0, c1) = eight!(0, $neg);
+                        up!(fix!(c0, $neg), fix!(c1, $neg), 3, 4);
+                        t = t.add(8);
+                    }
+                    if r & 4 != 0 {
+                        let (c0, c1) = four!(0, $neg);
+                        up!(fix!(c0, $neg), fix!(c1, $neg), 2, 3, 4);
+                        t = t.add(4);
+                    }
+                    if r & 2 != 0 {
+                        let (c0, c1) = two!(0, $neg);
+                        up!(fix!(c0, $neg), fix!(c1, $neg), 1, 2, 3, 4);
+                        t = t.add(2);
+                    }
+                    if r & 1 != 0 {
+                        let o = *t as usize;
+                        let a0 = vld1q_u8(be.add(o));
+                        let a1 = vld1q_u8(bo.add(o));
+                        let (c0, c1) = if $neg {
+                            let c = (vbicq_u8(s0[0], a0), vbicq_u8(s1[0], a1));
+                            s0[0] = vmvnq_u8(veorq_u8(s0[0], a0));
+                            s1[0] = vmvnq_u8(veorq_u8(s1[0], a1));
+                            c
+                        } else {
+                            let c = (vandq_u8(s0[0], a0), vandq_u8(s1[0], a1));
+                            s0[0] = veorq_u8(s0[0], a0);
+                            s1[0] = veorq_u8(s1[0], a1);
+                            c
+                        };
+                        up!(c0, c1, 1, 2, 3, 4);
+                    }
+                }};
+            }
+            entries!(pos, false);
+            entries!(neg, true);
+            if hn != 0 {
+                flush(hi, &h0);
+                flush(hi.add(HI), &h1);
+            }
+            for b in 0..LO {
+                *lo.add(b) = s0[b];
+                *lo.add(LO + b) = s1[b];
+            }
+        }
+
+
+        #[test]
+        fn pass_matches_the_previous_negative_adder() {
+            const NPL: usize = 72;
+            let mut x = 0xA3F0_1D00_C4A1_0000_5EED_0000_0000_0007u128;
+            let rand_v = |x: &mut u128| unsafe { vld1q_u8(next(x).to_le_bytes().as_ptr()) };
+            let bytes = |v: V| unsafe { let mut b = [0u8; 16]; vst1q_u8(b.as_mut_ptr(), v); b };
+            let lens = [0usize, 1, 2, 3, 5, 7, 16, 17, 30, 31, 32, 33, 63, 64, 65, 97, 224, 231, 300];
+            for (round, &np) in lens.iter().enumerate() {
+                for &nn in &lens {
+                    let planes: Vec<V> = (0..NPL).map(|_| match round % 3 {
+                        0 => rand_v(&mut x),
+                        1 => unsafe { vdupq_n_u8(0xff) },
+                        _ => unsafe { vdupq_n_u8(0) },
+                    }).collect();
+                    let off = |x: &mut u128| (16 * (next(x) % (NPL as u128 - 1))) as u16;
+                    let pos: Vec<u16> = (0..np).map(|_| off(&mut x)).collect();
+                    let neg: Vec<u16> = (0..nn).map(|_| off(&mut x)).collect();
+                    let lo: Vec<V> = (0..2 * LO).map(|_| rand_v(&mut x)).collect();
+                    let hi: Vec<V> = (0..2 * HI).map(|_| rand_v(&mut x)).collect();
+                    let (mut lo_a, mut hi_a, mut lo_b, mut hi_b) = (lo.clone(), hi.clone(), lo.clone(), hi.clone());
+                    unsafe {
+                        let be = planes.as_ptr() as *const u8;
+                        pass(be, &pos, &neg, lo_a.as_mut_ptr(), hi_a.as_mut_ptr());
+                        pass_ref(be, &pos, &neg, lo_b.as_mut_ptr(), hi_b.as_mut_ptr());
+                    }
+                    for b in 0..2 * LO {
+                        assert_eq!(bytes(lo_a[b]), bytes(lo_b[b]), "pos {np} neg {nn} lo {b}");
+                    }
+                    for b in 0..2 * HI {
+                        assert_eq!(bytes(hi_a[b]), bytes(hi_b[b]), "pos {np} neg {nn} hi {b}");
+                    }
+                }
+            }
         }
     }
 }

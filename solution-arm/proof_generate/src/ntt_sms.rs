@@ -630,6 +630,8 @@ unsafe fn sums(
     mut chunk: impl FnMut(usize, usize, &mut [int16x8_t; N]),
 ) {
     let kern = &kernels()[PB];
+    // levels 0 to 3 with SVE2 `tbl` ([`pass_lut_sve2`]) where available
+    let tbl2 = sve2_tbl();
     acc.fill(vdupq_n_s64(0));
     let mut e = 0usize;
     while e < a.elements {
@@ -644,7 +646,11 @@ unsafe fn sums(
                 let at = pass_words(words, a.elements, e, i);
                 indices(&at, nib);
                 let x = &mut xs[i];
-                pass_lut::<PB>(nib, x, kern);
+                if tbl2 {
+                    pass_lut_sve2::<PB>(nib, x, kern);
+                } else {
+                    pass_lut::<PB>(nib, x, kern);
+                }
                 pass_c::<PB>(x, kern);
                 pass_d::<PB, false>(x, kern, &[], &mut []);
             }

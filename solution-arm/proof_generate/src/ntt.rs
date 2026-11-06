@@ -377,61 +377,29 @@ pub const fn transform_bound(p: u32, s: Schedule) -> u32 {
     assert!(b <= MAX);
     // level 2, radix 2: a +- tau b
     let (a, x) = level_inputs(p, b, s.before[2], s.cheap);
-    let b = a + product_bound(p, x);
+    let mut b = a + product_bound(p, x);
     assert!(b <= MAX);
-    radix3_levels(p, s, b, 3)
-}
-
-/// One radix-3 level's output bound from its first input's bound `a` and its multiplied inputs'
-/// bound `m` (`b' = tau b`, `c' = tau^2 c`, already multiplied): `y0 = a + (b' + c')`,
-/// `y1 = (a - c') + e`, `y2 = (a - b') - e`, `e = eps (b' - c')`, `d = b' - c'` reduced first
-/// when the schedule says so. Checked against `i16`.
-const fn radix3_output(p: u32, s: Schedule, a: u32, m: u32) -> u32 {
-    const MAX: u32 = i16::MAX as u32;
-    assert!(2 * m <= MAX, "b' + c' and b' - c' fit");
-    let e = if s.reduce_d && s.cheap {
-        product_bound(p, cheap_bound(p, 2 * m))
-    } else if s.reduce_d {
-        product_bound(p, reduced_bound(p))
-    } else {
-        product_bound(p, 2 * m)
-    };
-    let y0 = a + 2 * m;
-    let y12 = a + m + e;
-    let b = if y0 > y12 { y0 } else { y12 };
-    assert!(b <= MAX, "a level's outputs fit i16");
-    b
-}
-
-/// The radix-3 levels `first..=6` of the schedule from the bound `b` on their first level's
-/// inputs as the previous level leaves them; returns the bound on the last level's outputs.
-const fn radix3_levels(p: u32, s: Schedule, mut b: u32, first: usize) -> u32 {
-    let mut l = first;
+    // levels 3 to 6, radix 3: y0 = a + (b' + c'), y1 = (a - c') + e, y2 = (a - b') - e,
+    // b' = tau b, c' = tau^2 c, e = eps (b' - c')
+    let mut l = 3;
     while l <= 6 {
         let (a, x) = level_inputs(p, b, s.before[l], s.cheap);
-        b = radix3_output(p, s, a, product_bound(p, x));
+        let m = product_bound(p, x);
+        assert!(2 * m <= MAX, "b' + c' and b' - c' fit");
+        let e = if s.reduce_d && s.cheap {
+            product_bound(p, cheap_bound(p, 2 * m))
+        } else if s.reduce_d {
+            product_bound(p, reduced_bound(p))
+        } else {
+            product_bound(p, 2 * m)
+        };
+        let y0 = a + 2 * m;
+        let y12 = a + m + e;
+        b = if y0 > y12 { y0 } else { y12 };
+        assert!(b <= MAX, "a level's outputs fit i16");
         l += 1;
     }
     b
-}
-
-/// The bound on every value of the table-fed binary transform (`neon::pass_lut`): levels 0 to 2
-/// and the level-3 twiddles are lookups in tables of centered residues (`|entry| <= h`,
-/// `h = (p - 1) / 2`), so every level-3 input, `a` as well as the multiplied `b' = tau b` and
-/// `c' = tau^2 c`, is the sum or difference of two entries, `|v| <= 2 h`, and level 3 multiplies
-/// only by `eps` (`s.before[3]` is not used: nothing is reduced before it). Levels 4 to 6 follow
-/// `s` as in [`transform_bound`]. Returns the bound on the transform's output.
-pub const fn lut_transform_bound(p: u32, s: Schedule) -> u32 {
-    radix3_levels(p, s, lut_level3_bound(p, s), 4)
-}
-
-/// The bound on the outputs of the table-fed level 3 (see [`lut_transform_bound`]).
-pub const fn lut_level3_bound(p: u32, s: Schedule) -> u32 {
-    const MAX: u32 = i16::MAX as u32;
-    let h = (p - 1) / 2;
-    let t = 2 * h;
-    assert!(t <= MAX, "a level-3 input fits i16");
-    radix3_output(p, s, t, t)
 }
 
 /// The accumulator bound: after a reduction a slot sum is at most `p` in magnitude, and each
@@ -439,11 +407,6 @@ pub const fn lut_level3_bound(p: u32, s: Schedule) -> u32 {
 /// the last level leaves it (`<= transform_bound(p, s)`, not reduced again).
 pub const fn accumulator_bound(p: u32, s: Schedule) -> u64 {
     p as u64 + s.accumulate as u64 * ((p as u64 - 1) / 2) * transform_bound(p, s) as u64
-}
-
-/// [`accumulator_bound`] for the slots of the table-fed transform (`<= lut_transform_bound`).
-pub const fn lut_accumulator_bound(p: u32, s: Schedule) -> u64 {
-    p as u64 + s.accumulate as u64 * ((p as u64 - 1) / 2) * lut_transform_bound(p, s) as u64
 }
 
 const _: () = {

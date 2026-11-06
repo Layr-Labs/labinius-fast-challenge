@@ -1351,6 +1351,7 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
     let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
 
     for k in 0..4 {
+        let t_tile = std::time::Instant::now();
         let lut = t.lut.as_ptr().add(12 * k) as *const u8;
         let l = |s2: usize, r: usize, ab: usize| -> __m512i {
             _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
@@ -1396,6 +1397,11 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
                 st(bp, i + 135, v1);
             }
         }
+        let t_tail = std::time::Instant::now();
+        crate::simd::commit::sms::SMS_TILE_NS.fetch_add(
+            t_tail.duration_since(t_tile).as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let cv = t.cv.as_ptr() as *const i16;
         let tail_blocks = core::hint::black_box(6usize);
         for j in 0..tail_blocks {
@@ -1419,6 +1425,10 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
             let kk = 6 * k + j;
             sink.rows(kk, ro(buf(kk)), 0, 27);
         }
+        crate::simd::commit::sms::SMS_TAIL_NS.fetch_add(
+            t_tail.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 

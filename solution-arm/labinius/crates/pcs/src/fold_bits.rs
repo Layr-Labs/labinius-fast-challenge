@@ -1099,7 +1099,7 @@ pub mod neon {
     /// Slot pairs; the odd slot of the last pair (243) is a dummy.
     const PAIRS: usize = SLOTS.div_ceil(2);
     /// Columns per group.
-    pub const GROUP: usize = 24;
+    pub const GROUP: usize = 30;
     /// Zero planes in front of the first column (plane 1 is column 0's leading guard).
     const GUARD: usize = 2;
     /// Planes per column: 128 and the trailing zero guard (the next column's leading guard).
@@ -1110,6 +1110,8 @@ pub mod neon {
     const LO: usize = 5;
     /// Counter bits above them, in memory: counts stay below `2^15`.
     const HI: usize = 10;
+    /// Bits of the in-register counter of weight-32 carries, flushed into `hi` when full.
+    const HB: usize = 4;
     /// Planes added to every offset so that it is non-negative (positions are below 162).
     const BIAS_PLANES: usize = 160;
     const _: () = assert!(16 * (GUARD + (GROUP - 1) * STRIDE + BIAS_PLANES + WORD_BITS) <= u16::MAX as usize);
@@ -1382,20 +1384,20 @@ pub mod neon {
         a
     }
 
-    /// `hi += h`: the three-bit counter `h` (weights `2^5 .. 2^7`) into the ten upper counter
+    /// `hi += h`: the `HB`-bit counter `h` (weights `2^5 ..`) into the ten upper counter
     /// bits at `p`.
     #[inline(always)]
-    unsafe fn flush(p: *mut V, h: &[V; 3]) {
+    unsafe fn flush(p: *mut V, h: &[V; HB]) {
         let m = *p;
         *p = veorq_u8(m, h[0]);
         let mut c = vandq_u8(m, h[0]);
-        for b in 1..3 {
+        for b in 1..HB {
             let m = *p.add(b);
             let t = opaque(veorq_u8(m, h[b]));
             *p.add(b) = veorq_u8(t, c);
             c = vbslq_u8(t, c, m);
         }
-        for b in 3..HI {
+        for b in HB..HI {
             let m = *p.add(b);
             *p.add(b) = veorq_u8(m, c);
             c = vandq_u8(m, c);
@@ -1413,29 +1415,27 @@ pub mod neon {
         let z = vdupq_n_u8(0);
         let mut s0: [V; LO] = core::array::from_fn(|b| *lo.add(b));
         let mut s1: [V; LO] = core::array::from_fn(|b| *lo.add(LO + b));
-        let mut h0 = [z; 3];
-        let mut h1 = [z; 3];
+        let mut h0 = [z; HB];
+        let mut h1 = [z; HB];
         let mut hn = 0u32;
         let mut t: *const u16;
         macro_rules! add_h {
             ($c0:expr, $c1:expr) => {{
-                let (c0, c1) = ($c0, $c1);
-                let u0 = vandq_u8(h0[0], c0);
-                h0[0] = veorq_u8(h0[0], c0);
-                let v0 = vandq_u8(h0[1], u0);
-                h0[1] = veorq_u8(h0[1], u0);
-                h0[2] = veorq_u8(h0[2], v0);
-                let u1 = vandq_u8(h1[0], c1);
-                h1[0] = veorq_u8(h1[0], c1);
-                let v1 = vandq_u8(h1[1], u1);
-                h1[1] = veorq_u8(h1[1], u1);
-                h1[2] = veorq_u8(h1[2], v1);
+                let (mut u0, mut u1) = ($c0, $c1);
+                for b in 0..HB - 1 {
+                    let (v0, v1) = (vandq_u8(h0[b], u0), vandq_u8(h1[b], u1));
+                    h0[b] = veorq_u8(h0[b], u0);
+                    h1[b] = veorq_u8(h1[b], u1);
+                    (u0, u1) = (v0, v1);
+                }
+                h0[HB - 1] = veorq_u8(h0[HB - 1], u0);
+                h1[HB - 1] = veorq_u8(h1[HB - 1], u1);
                 hn += 1;
-                if hn == 7 {
+                if hn == (1 << HB) - 1 {
                     flush(hi, &h0);
                     flush(hi.add(HI), &h1);
-                    h0 = [z; 3];
-                    h1 = [z; 3];
+                    h0 = [z; HB];
+                    h1 = [z; HB];
                     hn = 0;
                 }
             }};

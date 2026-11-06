@@ -300,7 +300,7 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
                 super::transform_general(PB, lanes);
                 for (j, l) in lanes.iter().enumerate() {
                     for e in 0..here {
-                        batch[(j * ROWS + r) * LOCK + e] = -centered(l[e] as i64, p);
+                        batch[(j * ROWS + r) * LOCK + e] = -centered(l[e] as i64 * KEY_SCALE as i64, p);
                     }
                 }
             }
@@ -309,6 +309,13 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
     use std::borrow::Cow::Owned;
     SmsMatrix { elements, data: Owned(data), mean_residues: Owned(mean_residues), mu: Owned(mu), margin, column_failure }
 }
+
+/// `324^-1 mod p`: the key image is scaled by it so that the lazy inverse transform
+/// ([`super::inverse_lazy`], which skips the radices' `1 / r` and leaves its outputs times
+/// [`super::LAZY_SCALE`]) gives the coefficients themselves. Every row of the key carries the same
+/// factor and every sum goes through the same inverse, so the commitment is unchanged.
+const KEY_SCALE: u64 = crate::ntt::pow_mod(super::LAZY_SCALE % P1 as u64, P1 as u64 - 2, P1 as u64);
+const _: () = assert!(KEY_SCALE * super::LAZY_SCALE % P1 as u64 == 1);
 
 /// Elements per vector of the key image, and of a tile of the slot-wise products.
 const LOCK: usize = 8;
@@ -544,6 +551,35 @@ unsafe fn narrow(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
     }
 }
 
+/// `2^16 mod p`, centered.
+const C16: i32 = centered(1 << 16, P1) as i32;
+/// `round(2^31 / p)`.
+const V31: i32 = ((1u64 << 32) / P1 as u64).div_ceil(2) as i32;
+// a chunk's digit sums `v` (`|v| <= CHUNK p/2 32767`, any i16 transform): `(v >> 16) C16 +
+// (v mod 2^16)` stays inside i32
+const _: () = assert!(((CHUNK as u64 * (P1 as u64 / 2 + 1) * 32767 >> 16) + 1) * C16.unsigned_abs() as u64 + 65535 < i32::MAX as u64);
+
+/// [`narrow`] for a chunk's digit rows in integers (after dadon's `narrow_digits`, submission
+/// e9ed89bd): `v = h 2^16 + l` is `h (2^16 mod p) + l (mod p)` inside `i32`, then a 32-bit Barrett
+/// step to `|r| <= 0.625 p` (0.643 p at CHUNK 256: the rounded quotient is off by 1/2 plus |t| (V31 / 2^31 - 1 / p), checked numerically).
+#[inline(always)]
+unsafe fn narrow_digits(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
+    let c = vdupq_n_s32(C16);
+    let low = vdupq_n_s32(0xFFFF);
+    let half = |a: int64x2_t, b: int64x2_t| -> int32x4_t {
+        let h = vshrn_high_n_s64::<16>(vshrn_n_s64::<16>(a), b);
+        let l = vandq_s32(vmovn_high_s64(vmovn_s64(a), b), low);
+        let t = vmlaq_s32(l, h, c);
+        vmlsq_n_s32(t, vqrdmulhq_n_s32(t, V31), P1 as i32)
+    };
+    for (s, o) in out.iter_mut().enumerate() {
+        let at = idx(s, r);
+        let lo = half(*acc.get_unchecked(at), *acc.get_unchecked(at + 1));
+        let hi = half(*acc.get_unchecked(at + 2), *acc.get_unchecked(at + 3));
+        *o = vmovn_high_s32(vmovn_s32(lo), hi);
+    }
+}
+
 /// `x` in `[-(p-1)/2, (p-1)/2]` for `|x| <= p + p/2`.
 #[inline(always)]
 unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
@@ -592,8 +628,8 @@ unsafe fn sums(
             e += l;
         }
         for d in 0..DIGITS {
-            narrow(acc, 1 + d, y);
-            super::inverse::<PB>(y);
+            narrow_digits(acc, 1 + d, y);
+            super::inverse_lazy(y);
             chunk((end - 1) / CHUNK, d, y);
         }
         for s in 0..N {
@@ -604,7 +640,11 @@ unsafe fn sums(
         }
     }
     narrow(acc, 0, y);
-    super::inverse::<PB>(y);
+    super::inverse_lazy(y);
+    // the base row's coefficients centered ([`super::inverse_lazy`] leaves `|x| <= p`)
+    for v in y.iter_mut() {
+        *v = canonical(*v, P1 as i16);
+    }
 }
 
 /// `r mod 9721` and `t mod M` into `[0, Q)`.
@@ -715,6 +755,35 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The integer narrowing of the digit rows is exact modulo p and within `0.65 p`, on edge
+    /// and random sums up to the chunk bound; `|r| <= 0.65 p`.
+    #[test]
+    fn digit_narrowing_is_exact() {
+        let bound = (CHUNK as u64 * (P1 as u64 / 2 + 1) * 32767) as i64;
+        let mut state = 5u64;
+        let edge = [bound, -bound, bound - 1, -bound + 1, 0, 1, -1, 65535, -65536, 4860, -4861, 65536 * 9721, -(65536 * 9721) - 1];
+        let mut want = vec![0i64; ROWS * 8 * N];
+        for (i, w) in want.iter_mut().enumerate() {
+            *w = if i < edge.len() { edge[i] } else { (crate::ntt::tests::xorshift(&mut state) % (2 * bound as u64 + 1)) as i64 - bound };
+        }
+        unsafe {
+            let mut acc = vec![vdupq_n_s64(0); ROWS * 4 * N];
+            core::ptr::copy_nonoverlapping(want.as_ptr() as *const int64x2_t, acc.as_mut_ptr(), acc.len());
+            for r in 0..ROWS {
+                let mut out = [vdupq_n_s16(0); N];
+                narrow_digits(&acc, r, &mut out);
+                for s in 0..N {
+                    let o: [i16; 8] = core::mem::transmute(out[s]);
+                    for c in 0..8 {
+                        let v = want[idx(s, r) * 2 + c];
+                        assert_eq!((o[c] as i64 - v).rem_euclid(P1 as i64), 0, "{v}");
+                        assert!((o[c] as i64).abs() <= 65 * P1 as i64 / 100, "{v} -> {}", o[c]);
+                    }
+                }
+            }
+        }
+    }
 
     /// `sum_d W_d L_d = A (mod M)` on random matrix elements, coefficient by coefficient.
     #[test]

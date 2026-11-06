@@ -940,6 +940,166 @@ pub unsafe fn inverse<const P: usize>(x: &mut [int16x8_t; N]) {
     }
 }
 
+/// [`InverseKernel`]'s twiddles without the `1 / r` factors, for [`inverse_lazy`]: per radix-3
+/// node, levels 6 down to 3 (216, 72, 24, 8 nodes), `[tau^-1, tau^-2, eps^-1]` as pairs; per
+/// radix-2 node, levels 2 and 1 (4, 2 nodes), `[tau^-1]`; and the trinomial unsplit's
+/// `[inv_split, zeta^324]`.
+pub struct LazyInverse {
+    r3: Vec<[i16; 8]>,
+    r2: Vec<[i16; 8]>,
+    u: [i16; 8],
+}
+
+impl LazyInverse {
+    fn new(index: usize) -> LazyInverse {
+        use super::{ORDER, RADICES};
+        let plan = &primes()[index];
+        let p = plan.p;
+        let (mut r3, mut r2) = (Vec::new(), Vec::new());
+        for level in (0..RADICES.len()).rev() {
+            let r = RADICES[level];
+            for &e in &plan.exps[level] {
+                let tau = e as usize / r;
+                let mut row = [0i16; 8];
+                for i in 1..r {
+                    row[2 * (i - 1)..2 * i].copy_from_slice(&twiddle(p, plan.root(ORDER - tau * i % ORDER)));
+                }
+                if r == 3 {
+                    row[4..6].copy_from_slice(&twiddle(p, plan.root(ORDER - ORDER / 3)));
+                    r3.push(row);
+                } else {
+                    r2.push(row);
+                }
+            }
+        }
+        assert!(r3.len() == 216 + 72 + 24 + 8 && r2.len() == 4 + 2);
+        let mut u = [0i16; 8];
+        u[..2].copy_from_slice(&twiddle(p, plan.inv_split as u64));
+        u[2..4].copy_from_slice(&twiddle(p, plan.root(super::HALF)));
+        LazyInverse { r3, r2, u }
+    }
+}
+
+pub fn lazy_inverses() -> &'static [LazyInverse; 3] {
+    static K: OnceLock<[LazyInverse; 3]> = OnceLock::new();
+    K.get_or_init(|| [LazyInverse::new(0), LazyInverse::new(1), LazyInverse::new(2)])
+}
+
+/// The factor [`inverse_lazy`]'s output carries: `3^4 2^2`, the radices it does not divide by.
+pub const LAZY_SCALE: u64 = 324;
+
+/// `a - round(a / 2^13) p`: `|result| <= 0.18664 |a| + p / 2` for `p = 9721`.
+#[inline(always)]
+unsafe fn r13(a: int16x8_t, k: int16x8_t) -> int16x8_t {
+    vmlsq_laneq_s16::<0>(a, vrshrq_n_s16::<13>(a), k)
+}
+
+/// The radix-3 step of [`inverse_lazy`] on inputs `|y| <= B`, `t` a node's twiddles:
+/// `a = y0 + y1 + y2` (cheaply reduced), `b = tau^-1 (y0 + eps^-1 y1 + eps^-2 y2)`,
+/// `c = tau^-2 (y0 + eps^-2 y1 + eps^-1 y2)`, `eps^-2 = -1 - eps^-1`: three times the inverse
+/// butterfly, with three Barrett products instead of four.
+#[inline(always)]
+unsafe fn ib3(y0: int16x8_t, y1: int16x8_t, y2: int16x8_t, t: int16x8_t, k: int16x8_t) -> (int16x8_t, int16x8_t, int16x8_t) {
+    let a = r13(vaddq_s16(vaddq_s16(y0, y1), y2), k);
+    let e = mulc::<4, 5>(vsubq_s16(y1, y2), t, k);
+    let b = mulc::<0, 1>(vaddq_s16(vsubq_s16(y0, y2), e), t, k);
+    let c = mulc::<2, 3>(vsubq_s16(vsubq_s16(y0, y1), e), t, k);
+    (a, b, c)
+}
+
+/// The radix-2 step: `a = y0 + y1` (cheaply reduced), `b = tau^-1 (y0 - y1)`: twice the inverse.
+#[inline(always)]
+unsafe fn ib2(y0: int16x8_t, y1: int16x8_t, t: int16x8_t, k: int16x8_t) -> (int16x8_t, int16x8_t) {
+    (r13(vaddq_s16(y0, y1), k), mulc::<0, 1>(vsubq_s16(y0, y1), t, k))
+}
+
+/// The inverse transform times [`LAZY_SCALE`] for the prime 9721, on eight lanes: inputs
+/// `|x| <= p`, outputs congruent to `324` times [`inverse`]'s with `|x| <= p` (not centered).
+/// Four passes: levels 6 and 5 per level-4 node, level 4, level 3, then levels 2, 1 and the
+/// trinomial unsplit per group of eight slots `j + 81 b`, each slot loaded and stored once per
+/// pass. Bounds (inputs `<= 9721`, `r13`'s `0.18664 |a| + 4860.5`, [`super::product_bound`]):
+/// the radix-3 sums reach 29163, 30912, 31890, 32439 and the outputs 10304, 10630, 10813,
+/// 10915; the radix-2 sums 21830 and 17870, outputs 8935 and 8196; the unsplit outputs 7499
+/// and 7292. The test `lazy_inverse_matches` checks the congruence and the output bound.
+#[inline(never)]
+pub unsafe fn inverse_lazy(x: &mut [int16x8_t; N]) {
+    const { assert!(PRIMES[1] == 9721) };
+    let k = vld1q_s16(kernels()[1].k.as_ptr());
+    let inv = &lazy_inverses()[1];
+    let (r3, r2) = (&inv.r3[..], &inv.r2[..]);
+    // levels 6 and 5, per level-4 node m (slots 9 m..9 m + 9)
+    for m in 0..72 {
+        let base = 9 * m;
+        let mut v: [int16x8_t; 9] = core::array::from_fn(|i| load(x, base + i));
+        for g in 0..3 {
+            let t = vld1q_s16(r3.get_unchecked(3 * m + g).as_ptr());
+            (v[3 * g], v[3 * g + 1], v[3 * g + 2]) = ib3(v[3 * g], v[3 * g + 1], v[3 * g + 2], t, k);
+        }
+        let t = vld1q_s16(r3.get_unchecked(216 + m).as_ptr());
+        for j in 0..3 {
+            (v[j], v[j + 3], v[j + 6]) = ib3(v[j], v[j + 3], v[j + 6], t, k);
+        }
+        for (i, &y) in v.iter().enumerate() {
+            store(x, base + i, y);
+        }
+    }
+    // level 4, per level-3 node n (27 slots): (j, j + 9, j + 18)
+    for n in 0..24 {
+        let t = vld1q_s16(r3.get_unchecked(288 + n).as_ptr());
+        let base = 27 * n;
+        for j0 in (0..9).step_by(3) {
+            let v: [[int16x8_t; 3]; 3] = core::array::from_fn(|q| core::array::from_fn(|i| load(x, base + j0 + q + 9 * i)));
+            let y: [(int16x8_t, int16x8_t, int16x8_t); 3] = core::array::from_fn(|q| ib3(v[q][0], v[q][1], v[q][2], t, k));
+            for (q, &(a, b, c)) in y.iter().enumerate() {
+                store(x, base + j0 + q, a);
+                store(x, base + j0 + q + 9, b);
+                store(x, base + j0 + q + 18, c);
+            }
+        }
+    }
+    // level 3, per level-2 node n (81 slots): (j, j + 27, j + 54)
+    for n in 0..8 {
+        let t = vld1q_s16(r3.get_unchecked(312 + n).as_ptr());
+        let base = 81 * n;
+        for j0 in (0..27).step_by(3) {
+            let v: [[int16x8_t; 3]; 3] = core::array::from_fn(|q| core::array::from_fn(|i| load(x, base + j0 + q + 27 * i)));
+            let y: [(int16x8_t, int16x8_t, int16x8_t); 3] = core::array::from_fn(|q| ib3(v[q][0], v[q][1], v[q][2], t, k));
+            for (q, &(a, b, c)) in y.iter().enumerate() {
+                store(x, base + j0 + q, a);
+                store(x, base + j0 + q + 27, b);
+                store(x, base + j0 + q + 54, c);
+            }
+        }
+    }
+    // levels 2 and 1 and the unsplit, per j < 81: slots j + 81 i, i < 8
+    let t2: [int16x8_t; 4] = core::array::from_fn(|n| vld1q_s16(r2.get_unchecked(n).as_ptr()));
+    let t1: [int16x8_t; 2] = core::array::from_fn(|n| vld1q_s16(r2.get_unchecked(4 + n).as_ptr()));
+    let uv = vld1q_s16(inv.u.as_ptr());
+    for j in 0..81 {
+        let mut v: [int16x8_t; 8] = core::array::from_fn(|i| load(x, j + 81 * i));
+        // level 2: node n pairs slots 162 n + j and 162 n + j + 81
+        for n in 0..4 {
+            (v[2 * n], v[2 * n + 1]) = ib2(v[2 * n], v[2 * n + 1], t2[n], k);
+        }
+        // level 1: node n pairs 324 n + i and 324 n + i + 162, i = j, j + 81
+        for n in 0..2 {
+            for h in 0..2 {
+                (v[4 * n + h], v[4 * n + h + 2]) = ib2(v[4 * n + h], v[4 * n + h + 2], t1[n], k);
+            }
+        }
+        // the unsplit: b = (u - v) inv_split, a = u - zeta^324 b, pairs i and i + 324
+        for i in 0..4 {
+            let (u, w) = (v[i], v[i + 4]);
+            let b = mulc::<0, 1>(vsubq_s16(u, w), uv, k);
+            let a = r13(vsubq_s16(u, mulc::<2, 3>(b, uv, k)), k);
+            (v[i], v[i + 4]) = (a, b);
+        }
+        for (i, &y) in v.iter().enumerate() {
+            store(x, j + 81 * i, y);
+        }
+    }
+}
+
 /// `acc` reduced to `|acc| <= p` lane by lane: `acc - round(acc v / 2^31) p`, `v = round(2^31 / p)`.
 #[inline(always)]
 unsafe fn reduce_sums(acc: &mut [int32x4_t], p: i32, v: i32) {
@@ -1174,6 +1334,36 @@ mod tests {
 
     /// Scalar forward then vector inverse is the identity, centered; the transform values enter
     /// as `[0, p)`, centered, or shifted by `-p`, by lane.
+    #[test]
+    fn lazy_inverse_matches() {
+        let p = PRIMES[1] as i64;
+        let mut state = 99u64;
+        for case in 0..40 {
+            let lanes: [[i16; 8]; N] = core::array::from_fn(|j| core::array::from_fn(|l| {
+                match case {
+                    0 => p as i16,
+                    1 => -(p as i16),
+                    2 => if (j + l) % 2 == 0 { p as i16 } else { -(p as i16) },
+                    _ => ((super::super::tests::xorshift(&mut state) % (2 * p as u64 + 1)) as i64 - p) as i16,
+                }
+            }));
+            let want = run_inverse(1, &lanes);
+            let mut x: [int16x8_t; N] = unsafe { core::array::from_fn(|j| vld1q_s16(lanes[j].as_ptr())) };
+            unsafe { inverse_lazy(&mut x) };
+            for j in 0..N {
+                let got = lanes_of(x[j]);
+                for l in 0..8 {
+                    assert!((got[l] as i64).abs() <= p, "bound case {case} slot {j}");
+                    assert_eq!((got[l] as i64 - LAZY_SCALE as i64 * want[j][l] as i64).rem_euclid(p), 0, "case {case} slot {j} lane {l}");
+                }
+            }
+        }
+    }
+
+    fn lanes_of(v: int16x8_t) -> [i16; 8] {
+        unsafe { core::mem::transmute(v) }
+    }
+
     #[test]
     fn inverse_round_trip() {
         let mut state = 23u64;

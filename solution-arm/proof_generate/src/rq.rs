@@ -334,6 +334,34 @@ pub fn pack_ring_elements(coefficients: &[u128], q: u128) -> Vec<u8> {
     out
 }
 
+/// [`pack_ring_elements`] with the coefficients split over the worker threads: each worker packs
+/// a contiguous run into its own disjoint slice of the output, so the bytes are identical.
+pub fn pack_ring_elements_parallel(coefficients: &[u128], q: u128) -> Vec<u8> {
+    let width = coefficient_bytes(q);
+    let n = coefficients.len();
+    let workers = labinius::par::workers(n, 1 << 14);
+    if workers <= 1 {
+        return pack_ring_elements(coefficients, q);
+    }
+    let mut out = vec![0u8; width * n];
+    let edges: Vec<(usize, usize)> = (0..workers)
+        .map(|t| {
+            let (s, e) = labinius::par::block(n, workers, t, 1);
+            (s * width, e * width)
+        })
+        .collect();
+    let mut parts: Vec<Option<&mut [u8]>> = labinius::par::split_mut(&mut out, &edges).into_iter().map(Some).collect();
+    let parts = std::sync::Mutex::new(&mut parts);
+    labinius::par::map_blocks(n, workers, 1, |t, s, e| {
+        let dst = parts.lock().unwrap()[t].take().unwrap();
+        for (i, &x) in coefficients[s..e].iter().enumerate() {
+            debug_assert!(x < q, "a coefficient is not reduced");
+            dst[i * width..(i + 1) * width].copy_from_slice(&x.to_le_bytes()[..width]);
+        }
+    });
+    out
+}
+
 /// The inverse of [`pack_ring_elements`] for `count` coefficients, strict.
 ///
 /// The length has to be exactly right and every coefficient has to be below `q`, which is what
@@ -522,5 +550,27 @@ mod tests {
         assert_eq!(ajtai_matrix(q, 64)[..N], wide[..N]);
         assert_ne!(ajtai_matrix(q, 65)[..N], wide[..N]);
         assert_ne!(ajtai_matrix(q + 2, 64)[..N], wide[..N]);
+    }
+}
+
+#[cfg(test)]
+mod pack_parallel_tests {
+    use super::*;
+
+    #[test]
+    fn parallel_pack_matches_sequential() {
+        let q = 35_039_150_080u128;
+        let mut x = 0x0123_4567_89ab_cdefu64;
+        for n in [0usize, 1, 5, 1 << 14, (1 << 15) + 7, 1_000_003] {
+            let v: Vec<u128> = (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u128 % q
+                })
+                .collect();
+            assert_eq!(pack_ring_elements_parallel(&v, q), pack_ring_elements(&v, q), "n {n}");
+        }
     }
 }

@@ -116,9 +116,13 @@ pub fn eq_expand_b128_scaled_into(r: &[B128], t: &mut [B128], scale: B128) {
     let scaled: Vec<(usize, usize)> = edges.iter().map(|&(s, e)| (s * size, e * size)).collect();
     let chunks = par::split_mut(t, &scaled);
     let prefix = &prefix;
-    par::for_each(chunks.into_iter().zip(&edges), |(chunk, &(s, _))| {
-        for (i, block) in chunk.chunks_exact_mut(size).enumerate() {
-            expand_from(low, block, prefix[s + i]);
+    std::thread::scope(|scope| {
+        for (chunk, &(s, _)) in chunks.into_iter().zip(&edges) {
+            scope.spawn(move || {
+                for (i, block) in chunk.chunks_exact_mut(size).enumerate() {
+                    expand_from(low, block, prefix[s + i]);
+                }
+            });
         }
     });
 }

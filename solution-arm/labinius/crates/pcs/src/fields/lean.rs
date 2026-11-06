@@ -287,8 +287,12 @@ impl<'a> Switch<'a> {
         let chunks = par::split_mut(a0, &edges).into_iter().zip(par::split_mut(a1, &edges))
             .zip(par::split_mut(b0, &edges)).zip(par::split_mut(b1, &edges))
             .zip(par::split_mut(c0, &edges)).zip(par::split_mut(c1, &edges));
-        let sums = par::map_each(chunks.zip(&edges), |((((((a0, a1), b0), b1), c0), c1), &(start, end))| {
-            work([a0, b0, c0], [a1, b1, c1], start, end)
+        let sums = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunks.zip(&edges).map(|((((((a0, a1), b0), b1), c0), c1), &(start, end))| {
+                let work = &work;
+                scope.spawn(move || work([a0, b0, c0], [a1, b1, c1], start, end))
+            }).collect();
+            handles.into_iter().map(|h| h.join().expect("switch worker panicked")).collect::<Vec<_>>()
         });
         sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])
     }
@@ -304,8 +308,10 @@ impl<'a> Switch<'a> {
         let chunks = par::split_mut(p0, &edges).into_iter()
             .zip(par::split_mut(p1, &edges)).zip(par::split_mut(p2, &edges));
         let weights = &weights;
-        par::for_each(chunks.zip(&edges), |(((a, b), c), &(start, _))| unsafe {
-            neon::materialize_prefix(words, weights, start, [a, b, c])
+        std::thread::scope(|scope| {
+            for (((a, b), c), &(start, _)) in chunks.zip(&edges) {
+                scope.spawn(move || unsafe { neon::materialize_prefix(words, weights, start, [a, b, c]) });
+            }
         });
     }
 

@@ -185,7 +185,7 @@ fn load_table(path: &str, n: usize) -> Table {
         if ptr as isize != -1 {
             let base = ptr as usize;
             // The range boundaries are 2 MiB aligned, also valid on 4/16/64 KiB kernels.
-            labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
+            labinius::par::map_blocks(n, threads(), (2 << 20) / 16, |_, s, e| {
                 if s < e {
                     let addr = (base + 16 * s) as *mut u8;
                     // Linux 5.14+: install the page-cache pages in parallel. Older kernels
@@ -231,7 +231,7 @@ fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
     t.absorb_u64(LOG_VARS as u64);
     t.absorb_u64(COLUMN_LOG as u64);
     t.absorb_bytes(&modulus.to_le_bytes());
-    t.absorb_bytes(commitment);
+    t.absorb_bytes_parallel(commitment, labinius::par::threads());
     t
 }
 
@@ -438,22 +438,23 @@ fn dot_lifted(eq: &[F162], column: &[B128]) -> F162 {
     cf::dot_lifted(eq, column)
 }
 
+/// `u_j = sum_i eq(p0, i) W[i + COLUMN_LEN j]`, one field element per column.
 fn row_evaluate(values: &[B128], p0: &[F162]) -> Vec<F162> {
     let eq = eq_table(p0);
+    let per = COLUMNS.div_ceil(threads());
     let mut out = vec![F162::ZERO; COLUMNS];
-    let eq = &eq;
-    labinius::par::for_each(
-        out.chunks_mut(ROW_BATCH).zip(values.chunks(ROW_BATCH * COLUMN_LEN)),
-        |(block, columns)| {
-            for (slot, column) in block.iter_mut().zip(columns.chunks_exact(COLUMN_LEN)) {
-                *slot = dot_lifted(eq, column);
-            }
-        },
-    );
+    std::thread::scope(|scope| {
+        for (block, columns) in out.chunks_mut(per).zip(values.chunks(per * COLUMN_LEN)) {
+            let eq = &eq;
+            scope.spawn(move || {
+                for (slot, column) in block.iter_mut().zip(columns.chunks_exact(COLUMN_LEN)) {
+                    *slot = dot_lifted(eq, column);
+                }
+            });
+        }
+    });
     out
 }
-
-const ROW_BATCH: usize = 32;
 
 /// The sumcheck coordinates split into the row point `p0` and the column point `p1`.
 fn split_point(coords: &[F162]) -> (Vec<F162>, Vec<F162>) {
@@ -863,7 +864,6 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
     let coefficients = commit(values, modulus);
     let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
     std::mem::forget(coefficients);
-    labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
     // round, and idle population workers measurably slowed it. The final encode faults the

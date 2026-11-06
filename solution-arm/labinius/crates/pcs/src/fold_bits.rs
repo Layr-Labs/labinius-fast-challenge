@@ -1657,9 +1657,11 @@ pub mod neon {
     }
 
     /// `v = sum_j c_j W_j` for every ring element of the `columns` columns of `column_words`
+    /// words (a multiple of 128) at `words`, on `threads` workers: they first build the
+    /// schedule's groups between them, then take blocks dynamically.
     pub fn fold(words: &[u128], column_words: usize, challenges: &[Challenge], threads: usize) -> Vec<RingElement> {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::OnceLock;
+        use std::sync::{Barrier, OnceLock};
         assert!(column_words % LANES == 0, "a column is whole blocks");
         assert_eq!(words.len(), challenges.len() * column_words, "one challenge per column");
         assert!(fits(challenges), "the counters would overflow");
@@ -1668,19 +1670,19 @@ pub mod neon {
         let ngroups = challenges.len().div_ceil(GROUP);
         let built: Vec<OnceLock<Group>> = (0..ngroups).map(|_| OnceLock::new()).collect();
         let workers = threads.clamp(1, blocks.max(1));
-        let pool = crate::par::pool();
-        pool.run(ngroups, |g| {
-            let _ = built[g].set(Group::of(challenges, g));
-        });
-        let groups: Vec<&Group> = built.iter().map(|g| g.get().expect("every group is built")).collect();
-        let bias = bias(groups.iter().copied());
+        let barrier = Barrier::new(workers);
         let mut out: Vec<RingElement> = Vec::with_capacity(elements);
         let out_addr = out.as_mut_ptr() as usize;
         let words_addr = words.as_ptr() as usize;
         let next = AtomicUsize::new(0);
-        let (groups, bias) = (&groups, &bias);
-        pool.run(workers, |_| {
+        let run = |w: usize| {
+            for g in (w..ngroups).step_by(workers) {
+                let _ = built[g].set(Group::of(challenges, g));
+            }
             let mut ws = Workspace::new();
+            barrier.wait();
+            let groups: Vec<&Group> = built.iter().map(|g| g.get().expect("every group is built")).collect();
+            let bias = bias(groups.iter().copied());
             let mut claim = || {
                 let b = next.fetch_add(1, Ordering::Relaxed);
                 (b < blocks).then_some(b)
@@ -1692,8 +1694,8 @@ pub mod neon {
                     fold_block(
                         words_addr as *const u128,
                         column_words,
-                        groups,
-                        bias,
+                        &groups,
+                        &bias,
                         b,
                         &mut claim,
                         &mut ws,
@@ -1701,6 +1703,13 @@ pub mod neon {
                     )
                 };
             }
+        };
+        std::thread::scope(|scope| {
+            for w in 1..workers {
+                let run = &run;
+                scope.spawn(move || run(w));
+            }
+            run(0);
         });
         // SAFETY: every block wrote all fields of its 32 elements.
         unsafe { out.set_len(elements) };

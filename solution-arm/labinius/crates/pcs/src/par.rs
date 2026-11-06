@@ -52,22 +52,9 @@ pub fn workers(n: usize, min: usize) -> usize {
     (n / min.max(1)).clamp(1, threads())
 }
 
+/// Runs `f(t, start, end)` for every block of [`block`] on its own scoped thread (the calling
+/// thread takes the last block) and returns the per-block results in block order.
 pub fn map_blocks<R: Send>(
-    n: usize,
-    parts: usize,
-    align: usize,
-    f: impl Fn(usize, usize, usize) -> R + Sync,
-) -> Vec<R> {
-    if parts <= 1 {
-        return vec![f(0, 0, n)];
-    }
-    pool().map(parts, |t| {
-        let (s, e) = block(n, parts, t, align);
-        f(t, s, e)
-    })
-}
-
-pub fn map_blocks_scoped<R: Send>(
     n: usize,
     parts: usize,
     align: usize,
@@ -95,22 +82,15 @@ pub fn map_blocks_scoped<R: Send>(
     })
 }
 
+// Keep the scoped map_blocks dispatcher until the kernel-owned scopes migrate together.
+// Mixed dispatchers contend on the same eight CPUs (see NOTES.md); output uses the pool.
+
 /// The result-free counterpart of [`map_blocks`].
 pub fn for_blocks(n: usize, parts: usize, align: usize, f: impl Fn(usize, usize, usize) + Sync) {
     pool().run(parts.max(1), |t| {
         let (s, e) = block(n, parts.max(1), t, align);
         f(t, s, e);
     });
-}
-
-pub fn map_each<T: Send, R: Send>(items: impl IntoIterator<Item = T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
-    struct Slot<T>(std::cell::UnsafeCell<Option<T>>);
-    unsafe impl<T: Send> Sync for Slot<T> {}
-    let items: Vec<_> = items.into_iter().map(|x| Slot(std::cell::UnsafeCell::new(Some(x)))).collect();
-    pool().map(items.len(), |i| {
-        let item = unsafe { (*items[i].0.get()).take().unwrap_unchecked() };
-        f(item)
-    })
 }
 
 /// Consume independent work items on the pool. In particular, items may contain disjoint

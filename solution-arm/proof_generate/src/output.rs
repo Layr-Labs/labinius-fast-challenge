@@ -240,6 +240,8 @@ fn encode_vec(p: &ProofParts) -> Vec<u8> {
 pub(super) fn pack_commitment(values: &[u128], q: u128, mut bytes: Vec<u8>) -> Vec<u8> {
     let width = rq::coefficient_bytes(q);
     assert_eq!(bytes.len(), width * values.len());
+    // Scoped threads, not the persistent pool: the switch that follows still spawns its own
+    // scoped workers, and pool workers spinning after this dispatch slowed it measurably.
     let per = values.len().div_ceil(par::threads()).max(1);
     std::thread::scope(|scope| {
         for (dst, values) in bytes.chunks_mut(per * width).zip(values.chunks(per)) {

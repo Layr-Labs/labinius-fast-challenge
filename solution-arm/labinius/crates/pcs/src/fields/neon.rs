@@ -408,6 +408,48 @@ pub(super) unsafe fn msg_range(
     [e0, einf]
 }
 
+/// Fold two entries in registers; used by both the reference fold and fused next message.
+#[inline(always)]
+unsafe fn fold2(x0: [uint64x2_t; 3], x1: [uint64x2_t; 3], rk: [uint64x2_t; 6]) -> [uint64x2_t; 3] {
+    let m17 = vdupq_n_u64((1 << 17) - 1);
+    let m34 = vdupq_n_u64((1 << 34) - 1);
+    let d = kara([x2(x0[0], x1[0]), x2(x0[1], x1[1]), x2(x0[2], x1[2])]);
+    // Products of lane 0 and lane 1, then their low and high words gathered across lanes.
+    let mut plo = [vdupq_n_u64(0); 6];
+    let mut phi = [vdupq_n_u64(0); 6];
+    for k in 0..6 {
+        let (a, b) = (pmul_lo(d[k], rk[k]), pmul_hi(d[k], rk[k]));
+        plo[k] = vzip1q_u64(a, b);
+        phi[k] = vzip2q_u64(a, b);
+    }
+    let [m0l, m1l, m2l, k01l, k02l, k12l] = plo;
+    let [m0h, m1h, m2h, k01h, k02h, k12h] = phi;
+    let d1l = x3(k01l, m0l, m1l);
+    let d1h = x3(k01h, m0h, m1h);
+    let d2l = x2(x3(k02l, m0l, m2l), m1l);
+    let d2h = x2(x3(k02h, m0h, m2h), m1h);
+    let d3l = x3(k12l, m1l, m2l);
+    let d3h = x3(k12h, m1h, m2h);
+    let p0 = m0l;
+    let p1 = x2(m0h, d1l);
+    let p2 = x2(d1h, d2l);
+    let p3 = x2(d2h, d3l);
+    let p4 = x2(d3h, m2l);
+    let p5 = m2h;
+    let h00 = vsliq_n_u64::<30>(vshrq_n_u64::<34>(p2), p3);
+    let h01 = vandq_u64(vshrq_n_u64::<34>(p3), m17);
+    let h10 = vsliq_n_u64::<13>(vshrq_n_u64::<51>(p3), p4);
+    let h11 = vsliq_n_u64::<13>(vshrq_n_u64::<51>(p4), p5);
+    let r0 = x3(p0, h00, h10);
+    let r1 = x2(x3(p1, h01, h11), vshlq_n_u64::<17>(h00));
+    let r2 = x3(
+        vandq_u64(p2, m34),
+        vshlq_n_u64::<17>(h01),
+        vshrq_n_u64::<47>(h00),
+    );
+    [x2(x0[0], r0), x2(x0[1], r1), x2(x0[2], r2)]
+}
+
 /// `lo[j] <- lo[j] + r (lo[j] + hi[j])` over one share.
 ///
 /// # Safety
@@ -422,8 +464,6 @@ pub(super) unsafe fn fold_share(lo: [&mut [u64]; 3], hi: [&[u64]; 3], r: F162) {
         vdupq_n_u64(r.0[1]),
         vdupq_n_u64(r.0[2]),
     ]);
-    let m17 = vdupq_n_u64((1 << 17) - 1);
-    let m34 = vdupq_n_u64((1 << 34) - 1);
     let pairs = m / 2;
     for i in 0..pairs {
         let j = 2 * i;
@@ -433,43 +473,10 @@ pub(super) unsafe fn fold_share(lo: [&mut [u64]; 3], hi: [&[u64]; 3], r: F162) {
             vld1q_u64(l2.as_ptr().add(j)),
         ];
         let x1 = load2(hi, j);
-        let d = kara([x2(x0[0], x1[0]), x2(x0[1], x1[1]), x2(x0[2], x1[2])]);
-        // Products of lane 0 and lane 1, then their low and high words gathered across lanes.
-        let mut plo = [vdupq_n_u64(0); 6];
-        let mut phi = [vdupq_n_u64(0); 6];
-        for k in 0..6 {
-            let (a, b) = (pmul_lo(d[k], rk[k]), pmul_hi(d[k], rk[k]));
-            plo[k] = vzip1q_u64(a, b);
-            phi[k] = vzip2q_u64(a, b);
-        }
-        let [m0l, m1l, m2l, k01l, k02l, k12l] = plo;
-        let [m0h, m1h, m2h, k01h, k02h, k12h] = phi;
-        let d1l = x3(k01l, m0l, m1l);
-        let d1h = x3(k01h, m0h, m1h);
-        let d2l = x2(x3(k02l, m0l, m2l), m1l);
-        let d2h = x2(x3(k02h, m0h, m2h), m1h);
-        let d3l = x3(k12l, m1l, m2l);
-        let d3h = x3(k12h, m1h, m2h);
-        let p0 = m0l;
-        let p1 = x2(m0h, d1l);
-        let p2 = x2(d1h, d2l);
-        let p3 = x2(d2h, d3l);
-        let p4 = x2(d3h, m2l);
-        let p5 = m2h;
-        let h00 = vsliq_n_u64::<30>(vshrq_n_u64::<34>(p2), p3);
-        let h01 = vandq_u64(vshrq_n_u64::<34>(p3), m17);
-        let h10 = vsliq_n_u64::<13>(vshrq_n_u64::<51>(p3), p4);
-        let h11 = vsliq_n_u64::<13>(vshrq_n_u64::<51>(p4), p5);
-        let r0 = x3(p0, h00, h10);
-        let r1 = x2(x3(p1, h01, h11), vshlq_n_u64::<17>(h00));
-        let r2 = x3(
-            vandq_u64(p2, m34),
-            vshlq_n_u64::<17>(h01),
-            vshrq_n_u64::<47>(h00),
-        );
-        vst1q_u64(l0.as_mut_ptr().add(j), x2(x0[0], r0));
-        vst1q_u64(l1.as_mut_ptr().add(j), x2(x0[1], r1));
-        vst1q_u64(l2.as_mut_ptr().add(j), x2(x0[2], r2));
+        let y = fold2(x0, x1, rk);
+        vst1q_u64(l0.as_mut_ptr().add(j), y[0]);
+        vst1q_u64(l1.as_mut_ptr().add(j), y[1]);
+        vst1q_u64(l2.as_mut_ptr().add(j), y[2]);
     }
     for j in 2 * pairs..m {
         let x0 = F162([l0[j], l1[j], l2[j]]);
@@ -564,33 +571,48 @@ impl ByteTables {
     }
 }
 
+/// Bind original words in cache-sized output tiles, reading eight input streams at a time.
+/// Unreduced accumulators survive across all groups: exactly one reduction per output.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start: usize, out: [&mut [u64]; 3]) {
     let stride = words.len() / weights.len();
     let [o0, o1, o2] = out;
     let len = o0.len();
     assert!(o1.len() == len && o2.len() == len && start + len <= stride && len % 2 == 0);
-    let weights: Vec<_> = weights.iter().map(|w| kara(w.0.map(|v| vdupq_n_u64(v)))).collect();
-    for i in (0..len).step_by(2) {
-        let mut acc0 = [vdupq_n_u64(0); 6];
-        let mut acc1 = acc0;
-        for (q, w) in weights.iter().enumerate() {
-            let p = vld2q_u64(words.as_ptr().add(q * stride + start + i) as *const u64);
-            let k = [p.0, p.1, vdupq_n_u64(0), x2(p.0, p.1), p.0, p.1];
-            for j in [0, 1, 3, 4, 5] {
-                acc0[j] = x2(acc0[j], pmul_lo(w[j], k[j]));
-                acc1[j] = x2(acc1[j], pmul_hi(w[j], k[j]));
+    let wk: Vec<_> = weights.iter().map(|w| kara(w.0.map(|x| vdupq_n_u64(x)))).collect();
+    const PAIRS: usize = 32;
+    let z = vdupq_n_u64(0);
+    let mut scratch = vec![[[z; 6]; 2]; PAIRS];
+    for first in (0..len).step_by(2 * PAIRS) {
+        let pairs = ((len - first) / 2).min(PAIRS);
+        for (group, ws) in wk.chunks(8).enumerate() {
+            for i in 0..pairs {
+                let mut acc = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
+                for (g, w) in ws.iter().enumerate() {
+                    let q = 8 * group + g;
+                    let p = vld2q_u64(words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64);
+                    let k = [p.0, p.1, z, x2(p.0, p.1), p.0, p.1];
+                    for j in [0, 1, 3, 4, 5] {
+                        acc[0][j] = x2(acc[0][j], pmul_lo(w[j], k[j]));
+                        acc[1][j] = x2(acc[1][j], pmul_hi(w[j], k[j]));
+                    }
+                }
+                scratch[i] = acc;
             }
         }
-        let a = reduce(assemble(acc0.map(|v| to_u128(v))));
-        let b = reduce(assemble(acc1.map(|v| to_u128(v))));
-        for (dst, k) in [(&mut *o0, 0), (&mut *o1, 1), (&mut *o2, 2)] {
-            dst[i] = a.0[k];
-            dst[i + 1] = b.0[k];
+        for (i, acc) in scratch[..pairs].iter().enumerate() {
+            let a = reduce(assemble(acc[0].map(|v| to_u128(v))));
+            let b = reduce(assemble(acc[1].map(|v| to_u128(v))));
+            let j = first + 2 * i;
+            for (dst, k) in [(&mut *o0, 0), (&mut *o1, 1), (&mut *o2, 2)] {
+                dst[j] = a.0[k]; dst[j + 1] = b.0[k];
+            }
         }
     }
 }
 
+// Reference for the `NibblePair` kernels (tests); the switch calls the `_pair` kernels.
+#[allow(dead_code)]
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn linear_message(eq: &[B128], lo: [&[u64]; 3], hi: [&[u64]; 3], l: &ByteTables, lp: &ByteTables) -> [F162; 2] {
     let n = eq.len();
@@ -612,6 +634,178 @@ pub(super) unsafe fn linear_message(eq: &[B128], lo: [&[u64]; 3], hi: [&[u64]; 3
         let p1 = F162(core::array::from_fn(|k| hi[k][j]));
         out[0] += l.apply(eq[j]) * p0;
         out[1] += lp.apply(eq[j]) * (p0 + p1);
+    }
+    out
+}
+
+/// The two linear maps of a sumcheck round (`l` and `lp`: the images of the 128 basis bits) as
+/// nibble tables side by side. Entry `16 n + s` holds both images of nibble value `s` at nibble `n`:
+/// `[l low limbs, lp low limbs, (l top, lp top)]`. That is 24 KiB, L1-resident on Neoverse V2, where
+/// the two byte tables (196 KiB) are L2 lookups; one nibble index serves both maps.
+pub(super) struct NibblePair {
+    t: Vec<[uint64x2_t; 3]>,
+}
+
+impl NibblePair {
+    pub(super) fn new(l: &[F162], lp: &[F162]) -> Self {
+        assert!(l.len() == 128 && lp.len() == 128);
+        unsafe {
+            let z = vdupq_n_u64(0);
+            let mut t = vec![[z; 3]; 32 * 16];
+            for n in 0..32 {
+                for s in 1..16usize {
+                    let i = s.trailing_zeros() as usize;
+                    let (a, b) = (l[4 * n + i].0, lp[4 * n + i].0);
+                    let prev = t[16 * n + (s & (s - 1))];
+                    t[16 * n + s] = [
+                        veorq_u64(prev[0], vcombine_u64(vcreate_u64(a[0]), vcreate_u64(a[1]))),
+                        veorq_u64(prev[1], vcombine_u64(vcreate_u64(b[0]), vcreate_u64(b[1]))),
+                        veorq_u64(prev[2], vcombine_u64(vcreate_u64(a[2]), vcreate_u64(b[2]))),
+                    ];
+                }
+            }
+            Self { t }
+        }
+    }
+
+    /// Both images of `x`: `[l(x) low limbs, lp(x) low limbs, (l(x) top, lp(x) top)]`, summed over
+    /// four independent register accumulators so the 32 lookups overlap. Fully unrolled: left as
+    /// a loop, LLVM keeps the accumulator array on the stack and every lookup becomes a
+    /// load-xor-store of it.
+    #[inline(always)]
+    pub(super) unsafe fn apply(&self, x: B128) -> [uint64x2_t; 3] {
+        let base = self.t.as_ptr();
+        let z = vdupq_n_u64(0);
+        let (lo, hi) = (x.0 as u64, (x.0 >> 64) as u64);
+        let (mut a0, mut a1, mut a2, mut a3) = ([z; 3], [z; 3], [z; 3], [z; 3]);
+        macro_rules! step {
+            ($acc:ident, $w:ident, $n:literal, $k:literal) => {{
+                let e = &*base.add(16 * $n + (($w >> (4 * $k)) & 15) as usize);
+                $acc[0] = veorq_u64($acc[0], e[0]);
+                $acc[1] = veorq_u64($acc[1], e[1]);
+                $acc[2] = veorq_u64($acc[2], e[2]);
+            }};
+        }
+        step!(a0, lo, 0, 0);
+        step!(a1, lo, 1, 1);
+        step!(a2, lo, 2, 2);
+        step!(a3, lo, 3, 3);
+        step!(a0, lo, 4, 4);
+        step!(a1, lo, 5, 5);
+        step!(a2, lo, 6, 6);
+        step!(a3, lo, 7, 7);
+        step!(a0, lo, 8, 8);
+        step!(a1, lo, 9, 9);
+        step!(a2, lo, 10, 10);
+        step!(a3, lo, 11, 11);
+        step!(a0, lo, 12, 12);
+        step!(a1, lo, 13, 13);
+        step!(a2, lo, 14, 14);
+        step!(a3, lo, 15, 15);
+        step!(a0, hi, 16, 0);
+        step!(a1, hi, 17, 1);
+        step!(a2, hi, 18, 2);
+        step!(a3, hi, 19, 3);
+        step!(a0, hi, 20, 4);
+        step!(a1, hi, 21, 5);
+        step!(a2, hi, 22, 6);
+        step!(a3, hi, 23, 7);
+        step!(a0, hi, 24, 8);
+        step!(a1, hi, 25, 9);
+        step!(a2, hi, 26, 10);
+        step!(a3, hi, 27, 11);
+        step!(a0, hi, 28, 12);
+        step!(a1, hi, 29, 13);
+        step!(a2, hi, 30, 14);
+        step!(a3, hi, 31, 15);
+        core::array::from_fn(|c| veorq_u64(veorq_u64(a0[c], a1[c]), veorq_u64(a2[c], a3[c])))
+    }
+
+    /// `(l(x), lp(x))` as field elements.
+    pub(super) fn images(&self, x: B128) -> (F162, F162) {
+        unsafe {
+            let e = self.apply(x);
+            (
+                F162([vgetq_lane_u64::<0>(e[0]), vgetq_lane_u64::<1>(e[0]), vgetq_lane_u64::<0>(e[2])]),
+                F162([vgetq_lane_u64::<0>(e[1]), vgetq_lane_u64::<1>(e[1]), vgetq_lane_u64::<1>(e[2])]),
+            )
+        }
+    }
+
+    /// Images of `eq[j]` and `eq[j + 1]` as `mac2` operands: limb `k` of the two entries in lanes
+    /// 0 and 1, for `l` (first) and `lp` (second). Same packing as `linear_message`'s `pack`.
+    #[inline(always)]
+    unsafe fn pair(&self, x0: B128, x1: B128) -> ([uint64x2_t; 3], [uint64x2_t; 3]) {
+        let e0 = self.apply(x0);
+        let e1 = self.apply(x1);
+        (
+            [vzip1q_u64(e0[0], e1[0]), vzip2q_u64(e0[0], e1[0]), vzip1q_u64(e0[2], e1[2])],
+            [vzip1q_u64(e0[1], e1[1]), vzip2q_u64(e0[1], e1[1]), vzip2q_u64(e0[2], e1[2])],
+        )
+    }
+}
+
+/// [`linear_message`] with both maps through one [`NibblePair`]: the same two sums.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn linear_message_pair(eq: &[B128], lo: [&[u64]; 3], hi: [&[u64]; 3], t: &NibblePair) -> [F162; 2] {
+    let n = eq.len();
+    assert!(lo.iter().chain(hi.iter()).all(|s| s.len() == n));
+    let mut acc0 = [vdupq_n_u64(0); 6];
+    let mut acci = acc0;
+    for j in (0..n / 2 * 2).step_by(2) {
+        let (a, d) = t.pair(*eq.get_unchecked(j), *eq.get_unchecked(j + 1));
+        let (p0, p1) = (load2(lo, j), load2(hi, j));
+        mac2(&mut acc0, a, p0);
+        mac2(&mut acci, d, core::array::from_fn(|k| x2(p0[k], p1[k])));
+    }
+    let mut out = [reduce(assemble(acc0.map(|v| to_u128(v)))), reduce(assemble(acci.map(|v| to_u128(v))))];
+    if n % 2 != 0 {
+        let j = n - 1;
+        let p0 = F162(core::array::from_fn(|k| lo[k][j]));
+        let p1 = F162(core::array::from_fn(|k| hi[k][j]));
+        let (a, d) = t.images(eq[j]);
+        out[0] += a * p0;
+        out[1] += d * (p0 + p1);
+    }
+    out
+}
+
+/// [`fold_linear_message`] with both maps through one [`NibblePair`]: the same folded quarters
+/// and the same two sums.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_linear_message_pair(
+    eq: &[B128], q0: [&mut [u64]; 3], q1: [&mut [u64]; 3],
+    h0: [&[u64]; 3], h1: [&[u64]; 3], r: F162, t: &NibblePair,
+) -> [F162; 2] {
+    let n = eq.len();
+    assert!(q0.iter().chain(q1.iter()).all(|s| s.len() == n));
+    assert!(h0.iter().chain(h1.iter()).all(|s| s.len() == n));
+    let rk = kara(r.0.map(|x| vdupq_n_u64(x)));
+    let mut acc0 = [vdupq_n_u64(0); 6];
+    let mut acci = acc0;
+    for j in (0..n / 2 * 2).step_by(2) {
+        let (a, d) = t.pair(*eq.get_unchecked(j), *eq.get_unchecked(j + 1));
+        let get = |q: &[&mut [u64]; 3]| core::array::from_fn(|k| vld1q_u64(q[k].as_ptr().add(j)));
+        let p0 = fold2(get(&q0), load2(h0, j), rk);
+        let p1 = fold2(get(&q1), load2(h1, j), rk);
+        mac2(&mut acc0, a, p0);
+        mac2(&mut acci, d, core::array::from_fn(|k| x2(p0[k], p1[k])));
+        for k in 0..3 {
+            vst1q_u64(q0[k].as_mut_ptr().add(j), p0[k]);
+            vst1q_u64(q1[k].as_mut_ptr().add(j), p1[k]);
+        }
+    }
+    let mut out = [reduce(assemble(acc0.map(|v| to_u128(v)))), reduce(assemble(acci.map(|v| to_u128(v))))];
+    if n % 2 != 0 {
+        let j = n - 1;
+        let get = |q: &[&mut [u64]; 3]| F162(core::array::from_fn(|k| q[k][j]));
+        let (a, b) = (get(&q0), get(&q1));
+        let p0 = a + r * (a + F162(core::array::from_fn(|k| h0[k][j])));
+        let p1 = b + r * (b + F162(core::array::from_fn(|k| h1[k][j])));
+        for k in 0..3 { q0[k][j] = p0.0[k]; q1[k][j] = p1.0[k]; }
+        let (ia, id) = t.images(eq[j]);
+        out[0] += ia * p0;
+        out[1] += id * (p0 + p1);
     }
     out
 }
@@ -706,6 +900,90 @@ mod tests {
 
     fn view(w: &[Vec<u64>; 3]) -> [&[u64]; 3] {
         [&w[0][..], &w[1][..], &w[2][..]]
+    }
+
+    #[test]
+    fn nibble_pair_matches_the_byte_tables() {
+        let mut rng = Rng(0x0F0F_1234_5678_9ABC_DEF0_2468_ACE1_3579);
+        let l: Vec<_> = (0..128).map(|_| rng.f162()).collect();
+        let lp: Vec<_> = (0..128).map(|_| rng.f162()).collect();
+        let (bl, blp) = (ByteTables::new(&l), ByteTables::new(&lp));
+        let t = NibblePair::new(&l, &lp);
+        for i in 0..2000 {
+            let v = B128(match i {
+                0..=127 => 1u128 << i,
+                128 => 0,
+                129 => u128::MAX,
+                _ => rng.next(),
+            });
+            let (a, d) = t.images(v);
+            assert_eq!(a.0, bl.apply(v).0, "l i={i}");
+            assert_eq!(d.0, blp.apply(v).0, "lp i={i}");
+        }
+    }
+
+    /// The fused pass equals `fold_share` on both quarters followed by the byte-table
+    /// `linear_message` over the folded quarters; `linear_message_pair` equals `linear_message`.
+    #[test]
+    fn fused_pair_fold_message_matches_separate_passes() {
+        if !pmull() { return; }
+        let mut rng = Rng(0xF053_DF01_D135_1A9E_6754_3210_ABCD_EF01);
+        let batch: Vec<_> = (0..128).map(|_| rng.f162()).collect();
+        let batch_p: Vec<_> = (0..128).map(|_| rng.f162()).collect();
+        let (l, lp) = (ByteTables::new(&batch), ByteTables::new(&batch_p));
+        let t = NibblePair::new(&batch, &batch_p);
+        for n in [0usize, 1, 2, 3, 8, 13, 63, 64, 257] {
+            let mut q0: [Vec<u64>; 3] = core::array::from_fn(|k| (0..n).map(|_| rng.f162().0[k]).collect());
+            let mut q1: [Vec<u64>; 3] = core::array::from_fn(|k| (0..n).map(|_| rng.f162().0[k]).collect());
+            let h0: [Vec<u64>; 3] = core::array::from_fn(|k| (0..n).map(|_| rng.f162().0[k]).collect());
+            let h1: [Vec<u64>; 3] = core::array::from_fn(|k| (0..n).map(|_| rng.f162().0[k]).collect());
+            let eq: Vec<_> = (0..n).map(|_| B128(rng.next())).collect();
+            let plain = unsafe { linear_message(&eq, view(&q0), view(&q1), &l, &lp) };
+            let paired = unsafe { linear_message_pair(&eq, view(&q0), view(&q1), &t) };
+            assert_eq!(paired, plain, "message n={n}");
+            let (mut want0, mut want1) = (q0.clone(), q1.clone());
+            let r = rng.f162();
+            let got = unsafe {
+                let [a, b, c] = &mut want0;
+                fold_share([a, b, c], view(&h0), r);
+                let [a, b, c] = &mut want1;
+                fold_share([a, b, c], view(&h1), r);
+                let [a, b, c] = &mut q0;
+                let [d, e, f] = &mut q1;
+                fold_linear_message_pair(&eq, [a, b, c], [d, e, f], view(&h0), view(&h1), r, &t)
+            };
+            assert_eq!(q0, want0, "lower n={n}");
+            assert_eq!(q1, want1, "upper n={n}");
+            let want = unsafe { linear_message(&eq, view(&want0), view(&want1), &l, &lp) };
+            assert_eq!(got, want, "fused message n={n}");
+        }
+    }
+
+    /// The tiled prefix binding against the scalar definition, for weight counts that are and
+    /// are not multiples of the eight-stream group (32 is the `PREFIX = 5` case).
+    #[test]
+    fn tiled_prefix_binding_matches_scalar_products() {
+        if !pmull() { return; }
+        let mut rng = Rng(0xCA03_B10C_6F12_ABCD_0123_4567_89AB_CDEF);
+        for blocks in [1usize, 2, 5, 8, 9, 16, 32, 64] {
+            let weights: Vec<_> = (0..blocks).map(|_| rng.f162()).collect();
+            for (start, n) in [(0, 2usize), (2, 8), (0, 64), (4, 70), (6, 130)] {
+                let words: Vec<_> = (0..blocks * (start + n)).map(|_| B128(rng.next())).collect();
+                let mut got = [vec![0; n], vec![0; n], vec![0; n]];
+                unsafe {
+                    let [a, b, c] = &mut got;
+                    materialize_prefix(&words, &weights, start, [a, b, c]);
+                }
+                let stride = start + n;
+                for j in 0..n {
+                    let want = weights.iter().enumerate().fold(F162::ZERO, |a, (q, &w)| {
+                        a + w * F162::from_b128(words[q * stride + start + j])
+                    });
+                    assert_eq!(F162(core::array::from_fn(|k| got[k][j])), want,
+                        "blocks={blocks} start={start} n={n} j={j}");
+                }
+            }
+        }
     }
 
     #[test]

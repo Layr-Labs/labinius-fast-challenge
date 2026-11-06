@@ -1337,7 +1337,7 @@ struct Mapped {
 }
 
 /// Bytes of the proof file each idle chunk faults in: one huge page.
-const POPULATE_CHUNK: usize = 2 << 20;
+const POPULATE_CHUNK: usize = 1 << 20;
 
 impl OutputState {
     #[cfg(target_os = "linux")]

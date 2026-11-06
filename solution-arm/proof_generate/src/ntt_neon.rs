@@ -29,7 +29,6 @@ const BITS: usize = 512;
 /// One prime's constants in the order the passes read them. A twiddle `w` is stored as the pair
 /// `(w, round(w 2^15 / p))`, both centered.
 pub struct Kernel {
-    /// `[p, round(2^26 / p), eps, eps', 0, 0, 0, 0]`, `eps = zeta^648`.
     k: [i16; 8],
     /// Levels 0 and 1: `[zeta^324, zeta^1620, zeta^162, zeta^486, zeta^810, zeta^486, 0, 0]`.
     a: [i16; 8],
@@ -75,7 +74,7 @@ impl Kernel {
         };
         let eps = tw(648);
         let v = (((1u64 << 27) / p as u64 + 1) / 2) as i16;
-        let k = [p as i16, v, eps[0], eps[1], 0, 0, 0, 0];
+        let k = [p as i16, v, eps[0], eps[1], -(p as i16), 0, 0, 0];
         let c = |e: usize| super::centered(plan.root(e) as i64, p);
         let a = [c(324), c(1620), c(162), c(486), c(810), c(486), 0, 0];
         let mut g = [0i16; 8];
@@ -159,21 +158,11 @@ pub fn kernels() -> &'static [Kernel; 3] {
 }
 
 /// Barrett product by the twiddle in lanes `W` (value) and `T` (twisted) of `t`; `k` holds `p` in
-/// lane 0. `|result| <= product_bound(p, |a|)`.
 #[inline(always)]
 unsafe fn mulc<const W: i32, const T: i32>(a: int16x8_t, t: int16x8_t, k: int16x8_t) -> int16x8_t {
-    let mut lo = vmulq_laneq_s16::<W>(a, t);
+    let lo = vmulq_laneq_s16::<W>(a, t);
     let hi = vqrdmulhq_laneq_s16::<T>(a, t);
-    // `lo - hi p` as one `mls`: written as the intrinsic, LLVM turns the two products into
-    // `mul`, `neg`, `mla`, one instruction more.
-    core::arch::asm!(
-        "mls {lo:v}.8h, {hi:v}.8h, {k:v}.h[0]",
-        lo = inout(vreg) lo,
-        hi = in(vreg) hi,
-        k = in(vreg_low16) k,
-        options(pure, nomem, nostack, preserves_flags)
-    );
-    lo
+    vmlaq_laneq_s16::<4>(lo, hi, k)
 }
 
 /// Barrett reduction of any `i16` lanes to `|result| <= reduced_bound(p)`, congruent mod `p`.
@@ -181,14 +170,14 @@ unsafe fn mulc<const W: i32, const T: i32>(a: int16x8_t, t: int16x8_t, k: int16x
 pub unsafe fn reduce(a: int16x8_t, k: int16x8_t) -> int16x8_t {
     let t = vqdmulhq_laneq_s16::<1>(a, k);
     let t = vrshrq_n_s16::<11>(t);
-    vmlsq_laneq_s16::<0>(a, t, k)
+    vmlaq_laneq_s16::<4>(a, t, k)
 }
 
 /// `a - round(a / 2^14) p`: one multiplication, `|result| <= cheap_bound(p, |a|)`, for the prime
 /// close to `2^14`.
 #[inline(always)]
 pub unsafe fn reduce_cheap(a: int16x8_t, k: int16x8_t) -> int16x8_t {
-    vmlsq_laneq_s16::<0>(a, vrshrq_n_s16::<14>(a), k)
+    vmlaq_laneq_s16::<4>(a, vrshrq_n_s16::<14>(a), k)
 }
 
 /// Reduces the level's inputs the schedule asks for: all of them (the multiplied ones cheaply
@@ -212,7 +201,7 @@ unsafe fn reduce_inputs<const L: usize>(
         }
     } else if mode == FIRST13 {
         for &i in first {
-            v[i] = vmlsq_laneq_s16::<0>(v[i], vrshrq_n_s16::<13>(v[i]), k);
+            v[i] = vmlaq_laneq_s16::<4>(v[i], vrshrq_n_s16::<13>(v[i]), k);
         }
     }
 }

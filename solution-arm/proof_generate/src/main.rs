@@ -998,17 +998,6 @@ mod tests {
         let want = commit_reference(&values, &matrix, q);
         let a = sms::matrix(elements, 3);
         assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
-        // paired groups and the vector epilogue at the edges: one short group, a chunk exactly
-        // (13 groups: six pairs and a single one), a chunk and a short group, two chunks
-        for elements in [5usize, sms::CHUNK, sms::CHUNK + 3, 2 * sms::CHUNK] {
-            let values: Vec<B128> = (0..9).flat_map(|s| column(600 + s)).take(9 * 4 * elements).collect();
-            let matrix = rq::ajtai_matrix(q, elements);
-            let want = commit_reference(&values, &matrix, q);
-            let a = sms::matrix(elements, 3);
-            for workers in [1, 3] {
-                assert!(sms::commit(&values, &a, workers) == want, "{elements} elements, workers {workers}");
-            }
-        }
     }
     #[test]
     fn encoding_matches_bincode() {

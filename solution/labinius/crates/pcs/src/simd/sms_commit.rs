@@ -482,20 +482,31 @@ unsafe fn sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *m
 impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
     #[inline(always)]
     unsafe fn rows_inline(&self, blk: usize, w0: *const i16, r0: usize, r1: usize) {
-        for i in r0..r1 {
-            let j = 27 * blk + i;
-            let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w0.add(32 * 27 * h) as *const __m512i).add(i)));
-            let k = self.k.add(j * STREAMS * LOCK);
-            let a = self.acc.add(j * STREAMS * 16);
+        // Two rows share one contiguous prefetch walk, with the same requested
+        // lines and lead as before; avoid a full-callback burst.
+        for begin in (r0..r1).step_by(2) {
+            let end = (begin + 2).min(r1);
             if PREFETCH_SLOTS > 0 {
-                let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
-                let hi = lo + STREAMS * LOCK * 4;
+                let first = 27 * blk + begin + PREFETCH_SLOTS;
+                let lo = self.k.wrapping_add(first * STREAMS * LOCK) as usize;
+                let hi = lo + (end - begin) * STREAMS * LOCK * 4;
                 let mut p = (lo + 63) & !63;
                 while p < hi {
                     _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
                     p += 64;
                 }
             }
+            self.rows_without_prefetch(blk, w0, begin, end);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn rows_without_prefetch(&self, blk: usize, w0: *const i16, r0: usize, r1: usize) {
+        for i in r0..r1 {
+            let j = 27 * blk + i;
+            let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w0.add(32 * 27 * h) as *const __m512i).add(i)));
+            let k = self.k.add(j * STREAMS * LOCK);
+            let a = self.acc.add(j * STREAMS * 16);
             macro_rules! call {
                 ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
                     core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
@@ -760,7 +771,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     let hl = np / 2;
     let span = range.end - range.start;
     assert!(range.start % (np / 2) == 0 && (span == np || span == np / 2), "whole halves of the column");
-    static ZERO8: [B128; 8] = [B128::ZERO; 8];
+    static ZERO64: [B128; 8 * LOCK] = [B128::ZERO; 8 * LOCK];
     let kbase = keys.pairs.as_ptr();
     // LOCK=8's FIRST sink broadcasts each digit's bias and overwrites all
     // digit accumulators before use. Only the base stream needs a fill here.
@@ -787,36 +798,42 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
                 }
             }
         }
-        for h in 0..LOCK {
-            let cols16: [*const B128; 16] = core::array::from_fn(|l| {
-                if l < g { cols[l].as_ptr().add(8 * (b + h)) } else { ZERO8.as_ptr() }
-            });
-            crate::simd::transpose_f162::slice_b128_cols16_into(&cols16, &mut ws.idx[h]);
-        }
-        let ins: [&BinaryIndex32; LOCK] = core::array::from_fn(|h| &ws.idx[h]);
+        let idx = ws.idx.as_mut_ptr();
+        let mut cols16: [*const B128; 16] = core::array::from_fn(|l| {
+            if l < g { cols[l].as_ptr().add(8 * b) } else { ZERO64.as_ptr() }
+        });
+        // The producer requests each h once, in order. Partial groups use
+        // enough zero words for all LOCK pointer advances.
+        let mut source = |_h: usize, out: *mut BinaryIndex32| {
+            crate::simd::transpose_f162::slice_b128_cols16_into(&cols16, &mut *out);
+            for p in &mut cols16 { *p = p.add(8); }
+        };
         let k = kbase.add((b / LOCK) * LOCK_WORDS);
         // A chunk's first step cancels its public mean in the NTT domain.
         // The FIRST sink overwrites the auxiliary accumulators from that image.
         let first = (b - b / hl * hl) % CHUNK_PAIRS == 0;
         let mode = bench_mode();
+        if mode == 2 || mode == 4 {
+            for h in 0..LOCK { source(h, idx.add(h)); }
+        }
         if mode == 4 { continue; }
         if mode == 1 {
             struct Nop;
             impl vb::SliceSink<LOCK> for Nop { unsafe fn rows(&mut self, _: usize, w: [*const i16; LOCK], _: usize, _: usize) { core::hint::black_box(w); } }
-            vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Nop);
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Nop, &mut source);
         } else if mode == 2 {
             let mut sk = Sink::<false> { k, acc, b: bias };
             for kk in 0..24 { vb::SliceSink::<LOCK>::rows(&mut sk, kk, core::array::from_fn(|h| w.add(32 * 27 * h) as *const i16), 0, 27); }
         } else if first && ((b + LOCK) % PP == 0 || LOCK > PP) {
-            vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<true, true> { k, acc, b: bias });
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<true, true> { k, acc, b: bias }, &mut source);
             sync(b + LOCK);
         } else if first {
-            vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<false, true> { k, acc, b: bias });
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<false, true> { k, acc, b: bias }, &mut source);
         } else if (b + LOCK) % PP == 0 || LOCK > PP {
-            vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<true> { k, acc, b: bias });
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<true> { k, acc, b: bias }, &mut source);
             sync(b + LOCK);
         } else {
-            vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<false> { k, acc, b: bias });
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<false> { k, acc, b: bias }, &mut source);
         }
         // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
         let (e, cph) = (b + LOCK, chunks_per_half(np));

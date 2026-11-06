@@ -1379,7 +1379,7 @@ mod bitsliced {
     const SLOTS: usize = 243;
     /// Schedule entries ahead of use that the accumulation prefetches the planes of: the planes
     /// (264 KB per worker) live in L2, and each entry's two vectors are otherwise demand misses.
-    const PF_AHEAD: usize = 0;
+    const PF_AHEAD: usize = 1;
     const BITS: usize = 15;
     /// Columns per group: 32 * 129 planes, about 258 KiB per worker. Larger groups
     /// amortize the schedule and partial carry-save trees. The qword offsets remain in u16:

@@ -458,6 +458,7 @@ pub(super) unsafe fn fold_share(lo: [&mut [u64]; 3], hi: [&[u64]; 3], r: F162) {
 }
 
 /// Partial sets share one equality block and its lookup tables across all word blocks.
+const SPASS: usize = 4;
 pub(super) fn partial_evals_sets(words: &[B128], eq: &[B128], start: usize, end: usize) -> Vec<Vec<B128>> {
     let stride = eq.len();
     assert_eq!(words.len() % stride, 0);
@@ -465,10 +466,10 @@ pub(super) fn partial_evals_sets(words: &[B128], eq: &[B128], start: usize, end:
     let blocks = words.len() / stride;
     unsafe {
         let mut sums = vec![[vdupq_n_u8(0); 128]; blocks];
-        let mut tabs = vec![[vdupq_n_u8(0); 256]; PASS];
-        let mut pats = [[0u8; 128]; PASS];
-        for base in (start..end).step_by(GROUP * PASS) {
-            let count = ((end - base) / GROUP).min(PASS);
+        let mut tabs = vec![[vdupq_n_u8(0); 256]; SPASS];
+        let mut pats = [[0u8; 128]; SPASS];
+        for base in (start..end).step_by(GROUP * SPASS) {
+            let count = ((end - base) / GROUP).min(SPASS);
             for x in 0..count {
                 combinations(eq.as_ptr().add(base + GROUP * x), &mut tabs[x]);
             }

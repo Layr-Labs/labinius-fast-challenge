@@ -91,6 +91,8 @@ pub struct Switch<'a> {
     planes: [Vec<u64>; 3],
     half: usize,
     round: usize,
+    /// The next round's message, computed by the fused fold of the previous round.
+    pending: Option<[F162; 2]>,
 }
 
 impl<'a> Switch<'a> {
@@ -105,6 +107,7 @@ impl<'a> Switch<'a> {
             planes: core::array::from_fn(|_| Vec::new()),
             half: words.len(),
             round: 0,
+            pending: None,
         }
     }
 
@@ -139,21 +142,22 @@ impl<'a> Switch<'a> {
 
     pub fn msg(&mut self) -> [F162; 2] {
         self.half /= 2;
+        if let Some(m) = self.pending.take() {
+            return m;
+        }
         if self.round < PREFIX {
             return self.prefix_message();
         }
-        let l = ByteTables::new(&self.l);
-        let lp = ByteTables::new(&self.lp);
+        let t = neon::NibblePair::new(&self.l, &self.lp);
         let p = &self.planes;
         let half = self.half;
         let parts = par::workers(half, 1 << 12);
         let sums = par::map_blocks(half, parts, 2, |_, start, end| unsafe {
-            neon::linear_message(
+            neon::linear_message_pair(
                 &self.prepared.eq[start..end],
                 core::array::from_fn(|k| &p[k][start..end]),
                 core::array::from_fn(|k| &p[k][half + start..half + end]),
-                &l,
-                &lp,
+                &t,
             )
         });
         sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])
@@ -171,6 +175,9 @@ impl<'a> Switch<'a> {
             if self.round + 1 == PREFIX {
                 self.materialize();
             }
+        } else if self.half > 1 {
+            // Every later round has a message: fold and accumulate it in one pass.
+            self.pending = Some(self.fold_message(r));
         } else {
             let half = self.half;
             let parts = par::workers(half, 1 << 13);
@@ -189,6 +196,58 @@ impl<'a> Switch<'a> {
             });
         }
         self.round += 1;
+    }
+
+    /// Folds the live `2 * half` entries with `r` and returns the next round's message over the
+    /// folded `half` entries: quarters `q0 = [0, hh)` and `q1 = [hh, 2 hh)` are folded with
+    /// `[2 hh, 3 hh)` and `[3 hh, 4 hh)` (`hh = half / 2`), exactly as `fold_share` over
+    /// `[0, half)` with `[half, 2 half)`, and the message pairs `q0[j]` with `q1[j]` under
+    /// `eq[j]` as [`Switch::msg`] would after the fold. `l` and `lp` are already the next round's.
+    fn fold_message(&mut self, r: F162) -> [F162; 2] {
+        let hh = self.half / 2;
+        debug_assert!(self.half == 2 * hh && hh > 0);
+        let t = neon::NibblePair::new(&self.l, &self.lp);
+        let eq = &self.prepared.eq[..hh];
+        let parts = par::workers(hh, 1 << 12);
+        let edges: Vec<_> = (0..parts).map(|w| par::block(hh, parts, w, 2)).collect();
+        fn split(p: &mut [u64], hh: usize) -> (&mut [u64], &mut [u64], &[u64], &[u64]) {
+            let (lo, hi) = p[..4 * hh].split_at_mut(2 * hh);
+            let (q0, q1) = lo.split_at_mut(hh);
+            let (h0, h1) = hi.split_at(hh);
+            (q0, q1, h0, h1)
+        }
+        let [p0, p1, p2] = &mut self.planes;
+        let (a0, a1, ah0, ah1) = split(p0, hh);
+        let (b0, b1, bh0, bh1) = split(p1, hh);
+        let (c0, c1, ch0, ch1) = split(p2, hh);
+        let t = &t;
+        let work = move |q0: [&mut [u64]; 3], q1: [&mut [u64]; 3], (start, end): (usize, usize)| unsafe {
+            neon::fold_linear_message_pair(
+                &eq[start..end],
+                q0,
+                q1,
+                [&ah0[start..end], &bh0[start..end], &ch0[start..end]],
+                [&ah1[start..end], &bh1[start..end], &ch1[start..end]],
+                r,
+                t,
+            )
+        };
+        if parts == 1 {
+            return work([a0, b0, c0], [a1, b1, c1], (0, hh));
+        }
+        let chunks = par::split_mut(a0, &edges).into_iter()
+            .zip(par::split_mut(b0, &edges)).zip(par::split_mut(c0, &edges))
+            .zip(par::split_mut(a1, &edges)).zip(par::split_mut(b1, &edges)).zip(par::split_mut(c1, &edges));
+        let sums = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunks.zip(&edges)
+                .map(|((((((x0, y0), z0), x1), y1), z1), &edge)| {
+                    let work = &work;
+                    scope.spawn(move || work([x0, y0, z0], [x1, y1, z1], edge))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().expect("switch worker panicked")).collect::<Vec<_>>()
+        });
+        sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])
     }
 
     fn materialize(&mut self) {
@@ -249,6 +308,36 @@ mod tests {
             }
             assert_eq!(lean.final_eval(), full.final_eval());
         }
+    }
+
+    /// The fused fold first splits across workers at `half / 2 >= 2 << 12` folded entries, which
+    /// needs `log >= PREFIX + 15`. Heavier than the shapes above: `cargo test --release -- --ignored`.
+    #[test]
+    #[ignore]
+    fn fused_switch_matches_transcript_across_workers() {
+        let mut state = 0x51fd_aac7_3fb5_5530_e3d6_29d3_d22c_8f29u128;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let log = PREFIX + 15;
+        let words: Vec<_> = (0..1 << log).map(|_| B128(next())).collect();
+        let r: Vec<_> = (0..log).map(|_| B128(next())).collect();
+        let batch = eq_expand_f162(&(0..7).map(|_| F162::from_b128(B128(next()))).collect::<Vec<_>>());
+        let prepared = Prepared::new(&words, &r).unwrap();
+        let (_, eq) = SwitchProver::partial_evals_and_eq(&words, &r);
+        let mut lean = Switch::new(&words, prepared, &batch);
+        let mut full = SwitchProver::new(&words, &eq, &batch);
+        for round in 0..log {
+            assert_eq!(lean.msg(), full.msg(), "round={round}");
+            let x = next();
+            let challenge = F162([x as u64, (x >> 64) as u64, next() as u64 & ((1 << 34) - 1)]);
+            lean.fold(challenge);
+            full.fold(challenge);
+        }
+        assert_eq!(lean.final_eval(), full.final_eval());
     }
 
     #[test]

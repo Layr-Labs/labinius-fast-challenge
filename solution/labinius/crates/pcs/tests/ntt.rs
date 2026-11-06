@@ -445,31 +445,80 @@ mod bin_asm {
     // stored rows exactly with the ordinary kernel on adversarial and random input.
     #[test]
     fn batched_matches_plain() {
-        struct Sink<'a>(&'a mut [Batch32]);
-        impl vb::SliceSink<8> for Sink<'_> {
-            unsafe fn rows(&mut self,blk:usize,w:[*const i16;8],r0:usize,r1:usize) {
-                for h in 0..8 { for i in r0..r1 {
-                    self.0[h].v[27*blk+i].copy_from_slice(core::slice::from_raw_parts(w[h].add(32*i),32));
-                }}
+        #[repr(C, align(64))]
+        #[derive(Clone)]
+        struct Vector([i16; 32]);
+        const GUARD: i16 = 0x6b6b;
+        struct Sink<'a, const H: usize> {
+            expected: &'a [Batch32],
+            base: *const i16,
+            calls: usize,
+        }
+        impl<const H: usize> vb::SliceSink<H> for Sink<'_, H> {
+            unsafe fn rows(&mut self, blk: usize, w: [*const i16; H], r0: usize, r1: usize) {
+                assert_eq!(blk, self.calls, "callback order");
+                assert_eq!((r0, r1), (0, 27));
+                assert_eq!(core::slice::from_raw_parts(self.base.sub(32), 32), &[GUARD; 32]);
+                assert_eq!(core::slice::from_raw_parts(self.base.add(6 * H * 27 * 32), 32), &[GUARD; 32]);
+                for h in 0..H {
+                    assert_eq!(w[h], self.base.add(32 * 27 * (H * (blk % 6) + h)));
+                }
+                // Every block in this quarter must already be complete, including the
+                // neighbors on both sides of every callback block. Recheck them at each
+                // callback to catch cross-block clobbers and early storage reuse.
+                for j in 0..6 {
+                    for h in 0..H {
+                        let p = self.base.add(32 * 27 * (H * j + h));
+                        for i in 0..27 {
+                            assert_eq!(core::slice::from_raw_parts(p.add(32 * i), 32),
+                                &self.expected[h].v[27 * (blk / 6 * 6 + j) + i],
+                                "H={H} callback={blk} block={j} h={h} row={i}");
+                        }
+                    }
+                }
+                self.calls += 1;
             }
         }
-        #[repr(align(64))]
-        struct Scratch([i16;6*8*27*32]);
-        fn check<const Q:u16>() {
-            let inputs=batches(32,0x51227 ^ Q as u64);
-            for polys in inputs.chunks_exact(8) {
-                let idx:Vec<_>=polys.iter().map(idx_of_polys).collect();
-                let mut got:Vec<_>=(0..8).map(|_|Batch32::zero(Representation::Coefficients)).collect();
-                let mut scratch=Box::new(Scratch([0;6*8*27*32]));
-                unsafe {vb::ntt_bin_batch32_batched::<Q,8,_>(core::array::from_fn(|h|&idx[h]),scratch.0.as_mut_ptr(),&mut Sink(&mut got));}
-                for h in 0..8 {
-                    let mut expected=Batch32::zero(Representation::Coefficients);
-                    unsafe {vb::ntt_bin_batch32::<Q>(&idx[h],&mut expected);}
-                    assert_eq!(got[h].v,expected.v,"Q={Q}, batch={h}");
+        fn check<const Q: u16, const H: usize>() {
+            let random = batches(4 * H, 0x51227 ^ Q as u64);
+            for fixture in 0..10 {
+                let idx: Vec<_> = (0..H).map(|h| {
+                    if fixture >= 6 { return idx_of_polys(&random[(fixture - 6) * H + h]); }
+                    let polys = core::array::from_fn(|p| core::array::from_fn(|i| match fixture {
+                        0 => 0,
+                        1 => 1,
+                        2 => ((i + h + p) % 2) as u32,
+                        3 => (i == (h * 81 + p) % N) as u32,
+                        4 => ((i / 27 + h + p) % 2) as u32,
+                        _ => (i >= N - 1 - (h + p) % 27) as u32,
+                    }));
+                    idx_of_polys(&polys)
+                }).collect();
+                let before: Vec<_> = idx.iter().map(|v| v.rows).collect();
+                let expected: Vec<_> = idx.iter().map(|v| {
+                    let mut out = Batch32::zero(Representation::Coefficients);
+                    unsafe { vb::ntt_bin_batch32::<Q>(v, &mut out); }
+                    out
+                }).collect();
+                for poison in [0x5a5a, -0x2525] {
+                    let mut scratch = vec![Vector([poison; 32]); 6 * H * 27 + 2];
+                    scratch[0].0 = [GUARD; 32];
+                    scratch[6 * H * 27 + 1].0 = [GUARD; 32];
+                    let base = scratch[1].0.as_mut_ptr();
+                    let mut sink = Sink::<H> { expected: &expected, base, calls: 0 };
+                    unsafe { vb::ntt_bin_batch32_batched::<Q, H, _>(
+                        core::array::from_fn(|h| &idx[h]), base, &mut sink); }
+                    assert_eq!(sink.calls, 24);
+                    assert_eq!(scratch[0].0, [GUARD; 32]);
+                    assert_eq!(scratch[6 * H * 27 + 1].0, [GUARD; 32]);
+                    for h in 0..H { assert_eq!(idx[h].rows, before[h], "input modified"); }
                 }
             }
         }
-        check::<3889>();check::<9721>();
+        check::<3889, 1>(); check::<3889, 2>(); check::<3889, 4>();
+        check::<3889, 8>(); check::<3889, 16>();
+        check::<9721, 1>(); check::<9721, 2>(); check::<9721, 4>();
+        check::<9721, 8>(); check::<9721, 16>();
     }
 
     /// The *proved* bound of the schedule (the shadow model only sees the inputs the test feeds it):

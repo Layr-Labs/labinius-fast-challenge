@@ -1330,8 +1330,13 @@ pub trait SliceSink<const H: usize> {
 
 /// Transform a quarter of all `H` inputs, then consume its six completed 27-row blocks.
 /// Batching callbacks amortizes the accumulator call boundary and its row-loop setup.
-/// `wbuf` holds `6 H` 27-vector blocks, each aligned to 64 bytes. Every callback receives
-/// rows `0..27`; the transforms and their output representatives match [`ntt_bin_batch32`].
+/// `wbuf` holds prefix and output in the same `6 H` 27-vector blocks, aligned to 64 bytes.
+/// Every callback receives rows `0..27`; representatives match [`ntt_bin_batch32`].
+///
+/// # Safety
+/// `wbuf` must cover `6 * H * 27 * 32` writable i16 values, disjoint from inputs, tables
+/// and sink state. Sinks must finish reading each quarter before returning; they must not
+/// retain pointers for reads after the next quarter begins.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink<H>>(
     ins: [&BinaryIndex32; H],
@@ -1345,8 +1350,13 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
         omp: bc(&t.om[1]),
     };
     let ips: [*const u8; H] = core::array::from_fn(|h| ins[h].rows.as_ptr() as *const u8);
-    let mut blks: [core::mem::MaybeUninit<Blk>; H] = [const { core::mem::MaybeUninit::uninit() }; H];
-    let bps: [*mut i16; H] = core::array::from_fn(|h| blks[h].as_mut_ptr() as *mut i16);
+    // Vector (j,h,i) lives at 27*(H*j+h)+i, with j<6, h<H, i<27. Division by
+    // 27, then H, recovers these indices, so distinct leaves cannot overlap.
+    // All prefixes finish before any leaf. Each unchanged leaf loads all 27 vectors
+    // before its first store, so equal raw input/output pointers are safe. All six
+    // callbacks finish before the next quarter reuses this storage. Do not replace
+    // these raw pointers with simultaneous aliased Rust references.
+    let bps: [*mut i16; H] = core::array::from_fn(|h| wbuf.add(32 * 27 * h));
     let buf = |kk: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk % 6) + h))) };
     let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
 
@@ -1389,11 +1399,11 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
                 let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
                 let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
                 st(bp, i, u0);
-                st(bp, i + 27, u1);
-                st(bp, i + 54, u2);
-                st(bp, i + 81, v2);
-                st(bp, i + 108, v0);
-                st(bp, i + 135, v1);
+                st(bp, i + 27 * H, u1);
+                st(bp, i + 54 * H, u2);
+                st(bp, i + 81 * H, v2);
+                st(bp, i + 108 * H, v0);
+                st(bp, i + 135 * H, v1);
             }
         }
         let cv = t.cv.as_ptr() as *const i16;
@@ -1411,7 +1421,7 @@ pub unsafe fn ntt_bin_batch32_batched<const Q: u16, const H: usize, S: SliceSink
                 t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
             ) };
             for h in 0..core::hint::black_box(H) {
-                let bpj = bps[h].add(32 * 27 * j);
+                let bpj = os[h];
                 tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
             }
         }
@@ -1551,3 +1561,7 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
 }
 
 include!("twiddle_expanded.rs");
+
+#[cfg(test)]
+#[path = "shared_scratch_tests.rs"]
+mod shared_scratch_tests;

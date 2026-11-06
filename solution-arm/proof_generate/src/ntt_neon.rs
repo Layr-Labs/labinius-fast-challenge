@@ -675,7 +675,14 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
     row: &[i16],
     acc: &mut [int32x4_t],
 ) {
-    let s: Schedule = schedule(S);
+    pass_d_schedule::<S, MAC>(x, kern, row, acc, schedule(S));
+}
+
+/// Level 6 with an explicitly certified schedule (SMS needs headroom for Winograd additions).
+#[inline(always)]
+unsafe fn pass_d_schedule<const S: usize, const MAC: bool>(
+    x: &mut [int16x8_t; N], kern: &Kernel, row: &[i16], acc: &mut [int32x4_t], s: Schedule,
+) {
     let k = vld1q_s16(kern.k.as_ptr());
     debug_assert!(!MAC || (row.len() == ROW && acc.len() == 2 * N));
     #[inline(always)]

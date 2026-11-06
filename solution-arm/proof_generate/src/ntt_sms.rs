@@ -26,6 +26,22 @@ mod lattice;
 /// The transform prime, by index into [`PRIMES`].
 const PB: usize = 1;
 const P1: u32 = PRIMES[PB];
+/// Stronger reduction of the two unmultiplied level-6 inputs leaves room for K + y.
+const WINOGRAD_SCHEDULE: Schedule = {
+    let mut s = SCHEDULES[PB];
+    s.before[6] = FIRST;
+    s
+};
+const Y_BOUND: u64 = crate::ntt::lut_transform_bound(P1, WINOGRAD_SCHEDULE) as u64;
+const K_BOUND: u64 = (P1 as u64 - 1) / 2;
+const _: () = {
+    assert!(Y_BOUND + K_BOUND <= i16::MAX as u64);
+    // Before subtracting H, each pair contributes at most 4 (K + y)^2.
+    assert!(4096 * (K_BOUND + Y_BOUND) * (K_BOUND + Y_BOUND) / 2 < (1u64 << 41));
+    // Afterwards the exact sum is K*y + Xi, including the base row's 4096 elements.
+    assert!(4096 * K_BOUND * Y_BOUND + 2048 * K_BOUND * K_BOUND < (1u64 << 41));
+};
+
 /// The digit-encoded factor of the modulus.
 pub const TAIL: u32 = lattice::M as u32;
 /// The commitment modulus.
@@ -65,7 +81,8 @@ const _: () = assert!((CHUNK as i64) * TERMS * (lattice::MAX_DIGIT_ABS as i64) *
 pub struct SmsMatrix {
     pub elements: usize,
     pub data: std::borrow::Cow<'static, [i16]>,
-    /// `mean_residues[(c DIGITS + d) N + coefficient]`.
+    /// `(mean + inverse(Xi)) mod p` at `[(c DIGITS + d) N + coefficient]`;
+    /// the final N entries are the base row's inverse(Xi), summed over all chunks.
     pub mean_residues: std::borrow::Cow<'static, [i16]>,
     /// `sum_{d, c} W_d mean_{d,c} mod M`, by coefficient.
     pub mu: std::borrow::Cow<'static, [u32]>,
@@ -139,7 +156,7 @@ impl SmsMatrix {
         let chunks = elements.div_ceil(CHUNK);
         let data = key_copy(data).unwrap_or(data);
         let data = view::<i16>(data, ROWS * elements.div_ceil(LOCK) * LOCK * N)?;
-        let mean_residues = view::<i16>(means, chunks * DIGITS * N)?;
+        let mean_residues = view::<i16>(means, (chunks * DIGITS + 1) * N)?;
         let mu = view::<u32>(mu, N)?;
         if meta.len() != 16 {
             return None;
@@ -259,7 +276,7 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
     let half = ((p - 1) / 2) as f64;
     let mut margin = f64::INFINITY;
     let mut column_failure = 0f64;
-    let mut mean_residues = vec![0i16; chunks * DIGITS * N];
+    let mut mean_residues = vec![0i16; (chunks * DIGITS + 1) * N];
     let mut mu = vec![0i64; N];
     for c in 0..chunks {
         for d in 0..DIGITS {
@@ -306,6 +323,30 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
             }
         }
     });
+    // Winograd's public Xi = sum K[e+k] K[e+4+k], per slot. Linearity of the
+    // inverse lets the digit rows absorb it into their mean residues, with no runtime pass.
+    // The last N entries hold the base row's Xi summed over the entire column.
+    for c in 0..chunks {
+        for r in 0..ROWS {
+            let mut xi = [0i64; N];
+            for e in (c * CHUNK..((c + 1) * CHUNK).min(elements)).step_by(LOCK) {
+                for j in 0..N {
+                    let at = ((e / LOCK * N + j) * ROWS + r) * LOCK;
+                    for k in 0..4 {
+                        xi[j] += data[at + k] as i64 * data[at + 4 + k] as i64;
+                    }
+                }
+            }
+            unsafe {
+                let mut v: [int16x8_t; N] = core::array::from_fn(|j| vdupq_n_s16(centered(xi[j], p)));
+                super::inverse::<PB>(&mut v);
+                let offset = if r == 0 { chunks * DIGITS * N } else { (c * DIGITS + r - 1) * N };
+                for j in 0..N {
+                    mean_residues[offset + j] = centered(mean_residues[offset + j] as i64 + vgetq_lane_s16::<0>(v[j]) as i64, p);
+                }
+            }
+        }
+    }
     use std::borrow::Cow::Owned;
     SmsMatrix { elements, data: Owned(data), mean_residues: Owned(mean_residues), mu: Owned(mu), margin, column_failure }
 }
@@ -365,13 +406,9 @@ const SINK: usize = 4;
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP == 2 * PASS);
 
-/// The register-resident sink for one slot (from 4381e86b's `sve::slot_sink`, after arm-big's
-/// `slot_chunk`): `acc(s, r) +=` the slot's products summed over `groups` key tiles (eight
-/// elements each) of transforms starting at `z` (transform stride `XS`, the [`pass_words`] lane
-/// order), keys starting at `k` (tile stride `KS`). Rows 0-3, then rows 4-6, keep their sums in
-/// v16-v31 across all the tiles: one load and one store per sum per sweep. The key halves are
-/// `sdot`'s indexed operand exactly as in [`dot`]: transforms `0..4` of a tile with key elements
-/// `0..4` (`[0]`), transforms `4..8` with `4..8` (`[1]`). `groups >= 1`.
+/// Winograd products for one slot: (K1 + y2)(K2 + y1) - H, with the public Xi
+/// removed after the inverse. H is accumulated once across the tiles, in z12-z15,
+/// and reused by both row groups. ld1rd loads each four-key half into both 64-bit lanes.
 #[cfg(target_feature = "sve")]
 #[inline(never)]
 unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
@@ -379,6 +416,11 @@ unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, gro
     const KS: usize = N * ROWS * LOCK * 2;
     debug_assert!((1..=SINK).contains(&groups));
     core::arch::asm!(
+    "ptrue p0.d",
+    "mov z12.d, #0",
+    "mov z13.d, #0",
+    "mov z14.d, #0",
+    "mov z15.d, #0",
     "ldp q16, q17, [{a}, #0]",
     "ldp q18, q19, [{a}, #32]",
     "ldp q20, q21, [{a}, #64]",
@@ -391,29 +433,95 @@ unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, gro
     "mov {kp}, {k}",
     "mov {n}, {g}",
     "2:",
-    "ldp q0, q1, [{kp}]",
-    "ldp q2, q3, [{kp}, #32]",
+    "ldr q0, [{zp}]",
+    "ldr q1, [{zp}, #{xs1}]",
+    "ldr q2, [{zp}, #{xs2}]",
+    "ldr q3, [{zp}, #{xs3}]",
+    "add {zp}, {zp}, {xs4}",
     "ldr q4, [{zp}]",
     "ldr q5, [{zp}, #{xs1}]",
     "ldr q6, [{zp}, #{xs2}]",
     "ldr q7, [{zp}, #{xs3}]",
     "add {zp}, {zp}, {xs4}",
-    "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
-    "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
-    "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
-    "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
-    "ldr q4, [{zp}]",
-    "ldr q5, [{zp}, #{xs1}]",
-    "ldr q6, [{zp}, #{xs2}]",
-    "ldr q7, [{zp}, #{xs3}]",
-    "add {zp}, {zp}, {xs4}",
+    "sdot z12.d, z0.h, z4.h",
+    "sdot z13.d, z1.h, z5.h",
+    "sdot z14.d, z2.h, z6.h",
+    "sdot z15.d, z3.h, z7.h",
+    "ld1rd {{ z8.d }}, p0/z, [{kp}, #0]",
+    "ld1rd {{ z9.d }}, p0/z, [{kp}, #8]",
+    "add z10.h, z8.h, z4.h",
+    "add z11.h, z9.h, z0.h",
+    "sdot z16.d, z10.h, z11.h",
+    "add z10.h, z8.h, z5.h",
+    "add z11.h, z9.h, z1.h",
+    "sdot z17.d, z10.h, z11.h",
+    "add z10.h, z8.h, z6.h",
+    "add z11.h, z9.h, z2.h",
+    "sdot z18.d, z10.h, z11.h",
+    "add z10.h, z8.h, z7.h",
+    "add z11.h, z9.h, z3.h",
+    "sdot z19.d, z10.h, z11.h",
+    "ld1rd {{ z8.d }}, p0/z, [{kp}, #16]",
+    "ld1rd {{ z9.d }}, p0/z, [{kp}, #24]",
+    "add z10.h, z8.h, z4.h",
+    "add z11.h, z9.h, z0.h",
+    "sdot z20.d, z10.h, z11.h",
+    "add z10.h, z8.h, z5.h",
+    "add z11.h, z9.h, z1.h",
+    "sdot z21.d, z10.h, z11.h",
+    "add z10.h, z8.h, z6.h",
+    "add z11.h, z9.h, z2.h",
+    "sdot z22.d, z10.h, z11.h",
+    "add z10.h, z8.h, z7.h",
+    "add z11.h, z9.h, z3.h",
+    "sdot z23.d, z10.h, z11.h",
+    "ld1rd {{ z8.d }}, p0/z, [{kp}, #32]",
+    "ld1rd {{ z9.d }}, p0/z, [{kp}, #40]",
+    "add z10.h, z8.h, z4.h",
+    "add z11.h, z9.h, z0.h",
+    "sdot z24.d, z10.h, z11.h",
+    "add z10.h, z8.h, z5.h",
+    "add z11.h, z9.h, z1.h",
+    "sdot z25.d, z10.h, z11.h",
+    "add z10.h, z8.h, z6.h",
+    "add z11.h, z9.h, z2.h",
+    "sdot z26.d, z10.h, z11.h",
+    "add z10.h, z8.h, z7.h",
+    "add z11.h, z9.h, z3.h",
+    "sdot z27.d, z10.h, z11.h",
+    "ld1rd {{ z8.d }}, p0/z, [{kp}, #48]",
+    "ld1rd {{ z9.d }}, p0/z, [{kp}, #56]",
+    "add z10.h, z8.h, z4.h",
+    "add z11.h, z9.h, z0.h",
+    "sdot z28.d, z10.h, z11.h",
+    "add z10.h, z8.h, z5.h",
+    "add z11.h, z9.h, z1.h",
+    "sdot z29.d, z10.h, z11.h",
+    "add z10.h, z8.h, z6.h",
+    "add z11.h, z9.h, z2.h",
+    "sdot z30.d, z10.h, z11.h",
+    "add z10.h, z8.h, z7.h",
+    "add z11.h, z9.h, z3.h",
+    "sdot z31.d, z10.h, z11.h",
     "add {kp}, {kp}, {ks}",
-    "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-    "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-    "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
-    "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
     "subs {n}, {n}, #1",
     "b.ne 2b",
+    "sub z16.d, z16.d, z12.d",
+    "sub z17.d, z17.d, z13.d",
+    "sub z18.d, z18.d, z14.d",
+    "sub z19.d, z19.d, z15.d",
+    "sub z20.d, z20.d, z12.d",
+    "sub z21.d, z21.d, z13.d",
+    "sub z22.d, z22.d, z14.d",
+    "sub z23.d, z23.d, z15.d",
+    "sub z24.d, z24.d, z12.d",
+    "sub z25.d, z25.d, z13.d",
+    "sub z26.d, z26.d, z14.d",
+    "sub z27.d, z27.d, z15.d",
+    "sub z28.d, z28.d, z12.d",
+    "sub z29.d, z29.d, z13.d",
+    "sub z30.d, z30.d, z14.d",
+    "sub z31.d, z31.d, z15.d",
     "stp q16, q17, [{a}, #0]",
     "stp q18, q19, [{a}, #32]",
     "stp q20, q21, [{a}, #64]",
@@ -432,51 +540,116 @@ unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, gro
     "mov {kp}, {k}",
     "mov {n}, {g}",
     "3:",
-    "ldp q0, q1, [{kp}, #64]",
-    "ldr q2, [{kp}, #96]",
+    "ldr q0, [{zp}]",
+    "ldr q1, [{zp}, #{xs1}]",
+    "ldr q2, [{zp}, #{xs2}]",
+    "ldr q3, [{zp}, #{xs3}]",
+    "add {zp}, {zp}, {xs4}",
     "ldr q4, [{zp}]",
     "ldr q5, [{zp}, #{xs1}]",
     "ldr q6, [{zp}, #{xs2}]",
     "ldr q7, [{zp}, #{xs3}]",
     "add {zp}, {zp}, {xs4}",
-    "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
-    "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
-    "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
-    "ldr q4, [{zp}]",
-    "ldr q5, [{zp}, #{xs1}]",
-    "ldr q6, [{zp}, #{xs2}]",
-    "ldr q7, [{zp}, #{xs3}]",
-    "add {zp}, {zp}, {xs4}",
+    "ld1rd {{ z8.d }}, p0/z, [{kp}, #64]",
+    "ld1rd {{ z9.d }}, p0/z, [{kp}, #72]",
+    "add z10.h, z8.h, z4.h",
+    "add z11.h, z9.h, z0.h",
+    "sdot z16.d, z10.h, z11.h",
+    "add z10.h, z8.h, z5.h",
+    "add z11.h, z9.h, z1.h",
+    "sdot z17.d, z10.h, z11.h",
+    "add z10.h, z8.h, z6.h",
+    "add z11.h, z9.h, z2.h",
+    "sdot z18.d, z10.h, z11.h",
+    "add z10.h, z8.h, z7.h",
+    "add z11.h, z9.h, z3.h",
+    "sdot z19.d, z10.h, z11.h",
+    "ld1rd {{ z8.d }}, p0/z, [{kp}, #80]",
+    "ld1rd {{ z9.d }}, p0/z, [{kp}, #88]",
+    "add z10.h, z8.h, z4.h",
+    "add z11.h, z9.h, z0.h",
+    "sdot z20.d, z10.h, z11.h",
+    "add z10.h, z8.h, z5.h",
+    "add z11.h, z9.h, z1.h",
+    "sdot z21.d, z10.h, z11.h",
+    "add z10.h, z8.h, z6.h",
+    "add z11.h, z9.h, z2.h",
+    "sdot z22.d, z10.h, z11.h",
+    "add z10.h, z8.h, z7.h",
+    "add z11.h, z9.h, z3.h",
+    "sdot z23.d, z10.h, z11.h",
+    "ld1rd {{ z8.d }}, p0/z, [{kp}, #96]",
+    "ld1rd {{ z9.d }}, p0/z, [{kp}, #104]",
+    "add z10.h, z8.h, z4.h",
+    "add z11.h, z9.h, z0.h",
+    "sdot z24.d, z10.h, z11.h",
+    "add z10.h, z8.h, z5.h",
+    "add z11.h, z9.h, z1.h",
+    "sdot z25.d, z10.h, z11.h",
+    "add z10.h, z8.h, z6.h",
+    "add z11.h, z9.h, z2.h",
+    "sdot z26.d, z10.h, z11.h",
+    "add z10.h, z8.h, z7.h",
+    "add z11.h, z9.h, z3.h",
+    "sdot z27.d, z10.h, z11.h",
     "add {kp}, {kp}, {ks}",
-    "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-    "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-    "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
     "subs {n}, {n}, #1",
     "b.ne 3b",
+    "sub z16.d, z16.d, z12.d",
+    "sub z17.d, z17.d, z13.d",
+    "sub z18.d, z18.d, z14.d",
+    "sub z19.d, z19.d, z15.d",
+    "sub z20.d, z20.d, z12.d",
+    "sub z21.d, z21.d, z13.d",
+    "sub z22.d, z22.d, z14.d",
+    "sub z23.d, z23.d, z15.d",
+    "sub z24.d, z24.d, z12.d",
+    "sub z25.d, z25.d, z13.d",
+    "sub z26.d, z26.d, z14.d",
+    "sub z27.d, z27.d, z15.d",
     "stp q16, q17, [{a}, #256]",
     "stp q18, q19, [{a}, #288]",
     "stp q20, q21, [{a}, #320]",
     "stp q22, q23, [{a}, #352]",
     "stp q24, q25, [{a}, #384]",
     "stp q26, q27, [{a}, #416]",
-        a = in(reg) acc,
-        z = in(reg) z,
-        k = in(reg) k,
-        g = in(reg) groups,
-        xs4 = in(reg) 4 * XS,
-        ks = in(reg) KS,
-        xs1 = const XS,
-        xs2 = const 2 * XS,
-        xs3 = const 3 * XS,
-        zp = out(reg) _,
-        kp = out(reg) _,
-        n = out(reg) _,
-        out("v0") _, out("v1") _, out("v2") _, out("v3") _,
-        out("v4") _, out("v5") _, out("v6") _, out("v7") _,
-        out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-        out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-        out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-        out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+        z = in(reg) z, k = in(reg) k, a = in(reg) acc, g = in(reg) groups,
+        xs1 = const XS, xs2 = const 2 * XS, xs3 = const 3 * XS,
+        xs4 = in(reg) 4 * XS, ks = in(reg) KS,
+        zp = out(reg) _, kp = out(reg) _, n = out(reg) _,
+        out("p0") _,
+        out("v0") _,
+        out("v1") _,
+        out("v2") _,
+        out("v3") _,
+        out("v4") _,
+        out("v5") _,
+        out("v6") _,
+        out("v7") _,
+        out("v8") _,
+        out("v9") _,
+        out("v10") _,
+        out("v11") _,
+        out("v12") _,
+        out("v13") _,
+        out("v14") _,
+        out("v15") _,
+        out("v16") _,
+        out("v17") _,
+        out("v18") _,
+        out("v19") _,
+        out("v20") _,
+        out("v21") _,
+        out("v22") _,
+        out("v23") _,
+        out("v24") _,
+        out("v25") _,
+        out("v26") _,
+        out("v27") _,
+        out("v28") _,
+        out("v29") _,
+        out("v30") _,
+        out("v31") _,
         options(nostack)
     );
 }
@@ -503,6 +676,12 @@ unsafe fn sink(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x
             let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
             for r in 0..ROWS {
                 dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
+                let key = tile.add((s * ROWS + r) * LOCK);
+                let xi = (0..4).map(|i| *key.add(i) as i64 * *key.add(4 + i) as i64).sum();
+                for q in 0..4 {
+                    let at = idx(s, r) + q;
+                    acc[at] = vaddq_s64(acc[at], vdupq_n_s64(xi));
+                }
             }
         }
     }
@@ -585,7 +764,7 @@ unsafe fn sums(
                 let x = &mut xs[i];
                 pass_lut::<PB>(nib, x, kern);
                 pass_c::<PB>(x, kern);
-                pass_d::<PB, false>(x, kern, &[], &mut []);
+                pass_d_schedule::<PB, false>(x, kern, &[], &mut [], WINOGRAD_SCHEDULE);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             sink(xs, keys, acc, groups);
@@ -671,7 +850,8 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
             let pv = vdupq_n_s16(p);
             let mut base = [[0u16; LANES]; N];
             for (k, b) in base.iter_mut().enumerate() {
-                let v = y[k];
+                let xi = a.mean_residues[a.elements.div_ceil(CHUNK) * DIGITS * N + k];
+                let v = canonical(vsubq_s16(y[k], vdupq_n_s16(xi)), p);
                 let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
                 vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
             }
@@ -715,6 +895,60 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Missing keys must cancel even with stale nonzero transforms in the final tile.
+    /// Check the actual register sink at the certified extreme values, before narrowing.
+    #[cfg(target_feature = "sve")]
+    #[test]
+    fn winograd_slot_matches_direct_with_stale_tail() {
+        unsafe {
+            for groups in 1..=SINK {
+                let mut xs = vec![[vdupq_n_s16(0); N]; SWEEP];
+                let mut keys = vec![0i16; groups * N * ROWS * LOCK];
+                let elements = groups * LOCK - 5;
+                for g in 0..groups {
+                    for t in 0..LOCK {
+                        let lanes: [i16; 8] = core::array::from_fn(|l| {
+                            if (t + l) % 3 == 0 { -(Y_BOUND as i16) } else { Y_BOUND as i16 }
+                        });
+                        xs[g * LOCK + t][0] = vld1q_s16(lanes.as_ptr());
+                    }
+                    for r in 0..ROWS {
+                        for k in 0..LOCK {
+                            if g * LOCK + k < elements {
+                                keys[g * N * ROWS * LOCK + r * LOCK + k] =
+                                    if (r + k) % 2 == 0 { K_BOUND as i16 } else { -(K_BOUND as i16) };
+                            }
+                        }
+                    }
+                }
+                let mut acc = [vdupq_n_s64(91); ROWS * 4];
+                slot_sink(xs.as_ptr() as *const int16x8_t, keys.as_ptr(), acc.as_mut_ptr(), groups);
+                for r in 0..ROWS {
+                    for q in 0..4 {
+                        let mut want = [91i64; 2];
+                        for g in 0..groups {
+                            let key = &keys[g * N * ROWS * LOCK + r * LOCK..][..LOCK];
+                            let mut a = [0i16; 8];
+                            let mut b = [0i16; 8];
+                            vst1q_s16(a.as_mut_ptr(), xs[g * LOCK + q][0]);
+                            vst1q_s16(b.as_mut_ptr(), xs[g * LOCK + 4 + q][0]);
+                            for l in 0..2 {
+                                for k in 0..4 {
+                                    want[l] += key[k] as i64 * a[4 * l + k] as i64
+                                        + key[4 + k] as i64 * b[4 * l + k] as i64
+                                        + key[k] as i64 * key[4 + k] as i64;
+                                }
+                            }
+                        }
+                        let mut got = [0i64; 2];
+                        vst1q_s64(got.as_mut_ptr(), acc[r * 4 + q]);
+                        assert_eq!(got, want, "groups {groups} row {r} q {q}");
+                    }
+                }
+            }
+        }
+    }
 
     /// `sum_d W_d L_d = A (mod M)` on random matrix elements, coefficient by coefficient.
     #[test]

@@ -272,7 +272,8 @@ pub fn crt(r: [u32; 3]) -> u128 {
 #[derive(Clone, Copy)]
 pub struct Schedule {
     /// `before[l]`: which inputs of level `l` to reduce (used for `l = 2..=6`): [`NONE`],
-    /// [`ALL`], or [`FIRST`], the input that is not multiplied by a twiddle.
+    /// [`ALL`], or [`FIRST`], the input that is not multiplied by a twiddle, or [`FIRST_LOW`],
+    /// that input with [`low_bound`]'s one-multiply reduction.
     pub before: [u8; 7],
     /// Reduce `d = tau b - tau^2 c` inside the radix-3 butterfly before it is multiplied by the
     /// cube root of unity.
@@ -288,9 +289,7 @@ pub struct Schedule {
 pub const NONE: u8 = 0;
 pub const ALL: u8 = 1;
 pub const FIRST: u8 = 2;
-/// Like [`FIRST`], with the one-multiplication reduction `a - round(a / 2^13) p`
-/// ([`shift_bound`]) instead of the Barrett one: for 9721, `|1 - p / 2^13| < 0.19`.
-pub const FIRST13: u8 = 3;
+pub const FIRST_LOW: u8 = 3;
 
 pub const SCHEDULES: [Schedule; 3] = [
     Schedule { before: [NONE; 7], reduce_d: false, cheap: false, accumulate: 35 },
@@ -317,15 +316,39 @@ pub const GENERAL: Schedule = Schedule {
     accumulate: 0,
 };
 
-/// The schedule of the binary transforms (`0..3`, by prime), of [`GENERAL`] (`3`), or of the
-/// table front end ([`FRONT_SCHEDULES`], `4 + prime`).
+/// The schedule of the SMS commitment's table-fed binary transform for prime 9721 (see
+/// [`lut_transform_bound`]): nothing reduced before level 3, and before each of levels 4 to 6
+/// only the first input, by `a - round(a / 2^13) p` (one multiplication, [`low_bound`]) where the
+/// Barrett reduction takes two.
+pub const SMS_SCHEDULE: Schedule = Schedule {
+    before: [NONE, NONE, NONE, NONE, FIRST_LOW, FIRST_LOW, FIRST_LOW],
+    reduce_d: false,
+    cheap: false,
+    accumulate: 0,
+};
+
+/// The index of [`SMS_SCHEDULE`] for [`schedule`].
+pub const SMS: usize = 4;
+
+/// The schedule of the binary transforms (`0..3`, by prime), of [`GENERAL`] (`3`) or
+/// [`SMS_SCHEDULE`] ([`SMS`]).
 pub const fn schedule(index: usize) -> Schedule {
     if index < 3 {
         SCHEDULES[index]
-    } else if index == 3 {
-        GENERAL
+    } else if index == SMS {
+        SMS_SCHEDULE
     } else {
-        FRONT_SCHEDULES[index - 4]
+        GENERAL
+    }
+}
+
+/// The prime of the binary schedule [`schedule`]`(index)` (`0..3` by prime, [`SMS`] 9721).
+pub const fn schedule_prime(index: usize) -> u32 {
+    assert!(index < 3 || index == SMS, "a binary transform's schedule");
+    if index == SMS {
+        PRIMES[1]
+    } else {
+        PRIMES[index]
     }
 }
 
@@ -358,14 +381,19 @@ pub const fn reduced_bound(p: u32) -> u32 {
 /// Largest `|a - round(a / 2^14) p|` for `|a| <= b`: `|a| |1 - p / 2^14| + p / 2`, rounded up.
 /// Close to [`reduced_bound`] only for a prime close to `2^14`.
 pub const fn cheap_bound(p: u32, b: u32) -> u32 {
-    let off = (p as i64 - (1 << 14)).unsigned_abs();
-    ((b as u64 * off + (p as u64) * (1 << 13)).div_ceil(1 << 14)) as u32
+    shift_bound(p, b, 14)
+}
+
+/// Largest `|a - round(a / 2^13) p|` for `|a| <= b`: [`cheap_bound`] for a prime between `2^13`
+/// and `2^14` nearer `2^13`, as 9721.
+pub const fn low_bound(p: u32, b: u32) -> u32 {
+    shift_bound(p, b, 13)
 }
 
 /// Largest `|a - round(a / 2^s) p|` for `|a| <= b`: `|a| |1 - p / 2^s| + p / 2`, rounded up.
-pub const fn shift_bound(p: u32, s: u32, b: u32) -> u32 {
-    let off = (p as i64 - (1i64 << s)).unsigned_abs();
-    ((b as u64 * off + (p as u64) * (1u64 << (s - 1))).div_ceil(1u64 << s)) as u32
+const fn shift_bound(p: u32, b: u32, s: u32) -> u32 {
+    let off = (p as i64 - (1 << s)).unsigned_abs();
+    ((b as u64 * off + (p as u64) * (1 << (s - 1))).div_ceil(1 << s)) as u32
 }
 
 /// The bounds on a level's first input `a` and on its multiplied inputs, from the bound `b` on
@@ -375,7 +403,7 @@ const fn level_inputs(p: u32, b: u32, mode: u8, cheap: bool) -> (u32, u32) {
         ALL if cheap => (reduced_bound(p), cheap_bound(p, b)),
         ALL => (reduced_bound(p), reduced_bound(p)),
         FIRST => (reduced_bound(p), b),
-        FIRST13 => (shift_bound(p, 13, b), b),
+        FIRST_LOW => (low_bound(p, b), b),
         _ => (b, b),
     }
 }
@@ -392,80 +420,60 @@ pub const fn transform_bound(p: u32, s: Schedule) -> u32 {
     let (a, x) = level_inputs(p, b, s.before[2], s.cheap);
     let b = a + product_bound(p, x);
     assert!(b <= MAX);
-    radix3_bound(p, b, s, 3)
+    radix3_levels(p, s, b, 3)
 }
 
-/// The bound after levels `first` to 6 from inputs bounded by `b`, checked level by level
-/// against `i16`. Radix 3: y0 = a + (b' + c'), y1 = (a - c') + e, y2 = (a - b') - e,
-/// b' = tau b, c' = tau^2 c, e = eps (b' - c').
-const fn radix3_bound(p: u32, mut b: u32, s: Schedule, first: usize) -> u32 {
+/// One radix-3 level's output bound from its first input's bound `a` and its multiplied inputs'
+/// bound `m` (`b' = tau b`, `c' = tau^2 c`, already multiplied): `y0 = a + (b' + c')`,
+/// `y1 = (a - c') + e`, `y2 = (a - b') - e`, `e = eps (b' - c')`, `d = b' - c'` reduced first
+/// when the schedule says so. Checked against `i16`.
+const fn radix3_output(p: u32, s: Schedule, a: u32, m: u32) -> u32 {
     const MAX: u32 = i16::MAX as u32;
+    assert!(2 * m <= MAX, "b' + c' and b' - c' fit");
+    let e = if s.reduce_d && s.cheap {
+        product_bound(p, cheap_bound(p, 2 * m))
+    } else if s.reduce_d {
+        product_bound(p, reduced_bound(p))
+    } else {
+        product_bound(p, 2 * m)
+    };
+    let y0 = a + 2 * m;
+    let y12 = a + m + e;
+    let b = if y0 > y12 { y0 } else { y12 };
+    assert!(b <= MAX, "a level's outputs fit i16");
+    b
+}
+
+/// The radix-3 levels `first..=6` of the schedule from the bound `b` on their first level's
+/// inputs as the previous level leaves them; returns the bound on the last level's outputs.
+const fn radix3_levels(p: u32, s: Schedule, mut b: u32, first: usize) -> u32 {
     let mut l = first;
     while l <= 6 {
         let (a, x) = level_inputs(p, b, s.before[l], s.cheap);
-        let m = product_bound(p, x);
-        assert!(2 * m <= MAX, "b' + c' and b' - c' fit");
-        let e = if s.reduce_d && s.cheap {
-            product_bound(p, cheap_bound(p, 2 * m))
-        } else if s.reduce_d {
-            product_bound(p, reduced_bound(p))
-        } else {
-            product_bound(p, 2 * m)
-        };
-        let y0 = a + 2 * m;
-        let y12 = a + m + e;
-        b = if y0 > y12 { y0 } else { y12 };
-        assert!(b <= MAX, "a level's outputs fit i16");
+        b = radix3_output(p, s, a, product_bound(p, x));
         l += 1;
     }
     b
 }
 
-/// The schedules of the binary transforms through the table front end (`schedule(4 + prime)`,
-/// [`neon::pass_ab`]), whose levels 0 to 2 are table lookups: each level-2 output is the sum of
-/// two centered table entries, so at most `p - 1`, and the level-3 twiddles are in the tables,
-/// so level 3 is the bare radix-3 butterfly ([`front_transform_bound`]) and reduces nothing.
-/// Prime 9721 (the SMS transform): Barrett-reduced first inputs at level 4 and the
-/// one-multiplication [`FIRST13`] reductions at levels 5 and 6; 19 elements per accumulator
-/// reduction ([`front_accumulator_bound`]).
-pub const FRONT_SCHEDULES: [Schedule; 2] = [
-    Schedule { before: [NONE; 7], reduce_d: false, cheap: false, accumulate: 37 },
-    Schedule {
-        before: [NONE, NONE, NONE, NONE, FIRST13, FIRST13, FIRST],
-        reduce_d: false,
-        cheap: false,
-        accumulate: 19,
-    },
-];
+/// The bound on every value of the table-fed binary transform (`neon::pass_lut`): levels 0 to 2
+/// and the level-3 twiddles are lookups in tables of centered residues (`|entry| <= h`,
+/// `h = (p - 1) / 2`), so every level-3 input, `a` as well as the multiplied `b' = tau b` and
+/// `c' = tau^2 c`, is the sum or difference of two entries, `|v| <= 2 h`, and level 3 multiplies
+/// only by `eps` (`s.before[3]` is not used: nothing is reduced before it). Levels 4 to 6 follow
+/// `s` as in [`transform_bound`]. Returns the bound on the transform's output.
+pub const fn lut_transform_bound(p: u32, s: Schedule) -> u32 {
+    radix3_levels(p, s, lut_level3_bound(p, s), 4)
+}
 
-/// The bound on every value of a [`FRONT_SCHEDULES`] transform. Level 3 takes `a`, `b' = tau b`
-/// and `c' = tau^2 c` as sums of two centered table entries (at most `p - 1` each) and computes
-/// `y0 = a + (b' + c')`, `y1 = (a - c') + e`, `y2 = (a - b') - e`, `e = eps (b' - c')`; levels 4
-/// to 6 follow the schedule.
-pub const fn front_transform_bound(p: u32, s: Schedule) -> u32 {
+/// The bound on the outputs of the table-fed level 3 (see [`lut_transform_bound`]).
+pub const fn lut_level3_bound(p: u32, s: Schedule) -> u32 {
     const MAX: u32 = i16::MAX as u32;
-    assert!(s.before[3] == NONE && !s.reduce_d);
-    let m = p - 1;
-    let e = product_bound(p, 2 * m);
-    let y0 = 3 * m;
-    let y12 = 2 * m + e;
-    let b = if y0 > y12 { y0 } else { y12 };
-    assert!(b <= MAX, "level 3 fits i16");
-    radix3_bound(p, b, s, 4)
+    let h = (p - 1) / 2;
+    let t = 2 * h;
+    assert!(t <= MAX, "a level-3 input fits i16");
+    radix3_output(p, s, t, t)
 }
-
-/// [`accumulator_bound`] for a [`FRONT_SCHEDULES`] transform.
-pub const fn front_accumulator_bound(p: u32, s: Schedule) -> u64 {
-    p as u64 + s.accumulate as u64 * ((p as u64 - 1) / 2) * front_transform_bound(p, s) as u64
-}
-
-const _: () = {
-    let mut i = 0;
-    while i < 2 {
-        assert!(front_accumulator_bound(PRIMES[i], FRONT_SCHEDULES[i]) <= i32::MAX as u64);
-        i += 1;
-    }
-};
 
 /// The accumulator bound: after a reduction a slot sum is at most `p` in magnitude, and each
 /// element adds a product of a centered matrix slot (`<= (p - 1) / 2`) and a transform slot as

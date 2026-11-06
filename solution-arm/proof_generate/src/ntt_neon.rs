@@ -11,7 +11,12 @@
 //! [`super::Schedule`] says. The last level's outputs are multiplied straight into the batch's
 //! `i32` slot sums with `smlsl` by the matrix slot (subtracting the product with `-s` adds the
 //! product with `s`); the sums are reduced every [`super::Schedule::accumulate`] elements.
-use super::{for_blocks, primes, schedule, Matrix, Schedule, ALL, FIRST, N, PRIMES, ROW, SCHEDULES};
+//!
+//! The SMS commitment ([`sms`]) runs levels 0 to 2 and the level-3 twiddles as lookups instead
+//! ([`nibbles`], [`pass_lut`]): per level-1 node, 16-entry `i16` tables indexed by the nibble of
+//! the coefficients `j + 162 g`, one `vqtbl2q_u8` per lookup and two lookups per level-3 input,
+//! within [`super::lut_transform_bound`] (the library's x86 `bin_asm` does the same).
+use super::{for_blocks, primes, schedule, schedule_prime, Matrix, Schedule, ALL, FIRST, FIRST_LOW, N, PRIMES, ROW, SCHEDULES, SMS};
 use core::arch::aarch64::*;
 use labinius::fields::scalar::B128;
 use std::sync::OnceLock;
@@ -41,6 +46,13 @@ pub struct Kernel {
     d: [[i16; 8]; 108],
     /// `round(2^31 / p)` for the reduction of the `i32` sums.
     v32: i32,
+    /// Levels 0 to 2 and the level-3 twiddles of the binary transform as nibble tables
+    /// ([`pass_lut`]), per level-1 node `n`: table `t` holds, for each nibble `v` (bit `g` the
+    /// coefficient `j + 162 g`), the centered residue of `f_t` times node `n`'s level-1 value of
+    /// `-s` ([`pass_a`]'s formula on that nibble), where, with `tau` node `n`'s radix-2 twiddle
+    /// and `z_h` the radix-3 twiddle of its level-2 child `2 n + h`, `f` is
+    /// `[1, tau, z_0, z_0 tau, z_1, z_1 tau, z_0^2, z_0^2 tau, z_1^2, z_1^2 tau]`.
+    lut: [[[i16; 16]; 10]; 4],
 }
 
 fn twiddle(p: u32, w: u64) -> [i16; 2] {
@@ -88,6 +100,32 @@ impl Kernel {
             slot[..4].copy_from_slice(&r3(plan.exps[5][2 * q]));
             slot[4..].copy_from_slice(&r3(plan.exps[5][2 * q + 1]));
         }
+        let mut lut = [[[0i16; 16]; 10]; 4];
+        for (n, tables) in lut.iter_mut().enumerate() {
+            let tau = plan.root(plan.exps[1][n] as usize / 2);
+            let z = |h: usize| plan.root(plan.exps[2][2 * n + h] as usize / 3);
+            let pp = p as u64;
+            let f = [
+                1,
+                tau,
+                z(0),
+                z(0) * tau % pp,
+                z(1),
+                z(1) * tau % pp,
+                z(0) * z(0) % pp,
+                z(0) * z(0) % pp * tau % pp,
+                z(1) * z(1) % pp,
+                z(1) * z(1) % pp * tau % pp,
+            ];
+            for v in 0..16 {
+                let level1 = lut_level1(&a, n, v) as i64;
+                for (t, table) in tables.iter_mut().enumerate() {
+                    table[v] = super::centered(level1 * f[t] as i64, p);
+                }
+            }
+        }
+        // `lut_transform_bound` takes every entry centered
+        assert!(lut.iter().flatten().flatten().all(|e| e.unsigned_abs() as u32 <= (p - 1) / 2));
         Kernel {
             k,
             a,
@@ -96,8 +134,23 @@ impl Kernel {
             c: cc,
             d,
             v32: ((1u64 << 32) / p as u64).div_ceil(2) as i32,
+            lut,
         }
     }
+}
+
+/// [`pass_a`]'s output for level-1 node `n` (slot `j + 162 n`) on the nibble `v`, bit `g` set
+/// where coefficient `j + 162 g` is, with the same constants `a` (the field of [`Kernel`]):
+/// `m & c` is `c` where the mask is set.
+fn lut_level1(a: &[i16; 8], n: usize, v: usize) -> i32 {
+    let m = |g: usize| -(((v >> g) & 1) as i32);
+    let sel = |g: usize, c: i16| if m(g) != 0 { c as i32 } else { 0 };
+    let (cw, cw5, ca, caw, cb, cbw) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+    let u = m(0) - sel(2, cw);
+    let v5 = m(0) - sel(2, cw5);
+    let w = sel(1, ca) + sel(3, caw);
+    let w2 = sel(1, cb) + sel(3, cbw);
+    [u - w, u + w, v5 - w2, v5 + w2][n]
 }
 
 pub fn kernels() -> &'static [Kernel; 3] {
@@ -138,9 +191,16 @@ pub unsafe fn reduce_cheap(a: int16x8_t, k: int16x8_t) -> int16x8_t {
     vmlsq_laneq_s16::<0>(a, vrshrq_n_s16::<14>(a), k)
 }
 
+/// `a - round(a / 2^13) p`: one multiplication, `|result| <= low_bound(p, |a|)`, for a prime
+/// between `2^13` and `2^14` nearer `2^13` (9721).
+#[inline(always)]
+pub unsafe fn reduce_low(a: int16x8_t, k: int16x8_t) -> int16x8_t {
+    vmlsq_laneq_s16::<0>(a, vrshrq_n_s16::<13>(a), k)
+}
+
 /// Reduces the level's inputs the schedule asks for: all of them (the multiplied ones cheaply
 /// when `cheap`), or only those at `first`, the butterflies' inputs that are not multiplied by
-/// a twiddle.
+/// a twiddle (by [`reduce_low`] under [`FIRST_LOW`]).
 #[inline(always)]
 unsafe fn reduce_inputs<const L: usize>(
     v: &mut [int16x8_t; L],
@@ -157,17 +217,11 @@ unsafe fn reduce_inputs<const L: usize>(
         for &i in first {
             v[i] = reduce(v[i], k);
         }
-    } else if mode == super::FIRST13 {
+    } else if mode == FIRST_LOW {
         for &i in first {
-            v[i] = reduce_shift13(v[i], k);
+            v[i] = reduce_low(v[i], k);
         }
     }
-}
-
-/// `a - round(a / 2^13) p`: one multiplication, `|result| <= shift_bound(p, 13, |a|)`.
-#[inline(always)]
-pub unsafe fn reduce_shift13(a: int16x8_t, k: int16x8_t) -> int16x8_t {
-    vmlsq_laneq_s16::<0>(a, vrshrq_n_s16::<13>(a), k)
 }
 
 /// [`radix3`] with the schedule's reduction of `d`: none, Barrett, or the cheap one.
@@ -193,6 +247,19 @@ unsafe fn radix3<const T0: i32, const T1: i32, const T2: i32, const T3: i32, con
 ) -> (int16x8_t, int16x8_t, int16x8_t) {
     let b1 = mulc::<T0, T1>(b, t, k);
     let c1 = mulc::<T2, T3>(c, t, k);
+    radix3_twiddled::<RD>(a, b1, c1, k)
+}
+
+/// The radix-3 butterfly on inputs already multiplied by their twiddles, `b1 = tau b` and
+/// `c1 = tau^2 c`: `y0 = a + (b1 + c1)`, `y1 = (a - c1) + e`, `y2 = (a - b1) - e`,
+/// `e = eps (b1 - c1)`, with `b1 - c1` reduced per `RD` (none, Barrett, cheap) first.
+#[inline(always)]
+unsafe fn radix3_twiddled<const RD: u8>(
+    a: int16x8_t,
+    b1: int16x8_t,
+    c1: int16x8_t,
+    k: int16x8_t,
+) -> (int16x8_t, int16x8_t, int16x8_t) {
     let s = vaddq_s16(b1, c1);
     let mut d = vsubq_s16(b1, c1);
     if RD == 1 {
@@ -214,28 +281,7 @@ unsafe fn radix3<const T0: i32, const T1: i32, const T2: i32, const T3: i32, con
 unsafe fn masks(words: &[*const u8; LANES], out: &mut [int16x8_t; BITS]) {
     let bit: [uint16x8_t; 8] = core::array::from_fn(|i| vdupq_n_u16(1 << i));
     for k in 0..4 {
-        let r: [uint8x16_t; 8] = core::array::from_fn(|c| vld1q_u8(words[c].add(16 * k)));
-        // three zip rounds transpose the 8 x 16 bytes: t[v] holds byte 2v of every column in
-        // its low half and byte 2v + 1 in its high half
-        let a: [uint8x16_t; 8] = core::array::from_fn(|i| {
-            let (x, y) = (r[2 * (i % 4)], r[2 * (i % 4) + 1]);
-            if i < 4 { vzip1q_u8(x, y) } else { vzip2q_u8(x, y) }
-        });
-        let b: [uint16x8_t; 8] = core::array::from_fn(|i| {
-            let h = i / 4; // bytes 0..8 or 8..16
-            let (x, y) = (
-                vreinterpretq_u16_u8(a[4 * h + 2 * ((i % 4) / 2)]),
-                vreinterpretq_u16_u8(a[4 * h + 2 * ((i % 4) / 2) + 1]),
-            );
-            if i % 2 == 0 { vzip1q_u16(x, y) } else { vzip2q_u16(x, y) }
-        });
-        // b[4h + 2g + z]: rows 4g..4g+4, bytes 8h + 4z .. 8h + 4z + 4
-        let t: [uint8x16_t; 8] = core::array::from_fn(|v| {
-            let h = v / 4;
-            let z = (v % 4) / 2;
-            let (x, y) = (vreinterpretq_u32_u16(b[4 * h + z]), vreinterpretq_u32_u16(b[4 * h + 2 + z]));
-            vreinterpretq_u8_u32(if v % 2 == 0 { vzip1q_u32(x, y) } else { vzip2q_u32(x, y) })
-        });
+        let t = transpose_word(words, k);
         for (v, &pair) in t.iter().enumerate() {
             for (half, column_bytes) in [vmovl_u8(vget_low_u8(pair)), vmovl_high_u8(pair)]
                 .into_iter()
@@ -248,6 +294,77 @@ unsafe fn masks(words: &[*const u8; LANES], out: &mut [int16x8_t; BITS]) {
             }
         }
     }
+}
+
+/// Word `k` of the eight columns' element transposed: `t[v]` holds byte `2 v` of every column in
+/// its low half and byte `2 v + 1` in its high half (three zip rounds on the 8 x 16 bytes).
+#[inline(always)]
+unsafe fn transpose_word(words: &[*const u8; LANES], k: usize) -> [uint8x16_t; 8] {
+    let r: [uint8x16_t; 8] = core::array::from_fn(|c| vld1q_u8(words[c].add(16 * k)));
+    let a: [uint8x16_t; 8] = core::array::from_fn(|i| {
+        let (x, y) = (r[2 * (i % 4)], r[2 * (i % 4) + 1]);
+        if i < 4 { vzip1q_u8(x, y) } else { vzip2q_u8(x, y) }
+    });
+    let b: [uint16x8_t; 8] = core::array::from_fn(|i| {
+        let h = i / 4; // bytes 0..8 or 8..16
+        let (x, y) = (
+            vreinterpretq_u16_u8(a[4 * h + 2 * ((i % 4) / 2)]),
+            vreinterpretq_u16_u8(a[4 * h + 2 * ((i % 4) / 2) + 1]),
+        );
+        if i % 2 == 0 { vzip1q_u16(x, y) } else { vzip2q_u16(x, y) }
+    });
+    // b[4h + 2g + z]: rows 4g..4g+4, bytes 8h + 4z .. 8h + 4z + 4
+    core::array::from_fn(|v| {
+        let h = v / 4;
+        let z = (v % 4) / 2;
+        let (x, y) = (vreinterpretq_u32_u16(b[4 * h + z]), vreinterpretq_u32_u16(b[4 * h + 2 + z]));
+        vreinterpretq_u8_u32(if v % 2 == 0 { vzip1q_u32(x, y) } else { vzip2q_u32(x, y) })
+    })
+}
+
+/// The element's bytes for [`word_nibbles`]: `d[k][b]`, bytes `(2 c, 2 c + 1)`, is byte `b` of
+/// word `k` of column `c` (coefficients `32 b + 4 i + k`, bit `i`), twice.
+pub type ByteLanes = [[uint8x16_t; 16]; 4];
+
+/// [`nibbles`] straight from the element's words, without the masks: the same `out`. Every
+/// group `j = R + 32 blk` reads bit `l / 4` of byte `blk + 5 g + (R + 2 g) / 32` of word `l % 4`,
+/// `l = (R + 2 g) % 32`, for its coefficient `j + 162 g = 32 (blk + 5 g) + R + 2 g`.
+#[inline(always)]
+unsafe fn word_nibbles(words: &[*const u8; LANES], d: &mut ByteLanes, out: &mut [uint8x16_t; GROUPS]) {
+    for (k, dk) in d.iter_mut().enumerate() {
+        let t = transpose_word(words, k);
+        for (v, &pair) in t.iter().enumerate() {
+            dk[2 * v] = vzip1q_u8(pair, pair);
+            dk[2 * v + 1] = vzip2q_u8(pair, pair);
+        }
+    }
+    #[inline(always)]
+    unsafe fn groups<const R: usize>(d: &ByteLanes, out: &mut [uint8x16_t; GROUPS]) {
+        let u8s = |x: u16| vreinterpretq_u8_u16(vdupq_n_u16(x));
+        let (lo, c) = (u8s(0x0100), [u8s(0x0302), u8s(0x0404), u8s(0x0808), u8s(0x1010)]);
+        // all ones in both bytes of a lane where coefficient R + 32 blk + 162 g is set
+        let set = |g: usize, blk: usize| {
+            let l = R + 2 * g;
+            let byte = *d.get_unchecked(l % 32 % 4).get_unchecked(blk + 5 * g + l / 32);
+            vtstq_u8(byte, vdupq_n_u8(1 << (l % 32 / 4)))
+        };
+        let mut blk = 0;
+        while R + 32 * blk < GROUPS {
+            let j = R + 32 * blk;
+            let mut r = vbslq_u8(set(0, blk), c[0], lo);
+            r = vorrq_u8(r, vandq_u8(set(1, blk), c[1]));
+            r = vorrq_u8(r, vandq_u8(set(2, blk), c[2]));
+            if j + 486 < BITS {
+                r = vorrq_u8(r, vandq_u8(set(3, blk), c[3]));
+            }
+            *out.get_unchecked_mut(j) = r;
+            blk += 1;
+        }
+    }
+    macro_rules! all {
+        ($($r:literal)*) => { $( groups::<$r>(d, out); )* };
+    }
+    all!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31);
 }
 
 #[inline(always)]
@@ -284,6 +401,83 @@ unsafe fn pass_a(m: &[int16x8_t; BITS], x: &mut [int16x8_t; N], kern: &Kernel) {
         store(x, j + 162, vaddq_s16(u, w));
         store(x, j + 324, vsubq_s16(v, w2));
         store(x, j + 486, vaddq_s16(v, w2));
+    }
+}
+
+/// Coefficient groups of the nibble tables: group `j < 162` is the coefficients `j + 162 g`.
+const GROUPS: usize = N / 4;
+
+/// `out[j]`, lane `c`: the byte pair `(2 v, 2 v + 1)` of column `c`'s nibble `v` at group `j`
+/// (bit `g` set where coefficient `j + 162 g` is; coefficients from 512 on are zero), the
+/// `vqtbl2q_u8` index of entry `v` of a 16-entry `i16` table.
+#[inline(always)]
+unsafe fn nibbles(m: &[int16x8_t; BITS], out: &mut [uint8x16_t; GROUPS]) {
+    let (lo, c0) = (vdupq_n_u16(0x0100), vdupq_n_u16(0x0302));
+    let (c1, c2, c3) = (vdupq_n_u16(0x0404), vdupq_n_u16(0x0808), vdupq_n_u16(0x1010));
+    let mask = |i: usize| vreinterpretq_u16_s16(*m.get_unchecked(i));
+    for j in 0..GROUPS {
+        let mut r = vbslq_u16(mask(j), c0, lo);
+        r = vorrq_u16(r, vandq_u16(mask(j + 162), c1));
+        r = vorrq_u16(r, vandq_u16(mask(j + 324), c2));
+        if j < BITS - 486 {
+            r = vorrq_u16(r, vandq_u16(mask(j + 486), c3));
+        }
+        *out.get_unchecked_mut(j) = vreinterpretq_u8_u16(r);
+    }
+}
+
+/// The 16-entry `i16` table `t` as the two registers `vqtbl2q_u8` reads.
+#[inline(always)]
+unsafe fn table(t: &[i16; 16]) -> uint8x16x2_t {
+    vld1q_u8_x2(t.as_ptr() as *const u8)
+}
+
+/// Entry `v` of table `t` in every lane, `v` from the lane's index pair in `i`.
+#[inline(always)]
+unsafe fn look(t: uint8x16x2_t, i: uint8x16_t) -> int16x8_t {
+    vreinterpretq_s16_u8(vqtbl2q_u8(t, i))
+}
+
+/// Levels 0 to 3 of the binary transform from the nibble indices ([`nibbles`]), in place of
+/// [`pass_a`] and [`pass_b`] (same output slots, values within [`super::lut_transform_bound`]'s
+/// level-3 bound): per level-1 node `n` and `j < 27`, the level-3 inputs of its two level-2
+/// children `2 n + h` are sums of two lookups ([`Kernel::lut`]), `a_r` and `b_r` for input `r`
+/// at slot `j + 27 r` of the child, already multiplied by their level-3 twiddles; level 3 then
+/// multiplies only by `eps`.
+#[inline(always)]
+unsafe fn pass_lut<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_t; N], kern: &Kernel) {
+    let s: Schedule = schedule(S);
+    // every value of this pass and of levels 4 to 6 after it fits i16
+    const { assert!(super::lut_transform_bound(schedule_prime(S), schedule(S)) <= i16::MAX as u32) };
+    let k = vld1q_s16(kern.k.as_ptr());
+    let ix = |i: usize| *idx.get_unchecked(i);
+    for n in 0..4 {
+        let l = &kern.lut[n];
+        let t: [uint8x16x2_t; 10] = core::array::from_fn(|i| table(&l[i]));
+        let base = 162 * n;
+        for j in 0..27 {
+            let (i0, i0h) = (ix(j), ix(j + 81));
+            let (i1, i1h) = (ix(j + 27), ix(j + 108));
+            let (i2, i2h) = (ix(j + 54), ix(j + 135));
+            let (x0, y0) = (look(t[0], i0), look(t[1], i0h));
+            let (a0, b0) = (vaddq_s16(x0, y0), vsubq_s16(x0, y0));
+            let a1 = vaddq_s16(look(t[2], i1), look(t[3], i1h));
+            let b1 = vsubq_s16(look(t[4], i1), look(t[5], i1h));
+            let a2 = vaddq_s16(look(t[6], i2), look(t[7], i2h));
+            let b2 = vsubq_s16(look(t[8], i2), look(t[9], i2h));
+            let (u, v) = match (s.reduce_d, s.cheap) {
+                (false, _) => (radix3_twiddled::<0>(a0, a1, a2, k), radix3_twiddled::<0>(b0, b1, b2, k)),
+                (true, false) => (radix3_twiddled::<1>(a0, a1, a2, k), radix3_twiddled::<1>(b0, b1, b2, k)),
+                (true, true) => (radix3_twiddled::<2>(a0, a1, a2, k), radix3_twiddled::<2>(b0, b1, b2, k)),
+            };
+            let at = base + j;
+            store(x, at, u.0);
+            store(x, at + 27, u.1);
+            store(x, at + 54, u.2);
+            store(x, at + 81, v.0);
+            store(x, at + 108, v.1);
+            store(x, at + 135, v.2);
+        }
     }
 }
 
@@ -443,6 +637,20 @@ pub unsafe fn transform<const P: usize>(m: &[int16x8_t; BITS], x: &mut [int16x8_
     pass_d::<P, false>(x, kern, &[], &mut []);
 }
 
+/// [`transform`] through the nibble tables: [`nibbles`] and [`pass_lut`] in place of [`pass_a`]
+/// and [`pass_b`], prime `P`'s kernel, schedule `S`, values within
+/// [`super::lut_transform_bound`].
+#[inline(never)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub unsafe fn transform_lut<const P: usize, const S: usize>(m: &[int16x8_t; BITS], idx: &mut [uint8x16_t; GROUPS], x: &mut [int16x8_t; N]) {
+    const { assert!(schedule_prime(S) == PRIMES[P]) };
+    let kern = &kernels()[P];
+    nibbles(m, idx);
+    pass_lut::<S>(idx, x, kern);
+    pass_c::<S>(x, kern);
+    pass_d::<S, false>(x, kern, &[], &mut []);
+}
+
 /// Levels 0 and 1 of a general transform: Barrett products, every value reduced in between
 /// (see [`super::general_transform_bound`]).
 #[inline(always)]
@@ -477,224 +685,6 @@ pub fn transform_general(prime: usize, x: &mut [[i16; 8]; N]) {
         pass_d::<3, false>(&mut v, kern, &[], &mut []);
         for (o, y) in x.iter_mut().zip(&v) {
             vst1q_s16(o.as_mut_ptr(), *y);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// The table front end of the binary transforms (the SMS commitment's, prime 9721).
-//
-// Levels 0 and 1 mix only the coefficients `j, j + 162, j + 324, j + 486` of the binary element
-// (`j < 162`), so the level-1 value of node `n` at position `j` is one of sixteen constants,
-// picked by the 4-bit pattern of those coefficients; level 2 adds or subtracts the same at
-// `j + 81` times the node's twiddle. Both are tables of sixteen centered `i16`, read eight
-// columns at a time by one two-register `tbl` whose byte indices are `2 p, 2 p + 1` per lane
-// ([`indices`]): no multiplication up to level 2, and the level-2 outputs are at most `p - 1`
-// ([`super::front_transform_bound`]), which leaves level 3 unreduced for every prime.
-// ---------------------------------------------------------------------------------------------
-
-/// One prime's tables, per level-2 node `n2` and `i < 3`: the level-2 value of `-s` at
-/// position `j + 27 i` of node `n2` (`j < 27`) is `t[n2][i][0][p] + t[n2][i][1][p']`, with `p`
-/// the pattern at that position of level-1 node `n2 / 2` and `p'` the pattern 81 on, scaled by
-/// `tau^i`, `tau` node `n2`'s level-3 twiddle; all centered. Level 3 then needs only `eps`.
-pub struct Front {
-    t: [[[[i16; 16]; 2]; 3]; 8],
-}
-
-impl Front {
-    fn new(index: usize) -> Front {
-        let plan = &primes()[index];
-        let p = plan.p as i64;
-        let root = |e: usize| plan.root(e) as i64;
-        let mut t = [[[[0i16; 16]; 2]; 3]; 8];
-        for pat in 0..16usize {
-            let s = |t: usize| ((pat >> t) & 1) as i64;
-            // level 0: (X^324 - zeta^324)(X^324 - zeta^1620), positions j and j + 162 of each half
-            let half = |w: i64| [s(0) + w * s(2), s(1) + w * s(3)];
-            let level0 = [half(root(super::HALF)), half(root(5 * super::HALF))];
-            for n in 0..4 {
-                // level 1: node n / 2 of exponent e split by +-zeta^(e / 2); the value of -s
-                let tau = root(plan.exps[0][n / 2] as usize / 2);
-                let [a, b] = level0[n / 2];
-                let u = (-(if n % 2 == 0 { a + tau * b } else { a - tau * b })).rem_euclid(p);
-                // level 2: node n split by +-w, w = zeta^(e / 2): node 2n gets u + w u', 2n + 1 u - w u'
-                let w = root(plan.exps[1][n] as usize / 2);
-                for (n2, sign) in [(2 * n, 1i64), (2 * n + 1, -1)] {
-                    let tau3 = root(plan.exps[2][n2] as usize / 3);
-                    for i in 0..3 {
-                        let scale = super::pow_mod(tau3 as u64, i as u64, p as u64) as i64;
-                        t[n2][i][0][pat] = super::centered(u * scale % p, plan.p);
-                        t[n2][i][1][pat] = super::centered(sign * u * w % p * scale % p, plan.p);
-                    }
-                }
-            }
-        }
-        Front { t }
-    }
-}
-
-pub fn fronts() -> &'static [Front; 2] {
-    static F: OnceLock<[Front; 2]> = OnceLock::new();
-    F.get_or_init(|| [Front::new(0), Front::new(1)])
-}
-
-/// Byte rows of [`indices`] per word: the 16 bytes of the word and zeros up to the furthest byte
-/// a coefficient `j + 486` (`j < 162`, so below 648) can name.
-const BYTE_ROWS: usize = 21;
-
-/// `idx` of position `32 b + JJ` from `row = bytes[0][b]`: coefficient `c = 32 b + JJ + 162 t`
-/// is bit `(c / 4) % 8` of byte `c / 32` of word `c % 4`, and goes to bits `t + 1` and `t + 9`.
-#[inline(always)]
-unsafe fn index_one<const JJ: usize>(
-    row: *const uint16x8_t,
-    bit: &[uint16x8_t; 8],
-    field: &[uint16x8_t; 4],
-    base: uint16x8_t,
-) -> uint8x16_t {
-    let mut x = base;
-    for t in 0..4 {
-        let c = JJ + 162 * t;
-        let l = *row.add((c % 4) * BYTE_ROWS + c / 32);
-        // `cmtst` and `bit` as written: from the intrinsics LLVM builds and/cmeq/bic/orr.
-        core::arch::asm!(
-            "cmtst {m:v}.8h, {l:v}.8h, {b:v}.8h",
-            "bit {x:v}.16b, {m:v}.16b, {f:v}.16b",
-            m = out(vreg) _,
-            l = in(vreg) l,
-            b = in(vreg) bit[(c / 4) % 8],
-            f = in(vreg) field[t],
-            x = inout(vreg) x,
-            options(pure, nomem, nostack, preserves_flags)
-        );
-    }
-    vreinterpretq_u8_u16(x)
-}
-
-/// The table indices of one element of the eight columns whose words `words` point at:
-/// `idx[j]`, lane `c`, holds the bytes `2 p, 2 p + 1` for column `c`'s pattern `p` at `j`
-/// (bit `t` of `p` is coefficient `j + 162 t`; coefficient `4 q + k` is bit `q` of word `k`, and
-/// none is set from 512 on).
-#[inline(always)]
-unsafe fn indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; 162]) {
-    // bytes[k][b], lane c: byte b of word k of column c, zero from 16 on
-    let mut bytes = [[vdupq_n_u16(0); BYTE_ROWS]; 4];
-    for (k, row) in bytes.iter_mut().enumerate() {
-        let r: [uint8x16_t; 8] = core::array::from_fn(|c| vld1q_u8(words[c].add(16 * k)));
-        // three zip rounds transpose the 8 x 16 bytes, as in `masks`
-        let a: [uint8x16_t; 8] = core::array::from_fn(|i| {
-            let (x, y) = (r[2 * (i % 4)], r[2 * (i % 4) + 1]);
-            if i < 4 { vzip1q_u8(x, y) } else { vzip2q_u8(x, y) }
-        });
-        let b: [uint16x8_t; 8] = core::array::from_fn(|i| {
-            let h = i / 4;
-            let (x, y) = (
-                vreinterpretq_u16_u8(a[4 * h + 2 * ((i % 4) / 2)]),
-                vreinterpretq_u16_u8(a[4 * h + 2 * ((i % 4) / 2) + 1]),
-            );
-            if i % 2 == 0 { vzip1q_u16(x, y) } else { vzip2q_u16(x, y) }
-        });
-        for v in 0..8 {
-            let h = v / 4;
-            let z = (v % 4) / 2;
-            let (x, y) = (vreinterpretq_u32_u16(b[4 * h + z]), vreinterpretq_u32_u16(b[4 * h + 2 + z]));
-            let pair = vreinterpretq_u8_u32(if v % 2 == 0 { vzip1q_u32(x, y) } else { vzip2q_u32(x, y) });
-            row[2 * v] = vmovl_u8(vget_low_u8(pair));
-            row[2 * v + 1] = vmovl_high_u8(pair);
-        }
-    }
-    let bit: [uint16x8_t; 8] = core::array::from_fn(|i| vdupq_n_u16(1 << i));
-    let field: [uint16x8_t; 4] = core::array::from_fn(|t| vdupq_n_u16(0x0202 << t));
-    let base = vdupq_n_u16(0x0100);
-    let rows = bytes.as_ptr() as *const uint16x8_t;
-    macro_rules! one {
-        ($b:expr, $($jj:literal)*) => {$(
-            *idx.get_unchecked_mut(32 * $b + $jj) = index_one::<$jj>(rows.add($b), &bit, &field, base);
-        )*};
-    }
-    for b in 0..5 {
-        one!(b, 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31);
-    }
-    one!(5, 0 1);
-}
-
-/// The bare radix-3 butterfly `y_k = a + eps^k b + eps^2k c`, with `eps^2 = -1 - eps`.
-#[inline(always)]
-unsafe fn radix3_bare(a: int16x8_t, b: int16x8_t, c: int16x8_t, k: int16x8_t) -> (int16x8_t, int16x8_t, int16x8_t) {
-    let s = vaddq_s16(b, c);
-    let d = vsubq_s16(b, c);
-    let e = mulc::<2, 3>(d, k, k);
-    (
-        vaddq_s16(a, s),
-        vaddq_s16(vsubq_s16(a, c), e),
-        vsubq_s16(vsubq_s16(a, b), e),
-    )
-}
-
-/// Levels 0 to 3 from the indices: per level-2 node `n2` and `j < 27`, the inputs at
-/// `j + 27 i` of the level-3 butterfly, already scaled by `tau^i`, are two table entries each
-/// ([`Front`]), so level 3 is [`radix3_bare`].
-#[inline(always)]
-unsafe fn pass_ab<const S: usize>(idx: &[uint8x16_t; 162], x: &mut [int16x8_t; N], kern: &Kernel, front: &Front) {
-    const { assert!(schedule(S).before[3] == super::NONE && !schedule(S).reduce_d) };
-    let k = vld1q_s16(kern.k.as_ptr());
-    let table = |t: &[i16; 16]| {
-        let p = t.as_ptr() as *const u8;
-        uint8x16x2_t(vld1q_u8(p), vld1q_u8(p.add(16)))
-    };
-    for n2 in 0..8 {
-        let tt: [[uint8x16x2_t; 2]; 3] = core::array::from_fn(|i| core::array::from_fn(|h| table(&front.t[n2][i][h])));
-        // the patterns at positions j + 27 i of level-1 node n2 / 2, and 81 on
-        let base = 81 * n2;
-        for j in 0..27 {
-            let v: [int16x8_t; 3] = core::array::from_fn(|i| {
-                let a = vqtbl2q_u8(tt[i][0], *idx.get_unchecked(j + 27 * i));
-                let b = vqtbl2q_u8(tt[i][1], *idx.get_unchecked(j + 81 + 27 * i));
-                vaddq_s16(vreinterpretq_s16_u8(a), vreinterpretq_s16_u8(b))
-            });
-            let (y0, y1, y2) = radix3_bare(v[0], v[1], v[2], k);
-            store(x, base + j, y0);
-            store(x, base + j + 27, y1);
-            store(x, base + j + 54, y2);
-        }
-    }
-}
-
-/// [`pass_c`] with two level-3 nodes `n` and `n + 12` in one loop body, so that two independent
-/// butterfly chains are in flight (one node's levels 4 and 5 are a dependent chain).
-#[inline(always)]
-unsafe fn pass_c2<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
-    let s: Schedule = schedule(S);
-    let k = vld1q_s16(kern.k.as_ptr());
-    for n in 0..12 {
-        let t = [n, n + 12].map(|m| (vld1q_s16(kern.c[m].as_ptr()), vld1q_s16(kern.c[m].as_ptr().add(8))));
-        for j in 0..3 {
-            let base = [27 * n + j, 27 * (n + 12) + j];
-            let mut v: [[int16x8_t; 9]; 2] = core::array::from_fn(|h| core::array::from_fn(|i| load(x, base[h] + 3 * i)));
-            for vh in v.iter_mut() {
-                reduce_inputs(vh, s.before[4], s.cheap, &[0, 1, 2], k);
-            }
-            for i in 0..3 {
-                for h in 0..2 {
-                    let (a, b, c) = r3!(s, 0, 1, 2, 3, v[h][i], v[h][i + 3], v[h][i + 6], t[h].0, k);
-                    (v[h][i], v[h][i + 3], v[h][i + 6]) = (a, b, c);
-                }
-            }
-            for vh in v.iter_mut() {
-                reduce_inputs(vh, s.before[5], s.cheap, &[0, 3, 6], k);
-            }
-            for h in 0..2 {
-                let vh = &v[h];
-                let r = [
-                    r3!(s, 4, 5, 6, 7, vh[0], vh[1], vh[2], t[h].0, k),
-                    r3!(s, 0, 1, 2, 3, vh[3], vh[4], vh[5], t[h].1, k),
-                    r3!(s, 4, 5, 6, 7, vh[6], vh[7], vh[8], t[h].1, k),
-                ];
-                for (g, (a, b, c)) in r.into_iter().enumerate() {
-                    store(x, base[h] + 9 * g, a);
-                    store(x, base[h] + 9 * g + 3, b);
-                    store(x, base[h] + 9 * g + 6, c);
-                }
-            }
         }
     }
 }
@@ -962,75 +952,6 @@ pub fn commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
     out
 }
 
-/// The transform of `-s` through the table front end, for the tests.
-#[cfg(test)]
-unsafe fn front_transform<const P: usize, const S: usize>(words: &[*const u8; LANES], x: &mut [int16x8_t; N]) {
-    let kern = &kernels()[P];
-    let mut idx = [vdupq_n_u8(0); 162];
-    indices(words, &mut idx);
-    pass_ab::<S>(&idx, x, kern, &fronts()[P]);
-    pass_c2::<S>(x, kern);
-    pass_d::<S, false>(x, kern, &[], &mut []);
-}
-
-#[cfg(test)]
-mod front_tests {
-    use super::super::tests::xorshift;
-    use super::*;
-
-    /// The table front-end transform of eight binary elements agrees lane by lane with the
-    /// scalar transform of `-s`, within [`super::super::front_transform_bound`].
-    #[test]
-    fn front_transform_matches_scalar() {
-        let mut state = 9u64;
-        for case in 0..16 {
-            let words: [[u128; 4]; 8] = core::array::from_fn(|c| {
-                core::array::from_fn(|k| match (case, c) {
-                    (0, _) => u128::MAX,
-                    (1, _) => 0,
-                    (2, 0) => (k == 0) as u128,
-                    (2, 1) => ((k == 3) as u128) << 127,
-                    (2, 2) => if k == 1 { 1 << 64 } else { 0 },
-                    (2, 3) => if k == 2 { 1 << 40 } else { 0 },
-                    (3, _) => if (c + k) % 2 == 0 { u128::MAX } else { 0 },
-                    _ => (xorshift(&mut state) as u128) << 64 | xorshift(&mut state) as u128,
-                })
-            });
-            let ptrs: [*const u8; 8] = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
-            for (i, plan) in primes().iter().take(2).enumerate() {
-                let mut x = [unsafe { vdupq_n_s16(0) }; N];
-                unsafe {
-                    match i {
-                        0 => front_transform::<0, 4>(&ptrs, &mut x),
-                        _ => front_transform::<1, 5>(&ptrs, &mut x),
-                    }
-                }
-                let bound = super::super::front_transform_bound(plan.p, super::super::FRONT_SCHEDULES[i]);
-                for c in 0..8 {
-                    let b: Vec<B128> = words[c].iter().map(|&w| B128(w)).collect();
-                    let mut s = [0u32; N];
-                    super::super::element_bits(&b, &mut s);
-                    plan.forward(&mut s);
-                    for (slot, &want) in s.iter().enumerate() {
-                        let got = lanes(x[slot])[c] as i64;
-                        assert!(got.unsigned_abs() <= bound as u64);
-                        assert_eq!(
-                            (got + want as i64).rem_euclid(plan.p as i64),
-                            0,
-                            "case {case} prime {} column {c} slot {slot}",
-                            plan.p
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn lanes(v: int16x8_t) -> [i16; 8] {
-        unsafe { core::mem::transmute(v) }
-    }
-}
-
 #[path = "ntt_hybrid.rs"]
 pub mod hybrid;
 
@@ -1092,20 +1013,19 @@ mod tests {
         }
     }
 
-    /// The one-multiplication shift reduction, over every `i16`: congruent, and within
-    /// [`super::super::shift_bound`] of `|a|`.
+    /// The one-multiply reduction by `2^13` of the SMS schedule, over every `i16` for 9721:
+    /// congruent, and within [`super::super::low_bound`] of `|a|`.
     #[test]
-    fn shift13_reduction_is_exact_and_bounded() {
-        for (i, kern) in kernels().iter().enumerate().take(2) {
-            let p = PRIMES[i] as i32;
-            let k = unsafe { vld1q_s16(kern.k.as_ptr()) };
-            for a in every_i16() {
-                let r = lanes(unsafe { reduce_shift13(a, k) });
-                for (x, y) in lanes(a).into_iter().zip(r) {
-                    assert_eq!((x as i32 - y as i32).rem_euclid(p), 0);
-                    let bound = super::super::shift_bound(p as u32, 13, x.unsigned_abs() as u32);
-                    assert!(y.unsigned_abs() as u32 <= bound, "prime {p}: {x} -> {y}");
-                }
+    fn low_reduction_is_exact_and_bounded() {
+        let p = schedule_prime(SMS) as i32;
+        let k = unsafe { vld1q_s16(kernels()[1].k.as_ptr()) };
+        assert_eq!(kernels()[1].k[0] as i32, p);
+        for a in every_i16() {
+            let r = lanes(unsafe { reduce_low(a, k) });
+            for (x, y) in lanes(a).into_iter().zip(r) {
+                assert_eq!((x as i32 - y as i32).rem_euclid(p), 0);
+                let bound = super::super::low_bound(p as u32, x.unsigned_abs() as u32);
+                assert!(y.unsigned_abs() as u32 <= bound, "{x} -> {y}");
             }
         }
     }
@@ -1282,6 +1202,164 @@ mod tests {
             }
         }
     }
+
+    /// Eight columns' words for one element in [`transform_matches_scalar`]'s twelve cases.
+    fn case_words(case: usize, state: &mut u64) -> [[u128; 4]; 8] {
+        core::array::from_fn(|c| {
+            core::array::from_fn(|k| match (case, c) {
+                (0, _) => u128::MAX,
+                (1, _) => 0,
+                (2, 0) => (k == 0) as u128,
+                (2, 1) => ((k == 3) as u128) << 127,
+                (2, 2) => if k == 1 { 1 << 64 } else { 0 },
+                _ => (xorshift(state) as u128) << 64 | xorshift(state) as u128,
+            })
+        })
+    }
+
+    /// Levels 0 to `last` of [`super::super::Prime::forward`] in scalar arithmetic (level 0 the
+    /// trinomial split, levels 1.. the binomial splits), residues in `[0, p)`.
+    fn forward_levels(plan: &super::super::Prime, x: &mut [u32; N], last: usize) {
+        use super::super::{HALF, ORDER, RADICES};
+        let p = plan.p as u64;
+        let (w, w5) = (plan.root(HALF), plan.root(5 * HALF));
+        for j in 0..HALF {
+            let (a, b) = (x[j] as u64, x[j + HALF] as u64);
+            x[j] = ((a + w * b) % p) as u32;
+            x[j + HALF] = ((a + w5 * b) % p) as u32;
+        }
+        let mut len = HALF;
+        for (level, &r) in RADICES.iter().enumerate().take(last) {
+            let sub = len / r;
+            for (node, &e) in plan.exps[level].iter().enumerate() {
+                let tau = e as usize / r;
+                for j in 0..sub {
+                    let at = node * len + j;
+                    let a: Vec<u64> = (0..r).map(|i| x[at + i * sub] as u64 * plan.root(tau * i) % p).collect();
+                    for k in 0..r {
+                        let acc: u64 = (0..r).map(|i| a[i] * plan.root(k * i * (ORDER / r)) % p).sum();
+                        x[at + k * sub] = (acc % p) as u32;
+                    }
+                }
+            }
+            len = sub;
+        }
+    }
+
+    /// The table-fed levels 0 to 3 ([`nibbles`], [`pass_lut`]) agree lane by lane with the scalar
+    /// levels 0 to 3 of `-s` and with [`pass_a`] and [`pass_b`] modulo `p`, within
+    /// [`super::super::lut_level3_bound`]; checked for every prime whose bound admits the tables.
+    #[test]
+    fn lut_levels_match_scalar() {
+        use super::super::{lut_level3_bound, lut_transform_bound};
+        let mut state = 7u64;
+        fn run<const P: usize>(m: &[int16x8_t; BITS], idx: &mut [uint8x16_t; GROUPS], x: &mut [int16x8_t; N], old: &mut [int16x8_t; N]) {
+            let kern = &kernels()[P];
+            unsafe {
+                nibbles(m, idx);
+                pass_lut::<P>(idx, x, kern);
+                pass_a(m, old, kern);
+                pass_b::<P>(old, kern);
+            }
+        }
+        for case in 0..12 {
+            let words = case_words(case, &mut state);
+            let ptrs: [*const u8; 8] = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
+            let mut m = [unsafe { vdupq_n_s16(0) }; BITS];
+            unsafe { masks(&ptrs, &mut m) };
+            // 3889 and 9721: for 17497 the level-3 difference of two table sums, 4 h, exceeds i16
+            for (i, plan) in primes().iter().enumerate().take(2) {
+                let mut idx = [unsafe { vdupq_n_u8(0) }; GROUPS];
+                let mut x = [unsafe { vdupq_n_s16(0) }; N];
+                let mut old = [unsafe { vdupq_n_s16(0) }; N];
+                match i {
+                    0 => run::<0>(&m, &mut idx, &mut x, &mut old),
+                    _ => run::<1>(&m, &mut idx, &mut x, &mut old),
+                }
+                let bound = lut_level3_bound(plan.p, SCHEDULES[i]);
+                assert!(lut_transform_bound(plan.p, SCHEDULES[i]) <= i16::MAX as u32);
+                let p = plan.p as i64;
+                for c in 0..8 {
+                    let b: Vec<B128> = words[c].iter().map(|&w| B128(w)).collect();
+                    let mut s = [0u32; N];
+                    super::super::element_bits(&b, &mut s);
+                    forward_levels(plan, &mut s, 3);
+                    for (slot, &want) in s.iter().enumerate() {
+                        let got = lanes(x[slot])[c] as i64;
+                        assert!(got.unsigned_abs() <= bound as u64, "case {case} prime {p} column {c} slot {slot}: {got}");
+                        assert_eq!((got + want as i64).rem_euclid(p), 0, "case {case} prime {p} column {c} slot {slot}");
+                        assert_eq!((got - lanes(old[slot])[c] as i64).rem_euclid(p), 0, "case {case} prime {p} column {c} slot {slot}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`word_nibbles`] builds the same indices as [`masks`] and [`nibbles`].
+    #[test]
+    fn word_nibbles_match_masks() {
+        let mut state = 9u64;
+        for case in 0..12 {
+            let words = case_words(case, &mut state);
+            let ptrs: [*const u8; 8] = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
+            let mut m = [unsafe { vdupq_n_s16(0) }; BITS];
+            let mut want = [unsafe { vdupq_n_u8(0) }; GROUPS];
+            let mut got = [unsafe { vdupq_n_u8(0) }; GROUPS];
+            let mut d = [[unsafe { vdupq_n_u8(0) }; 16]; 4];
+            unsafe {
+                masks(&ptrs, &mut m);
+                nibbles(&m, &mut want);
+                word_nibbles(&ptrs, &mut d, &mut got);
+            }
+            for j in 0..GROUPS {
+                let (w, g): ([u8; 16], [u8; 16]) = unsafe { (core::mem::transmute(want[j]), core::mem::transmute(got[j])) };
+                assert_eq!(w, g, "case {case} group {j}");
+            }
+        }
+    }
+
+    /// The table-fed transform ([`transform_lut`]) of eight binary elements agrees lane by lane
+    /// with the scalar transform of `-s`, within [`super::super::lut_transform_bound`].
+    #[test]
+    fn transform_lut_matches_scalar() {
+        let mut state = 7u64;
+        for case in 0..12 {
+            let words = case_words(case, &mut state);
+            let ptrs: [*const u8; 8] = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
+            let mut m = [unsafe { vdupq_n_s16(0) }; BITS];
+            unsafe { masks(&ptrs, &mut m) };
+            // primes 3889 and 9721 by their schedules, and 9721 by the SMS schedule
+            for (i, s) in [(0, 0), (1, 1), (1, SMS)] {
+                let plan = &primes()[i];
+                let mut idx = [unsafe { vdupq_n_u8(0) }; GROUPS];
+                let mut x = [unsafe { vdupq_n_s16(0) }; N];
+                unsafe {
+                    match s {
+                        0 => transform_lut::<0, 0>(&m, &mut idx, &mut x),
+                        1 => transform_lut::<1, 1>(&m, &mut idx, &mut x),
+                        _ => transform_lut::<1, SMS>(&m, &mut idx, &mut x),
+                    }
+                }
+                let bound = super::super::lut_transform_bound(plan.p, schedule(s));
+                for c in 0..8 {
+                    let b: Vec<B128> = words[c].iter().map(|&w| B128(w)).collect();
+                    let mut s = [0u32; N];
+                    super::super::element_bits(&b, &mut s);
+                    plan.forward(&mut s);
+                    for (slot, &want) in s.iter().enumerate() {
+                        let got = lanes(x[slot])[c] as i64;
+                        assert!(got.unsigned_abs() <= bound as u64);
+                        assert_eq!(
+                            (got + want as i64).rem_euclid(plan.p as i64),
+                            0,
+                            "case {case} prime {} column {c} slot {slot}",
+                            plan.p
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1364,7 +1442,59 @@ mod pass_timing {
                 time!("pass_c", pass_c::<1>(&mut x, kp::<1>()));
                 time!("pass_d", pass_d::<1, false>(&mut x, kp::<1>(), &[], &mut []));
                 time!("pass_dmac", pass_d::<1, true>(&mut x, kp::<1>(), &row, &mut acc));
+                let mut idx = Box::new([unsafe { vdupq_n_u8(0) }; GROUPS]);
+                time!("nibbles", nibbles(&m, &mut idx));
+                time!("pass_lut", pass_lut::<1>(&idx, &mut x, kp::<1>()));
             }
         }
+        // one element-prime transform of the SMS commit, old (pass_a, pass_b) against the
+        // nibble tables, masks included, interleaved
+        let mut idx = Box::new([unsafe { vdupq_n_u8(0) }; GROUPS]);
+        let (mut old, mut new) = (Vec::new(), Vec::new());
+        for _ in 0..15 {
+            let start = std::time::Instant::now();
+            for _ in 0..iters / 5 {
+                unsafe {
+                    masks(&ptrs, &mut m);
+                    transform::<1>(&m, &mut x);
+                }
+                core::hint::black_box(&mut *x);
+            }
+            old.push(start.elapsed().as_nanos() as f64 / (iters / 5) as f64);
+            let start = std::time::Instant::now();
+            for _ in 0..iters / 5 {
+                unsafe {
+                    masks(&ptrs, &mut m);
+                    transform_lut::<1, 1>(&m, &mut idx, &mut x);
+                }
+                core::hint::black_box(&mut *x);
+            }
+            new.push(start.elapsed().as_nanos() as f64 / (iters / 5) as f64);
+        }
+        let mut d = Box::new([[unsafe { vdupq_n_u8(0) }; 16]; 4]);
+        let mut fused = Vec::new();
+        for _ in 0..15 {
+            let start = std::time::Instant::now();
+            for _ in 0..iters / 5 {
+                unsafe {
+                    word_nibbles(&ptrs, &mut d, &mut idx);
+                    let kern = kp::<1>();
+                    pass_lut::<SMS>(&idx, &mut x, kern);
+                    pass_c::<SMS>(&mut x, kern);
+                    pass_d::<SMS, false>(&mut x, kern, &[], &mut []);
+                }
+                core::hint::black_box(&mut *x);
+            }
+            fused.push(start.elapsed().as_nanos() as f64 / (iters / 5) as f64);
+        }
+        fused.sort_by(f64::total_cmp);
+        time!("word_nibbles", word_nibbles(&ptrs, &mut d, &mut idx));
+        println!("word_nibbles+transform<SMS>: median {:.0} min {:.0} ns", fused[7], fused[0]);
+        old.sort_by(f64::total_cmp);
+        new.sort_by(f64::total_cmp);
+        println!(
+            "masks+transform<1>: old median {:.0} min {:.0} ns, lut median {:.0} min {:.0} ns ({:+.1}% median, {:+.1}% min)",
+            old[7], old[0], new[7], new[0], 100.0 * (new[7] / old[7] - 1.0), 100.0 * (new[0] / old[0] - 1.0)
+        );
     }
 }

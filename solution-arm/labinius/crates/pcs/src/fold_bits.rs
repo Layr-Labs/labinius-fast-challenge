@@ -1098,14 +1098,20 @@ pub mod neon {
     const SLOTS: usize = 243;
     /// Slot pairs; the odd slot of the last pair (243) is a dummy.
     const PAIRS: usize = SLOTS.div_ceil(2);
-    /// Columns per group.
-    pub const GROUP: usize = 24;
+    /// Most columns per group: the groups split the columns as evenly as they can.
+    pub const GROUP: usize = 28;
     /// Zero planes in front of the first column (plane 1 is column 0's leading guard).
     const GUARD: usize = 2;
     /// Planes per column: 128 and the trailing zero guard (the next column's leading guard).
     const STRIDE: usize = WORD_BITS + 1;
+    /// The first of the two zero planes and the two all-ones planes after the columns, which
+    /// the padding entries of a list's tail point at.
+    const PAD_ZERO: usize = GUARD + GROUP * STRIDE;
+    const PAD_ONES: usize = PAD_ZERO + 2;
     /// The group's plane buffer.
-    const PLANES: usize = GUARD + GROUP * STRIDE;
+    const PLANES: usize = PAD_ONES + 2;
+    /// Entries of a subtree: lists run in subtrees of eight, the last one padded.
+    const SUB: usize = 8;
     /// Counter bits kept in registers during a pair's pass.
     const LO: usize = 5;
     /// Counter bits above them, in memory: counts stay below `2^15`.
@@ -1113,6 +1119,7 @@ pub mod neon {
     /// Planes added to every offset so that it is non-negative (positions are below 162).
     const BIAS_PLANES: usize = 160;
     const _: () = assert!(16 * (GUARD + (GROUP - 1) * STRIDE + BIAS_PLANES + WORD_BITS) <= u16::MAX as usize);
+    const _: () = assert!(16 * (BIAS_PLANES + PLANES) <= u16::MAX as usize);
     const _: () = assert!(GUARD + BIAS_PLANES >= Q162);
 
     type V = uint8x16_t;
@@ -1131,6 +1138,20 @@ pub mod neon {
         list: [Vec<u16>; 2],
         /// Per pair: positive `[lo, hi)`, negative `[lo, hi)`.
         win: Vec<[u16; 4]>,
+        /// Per pair and sign, the last `len % SUB` entries of the window, then entries of the
+        /// pad planes (zero for positive, all-ones for negative: neither adds anything), as
+        /// offsets from that pair's base.
+        tail: Vec<[[u16; SUB]; 2]>,
+    }
+
+    /// The number of groups of `columns` columns.
+    pub fn groups(columns: usize) -> usize {
+        columns.div_ceil(GROUP)
+    }
+    /// The first column of group `g`: the groups split the columns evenly, at most `GROUP`
+    /// each.
+    fn group_first(columns: usize, g: usize) -> usize {
+        g * columns / groups(columns)
     }
 
     /// Positions of the sorted entries, shifted to be non-negative: real terms `0 .. 162`,
@@ -1139,11 +1160,13 @@ pub mod neon {
     const KEYS: usize = KEY0 as usize + Q162;
 
     impl Group {
-        /// The entries of group `g` (columns `GROUP g ..`) of `challenges`, bucket-sorted by
-        /// position, and per pair the windows of the terms reaching it.
+        /// The entries of group `g` (columns `group_first(n, g) ..`) of `challenges`,
+        /// bucket-sorted by position, per pair the windows of the terms reaching it, and the
+        /// windows' padded tails.
         pub fn of(challenges: &[Challenge], g: usize) -> Group {
-            let first = g * GROUP;
-            let cs = &challenges[first..(first + GROUP).min(challenges.len())];
+            let n = challenges.len();
+            let first = group_first(n, g);
+            let cs = &challenges[first..group_first(n, g + 1)];
             // Each entry is `(key, offset)`; a term at `m` reaches pair `i` when `[2i, 2i + 1]`
             // meets `[m, m + 127]`, i.e. `2i - 127 <= m <= 2i + 1`.
             let mut start = [[0u16; KEYS + 1]; 2];
@@ -1178,14 +1201,27 @@ pub mod neon {
                 list[sign][at[sign][key] as usize] = off;
                 at[sign][key] += 1;
             });
-            let win = (0..PAIRS)
+            let win: Vec<[u16; 4]> = (0..PAIRS)
                 .map(|i| {
                     let lo = 2 * i;
                     let hi = (2 * i + 1 + KEY0 as usize + 1).min(KEYS);
                     [start[0][lo], start[0][hi], start[1][lo], start[1][hi]]
                 })
                 .collect();
-            Group { first, columns: cs.len(), list, win }
+            let tail = win
+                .iter()
+                .enumerate()
+                .map(|(i, w)| {
+                    core::array::from_fn(|sign| {
+                        let (lo, hi) = (w[2 * sign] as usize, w[2 * sign + 1] as usize);
+                        let full = lo + (hi - lo) / SUB * SUB;
+                        let pad = [PAD_ZERO, PAD_ONES][sign];
+                        let pad = (16 * (BIAS_PLANES + pad) - 32 * i) as u16;
+                        core::array::from_fn(|k| if full + k < hi { list[sign][full + k] } else { pad })
+                    })
+                })
+                .collect();
+            Group { first, columns: cs.len(), list, win, tail }
         }
     }
 
@@ -1215,8 +1251,11 @@ pub mod neon {
     impl Workspace {
         pub fn new() -> Workspace {
             unsafe {
+                let mut planes = vec![vdupq_n_u8(0); PLANES];
+                planes[PAD_ONES] = vdupq_n_u8(0xFF);
+                planes[PAD_ONES + 1] = vdupq_n_u8(0xFF);
                 Workspace {
-                    planes: vec![vdupq_n_u8(0); PLANES],
+                    planes,
                     lo: vec![vdupq_n_u8(0); PAIRS * 2 * LO],
                     hi: vec![vdupq_n_u8(0); PAIRS * 2 * HI],
                     tmp: vec![vdupq_n_u8(0); WORD_BITS],
@@ -1382,62 +1421,77 @@ pub mod neon {
         a
     }
 
-    /// `hi += h`: the three-bit counter `h` (weights `2^5 .. 2^7`) into the ten upper counter
+    /// Bits of the register counter `h` above the `LO` bits (weights `2^5 .. 2^8`), added into
+    /// the memory bits at the end of a pass, or within it once the trees have added
+    /// `H_MAX - 1` carries.
+    const HB: usize = 4;
+    /// Carries of weight 32 that `h` holds.
+    const H_MAX: usize = (1 << HB) - 1;
+
+    /// `hi += h`: the four-bit counter `h` (weights `2^5 .. 2^8`) into the ten upper counter
     /// bits at `p`.
     #[inline(always)]
-    unsafe fn flush(p: *mut V, h: &[V; 3]) {
+    unsafe fn flush(p: *mut V, h: &[V; HB]) {
         let m = *p;
         *p = veorq_u8(m, h[0]);
         let mut c = vandq_u8(m, h[0]);
-        for b in 1..3 {
+        for b in 1..HB {
             let m = *p.add(b);
             let t = opaque(veorq_u8(m, h[b]));
             *p.add(b) = veorq_u8(t, c);
             c = vbslq_u8(t, c, m);
         }
-        for b in 3..HI {
+        for b in HB..HI {
             let m = *p.add(b);
             *p.add(b) = veorq_u8(m, c);
             c = vandq_u8(m, c);
         }
     }
 
-    /// One pair's pass over one group: the positive then the negative entries.
+    /// One pair's pass over one group: the positive then the negative entries. Each list is
+    /// `n8` subtrees of eight entries at `pos` / `neg` (whole 32-entry trees, then up to
+    /// three more subtrees) and its padded tail; the subtrees' weight-8 carries meet in the
+    /// counter bits 3 and 4, and whatever waits there at the end goes into `h` with the tail's,
+    /// without branching on the remainder.
     ///
     /// # Safety
-    /// `be + o` and `be + o + 16` are readable planes for every offset `o` of the lists; `lo`
-    /// and `hi` address the pair's `2 LO` and `2 HI` counter planes.
+    /// `be + o` and `be + o + 16` are readable planes for every offset `o` of the lists and
+    /// tails; `lo` and `hi` address the pair's `2 LO` and `2 HI` counter planes.
     #[inline(always)]
-    unsafe fn pass(be: *const u8, pos: &[u16], neg: &[u16], lo: *mut V, hi: *mut V) {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn pass(
+        be: *const u8,
+        pos: *const u16,
+        pos8: usize,
+        neg: *const u16,
+        neg8: usize,
+        tail: &[[u16; SUB]; 2],
+        lo: *mut V,
+        hi: *mut V,
+    ) {
         let bo = be.add(16);
         let z = vdupq_n_u8(0);
+        let ones = vdupq_n_u8(0xFF);
         let mut s0: [V; LO] = core::array::from_fn(|b| *lo.add(b));
         let mut s1: [V; LO] = core::array::from_fn(|b| *lo.add(LO + b));
-        let mut h0 = [z; 3];
-        let mut h1 = [z; 3];
-        let mut hn = 0u32;
+        let mut h0 = [z; HB];
+        let mut h1 = [z; HB];
+        // Carries in `h`: the trees' carries flush it at `H_MAX - 1`, which leaves room for
+        // the one carry of the list's end.
+        let mut hn = 0usize;
         let mut t: *const u16;
         macro_rules! add_h {
             ($c0:expr, $c1:expr) => {{
-                let (c0, c1) = ($c0, $c1);
-                let u0 = vandq_u8(h0[0], c0);
-                h0[0] = veorq_u8(h0[0], c0);
-                let v0 = vandq_u8(h0[1], u0);
-                h0[1] = veorq_u8(h0[1], u0);
-                h0[2] = veorq_u8(h0[2], v0);
-                let u1 = vandq_u8(h1[0], c1);
-                h1[0] = veorq_u8(h1[0], c1);
-                let v1 = vandq_u8(h1[1], u1);
-                h1[1] = veorq_u8(h1[1], u1);
-                h1[2] = veorq_u8(h1[2], v1);
-                hn += 1;
-                if hn == 7 {
-                    flush(hi, &h0);
-                    flush(hi.add(HI), &h1);
-                    h0 = [z; 3];
-                    h1 = [z; 3];
-                    hn = 0;
+                let (mut c0, mut c1) = ($c0, $c1);
+                for b in 0..HB - 1 {
+                    let u0 = vandq_u8(h0[b], c0);
+                    h0[b] = veorq_u8(h0[b], c0);
+                    let u1 = vandq_u8(h1[b], c1);
+                    h1[b] = veorq_u8(h1[b], c1);
+                    (c0, c1) = (u0, u1);
                 }
+                h0[HB - 1] = veorq_u8(h0[HB - 1], c0);
+                h1[HB - 1] = veorq_u8(h1[HB - 1], c1);
             }};
         }
         macro_rules! two {
@@ -1460,83 +1514,75 @@ pub mod neon {
         }
         macro_rules! four { ($off:expr, $neg:literal) => { level!(1, two, $off, $neg) }; }
         macro_rules! eight { ($off:expr, $neg:literal) => { level!(2, four, $off, $neg) }; }
-        macro_rules! sixteen { ($off:expr, $neg:literal) => { level!(3, eight, $off, $neg) }; }
-        macro_rules! thirty_two { ($off:expr, $neg:literal) => { level!(4, sixteen, $off, $neg) }; }
         // The true carry of a tree.
         macro_rules! fix {
             ($c:expr, $neg:literal) => {
                 if $neg { vmvnq_u8($c) } else { $c }
             };
         }
-        // A carry of weight `2^$bit` through half adders up to weight 32, then into `h`.
-        macro_rules! up {
-            ($c0:expr, $c1:expr $(, $bit:literal)*) => {{
-                #[allow(unused_mut)]
-                let (mut c0, mut c1) = ($c0, $c1);
-                $(
-                    let (u0, u1) = (vandq_u8(s0[$bit], c0), vandq_u8(s1[$bit], c1));
-                    s0[$bit] = veorq_u8(s0[$bit], c0);
-                    s1[$bit] = veorq_u8(s1[$bit], c1);
-                    (c0, c1) = (u0, u1);
-                )*
-                add_h!(c0, c1);
-            }};
-        }
+        // A list: subtrees of eight, their carries paired at bits 3 and 4 (`p3`, `p4` hold the
+        // one waiting, or nothing: zero, all-ones for the complemented carries of `NEG`).
         macro_rules! entries {
-            ($list:expr, $neg:literal) => {{
-                let list: &[u16] = $list;
-                t = list.as_ptr();
-                for _ in 0..list.len() / 32 {
-                    let (c0, c1) = thirty_two!(0, $neg);
-                    add_h!(fix!(c0, $neg), fix!(c1, $neg));
-                    t = t.add(32);
+            ($list:expr, $n8:expr, $tail:expr, $neg:literal) => {{
+                let none = if $neg { ones } else { z };
+                let (mut p30, mut p31) = (none, none);
+                let (mut p40, mut p41) = (none, none);
+                t = $list;
+                // Whole 32-entry trees, one branch each.
+                for _ in 0..$n8 / 4 {
+                    let (a0, a1) = eight!(0, $neg);
+                    let (b0, b1) = eight!(SUB, $neg);
+                    let d0 = fa::<$neg>(&mut s0[3], a0, b0);
+                    let d1 = fa::<$neg>(&mut s1[3], a1, b1);
+                    let (a0, a1) = eight!(2 * SUB, $neg);
+                    let (b0, b1) = eight!(3 * SUB, $neg);
+                    let f0 = fa::<$neg>(&mut s0[3], a0, b0);
+                    let f1 = fa::<$neg>(&mut s1[3], a1, b1);
+                    let e0 = fa::<$neg>(&mut s0[4], d0, f0);
+                    let e1 = fa::<$neg>(&mut s1[4], d1, f1);
+                    add_h!(fix!(e0, $neg), fix!(e1, $neg));
+                    t = t.add(4 * SUB);
+                    hn += 1;
+                    if hn >= H_MAX - 1 {
+                        flush(hi, &h0);
+                        flush(hi.add(HI), &h1);
+                        h0 = [z; HB];
+                        h1 = [z; HB];
+                        hn = 0;
+                    }
                 }
-                let r = list.len() % 32;
-                if r & 16 != 0 {
-                    let (c0, c1) = sixteen!(0, $neg);
-                    up!(fix!(c0, $neg), fix!(c1, $neg), 4);
-                    t = t.add(16);
+                // Up to three more subtrees of eight.
+                let left = $n8 % 4;
+                if left != 0 {
+                    (p30, p31) = eight!(0, $neg);
+                    t = t.add(SUB);
+                    if left != 1 {
+                        let (c0, c1) = eight!(0, $neg);
+                        t = t.add(SUB);
+                        p40 = fa::<$neg>(&mut s0[3], p30, c0);
+                        p41 = fa::<$neg>(&mut s1[3], p31, c1);
+                        (p30, p31) = (none, none);
+                        if left != 2 {
+                            (p30, p31) = eight!(0, $neg);
+                        }
+                    }
                 }
-                if r & 8 != 0 {
-                    let (c0, c1) = eight!(0, $neg);
-                    up!(fix!(c0, $neg), fix!(c1, $neg), 3, 4);
-                    t = t.add(8);
-                }
-                if r & 4 != 0 {
-                    let (c0, c1) = four!(0, $neg);
-                    up!(fix!(c0, $neg), fix!(c1, $neg), 2, 3, 4);
-                    t = t.add(4);
-                }
-                if r & 2 != 0 {
-                    let (c0, c1) = two!(0, $neg);
-                    up!(fix!(c0, $neg), fix!(c1, $neg), 1, 2, 3, 4);
-                    t = t.add(2);
-                }
-                if r & 1 != 0 {
-                    let o = *t as usize;
-                    let a0 = vld1q_u8(be.add(o));
-                    let a1 = vld1q_u8(bo.add(o));
-                    let (c0, c1) = if $neg {
-                        let c = (vbicq_u8(s0[0], a0), vbicq_u8(s1[0], a1));
-                        s0[0] = vmvnq_u8(veorq_u8(s0[0], a0));
-                        s1[0] = vmvnq_u8(veorq_u8(s1[0], a1));
-                        c
-                    } else {
-                        let c = (vandq_u8(s0[0], a0), vandq_u8(s1[0], a1));
-                        s0[0] = veorq_u8(s0[0], a0);
-                        s1[0] = veorq_u8(s1[0], a1);
-                        c
-                    };
-                    up!(c0, c1, 1, 2, 3, 4);
-                }
+                // The tail, and whatever waits at bits 3 and 4, into `h`.
+                t = $tail.as_ptr();
+                let (c0, c1) = eight!(0, $neg);
+                let d0 = fa::<$neg>(&mut s0[3], p30, c0);
+                let d1 = fa::<$neg>(&mut s1[3], p31, c1);
+                let e0 = fa::<$neg>(&mut s0[4], p40, d0);
+                let e1 = fa::<$neg>(&mut s1[4], p41, d1);
+                add_h!(fix!(e0, $neg), fix!(e1, $neg));
+                hn += 1;
             }};
         }
-        entries!(pos, false);
-        entries!(neg, true);
-        if hn != 0 {
-            flush(hi, &h0);
-            flush(hi.add(HI), &h1);
-        }
+        entries!(pos, pos8, tail[0], false);
+        entries!(neg, neg8, tail[1], true);
+        debug_assert!(hn <= H_MAX);
+        flush(hi, &h0);
+        flush(hi.add(HI), &h1);
         for b in 0..LO {
             *lo.add(b) = s0[b];
             *lo.add(LO + b) = s1[b];
@@ -1594,8 +1640,11 @@ pub mod neon {
                 let be = base.wrapping_add(32 * i);
                 pass(
                     be,
-                    g.list[0].get_unchecked(w[0] as usize..w[1] as usize),
-                    g.list[1].get_unchecked(w[2] as usize..w[3] as usize),
+                    g.list[0].as_ptr().add(w[0] as usize),
+                    (w[1] - w[0]) as usize / SUB,
+                    g.list[1].as_ptr().add(w[2] as usize),
+                    (w[3] - w[2]) as usize / SUB,
+                    g.tail.get_unchecked(i),
                     lo.add(2 * LO * i),
                     hi.add(2 * HI * i),
                 );
@@ -1667,7 +1716,7 @@ pub mod neon {
         assert!(fits(challenges), "the counters would overflow");
         let elements = column_words / 4;
         let blocks = column_words / LANES;
-        let ngroups = challenges.len().div_ceil(GROUP);
+        let ngroups = groups(challenges.len());
         let built: Vec<OnceLock<Group>> = (0..ngroups).map(|_| OnceLock::new()).collect();
         let workers = threads.clamp(1, blocks.max(1));
         let barrier = Barrier::new(workers);
@@ -1783,14 +1832,16 @@ pub mod neon {
             let challenges: Vec<Challenge> = (0..2 * GROUP + 5)
                 .map(|j| challenge(&mut x, [0usize, 1, 2, 28, 7, 32][j % 6]))
                 .collect();
-            for g in 0..challenges.len().div_ceil(GROUP) {
+            for g in 0..groups(challenges.len()) {
                 let group = Group::of(&challenges, g);
+                let (first, end) = (group_first(challenges.len(), g), group_first(challenges.len(), g + 1));
+                assert!(end - first <= GROUP && group.first == first && group.columns == end - first);
                 for i in 0..PAIRS {
                     for sign in 0..2 {
                         let w = group.win[i];
                         let mut got: Vec<u16> = group.list[sign][w[2 * sign] as usize..w[2 * sign + 1] as usize].to_vec();
                         let mut want = Vec::new();
-                        for (jl, c) in challenges[g * GROUP..].iter().take(GROUP).enumerate() {
+                        for (jl, c) in challenges[first..end].iter().enumerate() {
                             for t in 0..c.weight {
                                 let p = c.positions[t] as i32;
                                 let negative = (((c.signs >> t) & 1 == 1) ^ (p % 2 == 1)) as usize;
@@ -1803,11 +1854,45 @@ pub mod neon {
                                 }
                             }
                         }
+                        let (lo, hi) = (w[2 * sign] as usize, w[2 * sign + 1] as usize);
+                        let full = lo + (hi - lo) / SUB * SUB;
+                        let pad = (16 * (BIAS_PLANES + [PAD_ZERO, PAD_ONES][sign]) - 32 * i) as u16;
+                        for k in 0..SUB {
+                            let e = if full + k < hi { group.list[sign][full + k] } else { pad };
+                            assert_eq!(group.tail[i][sign][k], e, "tail of group {g} pair {i} sign {sign}");
+                        }
                         got.sort_unstable();
                         want.sort_unstable();
                         assert_eq!(got, want, "group {g} pair {i} sign {sign}");
                     }
                 }
+            }
+        }
+
+        /// Whole groups of one effective sign on all-ones words: a pass's list carries far more
+        /// than `h` holds, so the in-loop flush must run; the signs alternate by group so that
+        /// the coefficients still fit.
+        #[test]
+        fn neon_fold_long_lists() {
+            let (columns, column_words) = (1024usize, 128usize);
+            let words = vec![u128::MAX; columns * column_words];
+            let n = groups(columns);
+            let challenges: Vec<Challenge> = (0..columns)
+                .map(|j| {
+                    let g = (0..n).rev().find(|&g| group_first(columns, g) <= j).unwrap();
+                    let start = (j * 37) % 130;
+                    let mut positions = [0u8; 32];
+                    for (t, p) in positions.iter_mut().take(31).enumerate() {
+                        *p = (start + t) as u8;
+                    }
+                    let signs = (0..31).fold(0u32, |a, t| a | (((positions[t] as u32 & 1) ^ (g % 2) as u32) << t));
+                    Challenge { positions, signs, weight: 31 }
+                })
+                .collect();
+            let got = fold(&words, column_words, &challenges, 3);
+            for m in 0..column_words / 4 {
+                let want = reference_element(&words, columns, column_words, &challenges, m);
+                assert_eq!(got[m].v[..], want[..], "element {m}");
             }
         }
 

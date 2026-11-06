@@ -288,14 +288,16 @@ pub struct Schedule {
 pub const NONE: u8 = 0;
 pub const ALL: u8 = 1;
 pub const FIRST: u8 = 2;
+/// As [`FIRST`], with the one-multiply reduction of [`round13_bound`].
+pub const FIRST13: u8 = 3;
 
 pub const SCHEDULES: [Schedule; 3] = [
     Schedule { before: [NONE; 7], reduce_d: false, cheap: false, accumulate: 35 },
     Schedule {
-        before: [NONE, NONE, NONE, FIRST, FIRST, FIRST, FIRST],
+        before: [NONE, NONE, NONE, FIRST13, FIRST13, FIRST13, FIRST13],
         reduce_d: false,
         cheap: false,
-        accumulate: 21,
+        accumulate: 15,
     },
     Schedule {
         before: [NONE, NONE, FIRST, ALL, ALL, ALL, ALL],
@@ -356,6 +358,12 @@ pub const fn cheap_bound(p: u32, b: u32) -> u32 {
     ((b as u64 * off + (p as u64) * (1 << 13)).div_ceil(1 << 14)) as u32
 }
 
+/// Largest `|a - round(a / 2^13) p|` for `|a| <= b`: `|a| |1 - p / 2^13| + p / 2`, rounded up.
+pub const fn round13_bound(p: u32, b: u32) -> u32 {
+    let off = (p as i64 - (1 << 13)).unsigned_abs();
+    ((b as u64 * off + (p as u64) * (1 << 12)).div_ceil(1 << 13)) as u32
+}
+
 /// The bounds on a level's first input `a` and on its multiplied inputs, from the bound `b` on
 /// the previous level's outputs and the level's reduction mode.
 const fn level_inputs(p: u32, b: u32, mode: u8, cheap: bool) -> (u32, u32) {
@@ -363,6 +371,7 @@ const fn level_inputs(p: u32, b: u32, mode: u8, cheap: bool) -> (u32, u32) {
         ALL if cheap => (reduced_bound(p), cheap_bound(p, b)),
         ALL => (reduced_bound(p), reduced_bound(p)),
         FIRST => (reduced_bound(p), b),
+        FIRST13 => (round13_bound(p, b), b),
         _ => (b, b),
     }
 }

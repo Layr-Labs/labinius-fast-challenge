@@ -11,7 +11,7 @@
 //! [`super::Schedule`] says. The last level's outputs are multiplied straight into the batch's
 //! `i32` slot sums with `smlsl` by the matrix slot (subtracting the product with `-s` adds the
 //! product with `s`); the sums are reduced every [`super::Schedule::accumulate`] elements.
-use super::{for_blocks, primes, schedule, Matrix, Schedule, ALL, FIRST, N, PRIMES, ROW, SCHEDULES};
+use super::{for_blocks, primes, schedule, Matrix, Schedule, ALL, FIRST, FIRST13, N, PRIMES, ROW, SCHEDULES};
 use core::arch::aarch64::*;
 use labinius::fields::scalar::B128;
 use std::sync::OnceLock;
@@ -156,6 +156,10 @@ unsafe fn reduce_inputs<const L: usize>(
     } else if mode == FIRST {
         for &i in first {
             v[i] = reduce(v[i], k);
+        }
+    } else if mode == FIRST13 {
+        for &i in first {
+            v[i] = vmlsq_laneq_s16::<0>(v[i], vrshrq_n_s16::<13>(v[i]), k);
         }
     }
 }

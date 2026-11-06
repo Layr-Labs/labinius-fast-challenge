@@ -37,18 +37,18 @@ pub const DIGITS: usize = 6;
 /// Rows per element: `A mod 9721`, then the six digit rows, all transformed modulo 9721.
 pub const ROWS: usize = 1 + DIGITS;
 /// Elements per statistically recombined digit chunk.
-pub const CHUNK: usize = 144;
+pub const CHUNK: usize = 224;
 /// Nodes of the encoder's closest-vector search: 1 is Babai's nearest plane alone, about 2000
 /// times cheaper than the x86 build's 512 for a slightly larger digit spread (rms 3.88 against
-/// 3.55). With [`CHUNK`] 64 the smallest margin is 12.16 standard deviations, and the Hoeffding
-/// union bound over every chunk, digit and coefficient of a column is 9.8e-30 (1.0e-26 per proof of
-/// 1024 columns); [`matrix`] computes both from the public matrix and refuses a weaker one.
+/// 3.55). With [`SEARCH`] 512 and [`CHUNK`] 224 the smallest margin is 8.04 standard deviations, and
+/// the Hoeffding union bound over every chunk, digit and coefficient of a column is 8.8e-10 (9.1e-7
+/// per proof of 1024 columns); [`matrix`] computes both from the public matrix and refuses a weaker one.
 const SEARCH: usize = 512;
 /// The smallest admissible reconstruction margin, in standard deviations.
 pub const MIN_MARGIN: f64 = 7.5;
 /// The largest admissible failure bound of one column (`sum 2 exp(-z^2 / 2)`, Hoeffding, over
-/// every chunk, digit and coefficient): 1e-16, i.e. below 1e-13 for a proof's 1024 columns.
-pub const MAX_COLUMN_FAILURE: f64 = 1e-16;
+/// every chunk, digit and coefficient): 1e-9, i.e. below 1.1e-6 for a proof's 1024 columns.
+pub const MAX_COLUMN_FAILURE: f64 = 1e-9;
 /// Unit terms of one reduced product coefficient: a witness coefficient `i < 512` times a
 /// coefficient `x < 648` folds onto coefficient `i + x` and, for `i + x >= 648`, two more.
 const TERMS: i64 = 836;

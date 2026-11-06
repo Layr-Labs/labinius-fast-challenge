@@ -181,11 +181,9 @@ impl<'a> Switch<'a> {
             let (l2, h2) = p2.split_at_mut(half);
             let chunks = par::split_mut(l0, &edges).into_iter()
                 .zip(par::split_mut(l1, &edges)).zip(par::split_mut(l2, &edges));
-            std::thread::scope(|scope| {
-                for (((a, b), c), &(start, end)) in chunks.zip(&edges) {
-                    let hi = [&h0[start..end], &h1[start..end], &h2[start..end]];
-                    scope.spawn(move || unsafe { neon::fold_share([a, b, c], hi, r) });
-                }
+            par::for_each(chunks.zip(&edges), |(((a, b), c), &(start, end))| {
+                let hi = [&h0[start..end], &h1[start..end], &h2[start..end]];
+                unsafe { neon::fold_share([a, b, c], hi, r) };
             });
         }
         self.round += 1;
@@ -202,10 +200,8 @@ impl<'a> Switch<'a> {
         let chunks = par::split_mut(p0, &edges).into_iter()
             .zip(par::split_mut(p1, &edges)).zip(par::split_mut(p2, &edges));
         let weights = &weights;
-        std::thread::scope(|scope| {
-            for (((a, b), c), &(start, _)) in chunks.zip(&edges) {
-                scope.spawn(move || unsafe { neon::materialize_prefix(words, weights, start, [a, b, c]) });
-            }
+        par::for_each(chunks.zip(&edges), |(((a, b), c), &(start, _))| {
+            unsafe { neon::materialize_prefix(words, weights, start, [a, b, c]) };
         });
     }
 
@@ -231,7 +227,7 @@ mod tests {
         };
         // The smallest shape the fast path accepts, and larger ones.
         assert!(PREFIX + 3 < 10);
-        for log in [PREFIX + 3, 10, 14] {
+        for log in [PREFIX + 3, 10, 14, PREFIX + 15] {
             let words: Vec<_> = (0..1 << log).map(|_| B128(next())).collect();
             let r: Vec<_> = (0..log).map(|_| B128(next())).collect();
             let batch = eq_expand_f162(&(0..7).map(|_| F162::from_b128(B128(next()))).collect::<Vec<_>>());

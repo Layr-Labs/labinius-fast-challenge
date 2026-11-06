@@ -5,6 +5,7 @@
 //! GF(2)) combine their per-worker partial sums afterwards, so the result does not depend on the
 //! worker count.
 
+use rayon::prelude::*;
 use std::sync::OnceLock;
 
 /// Worker threads: `LABINIUS_THREADS` when it holds a positive integer, otherwise the available
@@ -19,6 +20,27 @@ pub fn threads() -> usize {
             .filter(|&n| n > 0)
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
     })
+}
+
+fn pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads())
+            .build()
+            .expect("create prover workers")
+    })
+}
+
+/// Process borrowed, disjoint work items and wait for every item before returning.
+pub fn for_each<T: Send>(items: impl IntoIterator<Item = T>, f: impl Fn(T) + Sync) {
+    let items: Vec<T> = items.into_iter().collect();
+    if items.len() <= 1 {
+        items.into_iter().for_each(f);
+    } else {
+        let f = &f;
+        pool().install(move || items.into_par_iter().for_each(f));
+    }
 }
 
 /// `[start, end)` of block `t` of `parts` over `n` items, block edges on multiples of `align`.
@@ -52,8 +74,7 @@ pub fn workers(n: usize, min: usize) -> usize {
     (n / min.max(1)).clamp(1, threads())
 }
 
-/// Runs `f(t, start, end)` for every block of [`block`] on its own scoped thread (the calling
-/// thread takes the last block) and returns the per-block results in block order.
+/// Run each block on reusable workers and collect results in block order.
 pub fn map_blocks<R: Send>(
     n: usize,
     parts: usize,
@@ -64,27 +85,75 @@ pub fn map_blocks<R: Send>(
         return vec![f(0, 0, n)];
     }
     let f = &f;
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..parts - 1)
+    pool().install(|| {
+        (0..parts)
+            .into_par_iter()
             .map(|t| {
                 let (s, e) = block(n, parts, t, align);
-                scope.spawn(move || f(t, s, e))
+                f(t, s, e)
             })
-            .collect();
-        let (s, e) = block(n, parts, parts - 1, align);
-        let last = f(parts - 1, s, e);
-        let mut out: Vec<R> = handles
-            .into_iter()
-            .map(|h| h.join().expect("worker panicked"))
-            .collect();
-        out.push(last);
-        out
+            .collect()
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_passes_preserve_results_and_borrowed_outputs() {
+        let mut values = vec![0usize; 1003];
+        for round in 1..=20 {
+            for_each(values.chunks_mut(64).enumerate(), |(i, chunk)| {
+                for (j, value) in chunk.iter_mut().enumerate() {
+                    *value += round * (64 * i + j);
+                }
+            });
+            let results = map_blocks(values.len(), 9, 64, |t, start, end| {
+                (t, values[start..end].iter().sum::<usize>())
+            });
+            let expected: Vec<_> = (0..9)
+                .map(|t| {
+                    let (start, end) = block(values.len(), 9, t, 64);
+                    (t, (start..end).sum::<usize>() * round * (round + 1) / 2)
+                })
+                .collect();
+            assert_eq!(results, expected);
+        }
+    }
+
+    #[test]
+    fn nested_and_concurrent_dispatches_complete() {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..3)
+                .map(|caller| {
+                    scope.spawn(move || {
+                        map_blocks(16, 4, 1, |t, _, _| {
+                            map_blocks(8, 4, 1, |u, _, _| caller + t + u)
+                        })
+                    })
+                })
+                .collect();
+            for (caller, handle) in handles.into_iter().enumerate() {
+                let expected: Vec<Vec<_>> = (0..4)
+                    .map(|t| (0..4).map(|u| caller + t + u).collect())
+                    .collect();
+                assert_eq!(handle.join().unwrap(), expected);
+            }
+        });
+    }
+
+    #[test]
+    fn worker_panic_propagates_and_pool_remains_usable() {
+        let result = std::panic::catch_unwind(|| {
+            map_blocks(8, 4, 1, |t, _, _| {
+                assert_ne!(t, 2, "test worker panic");
+                t
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(map_blocks(8, 4, 1, |t, _, _| t), vec![0, 1, 2, 3]);
+    }
 
     #[test]
     fn blocks_tile_the_range() {

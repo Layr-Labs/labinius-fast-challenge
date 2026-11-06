@@ -57,14 +57,16 @@ const TERMS: i64 = 836;
 // every chunk digit sum and its mean fit in i32 with room: |S| <= CHUNK * TERMS * 32
 const _: () = assert!((CHUNK as i64) * TERMS * (lattice::MAX_DIGIT_ABS as i64) * 4 < i32::MAX as i64);
 
-/// The SMS matrix: in the transform domain, slot `j` of row `r` of element `m` is
-/// `data[(((m / 8) N + j) ROWS + r) 8 + m % 8]`, centered residues, so that one vector holds the
-/// eight elements of a tile, each residue negated because the forward kernel transforms `-s`; per
-/// chunk and digit the centered residue
-/// of the mean modulo 9721; and the weighted sum of all means modulo `M`.
+/// The SMS matrix: in the transform domain, the keys `k` of slot `j` of the eight elements of tile
+/// `t` (elements `8 t..8 t + 8`) are the [`SLOT`] bytes `data[(t N + j) SLOT..]` ([`put_key`]),
+/// centered residues, each negated because the forward kernel transforms `-s`; per chunk and
+/// digit the centered residue of the mean modulo 9721; and the weighted sum of all means modulo `M`.
 pub struct SmsMatrix {
     pub elements: usize,
-    pub data: std::borrow::Cow<'static, [i16]>,
+    pub data: std::borrow::Cow<'static, [u8]>,
+    /// The keys as `i16`, slot `j` of row `r` of element `m` at `[(((m / 8) N + j) ROWS + r) 8 +
+    /// m % 8]`, for the `sdot` tiles: built from `data` when they first run.
+    legacy: std::sync::OnceLock<Vec<i16>>,
     /// `mean_residues[(c DIGITS + d) N + coefficient]`.
     pub mean_residues: std::borrow::Cow<'static, [i16]>,
     /// `sum_{d, c} W_d mean_{d,c} mod M`, by coefficient.
@@ -138,7 +140,7 @@ impl SmsMatrix {
     pub fn from_images(data: &'static [u8], means: &'static [u8], mu: &'static [u8], meta: &'static [u8], elements: usize) -> Option<SmsMatrix> {
         let chunks = elements.div_ceil(CHUNK);
         let data = key_copy(data).unwrap_or(data);
-        let data = view::<i16>(data, ROWS * elements.div_ceil(LOCK) * LOCK * N)?;
+        let data = view::<u8>(data, elements.div_ceil(LOCK) * N * SLOT)?;
         let mean_residues = view::<i16>(means, chunks * DIGITS * N)?;
         let mu = view::<u32>(mu, N)?;
         if meta.len() != 16 {
@@ -150,7 +152,15 @@ impl SmsMatrix {
             return None;
         }
         use std::borrow::Cow::Borrowed;
-        Some(SmsMatrix { elements, data: Borrowed(data), mean_residues: Borrowed(mean_residues), mu: Borrowed(mu), margin, column_failure })
+        Some(SmsMatrix {
+            elements,
+            data: Borrowed(data),
+            legacy: Default::default(),
+            mean_residues: Borrowed(mean_residues),
+            mu: Borrowed(mu),
+            margin,
+            column_failure,
+        })
     }
 
     /// The four images [`SmsMatrix::from_images`] reads.
@@ -158,7 +168,7 @@ impl SmsMatrix {
         let mut meta = self.margin.to_le_bytes().to_vec();
         meta.extend_from_slice(&self.column_failure.to_le_bytes());
         [
-            self.data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            self.data.to_vec(),
             self.mean_residues.iter().flat_map(|v| v.to_le_bytes()).collect(),
             self.mu.iter().flat_map(|v| v.to_le_bytes()).collect(),
             meta,
@@ -168,6 +178,84 @@ impl SmsMatrix {
     #[inline]
     fn mean_residues(&self, c: usize, d: usize) -> &[i16] {
         &self.mean_residues[(c * DIGITS + d) * N..][..N]
+    }
+
+    /// The keys in the `i16` layout of [`tile`] (see `legacy`), decoded from `data` once.
+    pub fn legacy(&self) -> &[i16] {
+        self.legacy.get_or_init(|| {
+            let mut out = vec![0i16; self.data.len() / SLOT * ROWS * LOCK];
+            for_blocks(&mut out, N * ROWS * LOCK, 1, 8, |first, block| {
+                for (t, keys) in block.chunks_exact_mut(N * ROWS * LOCK).enumerate() {
+                    for j in 0..N {
+                        let slot = &self.data[((first + t) * N + j) * SLOT..][..SLOT];
+                        for r in 0..ROWS {
+                            for e in 0..LOCK {
+                                keys[(j * ROWS + r) * LOCK + e] = get_key(slot, r, e);
+                            }
+                        }
+                    }
+                }
+            });
+            out
+        })
+    }
+}
+
+/// Bytes of one slot of the keys of a tile's eight elements: the base row as eight `i16`, then
+/// per digit-row pair `(1 + 2 q, 2 + 2 q)` its two byte planes, the low bytes `klo` of both rows
+/// (row `1 + 2 q` in bytes `0..8`, by element) and then the high bytes `khi`, at
+/// `2 LOCK + 4 LOCK q` and `+ 2 LOCK`: each plane is the 2 x 8 right operand of an `smmla`.
+/// The same 112 bytes as seven `i16` vectors.
+pub const SLOT: usize = 2 * LOCK + DIGITS * 2 * LOCK;
+const _: () = assert!(SLOT == ROWS * LOCK * 2 && DIGITS % 2 == 0);
+// every key vector of a 16-aligned image is 16-aligned ([`mm::tiles`] reads them as `int8x16_t`)
+const _: () = assert!(SLOT % 16 == 0 && (N * SLOT) % 16 == 0);
+
+/// `k = 2^8 khi + klo` with `klo` the low byte of `k` as a signed byte: for `|k| <= 4860` (a
+/// centered key), `|khi| <= KHI`.
+const fn split_key(k: i16) -> (i8, i8) {
+    let lo = k as i8;
+    (lo, ((k - lo as i16) >> 8) as i8)
+}
+/// The largest `|khi|` of a centered key.
+const KHI: i32 = ((P1 as i32 - 1) / 2 + 128) >> 8;
+const _: () = {
+    assert!(KHI == 19);
+    let h = (P1 as i16 - 1) / 2;
+    let (mut k, mut worst) = (-h, 0);
+    while k <= h {
+        let (lo, hi) = split_key(k);
+        assert!(hi as i16 * 256 + lo as i16 == k);
+        let a = (hi as i32).abs();
+        if a > worst {
+            worst = a;
+        }
+        k += 1;
+    }
+    assert!(worst == KHI);
+};
+
+/// Writes key `k` of row `r`, lane (element) `e` into a [`SLOT`].
+fn put_key(slot: &mut [u8], r: usize, e: usize, k: i16) {
+    assert!(k.unsigned_abs() <= (P1 as u16 - 1) / 2 && e < LOCK && r < ROWS);
+    if r == 0 {
+        slot[2 * e..2 * e + 2].copy_from_slice(&k.to_le_bytes());
+    } else {
+        let (q, i) = ((r - 1) / 2, (r - 1) % 2);
+        let (lo, hi) = split_key(k);
+        let at = 2 * LOCK + 4 * LOCK * q + LOCK * i + e;
+        slot[at] = lo as u8;
+        slot[at + 2 * LOCK] = hi as u8;
+    }
+}
+
+/// Key `r`, `e` of a [`SLOT`], as [`put_key`] wrote it.
+fn get_key(slot: &[u8], r: usize, e: usize) -> i16 {
+    if r == 0 {
+        i16::from_le_bytes([slot[2 * e], slot[2 * e + 1]])
+    } else {
+        let at = 2 * LOCK + 4 * LOCK * ((r - 1) / 2) + LOCK * ((r - 1) % 2) + e;
+        (slot[at + 2 * LOCK] as i8 as i16) * 256 + slot[at] as i8 as i16
     }
 }
 
@@ -282,13 +370,13 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
     assert!(margin >= MIN_MARGIN, "SMS reconstruction margin {margin} below {MIN_MARGIN}");
     assert!(column_failure <= MAX_COLUMN_FAILURE, "SMS column failure bound {column_failure:e} above {MAX_COLUMN_FAILURE:e}");
     let mu = mu.into_iter().map(|v| v.rem_euclid(TAIL as i64) as u32).collect();
-    // the transformed rows, eight elements per vector
-    let mut data = vec![0i16; elements.div_ceil(LOCK) * N * ROWS * LOCK];
+    // the transformed rows, eight elements per slot ([`SLOT`]); missing elements' keys are zero
+    let mut data = vec![0u8; elements.div_ceil(LOCK) * N * SLOT];
     let raw = &raw;
-    for_blocks(&mut data, N * ROWS * LOCK, 1, workers, |first, block| {
+    for_blocks(&mut data, N * SLOT, 1, workers, |first, block| {
         let mut lanes = vec![[0i16; 8]; N];
         let lanes: &mut [[i16; 8]; N] = (&mut lanes[..]).try_into().unwrap();
-        for (g, batch) in block.chunks_exact_mut(N * ROWS * LOCK).enumerate() {
+        for (g, batch) in block.chunks_exact_mut(N * SLOT).enumerate() {
             let base = (first + g) * LOCK;
             let here = (elements - base).min(LOCK);
             for r in 0..ROWS {
@@ -300,14 +388,22 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
                 super::transform_general(PB, lanes);
                 for (j, l) in lanes.iter().enumerate() {
                     for e in 0..here {
-                        batch[(j * ROWS + r) * LOCK + e] = -centered(l[e] as i64, p);
+                        put_key(&mut batch[j * SLOT..][..SLOT], r, e, -centered(l[e] as i64, p));
                     }
                 }
             }
         }
     });
     use std::borrow::Cow::Owned;
-    SmsMatrix { elements, data: Owned(data), mean_residues: Owned(mean_residues), mu: Owned(mu), margin, column_failure }
+    SmsMatrix {
+        elements,
+        data: Owned(data),
+        legacy: Default::default(),
+        mean_residues: Owned(mean_residues),
+        mu: Owned(mu),
+        margin,
+        column_failure,
+    }
 }
 
 /// Elements per vector of the key image, and of a tile of the slot-wise products.
@@ -508,6 +604,198 @@ unsafe fn sink(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x
     }
 }
 
+/// The digit-row products as Armv8.6 int8 matrix multiplies (I8MM), the base row with SVE `sdot`.
+///
+/// The transforms are in column order ([`column_words`]): transform `8 h + c` holds column `c` of
+/// the tile's eight elements `8 h..8 h + 8`, one per lane. A transform value `y` (any `i16`) is
+/// `2^8 yhi + ylo`, `ylo` its low byte unsigned and `yhi` its high byte signed, which `uzp1` and
+/// `uzp2` of two columns' vectors give as the 2 x 8 left operands of `usmmla` / `smmla` (row =
+/// column, by element). A key is `2^8 khi + klo` ([`split_key`]), stored as byte planes. So per
+/// two columns, two digit rows and eight elements
+/// `y k = ylo klo + 2^8 (ylo khi + yhi klo) + 2^16 yhi khi`
+/// is four instructions into three `i32` accumulators `A`, `C`, `H` (lanes: column 0 row 0,
+/// column 0 row 1, column 1 row 0, column 1 row 1), recombined in `i64` at the chunk's end
+/// ([`narrow_digit`]): 32 byte products an instruction on all four vector pipes of a Neoverse
+/// V2, against `sdot`'s eight halfword products on two. The base row stays on `sdot` (its sum
+/// runs over every element), plain (not indexed): one `i64` accumulator per column, whose two
+/// lanes are the sums over the elements `0..4` and `4..8` of every tile, added at the end.
+pub mod mm {
+    use super::*;
+
+    /// Accumulator vectors per slot: the base row's eight (`i64`), then per column pair `p` and
+    /// digit-row pair `q` the tile `A, C, H` (`i32`) at `8 + 3 (3 p + q)`.
+    pub const ACC: usize = LANES + 3 * (LANES / 2) * (DIGITS / 2);
+    const _: () = assert!(LANES == LOCK && LANES == 8);
+
+    // Per chunk, an accumulator lane sums CHUNK elements' byte products, `0 <= ylo <= 255`,
+    // `-128 <= yhi <= 127`, `|klo| <= 128`, `|khi| <= KHI`: all within `i32`.
+    /// Bounds of `|A|`, `|C|`, `|H|` over a chunk.
+    pub const BOUND_A: i64 = CHUNK as i64 * 255 * 128;
+    pub const BOUND_C: i64 = CHUNK as i64 * (255 * KHI as i64 + 128 * 128);
+    pub const BOUND_H: i64 = CHUNK as i64 * 128 * KHI as i64;
+    const _: () = assert!(BOUND_A <= i32::MAX as i64 && BOUND_C <= i32::MAX as i64 && BOUND_H <= i32::MAX as i64);
+    // ... and their recombination is the chunk's exact digit sum, below the 2^41 of `narrow_sum`
+    const _: () = assert!(BOUND_A + 256 * BOUND_C + 65536 * BOUND_H < 1 << 41);
+    const _: () = assert!(CHUNK as i64 * 32768 * ((P1 as i64 - 1) / 2) < 1 << 41);
+
+    /// I8MM and SVE present, and `LABINIUS_NO_I8MM` unset (which selects the `sdot` tiles).
+    pub fn available() -> bool {
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| {
+            std::env::var_os("LABINIUS_NO_I8MM").is_none()
+                && std::arch::is_aarch64_feature_detected!("i8mm")
+                && std::arch::is_aarch64_feature_detected!("sve")
+        })
+    }
+
+    /// Sets assembler symbol `$sym` to the register number of vector operand `$op`.
+    macro_rules! regnum {
+        ($op:literal, $sym:literal) => {
+            concat!(
+                ".irp n,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31\n",
+                ".ifc {", $op, ":v},v\\n\n.set ", $sym, ",\\n\n.endif\n.endr\n"
+            )
+        };
+    }
+
+    /// `acc.d[i] += sum_{k < 4} a.h[4 i + k] b.h[4 i + k]`: SVE `sdot z.d, z.h, z.h`, encoded by
+    /// hand (Rust's `asm!` cannot name a `z` register for an allocated operand). With 128-bit or
+    /// longer vectors the `v` operands are the low lanes of the `z` registers, the rest zero.
+    #[inline(always)]
+    unsafe fn sdot(acc: int64x2_t, a: int16x8_t, b: int16x8_t) -> int64x2_t {
+        let mut acc = acc;
+        core::arch::asm!(
+            regnum!("acc", "lab_sdot_d"), regnum!("a", "lab_sdot_n"), regnum!("b", "lab_sdot_m"),
+            ".inst 0x44c00000 | (lab_sdot_m << 16) | (lab_sdot_n << 5) | lab_sdot_d",
+            acc = inout(vreg) acc, a = in(vreg) a, b = in(vreg) b,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        acc
+    }
+
+    /// One tile of two columns (rows of `ylo`, `yhi`) and two digit rows (rows of `klo`, `khi`)
+    /// over eight elements into `A`, `C`, `H`, the cross terms of `C` in two halves `c`, `c2`
+    /// (two dependency chains, added at the sweep's end).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn mmla(a: &mut int32x4_t, c: &mut int32x4_t, c2: &mut int32x4_t, h: &mut int32x4_t, ylo: uint8x16_t, yhi: int8x16_t, klo: int8x16_t, khi: int8x16_t) {
+        core::arch::asm!(
+            "usmmla {a:v}.4s, {ylo:v}.16b, {klo:v}.16b",
+            "usmmla {c:v}.4s, {ylo:v}.16b, {khi:v}.16b",
+            "smmla {c2:v}.4s, {yhi:v}.16b, {klo:v}.16b",
+            "smmla {h:v}.4s, {yhi:v}.16b, {khi:v}.16b",
+            a = inout(vreg) *a, c = inout(vreg) *c, c2 = inout(vreg) *c2, h = inout(vreg) *h,
+            ylo = in(vreg) ylo, yhi = in(vreg) yhi, klo = in(vreg) klo, khi = in(vreg) khi,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+    }
+
+    /// The sums of the first `8 T` transforms of `xs` (`T` tiles, column order) with the keys of
+    /// the `T` consecutive tiles at `keys`, every slot and row. Per slot and column pair the pair's
+    /// eleven sums (two base, nine digit) stay in registers across the `T` tiles: each sum read
+    /// and written once per sweep; the tile's keys come again from L1 for each pair.
+    #[target_feature(enable = "i8mm")]
+    #[inline(never)]
+    pub unsafe fn tiles<const T: usize>(xs: &[[int16x8_t; N]; SWEEP], keys: *const u8, acc: &mut [int64x2_t]) {
+        const { assert!(T >= 1 && T <= SINK) };
+        debug_assert!(acc.len() == ACC * N && keys as usize % 16 == 0);
+        let accp = acc.as_mut_ptr();
+        for s in 0..N {
+            let k0 = keys.add(s * SLOT);
+            let at = accp.add(ACC * s);
+            for p in 0..LANES / 2 {
+                let (mut b0, mut b1) = (*at.add(2 * p), *at.add(2 * p + 1));
+                let d = at.add(LANES + 3 * (DIGITS / 2) * p) as *mut int32x4_t;
+                let mut v: [int32x4_t; 3 * (DIGITS / 2)] = core::array::from_fn(|i| *d.add(i));
+                let mut c2 = [vdupq_n_s32(0); DIGITS / 2];
+                for t in 0..T {
+                    let y0 = *xs.get_unchecked(LANES * t + 2 * p).get_unchecked(s);
+                    let y1 = *xs.get_unchecked(LANES * t + 2 * p + 1).get_unchecked(s);
+                    // the keys again for every pair, from L1 (volatile: not hoisted into spills)
+                    let key = |off: usize| core::ptr::read_volatile(k0.add(t * N * SLOT + off) as *const int8x16_t);
+                    let base = vreinterpretq_s16_s8(key(0));
+                    b0 = sdot(b0, y0, base);
+                    b1 = sdot(b1, y1, base);
+                    let ylo = vuzp1q_u8(vreinterpretq_u8_s16(y0), vreinterpretq_u8_s16(y1));
+                    let yhi = vuzp2q_s8(vreinterpretq_s8_s16(y0), vreinterpretq_s8_s16(y1));
+                    for q in 0..DIGITS / 2 {
+                        let (klo, khi) = (key(2 * LOCK + 4 * LOCK * q), key(4 * LOCK + 4 * LOCK * q));
+                        let (a, rest) = v[3 * q..].split_at_mut(1);
+                        let (c, h) = rest.split_at_mut(1);
+                        mmla(&mut a[0], &mut c[0], &mut c2[q], &mut h[0], ylo, yhi, klo, khi);
+                    }
+                }
+                for q in 0..DIGITS / 2 {
+                    v[3 * q + 1] = vaddq_s32(v[3 * q + 1], c2[q]);
+                }
+                (*at.add(2 * p), *at.add(2 * p + 1)) = (b0, b1);
+                for (i, x) in v.iter().enumerate() {
+                    *d.add(i) = *x;
+                }
+            }
+        }
+    }
+
+    /// [`super::sink`] with these tiles: the first `groups` tiles of `xs` (column order) with
+    /// the key tiles at `keys`. `1 <= groups <= SINK`.
+    pub unsafe fn sink(xs: &[[int16x8_t; N]; SWEEP], keys: *const u8, acc: &mut [int64x2_t], groups: usize) {
+        const _: () = assert!(SINK == 4);
+        match groups {
+            1 => tiles::<1>(xs, keys, acc),
+            2 => tiles::<2>(xs, keys, acc),
+            3 => tiles::<3>(xs, keys, acc),
+            4 => tiles::<4>(xs, keys, acc),
+            _ => unreachable!("1 to {SINK} tiles a sweep"),
+        }
+    }
+
+    /// Clears the digit rows' sums (a chunk's end).
+    pub fn clear_digits(acc: &mut [int64x2_t]) {
+        for s in acc.chunks_exact_mut(ACC) {
+            // SAFETY: zero vectors.
+            s[LANES..].fill(unsafe { vdupq_n_s64(0) });
+        }
+    }
+
+    /// Digit row `d`'s chunk sums `A + 2^8 C + 2^16 H` as residues, one `i16` vector per slot,
+    /// lane = column: the same `i64` sums, and so the same residues, as [`narrow`] of the `sdot`
+    /// tiles' row `1 + d`.
+    pub unsafe fn narrow_digit(acc: &[int64x2_t], d: usize, out: &mut [int16x8_t; N]) {
+        let (q, i) = (d / 2, d % 2);
+        for (s, o) in out.iter_mut().enumerate() {
+            let sum = |p: usize| -> int64x2_t {
+                let v = acc.as_ptr().add(ACC * s + LANES + 3 * (3 * p + q)) as *const int32x4_t;
+                // lanes 0, 2 (row 0) or 1, 3 (row 1): columns 2 p, 2 p + 1
+                let pick = |x: int32x4_t| vmovl_s32(vget_low_s32(if i == 0 { vuzp1q_s32(x, x) } else { vuzp2q_s32(x, x) }));
+                vaddq_s64(pick(*v), vaddq_s64(vshlq_n_s64::<8>(pick(*v.add(1))), vshlq_n_s64::<16>(pick(*v.add(2)))))
+            };
+            let lo = vcombine_s32(narrow_sum(sum(0)), narrow_sum(sum(1)));
+            let hi = vcombine_s32(narrow_sum(sum(2)), narrow_sum(sum(3)));
+            *o = vcombine_s16(vmovn_s32(lo), vmovn_s32(hi));
+        }
+    }
+
+    /// The base row's sums as residues, as [`narrow`] of the `sdot` tiles' row 0.
+    pub unsafe fn narrow_base(acc: &[int64x2_t], out: &mut [int16x8_t; N]) {
+        for (s, o) in out.iter_mut().enumerate() {
+            let b = &acc[ACC * s..][..LANES];
+            let lo = vcombine_s32(narrow_sum(vpaddq_s64(b[0], b[1])), narrow_sum(vpaddq_s64(b[2], b[3])));
+            let hi = vcombine_s32(narrow_sum(vpaddq_s64(b[4], b[5])), narrow_sum(vpaddq_s64(b[6], b[7])));
+            *o = vcombine_s16(vmovn_s32(lo), vmovn_s32(hi));
+        }
+    }
+}
+
+/// The eight witness pointers of transform `t` of a pass starting at element `e`, in the column
+/// order of [`mm`]: lane `k` of transform `8 h + c` is column `c` of element `e + 8 h + k`.
+/// Elements past the column read as zero.
+#[inline(always)]
+unsafe fn column_words(words: &[(*const u8, usize); LANES], elements: usize, e: usize, t: usize) -> [*const u8; LANES] {
+    let (w, stride) = words[t % LANES];
+    let first = e + LOCK * (t / LANES);
+    core::array::from_fn(|k| if first + k < elements { w.add((first + k) * stride) } else { ZERO_WORDS.as_ptr() as *const u8 })
+}
+
 /// The eight witness pointers of transform `t` of a pass starting at element `e`, in dot-product
 /// lane order: lane `4 l + k` of transform `4 h + q` is column `2 q + l` of element `e + 4 h + k`.
 /// Each lane is an independent transform, so a 64-bit lane then holds one column's four elements
@@ -555,10 +843,52 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
     vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
 }
 
+/// The tiles of the slot-wise products.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tiles {
+    /// [`mm`]: I8MM digit rows, the transforms in column order.
+    Mmla,
+    /// [`sink`]: `sdot` on every row, the transforms in dot-product lane order.
+    Dot,
+}
+
+impl Tiles {
+    /// [`Tiles::Mmla`] where the CPU has I8MM ([`mm::available`]), else [`Tiles::Dot`].
+    pub fn best() -> Tiles {
+        if mm::available() { Tiles::Mmla } else { Tiles::Dot }
+    }
+
+    /// [`Tiles::best`] for the keys of `a`: [`Tiles::Mmla`] needs them 16-aligned (the embedded
+    /// image and its copy are; a built matrix is in practice), else [`Tiles::Dot`].
+    pub fn best_for(a: &SmsMatrix) -> Tiles {
+        if a.data.as_ptr() as usize % 16 == 0 { Tiles::best() } else { Tiles::Dot }
+    }
+
+    /// Every variant this CPU runs.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn all() -> Vec<Tiles> {
+        let mut v = vec![Tiles::Dot];
+        if mm::available() {
+            v.push(Tiles::Mmla);
+        }
+        v
+    }
+
+    /// Accumulator vectors per batch.
+    fn acc_len(self) -> usize {
+        match self {
+            Tiles::Mmla => mm::ACC * N,
+            Tiles::Dot => ROWS * 4 * N,
+        }
+    }
+}
+
 /// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
-/// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients.
+/// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients. `MM`: the
+/// [`mm`] tiles, else the `sdot` ones; the same sums either way.
 #[inline(never)]
-unsafe fn sums(
+#[allow(clippy::too_many_arguments)]
+unsafe fn sums<const MM: bool>(
     words: &[(*const u8, usize); LANES],
     a: &SmsMatrix,
     m: &mut [int16x8_t; BITS],
@@ -569,6 +899,7 @@ unsafe fn sums(
     mut chunk: impl FnMut(usize, usize, &mut [int16x8_t; N]),
 ) {
     let kern = &kernels()[PB];
+    let legacy = if MM { &[][..] } else { a.legacy() };
     acc.fill(vdupq_n_s64(0));
     let mut e = 0usize;
     while e < a.elements {
@@ -580,30 +911,45 @@ unsafe fn sums(
             let l = SWEEP.min(end - e);
             let groups = l.div_ceil(LOCK);
             for i in 0..groups * LOCK {
-                let at = pass_words(words, a.elements, e, i);
+                let at = if MM { column_words(words, a.elements, e, i) } else { pass_words(words, a.elements, e, i) };
                 indices(&at, nib);
                 let x = &mut xs[i];
                 pass_lut::<PB>(nib, x, kern);
                 pass_c::<PB>(x, kern);
                 pass_d::<PB, false>(x, kern, &[], &mut []);
             }
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-            sink(xs, keys, acc, groups);
+            if MM {
+                mm::sink(xs, a.data.as_ptr().add(e / LOCK * N * SLOT), acc, groups);
+            } else {
+                sink(xs, legacy.as_ptr().add(e / LOCK * N * ROWS * LOCK), acc, groups);
+            }
             e += l;
         }
         for d in 0..DIGITS {
-            narrow(acc, 1 + d, y);
+            if MM {
+                mm::narrow_digit(acc, d, y);
+            } else {
+                narrow(acc, 1 + d, y);
+            }
             super::inverse::<PB>(y);
             chunk((end - 1) / CHUNK, d, y);
         }
-        for s in 0..N {
-            for d in 0..DIGITS {
-                let at = idx(s, 1 + d);
-                acc[at..at + 4].fill(vdupq_n_s64(0));
+        if MM {
+            mm::clear_digits(acc);
+        } else {
+            for s in 0..N {
+                for d in 0..DIGITS {
+                    let at = idx(s, 1 + d);
+                    acc[at..at + 4].fill(vdupq_n_s64(0));
+                }
             }
         }
     }
-    narrow(acc, 0, y);
+    if MM {
+        mm::narrow_base(acc, y);
+    } else {
+        narrow(acc, 0, y);
+    }
     super::inverse::<PB>(y);
 }
 
@@ -630,8 +976,19 @@ fn crt(r: u32, t: u32) -> u128 {
 /// The commitment of every column of `values` (columns of `4 a.elements` words) modulo
 /// [`MODULUS`].
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
+    commit_with(values, a, workers, Tiles::best_for(a))
+}
+
+/// [`commit`] with the given tiles (the same commitment with any).
+pub fn commit_with(values: &[B128], a: &SmsMatrix, workers: usize, tiles: Tiles) -> Vec<u128> {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
+    assert!(tiles == Tiles::Dot || mm::available(), "no I8MM here");
+    assert!(tiles == Tiles::Dot || a.data.as_ptr() as usize % 16 == 0, "the I8MM tiles read 16-aligned keys");
+    if tiles == Tiles::Dot {
+        // decoded once, before the workers start
+        a.legacy();
+    }
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
@@ -639,7 +996,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
         let mut nib = Box::new([vdupq_n_u8(0); N / 4]);
         let mut xs = Box::new([[vdupq_n_s16(0); N]; SWEEP]);
         let mut y = Box::new([vdupq_n_s16(0); N]);
-        let mut acc = vec![vdupq_n_s64(0); ROWS * 4 * N];
+        let mut acc = vec![vdupq_n_s64(0); tiles.acc_len()];
         // per digit, the chunk deviations S - mean summed over the chunks
         let mut dev = vec![vdupq_n_s32(0); DIGITS * 2 * N];
         // the eight columns' tails, `i64` per lane (41 KiB, off the stack)
@@ -657,7 +1014,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             });
             dev.fill(vdupq_n_s32(0));
-            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, |c, d, r| {
+            let deviations = |c: usize, d: usize, r: &mut [int16x8_t; N]| {
                 let mr = a.mean_residues(c, d);
                 let dv = &mut dev[d * 2 * N..][..2 * N];
                 for s in 0..N {
@@ -665,7 +1022,11 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     dv[2 * s] = vaddw_s16(dv[2 * s], vget_low_s16(v));
                     dv[2 * s + 1] = vaddw_high_s16(dv[2 * s + 1], v);
                 }
-            });
+            };
+            match tiles {
+                Tiles::Mmla => sums::<true>(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, deviations),
+                Tiles::Dot => sums::<false>(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, deviations),
+            }
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
             let pv = vdupq_n_s16(p);
@@ -736,6 +1097,179 @@ mod tests {
         }
     }
 
+    /// Every centered key of every row and lane survives the byte-plane encoding.
+    #[test]
+    fn keys_round_trip() {
+        let h = (P1 as i16 - 1) / 2;
+        let mut slot = [0u8; SLOT];
+        for k in -h..=h {
+            for r in 0..ROWS {
+                for e in 0..LOCK {
+                    put_key(&mut slot, r, e, k);
+                    assert_eq!(get_key(&slot, r, e), k, "row {r} lane {e}");
+                }
+            }
+        }
+        // distinct values in every position at once
+        let mut state = 11u64;
+        let want: Vec<i16> = (0..ROWS * LOCK).map(|_| (crate::ntt::tests::xorshift(&mut state) % P1 as u64) as i16 - h).collect();
+        for r in 0..ROWS {
+            for e in 0..LOCK {
+                put_key(&mut slot, r, e, want[r * LOCK + e]);
+            }
+        }
+        for r in 0..ROWS {
+            for e in 0..LOCK {
+                assert_eq!(get_key(&slot, r, e), want[r * LOCK + e]);
+            }
+        }
+    }
+
+    /// The I8MM tiles against the `sdot` tiles and the integer sums, over a whole chunk of passes
+    /// (the `i32` bounds' worst case), on random transforms and keys and on constant extremes: `y`
+    /// over all of `i16` (`i16::MIN`, `i16::MAX`, byte edges), keys at `+-4860` and at the byte
+    /// splits' edges (`+-4736`: `klo = -128`, `|khi|` 19 and 18). Then their residues.
+    #[test]
+    fn mmla_tiles_match_sdot_tiles() {
+        if !mm::available() {
+            eprintln!("no I8MM here; skipped");
+            return;
+        }
+        let h = (P1 as i16 - 1) / 2;
+        let ys = [i16::MIN, i16::MAX, -1, 0, 1, 255, 256, -256, -255, 127, -128, 128, -129];
+        let ks = [h, -h, 4736, -4736, 127, -128, 128, -129, 0, 255, -256, 1, -1];
+        // (y, k): None random over the whole range (with edge values mixed in)
+        let mut cases: Vec<(Option<i16>, Option<i16>)> = vec![(None, None), (None, Some(h)), (Some(i16::MIN), None)];
+        for &(y, k) in &[(i16::MAX, 4736), (i16::MAX, -4736), (i16::MIN, h), (i16::MIN, -h), (-1, 4736), (255, -4736), (-32513, 4736)] {
+            cases.push((Some(y), Some(k)));
+        }
+        let mut state = 7u64;
+        let mut rnd = move || crate::ntt::tests::xorshift(&mut state);
+        let mut worst = [0i64; 3];
+        for (case, &(fy, fk)) in cases.iter().enumerate() {
+            let mut dot = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
+            let mut mma = vec![unsafe { vdupq_n_s64(0) }; mm::ACC * N];
+            // want[(s ROWS + r) LANES + c]
+            let mut want = vec![0i64; N * ROWS * LANES];
+            // one chunk in sweeps of one to four tiles
+            const SWEEPS: [usize; 10] = [4, 4, 4, 4, 4, 4, 2, 3, 2, 1];
+            const _: () = {
+                let (mut i, mut n) = (0, 0);
+                while i < SWEEPS.len() {
+                    n += SWEEPS[i];
+                    i += 1;
+                }
+                assert!(n * LOCK == CHUNK && SINK == 4);
+            };
+            for &tiles in &SWEEPS {
+                let mut y = |_: usize| -> i16 {
+                    fy.unwrap_or_else(|| { let r = rnd(); if r % 5 == 0 { ys[(r >> 8) as usize % ys.len()] } else { (r >> 16) as i16 } })
+                };
+                // yv[(c SWEEP + e) N + s], kv[(r SWEEP + e) N + s]
+                let yv: Vec<i16> = (0..LANES * SWEEP * N).map(&mut y).collect();
+                let kv: Vec<i16> = (0..ROWS * SWEEP * N)
+                    .map(|i| {
+                        if (i / N) % SWEEP >= tiles * LOCK {
+                            return 0;
+                        }
+                        fk.unwrap_or_else(|| { let r = rnd(); if r % 5 == 0 { ks[(r >> 8) as usize % ks.len()] } else { (r % P1 as u64) as i16 - h } })
+                    })
+                    .collect();
+                let mut bytes = vec![0u8; SINK * N * SLOT];
+                let mut words = vec![0i16; SINK * N * ROWS * LOCK];
+                for t in 0..SINK {
+                    for s in 0..N {
+                        for r in 0..ROWS {
+                            for e in 0..LOCK {
+                                let k = kv[(r * SWEEP + LOCK * t + e) * N + s];
+                                put_key(&mut bytes[(t * N + s) * SLOT..][..SLOT], r, e, k);
+                                words[t * N * ROWS * LOCK + (s * ROWS + r) * LOCK + e] = k;
+                            }
+                        }
+                    }
+                }
+                let mut xd = vec![[[0i16; 8]; N]; SWEEP];
+                let mut xm = vec![[[0i16; 8]; N]; SWEEP];
+                for t in 0..SWEEP {
+                    for lane in 0..8 {
+                        // dot-product lane order ([`pass_words`]) and column order ([`column_words`])
+                        let (c, e) = (2 * (t % 4) + lane / 4, 4 * (t / 4) + lane % 4);
+                        let (cm, em) = (t % LANES, LOCK * (t / LANES) + lane);
+                        for s in 0..N {
+                            xd[t][s][lane] = yv[(c * SWEEP + e) * N + s];
+                            xm[t][s][lane] = yv[(cm * SWEEP + em) * N + s];
+                        }
+                    }
+                }
+                let load = |x: &Vec<[[i16; 8]; N]>| -> Box<[[int16x8_t; N]; SWEEP]> {
+                    let mut b = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
+                    for t in 0..SWEEP {
+                        for s in 0..N {
+                            b[t][s] = unsafe { vld1q_s16(x[t][s].as_ptr()) };
+                        }
+                    }
+                    b
+                };
+                let (xd, xm) = (load(&xd), load(&xm));
+                assert_eq!(bytes.as_ptr() as usize % 16, 0, "the I8MM tiles read 16-aligned keys");
+                unsafe {
+                    sink(&xd, words.as_ptr(), &mut dot, tiles);
+                    mm::sink(&xm, bytes.as_ptr(), &mut mma, tiles);
+                }
+                for s in 0..N {
+                    for r in 0..ROWS {
+                        for c in 0..LANES {
+                            let mut v = 0i64;
+                            for e in 0..tiles * LOCK {
+                                v += yv[(c * SWEEP + e) * N + s] as i64 * kv[(r * SWEEP + e) * N + s] as i64;
+                            }
+                            want[(s * ROWS + r) * LANES + c] += v;
+                        }
+                    }
+                }
+            }
+            let lanes64 = |v: int64x2_t| -> [i64; 2] { unsafe { core::mem::transmute(v) } };
+            let lanes32 = |v: int64x2_t| -> [i32; 4] { unsafe { core::mem::transmute(v) } };
+            for s in 0..N {
+                for r in 0..ROWS {
+                    for c in 0..LANES {
+                        let w = want[(s * ROWS + r) * LANES + c];
+                        assert_eq!(lanes64(dot[idx(s, r) + c / 2])[c % 2], w, "case {case}: sdot slot {s} row {r} column {c}");
+                        let got = if r == 0 {
+                            let b = lanes64(mma[mm::ACC * s + c]);
+                            b[0] + b[1]
+                        } else {
+                            let (q, i) = ((r - 1) / 2, (r - 1) % 2);
+                            let t = mm::ACC * s + LANES + 3 * (3 * (c / 2) + q);
+                            let lane = 2 * (c % 2) + i;
+                            let (a, cc, hh) = (lanes32(mma[t])[lane] as i64, lanes32(mma[t + 1])[lane] as i64, lanes32(mma[t + 2])[lane] as i64);
+                            assert!(a.abs() <= mm::BOUND_A && cc.abs() <= mm::BOUND_C && hh.abs() <= mm::BOUND_H);
+                            worst = [worst[0].max(a.abs()), worst[1].max(cc.abs()), worst[2].max(hh.abs())];
+                            a + 256 * cc + 65536 * hh
+                        };
+                        assert_eq!(got, w, "case {case}: mmla slot {s} row {r} column {c}");
+                    }
+                }
+            }
+            // the same residues
+            unsafe {
+                let (mut o1, mut o2) = (Box::new([vdupq_n_s16(0); N]), Box::new([vdupq_n_s16(0); N]));
+                for d in 0..DIGITS {
+                    narrow(&dot, 1 + d, &mut o1);
+                    mm::narrow_digit(&mma, d, &mut o2);
+                    let (a, b): (&[[i16; 8]; N], &[[i16; 8]; N]) = (core::mem::transmute(&*o1), core::mem::transmute(&*o2));
+                    assert!(a == b, "case {case}: digit {d} residues");
+                }
+                narrow(&dot, 0, &mut o1);
+                mm::narrow_base(&mma, &mut o2);
+                let (a, b): (&[[i16; 8]; N], &[[i16; 8]; N]) = (core::mem::transmute(&*o1), core::mem::transmute(&*o2));
+                assert!(a == b, "case {case}: base residues");
+            }
+        }
+        // the extreme cases reach every bound
+        assert_eq!(worst, [mm::BOUND_A, mm::BOUND_C, mm::BOUND_H]);
+    }
+
     /// The moments against the ring product of `L` by every unit `X^i`, `i < 512`.
     #[test]
     fn moments_match_the_ring_map() {
@@ -769,6 +1303,40 @@ mod tests {
 #[cfg(test)]
 mod timing {
     use super::*;
+
+    /// The sweeps alone, one thread, four tiles: `cargo test --release sms_tile_timing --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sms_tile_timing() {
+        let mut state = 9u64;
+        let xs = Box::new(core::array::from_fn::<_, SWEEP, _>(|_| core::array::from_fn::<_, N, _>(|_| unsafe {
+            vreinterpretq_s16_u64(vdupq_n_u64(crate::ntt::tests::xorshift(&mut state)))
+        })));
+        let words: Vec<i16> = (0..SINK * N * ROWS * LOCK).map(|i| (i * 37 % 9721) as i16 - 4860).collect();
+        let bytes: Vec<u8> = (0..SINK * N * SLOT).map(|i| (i * 37 % 251) as u8).collect();
+        let mut dot = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
+        let mut mma = vec![unsafe { vdupq_n_s64(0) }; mm::ACC * N];
+        let reps = 400u32;
+        for round in 0..5 {
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                unsafe { sink(&xs, words.as_ptr(), &mut dot, SINK) };
+            }
+            let a = t.elapsed();
+            let mut b = a;
+            if mm::available() {
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    unsafe { mm::sink(&xs, bytes.as_ptr(), &mut mma, SINK) };
+                }
+                b = t.elapsed();
+            }
+            std::hint::black_box((&dot, &mma));
+            let per = |d: std::time::Duration| d.as_nanos() as f64 / (reps as usize * N) as f64;
+            println!("round {round}: per slot, 32 elements: sdot {:.2} ns, mmla {:.2} ns ({:+.1}%)", per(a), per(b), 100.0 * (per(b) / per(a) - 1.0));
+        }
+    }
 
     /// Phase costs of [`matrix`] on one thread: `cargo test --release sms_phase_timing --
     /// --ignored --nocapture`.

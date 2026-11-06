@@ -248,6 +248,9 @@ mod huge {
                 CARVE.lock.unlock();
                 return (core::ptr::null_mut(), false);
             }
+            // Fault the fresh chunk before publishing blocks from it to several workers.
+            // The zero store preserves alloc_zeroed's fresh-mapping contract.
+            core::ptr::write_volatile(chunk as *mut u8, 0);
             at = chunk;
             *CARVE.end.get() = chunk + HUGE;
         }

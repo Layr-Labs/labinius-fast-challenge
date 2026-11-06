@@ -892,23 +892,45 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
 unsafe fn columns_out(a: &SmsMatrix, acc: &[int32x4_t], dev: &[int32x4_t], y: &mut [int16x8_t; N], target: &mut [u128]) {
     narrow(acc, 0, y);
     super::inverse::<PB>(y);
-    let base: &[[i16; LANES]; N] = &*(y.as_ptr() as *const [[i16; LANES]; N]);
+    // The centered residues (`|x| <= (p - 1) / 2`) to `[0, p)` lane-wise, eight columns per
+    // vector: `+ p` where negative, the value `rem_euclid` gives.
+    let pv = vdupq_n_s16(P1 as i16);
+    let mut base = [[0u16; LANES]; N];
+    for (k, b) in base.iter_mut().enumerate() {
+        let v = y[k];
+        let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+        vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
+    }
+    // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at once, in
+    // `i64` lanes: one pass per digit over the slots instead of one per column.
     let devs: &[[i32; 4]] = core::slice::from_raw_parts(dev.as_ptr() as *const [i32; 4], dev.len());
-    for (c, column) in target.chunks_exact_mut(N).enumerate() {
-        let mut tail = [0i64; N];
-        for (t, &v) in tail.iter_mut().zip(a.mu.iter()) {
-            *t = v as i64;
-        }
-        let mut e = [0i64; N];
-        for d in 0..DIGITS {
-            for (k, v) in e.iter_mut().enumerate() {
-                *v = devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
+    let mut tail = [[0i64; LANES]; N];
+    for (t, &mu) in tail.iter_mut().zip(a.mu.iter()) {
+        *t = [mu as i64; LANES];
+    }
+    for d in 0..DIGITS {
+        let (u, v) = lattice::WEIGHTS[d];
+        let (u, v) = (u as i64, v as i64);
+        let e = |k: usize, c: usize| devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
+        for k in 0..N / 2 {
+            for c in 0..LANES {
+                let x = e(k, c);
+                tail[k][c] += u * x;
+                tail[k + N / 2][c] += v * x;
             }
-            add_weighted(&mut tail, d, &e);
         }
+        for k in N / 2..N {
+            for c in 0..LANES {
+                let x = e(k, c);
+                tail[k - N / 2][c] -= v * x;
+                tail[k][c] += (u + v) * x;
+            }
+        }
+    }
+    // a partial batch has fewer than eight columns in `target`: only those lanes are written
+    for (c, column) in target.chunks_exact_mut(N).enumerate() {
         for (k, o) in column.iter_mut().enumerate() {
-            let r = (base[k][c] as i32).rem_euclid(P1 as i32) as u32;
-            *o = crt(r, tail[k].rem_euclid(TAIL as i64) as u32);
+            *o = crt(base[k][c] as u32, tail[k][c].rem_euclid(TAIL as i64) as u32);
         }
     }
 }

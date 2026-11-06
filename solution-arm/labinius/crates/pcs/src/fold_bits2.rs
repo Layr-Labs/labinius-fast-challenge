@@ -60,7 +60,7 @@ const PAD_PER_GROUP: usize = 2;
 /// Output slots: coefficients of `R_162` per component.
 const OUT_SLOTS: usize = 162;
 /// Columns ahead whose words the transpose prefetches.
-const PF_COLUMNS: usize = 2;
+const PF_COLUMNS: usize = 8;
 
 const _: () = assert!(GUARD + COL_GROUP * STRIDE <= u16::MAX as usize);
 
@@ -224,9 +224,20 @@ mod neon {
     /// returned.
     #[inline(always)]
     unsafe fn csa(s: &mut V, a: V, b: V) -> V {
-        let x = veorq_u64(a, b);
-        let c = vbslq_u64(x, *s, a);
-        *s = veorq_u64(*s, x);
+        // The whole full adder as three NEON instructions: `x = a ^ b`, the carry
+        // `bsl(x, s, a)` as a `bit` into `a`, `s ^= x`. Left to LLVM at neoverse-v2 the select
+        // becomes `and, and, orr` and the sum a destructive SVE `eor3` with register copies.
+        let mut c = a;
+        core::arch::asm!(
+            "eor {x:v}.16b, {c:v}.16b, {b:v}.16b",
+            "bit {c:v}.16b, {s:v}.16b, {x:v}.16b",
+            "eor {s:v}.16b, {s:v}.16b, {x:v}.16b",
+            c = inout(vreg) c,
+            s = inout(vreg) *s,
+            b = in(vreg) b,
+            x = out(vreg) _,
+            options(pure, nomem, nostack, preserves_flags)
+        );
         c
     }
 
@@ -235,9 +246,18 @@ mod neon {
     /// sum. Its inputs may themselves be complemented carries of the level below.
     #[inline(always)]
     unsafe fn csa_c(s: &mut V, a: V, b: V) -> V {
-        let x = veorq_u64(a, b);
-        *s = veorq_u64(*s, x);
-        vbslq_u64(x, *s, a)
+        let mut c = a;
+        core::arch::asm!(
+            "eor {x:v}.16b, {c:v}.16b, {b:v}.16b",
+            "eor {s:v}.16b, {s:v}.16b, {x:v}.16b",
+            "bit {c:v}.16b, {s:v}.16b, {x:v}.16b",
+            c = inout(vreg) c,
+            s = inout(vreg) *s,
+            b = in(vreg) b,
+            x = out(vreg) _,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        c
     }
 
     #[inline(always)]

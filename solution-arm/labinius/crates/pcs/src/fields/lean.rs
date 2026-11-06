@@ -1,10 +1,10 @@
-use super::crossfield::{eq_expand_b128, eq_expand_f162};
+use super::crossfield::{eq_expand_b128_scaled_into, eq_expand_f162};
 use super::neon::{self, ByteTables};
 use super::scalar::{B128, F162};
 use crate::par;
 
 const PACK: usize = 128;
-const PREFIX: usize = 4;
+const PREFIX: usize = 5;
 
 fn inverse(x: B128) -> B128 {
     assert_ne!(x, B128::ZERO);
@@ -52,18 +52,9 @@ impl Prepared {
         let inverses: Vec<_> = r.iter().map(|&x| inverse(B128::ONE + x)).collect();
         let ratios = r.iter().zip(&inverses).map(|(&x, &d)| x * d).collect();
         let scale = r[..PREFIX].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
-        let mut eq = eq_expand_b128(&r[PREFIX..]);
+        let mut eq = vec![B128::ZERO; 1usize << (r.len() - PREFIX)];
+        eq_expand_b128_scaled_into(&r[PREFIX..], &mut eq, scale);
         let parts = par::workers(eq.len(), 1 << 13);
-        let per = eq.len().div_ceil(parts);
-        std::thread::scope(|scope| {
-            for chunk in eq.chunks_mut(per) {
-                scope.spawn(move || {
-                    for e in chunk {
-                        *e = *e * scale;
-                    }
-                });
-            }
-        });
         let parts = par::map_blocks(eq.len(), parts, 64, |_, start, end| {
             neon::partial_evals_sets(words, &eq, start, end)
         });
@@ -238,7 +229,8 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for log in [7, 8, 10, 14] {
+        assert!(PREFIX + 3 < 10);
+        for log in [PREFIX + 3, 10, 14] {
             let words: Vec<_> = (0..1 << log).map(|_| B128(next())).collect();
             let r: Vec<_> = (0..log).map(|_| B128(next())).collect();
             let batch = eq_expand_f162(&(0..7).map(|_| F162::from_b128(B128(next()))).collect::<Vec<_>>());
@@ -260,8 +252,12 @@ mod tests {
 
     #[test]
     fn exceptional_coordinates_use_reference_path() {
-        let words = vec![B128::ZERO; 1 << 7];
-        let mut r = vec![B128(3); 7];
+        let log = PREFIX + 3;
+        let words = vec![B128::ZERO; 1 << log];
+        let mut r = vec![B128(3); log];
+        assert!(Prepared::new(&words, &r).is_some());
+        let short = vec![B128(3); log - 1];
+        assert!(Prepared::new(&words[..1 << (log - 1)], &short).is_none());
         for k in 0..r.len() {
             r[k] = B128::ONE;
             assert!(Prepared::new(&words, &r).is_none());

@@ -164,6 +164,27 @@ impl Drop for Table {
     }
 }
 
+impl Table {
+    fn release_during<R>(self, work: impl FnOnce() -> R) -> R {
+        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        if let Self::Mapped { ptr, len } = self {
+            core::mem::forget(self);
+            let (base, bytes) = (ptr as usize, 16 * len);
+            let part = bytes.div_ceil(threads()).next_multiple_of(2 << 20).max(2 << 20);
+            return std::thread::scope(|scope| {
+                for start in (0..bytes).step_by(part) {
+                    let n = part.min(bytes - start);
+                    scope.spawn(move || unsafe { table_sys::munmap((base + start) as *mut u8, n) });
+                }
+                work()
+            });
+        }
+        let out = work();
+        drop(self);
+        out
+    }
+}
+
 fn read_table(path: &str) -> Table {
     load_table(path, 1 << LOG_PACKED)
 }
@@ -912,8 +933,10 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer);
-    let bytes = proof.encode();
-    std::fs::write(&args[2], bytes).expect("write proof");
+    values.release_during(|| {
+        let bytes = proof.encode();
+        std::fs::write(&args[2], bytes).expect("write proof");
+    });
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
 }

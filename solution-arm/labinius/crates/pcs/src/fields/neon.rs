@@ -38,6 +38,14 @@ const PASS: usize = 8;
 /// `0..8` in bits `0..8`.
 #[inline(always)]
 unsafe fn patterns(p: *const B128, out: &mut [u8; 128]) {
+    for (t, vt) in pattern_regs(p).iter().enumerate() {
+        vst1q_u8(out.as_mut_ptr().add(16 * t), *vt);
+    }
+}
+
+/// [`patterns`] in registers: byte `b` of register `t` collects bit `8 b + t` of the rows.
+#[inline(always)]
+unsafe fn pattern_regs(p: *const B128) -> [uint8x16_t; 8] {
     let mut v: [uint8x16_t; 8] = core::array::from_fn(|i| vld1q_u8(p.add(i) as *const u8));
     let m1 = vdupq_n_u8(0x55);
     for i in [0usize, 2, 4, 6] {
@@ -56,8 +64,24 @@ unsafe fn patterns(p: *const B128, out: &mut [u8; 128]) {
         v[i] = vsliq_n_u8::<4>(x, y);
         v[i + 4] = vsriq_n_u8::<4>(y, x);
     }
-    for (t, vt) in v.iter().enumerate() {
-        vst1q_u8(out.as_mut_ptr().add(16 * t), *vt);
+    v
+}
+
+/// Register `t` of each of eight groups' patterns, interleaved: `out[b]` holds, in byte `x`, the
+/// pattern of group `x` for byte `b`. A lookup then takes its index from a register rather than
+/// from a load of its own.
+#[inline(always)]
+unsafe fn interleave_patterns(a: [uint8x16_t; 8], out: *mut u64) {
+    let mut x = a;
+    for _ in 0..3 {
+        let y = x;
+        for i in 0..4 {
+            x[2 * i] = vzip1q_u8(y[i], y[i + 4]);
+            x[2 * i + 1] = vzip2q_u8(y[i], y[i + 4]);
+        }
+    }
+    for (i, r) in x.iter().enumerate() {
+        vst1q_u8(out.add(2 * i) as *mut u8, *r);
     }
 }
 
@@ -467,12 +491,41 @@ pub(super) fn partial_evals_sets(words: &[B128], eq: &[B128], start: usize, end:
         let mut sums = vec![[vdupq_n_u8(0); 128]; blocks];
         let mut tabs = vec![[vdupq_n_u8(0); 256]; PASS];
         let mut pats = [[0u8; 128]; PASS];
+        const _: () = assert!(PASS == 8);
+        #[repr(align(64))]
+        struct Packed([u64; 128]);
+        let mut packed = Packed([0u64; 128]);
         for base in (start..end).step_by(GROUP * PASS) {
             let count = ((end - base) / GROUP).min(PASS);
             for x in 0..count {
                 combinations(eq.as_ptr().add(base + GROUP * x), &mut tabs[x]);
             }
             for (q, sum) in sums.iter_mut().enumerate() {
+                if count == PASS {
+                    let at = words.as_ptr().add(q * stride + base);
+                    let regs: [[uint8x16_t; 8]; PASS] =
+                        core::array::from_fn(|x| pattern_regs(at.add(GROUP * x)));
+                    for t in 0..8 {
+                        let a = core::array::from_fn(|x| regs[x][t]);
+                        interleave_patterns(a, packed.0.as_mut_ptr().add(16 * t));
+                    }
+                    let (t0, t1, t2, t3) = (&tabs[0], &tabs[1], &tabs[2], &tabs[3]);
+                    let (t4, t5, t6, t7) = (&tabs[4], &tabs[5], &tabs[6], &tabs[7]);
+                    for k in 0..128 {
+                        let w = *packed.0.get_unchecked(k);
+                        let mut a = *sum.get_unchecked(k);
+                        a = veorq_u8(a, *t0.get_unchecked((w & 255) as usize));
+                        a = veorq_u8(a, *t1.get_unchecked((w >> 8 & 255) as usize));
+                        a = veorq_u8(a, *t2.get_unchecked((w >> 16 & 255) as usize));
+                        a = veorq_u8(a, *t3.get_unchecked((w >> 24 & 255) as usize));
+                        a = veorq_u8(a, *t4.get_unchecked((w >> 32 & 255) as usize));
+                        a = veorq_u8(a, *t5.get_unchecked((w >> 40 & 255) as usize));
+                        a = veorq_u8(a, *t6.get_unchecked((w >> 48 & 255) as usize));
+                        a = veorq_u8(a, *t7.get_unchecked((w >> 56) as usize));
+                        *sum.get_unchecked_mut(k) = a;
+                    }
+                    continue;
+                }
                 for x in 0..count {
                     patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);
                 }

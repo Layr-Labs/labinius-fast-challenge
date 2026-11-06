@@ -248,7 +248,7 @@ fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
     t.absorb_u64(LOG_VARS as u64);
     t.absorb_u64(COLUMN_LOG as u64);
     t.absorb_bytes(&modulus.to_le_bytes());
-    t.absorb_bytes(commitment);
+    t.absorb_bytes_parallel(commitment, labinius::par::threads());
     t
 }
 
@@ -893,7 +893,7 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 }
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> Proof {
-    let commitment = rq::pack_ring_elements(&commit(values, modulus), modulus);
+    let commitment = rq::pack_ring_elements_parallel(&commit(values, modulus), modulus);
     timer.lap("commit");
     let mut t = transcript(seed, modulus, &commitment);
     let lo = t.sample_b128(b"r-lo", 7);

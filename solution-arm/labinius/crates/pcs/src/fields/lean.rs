@@ -142,18 +142,16 @@ impl<'a> Switch<'a> {
         if self.round < PREFIX {
             return self.prefix_message();
         }
-        let l = ByteTables::new(&self.l);
-        let lp = ByteTables::new(&self.lp);
+        let t = neon::NibblePair::new(&self.l, &self.lp);
         let p = &self.planes;
         let half = self.half;
         let parts = par::workers(half, 1 << 12);
         let sums = par::map_blocks(half, parts, 2, |_, start, end| unsafe {
-            neon::linear_message(
+            neon::linear_message_pair(
                 &self.prepared.eq[start..end],
                 core::array::from_fn(|k| &p[k][start..end]),
                 core::array::from_fn(|k| &p[k][half + start..half + end]),
-                &l,
-                &lp,
+                &t,
             )
         });
         sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])

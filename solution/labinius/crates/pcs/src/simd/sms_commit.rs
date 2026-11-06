@@ -425,7 +425,7 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-const PREFETCH_SLOTS: usize = 7;
+const PREFETCH_SLOTS: usize = 6;
 
 /// Pair batches between two folds of the sink: every [`PP`] pair batches, at the end of a call
 /// (every `PP / LOCK` calls) or, for `LOCK > PP`, inside it as well (the slot macro folds after
@@ -466,7 +466,10 @@ impl<const RED: bool, const FIRST: bool> vb::SliceSink<LOCK> for Sink<RED, FIRST
     unsafe fn rows(&mut self, blk: usize, w: [*const i16; LOCK], r0: usize, r1: usize) {
         // Every producer uses H contiguous 27-vector blocks in wbuf.
         debug_assert!(w.iter().enumerate().all(|(h, &p)| p == w[0].wrapping_add(32 * 27 * h)));
+        let t0 = std::time::Instant::now();
         sink_rows::<RED, FIRST>(self.k, self.acc, self.b, blk, w[0], r0, r1);
+        let d = t0.elapsed().as_nanos() as u64;
+        SINK_NS.with(|c| c.set(c.get() + d));
     }
 }
 
@@ -787,12 +790,15 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
                 }
             }
         }
+        let t_slice = std::time::Instant::now();
         for h in 0..LOCK {
             let cols16: [*const B128; 16] = core::array::from_fn(|l| {
                 if l < g { cols[l].as_ptr().add(8 * (b + h)) } else { ZERO8.as_ptr() }
             });
             crate::simd::transpose_f162::slice_b128_cols16_into(&cols16, &mut ws.idx[h]);
         }
+        SMS_SLICE_NS.fetch_add(t_slice.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let t_work = std::time::Instant::now();
         let ins: [&BinaryIndex32; LOCK] = core::array::from_fn(|h| &ws.idx[h]);
         let k = kbase.add((b / LOCK) * LOCK_WORDS);
         // A chunk's first step cancels its public mean in the NTT domain.
@@ -818,6 +824,8 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         } else {
             vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<false> { k, acc, b: bias });
         }
+        SMS_WORK_NS.fetch_add(t_work.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let t_rec = std::time::Instant::now();
         // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
         let (e, cph) = (b + LOCK, chunks_per_half(np));
         let (eh, local) = ((e - 1) / hl, e - (e - 1) / hl * hl);
@@ -834,6 +842,8 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
             }
 
         }
+        SMS_RECON_NS.fetch_add(t_rec.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        SMS_SINK_NS.fetch_add(SINK_NS.with(|c| c.take()), std::sync::atomic::Ordering::Relaxed);
     }
     match out {
         RowsOut::Full => write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, RowsMode::Full),
@@ -866,7 +876,7 @@ fn bench_mode() -> u32 {
 struct Progress(std::sync::atomic::AtomicUsize);
 const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(500);
 /// Maximum lead (in pair batches) between two hyperthread siblings on one physical core.
-const PAIR_LEAD: usize = 2 * PP;
+const PAIR_LEAD: usize = PP;
 
 /// Diagnostics of the last [`commit_paired`], for the profile line only: per worker, the
 /// microseconds from the commitment's start to the end of its last group, and the 16-column
@@ -877,6 +887,24 @@ pub static DECOUPLED_PAIRS: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 /// When (microseconds into the commitment, shifted by 4) and by which waiting worker (low 4 bits)
 /// each pair decoupled.
 pub static DECOUPLED_AT: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// Diagnostics of the group loop, summed over all workers in nanoseconds: the witness slicing
+/// (GHASH words to `F162` digits), the transform with its accumulation sink (including the
+/// sibling sync) and the chunk reconstruction (inverse transform, digit banks, rows).
+pub static SMS_SLICE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SMS_WORK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SMS_RECON_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Part of [`SMS_WORK_NS`] spent inside the accumulation sink itself: the 27-slot product
+/// blocks. `sms_work_us - sms_sink_us` is therefore the transform alone.
+pub static SMS_SINK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Transform stage split: levels 0..3 (tile) and levels 4..6 plus the sink hand-off (tail).
+pub static SMS_TILE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SMS_TAIL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Per-thread (one pool worker) so the hot path never touches a shared cache line; published to
+// the counter above once per column group.
+thread_local! {
+    static SINK_NS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+fn ns_get(a: &std::sync::atomic::AtomicU64) -> u64 { a.load(std::sync::atomic::Ordering::Relaxed) / 1000 }
 
 /// The diagnostics above as ` sms_end_us=a/b/.. sms_groups=a/b/.. sms_decoupled=n`.
 pub fn worker_report(workers: usize) -> String {
@@ -886,7 +914,13 @@ pub fn worker_report(workers: usize) -> String {
     let groups: Vec<String> = (0..w).map(|i| WORKER_GROUPS[i].load(Relaxed).to_string()).collect();
     let nd = (DECOUPLED_PAIRS.load(Relaxed) as usize).min(16);
     let at: Vec<String> = (0..nd).map(|i| { let v = DECOUPLED_AT[i].load(Relaxed); format!("{}@{}", v & 15, v >> 4) }).collect();
-    format!(" sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={}", ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"))
+    format!(
+        " sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={} \
+         sms_slice_us={} sms_work_us={} sms_sink_us={} sms_tile_us={} sms_tail_us={} sms_recon_us={}",
+        ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"),
+        ns_get(&SMS_SLICE_NS), ns_get(&SMS_WORK_NS), ns_get(&SMS_SINK_NS), ns_get(&SMS_TILE_NS),
+        ns_get(&SMS_TAIL_NS), ns_get(&SMS_RECON_NS)
+    )
 }
 
 /// The commitment on sibling pairs: hyperthreads `2k`, `2k + 1` (placed on core `k`) take

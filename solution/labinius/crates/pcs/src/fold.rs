@@ -1810,23 +1810,26 @@ mod bitsliced {
             }};
         }
         let mut t: *const u16;
-        macro_rules! two {
-            ($off:expr, $leaf:ident) => {{
-                if PF_AHEAD > 0 {
-                    let fa = planes.add(*t.add($off + PF_AHEAD) as usize) as *const i8;
-                    let fb = planes.add(*t.add($off + 1 + PF_AHEAD) as usize) as *const i8;
-                    _mm_prefetch::<_MM_HINT_T0>(fa);
-                    _mm_prefetch::<_MM_HINT_T0>(fa.add(64));
-                    _mm_prefetch::<_MM_HINT_T0>(fb);
-                    _mm_prefetch::<_MM_HINT_T0>(fb.add(64));
-                }
-                let pa = planes.add(*t.add($off) as usize);
-                let pb = planes.add(*t.add($off + 1) as usize);
+        // Two scheduled offsets, already fetched. This loop is bound by the load ports, not by
+        // the vector ports: an entry costs a 128-byte pair of plane loads plus its own offset,
+        // so the offset load is a third of the pressure and every offset load removed is worth
+        // more than a vector op saved. [`four`] therefore fetches four offsets with one 64-bit
+        // load and splits them in the integer ALUs, leaving the load ports to the planes.
+        macro_rules! two_off {
+            ($oa:expr, $ob:expr, $leaf:ident) => {{
+                let pa = planes.add($oa);
+                let pb = planes.add($ob);
                 let a0 = _mm512_load_si512(pa as *const __m512i);
                 let b0 = _mm512_load_si512(pb as *const __m512i);
                 let a1 = _mm512_load_si512(pa.add(8) as *const __m512i);
                 let b1 = _mm512_load_si512(pb.add(8) as *const __m512i);
                 ($leaf(&mut s0[0], a0, b0), $leaf(&mut s1[0], a1, b1))
+            }};
+        }
+        macro_rules! two {
+            ($off:expr, $leaf:ident) => {{
+                let w = core::ptr::read_unaligned(t.add($off) as *const u32);
+                two_off!((w & 0xffff) as usize, (w >> 16) as usize, $leaf)
             }};
         }
         macro_rules! level {
@@ -1836,7 +1839,25 @@ mod bitsliced {
                 (csa(&mut s0[$bit], x0, y0), csa(&mut s1[$bit], x1, y1))
             }};
         }
-        macro_rules! four { ($off:expr, $leaf:ident) => { level!(1, two, $off, $leaf) }; }
+        // Four entries from one 64-bit load. Every call site passes a whole `four`-sized group
+        // (the chunk loop's levels and the remainder's binary partial trees of size 4 and up),
+        // so the four contiguous u16 offsets are always in bounds.
+        macro_rules! four {
+            ($off:expr, $leaf:ident) => {{
+                let w = core::ptr::read_unaligned(t.add($off) as *const u64);
+                let (x0, x1) = two_off!(
+                    (w & 0xffff) as usize,
+                    ((w >> 16) & 0xffff) as usize,
+                    $leaf
+                );
+                let (y0, y1) = two_off!(
+                    ((w >> 32) & 0xffff) as usize,
+                    (w >> 48) as usize,
+                    $leaf
+                );
+                (csa(&mut s0[1], x0, y0), csa(&mut s1[1], x1, y1))
+            }};
+        }
         macro_rules! eight { ($off:expr, $leaf:ident) => { level!(2, four, $off, $leaf) }; }
         macro_rules! sixteen { ($off:expr, $leaf:ident) => { level!(3, eight, $off, $leaf) }; }
         macro_rules! thirty_two { ($off:expr, $leaf:ident) => { level!(4, sixteen, $off, $leaf) }; }

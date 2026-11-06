@@ -164,6 +164,28 @@ impl Drop for Table {
     }
 }
 
+/// Faults the embedded SMS key image in now, on every core (`MADV_POPULATE_READ`, Linux 5.14+),
+/// so that the commitment's workers, which walk the key in step, do not all wait on the same
+/// page-cache faults (fault-around maps 64 KiB per fault). Best effort: an error changes nothing.
+fn prefault_images() {
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    {
+        const PAGE: usize = 4096;
+        let image: &[u8] = &SMS_DATA.0;
+        if image.is_empty() {
+            return;
+        }
+        let start = image.as_ptr() as usize & !(PAGE - 1);
+        let end = (image.as_ptr() as usize + image.len() + PAGE - 1) & !(PAGE - 1);
+        let pages = (end - start) / PAGE;
+        labinius::par::map_blocks(pages, threads(), 16, |_, s, e| {
+            if s < e {
+                unsafe { table_sys::madvise((start + s * PAGE) as *mut u8, (e - s) * PAGE, 22) };
+            }
+        });
+    }
+}
+
 fn read_table(path: &str) -> Table {
     load_table(path, 1 << LOG_PACKED)
 }
@@ -810,14 +832,14 @@ impl Proof {
 
 fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
     #[cfg(target_arch = "aarch64")]
-    if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
-        let partials = prepared.partials();
+    {
+        let (mut switch, partials) = labinius::fields::lean34::LeanSwitch::partials(values, hi);
         let value = partials.iter().zip(cf::eq_expand_b128(lo))
             .fold(B128::ZERO, |a, (&v, e)| a + v * e);
         t.absorb_b128(&[value]);
         t.absorb_b128(&partials);
         let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-        let mut switch = labinius::fields::lean::Switch::new(values, prepared, &batch);
+        switch.start(&batch);
         let mut rounds = Vec::with_capacity(LOG_PACKED);
         let mut coords = Vec::with_capacity(LOG_PACKED);
         for _ in 0..LOG_PACKED {
@@ -830,6 +852,7 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
         }
         return (partials, rounds, coords, switch.final_eval());
     }
+    #[allow(unreachable_code)]
     let mut ws = cf::Workspace::new(LOG_PACKED, 1);
     let partials = ws.partial_evals(0, values, hi);
     let value = partials
@@ -910,10 +933,23 @@ fn main() {
     #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS { ntt::neon::sms::prefetch_key(&SMS_DATA.0) }
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
+    prefault_images();
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer);
     let bytes = proof.encode();
-    std::fs::write(&args[2], bytes).expect("write proof");
+    // The table is not read again. Unmapping it (65,536 page-table entries on 4 KiB pages, about
+    // 4 ms on one core) runs on a helper thread while this one writes the proof, instead of after
+    // it in `main`'s epilogue. The proof buffer is allocated and filled before, so the write takes
+    // no page faults that would wait for the unmap.
+    struct Owned(Table);
+    // SAFETY: the mapping (or the owned words) is used by no one else from here on; dropping it
+    // on another thread only unmaps (or frees) it.
+    unsafe impl Send for Owned {}
+    let owned = Owned(values);
+    std::thread::scope(|scope| {
+        scope.spawn(move || drop(owned));
+        std::fs::write(&args[2], bytes).expect("write proof");
+    });
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
 }

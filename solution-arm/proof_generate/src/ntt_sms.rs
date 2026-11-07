@@ -368,7 +368,7 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 }
 
 /// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 8;
+const SINK: usize = 16;
 /// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);

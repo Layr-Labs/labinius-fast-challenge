@@ -491,7 +491,7 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             if PREFETCH_SLOTS > 0 {
                 let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
                 let hi = lo + STREAMS * LOCK * 4;
-                let mut p = (lo + 63) & !63;
+                let mut p = lo & !63;
                 while p < hi {
                     _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
                     p += 64;

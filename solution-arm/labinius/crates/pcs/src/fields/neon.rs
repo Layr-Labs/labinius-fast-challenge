@@ -313,6 +313,39 @@ pub(super) fn dot_lifted(a: &[F162], b: &[B128]) -> F162 {
     }
 }
 
+/// [`dot_lifted`] of `a` against two columns at once: `a` (the eq table) is loaded once per pair
+/// for both, halving its L2 traffic. Each column's products are summed in the same order as
+/// [`dot_lifted`]'s, so each result is the same field element.
+pub(super) fn dot_lifted2(a: &[F162], b0: &[B128], b1: &[B128]) -> [F162; 2] {
+    assert!(a.len() == b0.len() && a.len() == b1.len());
+    unsafe {
+        let mut acc0 = [vdupq_n_u64(0); 6];
+        let mut acc1 = [vdupq_n_u64(0); 6];
+        let pairs = a.len() / 2;
+        for i in 0..pairs {
+            let aa = vld3q_u64(a.as_ptr().add(2 * i) as *const u64);
+            let ka = [aa.0, aa.1, vdupq_n_u64(0), x2(aa.0, aa.1), x2(aa.0, aa.2), x2(aa.1, aa.2)];
+            let bb = vld2q_u64(b0.as_ptr().add(2 * i) as *const u64);
+            let kb = [bb.0, bb.1, vdupq_n_u64(0), x2(bb.0, bb.1), bb.0, bb.1];
+            let cc = vld2q_u64(b1.as_ptr().add(2 * i) as *const u64);
+            let kc = [cc.0, cc.1, vdupq_n_u64(0), x2(cc.0, cc.1), cc.0, cc.1];
+            for k in [0usize, 1, 3, 4, 5] {
+                acc0[k] = x2(acc0[k], pmul_lo(ka[k], kb[k]));
+                acc0[k] = x2(acc0[k], pmul_hi(ka[k], kb[k]));
+                acc1[k] = x2(acc1[k], pmul_lo(ka[k], kc[k]));
+                acc1[k] = x2(acc1[k], pmul_hi(ka[k], kc[k]));
+            }
+        }
+        let mut out0 = reduce(assemble(acc0.map(|x| to_u128(x))));
+        let mut out1 = reduce(assemble(acc1.map(|x| to_u128(x))));
+        if pairs * 2 < a.len() {
+            out0 += a[2 * pairs] * F162::from_b128(b0[2 * pairs]);
+            out1 += a[2 * pairs] * F162::from_b128(b1[2 * pairs]);
+        }
+        [out0, out1]
+    }
+}
+
 
 #[inline(always)]
 unsafe fn to_u128(x: uint64x2_t) -> u128 {
@@ -483,6 +516,14 @@ unsafe fn eor_plain(mut a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
     a
 }
 
+/// `prfm pldl2keep` on every 64-byte line of `[p, p + bytes)` (a hint: no fault, no effect on results).
+#[inline(always)]
+unsafe fn prefetch_l2(p: *const u8, bytes: usize) {
+    for off in (0..bytes).step_by(64) {
+        core::arch::asm!("prfm pldl2keep, [{p}]", p = in(reg) p.wrapping_add(off), options(nostack, preserves_flags, readonly));
+    }
+}
+
 #[cfg(test)]
 pub(super) fn partial_evals_sets(words: &[B128], eq: &[B128], start: usize, end: usize) -> Vec<Vec<B128>> {
     partial_evals_sets_tiled(words, eq.len(), start, end, |base, tile| {
@@ -508,7 +549,14 @@ pub(super) fn partial_evals_sets_tiled(
             for x in 0..count {
                 combinations(tile.as_ptr().add(GROUP * x), &mut tabs[x]);
             }
+            let next = base + GROUP * PASS < end;
             for (q, sum) in sums.iter_mut().enumerate() {
+                // This block's next tile into L2: 64 blocks 4 MiB apart, 1 KiB each per tile, are more
+                // streams than the hardware prefetchers follow.
+                let row = words.as_ptr().add(q * stride + base) as *const u8;
+                if next {
+                    prefetch_l2(row.add(16 * GROUP * PASS), 16 * GROUP * PASS);
+                }
                 for x in 0..count {
                     patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);
                 }
@@ -551,6 +599,16 @@ impl ByteTables {
     }
 }
 
+/// `acc += w * (two words p)`, unreduced (limb product 2 is always zero: B128 has two limbs).
+#[inline(always)]
+unsafe fn mat_step(acc: &mut [[uint64x2_t; 6]; 2], w: &[uint64x2_t; 6], p: uint64x2x2_t) {
+    let k = [p.0, p.1, vdupq_n_u64(0), x2(p.0, p.1), p.0, p.1];
+    for j in [0, 1, 3, 4, 5] {
+        acc[0][j] = x2(acc[0][j], pmul_lo(w[j], k[j]));
+        acc[1][j] = x2(acc[1][j], pmul_hi(w[j], k[j]));
+    }
+}
+
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start: usize, out: [&mut [u64]; 3]) {
     let stride = words.len() / weights.len();
@@ -563,17 +621,37 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
     let mut scratch = vec![[[z; 6]; 2]; PAIRS];
     for first in (0..len).step_by(2 * PAIRS) {
         let pairs = ((len - first) / 2).min(PAIRS);
+        let next = first + 2 * PAIRS < len;
         for (group, ws) in wk.chunks(8).enumerate() {
-            for i in 0..pairs {
+            // This group's rows of the next chunk into L2.
+            for g in 0..ws.len() {
+                let row = words.as_ptr().add((8 * group + g) * stride + start + first) as *const u8;
+                if next {
+                    prefetch_l2(row.wrapping_add(64 * PAIRS), 64 * PAIRS);
+                }
+            }
+            // Two pairs (one 64-byte line of each row) per step: the eight rows of a group sit 4 MiB
+            // apart, so their lines share one L1 set; reading a line once instead of once per pair
+            // halves the L1 refills (a 4-way set cannot hold eight rows' lines between two pairs).
+            let mut i = 0;
+            while i + 2 <= pairs {
+                let mut a = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
+                let mut b = if group == 0 { [[z; 6]; 2] } else { scratch[i + 1] };
+                for (g, w) in ws.iter().enumerate() {
+                    let q = 8 * group + g;
+                    let row = words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64;
+                    mat_step(&mut a, w, vld2q_u64(row));
+                    mat_step(&mut b, w, vld2q_u64(row.add(4)));
+                }
+                scratch[i] = a;
+                scratch[i + 1] = b;
+                i += 2;
+            }
+            if i < pairs {
                 let mut acc = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
                 for (g, w) in ws.iter().enumerate() {
                     let q = 8 * group + g;
-                    let p = vld2q_u64(words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64);
-                    let k = [p.0, p.1, z, x2(p.0, p.1), p.0, p.1];
-                    for j in [0, 1, 3, 4, 5] {
-                        acc[0][j] = x2(acc[0][j], pmul_lo(w[j], k[j]));
-                        acc[1][j] = x2(acc[1][j], pmul_hi(w[j], k[j]));
-                    }
+                    mat_step(&mut acc, w, vld2q_u64(words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64));
                 }
                 scratch[i] = acc;
             }
@@ -841,6 +919,8 @@ mod tests {
             let b: Vec<_> = (0..n).map(|_| B128(rng.next())).collect();
             let want = a.iter().zip(&b).fold(F162::ZERO, |sum, (&x, &y)| sum + x * F162::from_b128(y));
             assert_eq!(dot_lifted(&a, &b), want, "n={n}");
+            let c: Vec<_> = (0..n).map(|_| B128(rng.next())).collect();
+            assert_eq!(dot_lifted2(&a, &b, &c), [dot_lifted(&a, &b), dot_lifted(&a, &c)], "n={n}");
         }
     }
 

@@ -179,7 +179,8 @@ impl Output {
         let bytes = commitment.len();
         let worker = Arc::downgrade(&state);
         // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
-        // disturbs its placement; one short setup thread completes during the commitment.
+        // disturbs its placement; one short setup thread runs alongside the table read and the
+        // key copy, and `prove` waits for it before the commitment (see `wait_setup`).
         let setup = std::thread::spawn(move || {
             if let Some(state) = worker.upgrade() { let _ = state.mapped(); }
             labinius::challenge::warm();
@@ -188,6 +189,14 @@ impl Output {
             }
         });
         Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
+    }
+    /// Waits for the setup thread (it ends ~3 ms after [`Output::start`]). `prove` calls this
+    /// before the commitment: when the eight commitment workers were spawned while the setup thread
+    /// still held a core, the scheduler put two workers on one core in about 40% of the runs on the
+    /// board's Graviton4 (8 vCPUs), and they shared it for ~10 ms before one was moved: both
+    /// finished 5-20 ms late, and the commitment with them.
+    pub fn wait_setup(&self) {
+        self.finish_setup();
     }
     fn finish_setup(&self) {
         if let Some(thread) = self.setup.lock().unwrap().take() {

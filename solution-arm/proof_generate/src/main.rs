@@ -859,10 +859,25 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
     (partials, rounds, coords, opened)
 }
 
-fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
+fn commit_encoded(values: &[B128], modulus: u128) -> Vec<u8> {
+    let bytes = vec![0u8; rq::coefficient_bytes(modulus) * (values.len() / COLUMN_LEN) * rq::N];
+    #[cfg(target_arch = "aarch64")]
+    if modulus == ntt::neon::sms::MODULUS {
+        use ntt::neon::sms;
+        let mut bytes = bytes;
+        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
+            .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+        sms::commit_wire(values, &matrix, threads(), &mut bytes);
+        return bytes;
+    }
     let coefficients = commit(values, modulus);
-    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
+    let bytes = output::pack_commitment(&coefficients, modulus, bytes);
     std::mem::forget(coefficients);
+    bytes
+}
+
+fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer) -> ProofParts {
+    let commitment = commit_encoded(values, modulus);
     labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
@@ -922,7 +937,7 @@ fn main() {
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
     timer.lap("read");
-    let proof = prove(&seed, modulus, &values, &mut timer, &output);
+    let proof = prove(&seed, modulus, &values, &mut timer);
     output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));

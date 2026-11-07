@@ -566,7 +566,7 @@ fn check(elems: &[F162], a: &[Batch32]) {
 }
 
 /// Distance, in batches, of the A prefetch.
-pub const PF_DIST: usize = 1;
+pub const PF_DIST: usize = 4;
 
 // =============================================================================================
 // quadratic-slot limbs

@@ -711,6 +711,56 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
     }
 }
 
+#[inline(always)]
+unsafe fn pass_cd<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
+    let s: Schedule = schedule(S);
+    let k = vld1q_s16(kern.k.as_ptr());
+    #[inline(always)]
+    unsafe fn lvl4(x: &[int16x8_t; N], s: Schedule, t0: int16x8_t, k: int16x8_t, at: usize) -> [int16x8_t; 9] {
+        let mut v: [int16x8_t; 9] = core::array::from_fn(|i| load(x, at + 3 * i));
+        reduce_inputs(&mut v, s.before[4], s.cheap, &[0, 1, 2], k);
+        for i in 0..3 {
+            let (a, b, c) = r3!(s, 0, 1, 2, 3, v[i], v[i + 3], v[i + 6], t0, k);
+            (v[i], v[i + 3], v[i + 6]) = (a, b, c);
+        }
+        reduce_inputs(&mut v, s.before[5], s.cheap, &[0, 3, 6], k);
+        v
+    }
+    #[inline(always)]
+    unsafe fn lvl5(s: Schedule, v: &[int16x8_t; 9], g: usize, t0: int16x8_t, t1: int16x8_t, k: int16x8_t) -> [int16x8_t; 3] {
+        let (a, b, c) = match g {
+            0 => r3!(s, 4, 5, 6, 7, v[0], v[1], v[2], t0, k),
+            1 => r3!(s, 0, 1, 2, 3, v[3], v[4], v[5], t1, k),
+            _ => r3!(s, 4, 5, 6, 7, v[6], v[7], v[8], t1, k),
+        };
+        [a, b, c]
+    }
+    for n in 0..24 {
+        let t0 = vld1q_s16(kern.c[n].as_ptr());
+        let t1 = vld1q_s16(kern.c[n].as_ptr().add(8));
+        let base = 27 * n;
+        let v = [lvl4(x, s, t0, k, base), lvl4(x, s, t0, k, base + 1), lvl4(x, s, t0, k, base + 2)];
+        for g in 0..3 {
+            let y = [lvl5(s, &v[0], g, t0, t1, k), lvl5(s, &v[1], g, t0, t1, k), lvl5(s, &v[2], g, t0, t1, k)];
+            for i in 0..3 {
+                let t = 9 * n + 3 * g + i;
+                let tw = vld1q_s16(kern.d[t / 2].as_ptr());
+                let mut w = [y[0][i], y[1][i], y[2][i]];
+                reduce_inputs(&mut w, s.before[6], s.cheap, &[0], k);
+                let (a, b, c) = if t % 2 == 0 {
+                    r3!(s, 0, 1, 2, 3, w[0], w[1], w[2], tw, k)
+                } else {
+                    r3!(s, 4, 5, 6, 7, w[0], w[1], w[2], tw, k)
+                };
+                let at = 3 * t;
+                store(x, at, a);
+                store(x, at + 1, b);
+                store(x, at + 2, c);
+            }
+        }
+    }
+}
+
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].
 #[inline(never)]

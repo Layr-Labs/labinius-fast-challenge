@@ -665,8 +665,7 @@ unsafe fn sums(
                 indices(&at, nib);
                 let x = &mut xs[i];
                 pass_lut::<PB>(nib, x, kern);
-                pass_c::<PB>(x, kern);
-                pass_d::<PB, false>(x, kern, &[], &mut []);
+                pass_cd::<PB>(x, kern);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             // the chunk's first sweep starts the digit rows' sums afresh

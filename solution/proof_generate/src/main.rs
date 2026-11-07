@@ -102,6 +102,7 @@ mod sys {
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
         pub fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+        pub fn _exit(status: i32) -> !;
     }
     pub const PROT_NONE: i32 = 0;
     pub const PROT_READ: i32 = 1;
@@ -1103,6 +1104,7 @@ unsafe fn lift_sms_column(r: &[i16], tail: &[u32; N], out: &mut [u8]) {
     let magic = _mm512_set1_epi64(3_619_418_999);
     let pick = _mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
     let keep: __mmask64 = (1u64 << 40) - 1;
+    let tail_mod = _mm512_set1_epi64(sms::TAIL_MODULUS as i64);
     let modq = |x: __m512i| -> __m512i {
         let qq = _mm512_srli_epi64::<45>(_mm512_mul_epu32(x, magic));
         _mm512_sub_epi64(x, _mm512_mul_epu32(qq, q))
@@ -1114,7 +1116,7 @@ unsafe fn lift_sms_column(r: &[i16], tail: &[u32; N], out: &mut [u8]) {
         let d = _mm512_sub_epi64(a, modq(t));
         let d = _mm512_add_epi64(d, _mm512_and_si512(_mm512_srai_epi64::<63>(d), q));
         let k = modq(_mm512_mul_epu32(d, inv));
-        let value = _mm512_add_epi64(t, _mm512_mul_epu32(k,_mm512_set1_epi64(sms::TAIL_MODULUS as i64)));
+        let value = _mm512_add_epi64(t, _mm512_mul_epu32(k, tail_mod));
         _mm512_mask_storeu_epi8(out.as_mut_ptr().add(40 * j) as *mut i8, keep, _mm512_permutexvar_epi8(pick, value));
     }
 }
@@ -1242,25 +1244,22 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
     put(&mut at, &(parts.commitment.len() as u64).to_le_bytes());
     debug_assert_eq!(at, layout.commitment_at());
     let mut at = layout.middle_at();
-    let mut middle = Vec::with_capacity(layout.middle());
-    middle.extend_from_slice(&(parts.partials.len() as u64).to_le_bytes());
+    put(&mut at, &(parts.partials.len() as u64).to_le_bytes());
     for v in &parts.partials {
-        middle.extend_from_slice(&v.to_le_bytes());
+        put(&mut at, &v.to_le_bytes());
     }
-    middle.extend_from_slice(&(parts.rounds.len() as u64).to_le_bytes());
+    put(&mut at, &(parts.rounds.len() as u64).to_le_bytes());
     for r in &parts.rounds {
         for x in r.iter().flatten() {
-            middle.extend_from_slice(&x.to_le_bytes());
+            put(&mut at, &x.to_le_bytes());
         }
     }
     for x in &parts.opened {
-        middle.extend_from_slice(&x.to_le_bytes());
+        put(&mut at, &x.to_le_bytes());
     }
-    middle.extend_from_slice(&(parts.row.len() as u64).to_le_bytes());
-    middle.extend_from_slice(&parts.row);
-    middle.extend_from_slice(&(layout.folded_bytes as u64).to_le_bytes());
-    debug_assert_eq!(middle.len(), layout.middle());
-    put(&mut at, &middle);
+    put(&mut at, &(parts.row.len() as u64).to_le_bytes());
+    put(&mut at, &parts.row);
+    put(&mut at, &(layout.folded_bytes as u64).to_le_bytes());
     debug_assert_eq!(at, layout.folded_at());
     let elements = parts.folded.elements();
     assert!(
@@ -1901,6 +1900,10 @@ fn main() {
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
     // The proof is on disk; nothing the destructors would do is observable.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        sys::_exit(0);
+    }
     std::process::exit(0);
 }
 

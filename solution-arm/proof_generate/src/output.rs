@@ -124,6 +124,7 @@ impl Drop for Mapped {
     }
 }
 const CHUNK: usize = 2 << 20;
+const POPULATE: usize = 64 << 10;
 
 struct State {
     path: String,
@@ -157,8 +158,8 @@ impl State {
     fn mapped(&self) -> Option<&Mapped> { self.map.get_or_init(|| self.create_and_map()).as_ref() }
     fn populate(&self, i: usize) {
         let Some(map) = self.mapped() else { return; };
-        let at = i * CHUNK;
-        let len = CHUNK.min(self.layout.len() - at);
+        let at = i * POPULATE;
+        let len = POPULATE.min(self.layout.len() - at);
         #[cfg(target_os = "linux")]
         unsafe { sys::madvise((map.addr + at) as *mut u8, len, 23); }
     }
@@ -200,15 +201,16 @@ impl Output {
         self.finish_setup();
         self.commitment.lock().unwrap().take().expect("commitment buffer used once")
     }
-    /// Called before transcript absorb, while the caller is about to run alone. Avoid file
-    /// population chunks at commitment dispatch: they can delay a coarse commitment task.
     pub fn populate(&self) {
         let worker = Arc::downgrade(&self.state);
-        let chunks = self.state.layout.len().div_ceil(CHUNK);
+        let chunks = self.state.layout.len().div_ceil(POPULATE);
         let job = par::pool().idle(chunks, move |i| {
             if let Some(state) = worker.upgrade() { state.populate(i); }
         });
         assert!(self.populate.set(job).is_ok(), "output populated once");
+    }
+    pub fn pause_population(&self) {
+        if let Some(job) = self.populate.get() { par::pool().quiesce(job); }
     }
     pub fn write(&self, p: &ProofParts) {
         self.quiesce();

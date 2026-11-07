@@ -879,12 +879,11 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
     std::mem::forget(coefficients);
     labinius::par::pool();
     timer.lap("commit");
-    // No output prefault here: the switch that follows runs on every core from its first
-    // round, and idle population workers measurably slowed it. The final encode faults the
-    // file pages itself, in parallel.
+    output.populate();
     let mut t = transcript(seed, modulus, &commitment);
     let lo = t.sample_b128(b"r-lo", 7);
     let hi = t.sample_b128(b"r-hi", LOG_PACKED);
+    output.pause_population();
     let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t);
     t.absorb_f162(&[opened]);
     timer.lap("switch");

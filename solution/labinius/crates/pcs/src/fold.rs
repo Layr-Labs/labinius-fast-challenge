@@ -1576,33 +1576,25 @@ mod bitsliced {
     /// bit and the byte-position bit exchanged in round r are 3-r. Constant pair indices let
     /// the compiler keep all sixteen vectors in registers instead of indexing a stack array.
     #[inline(always)]
-    unsafe fn transpose_tile(src: *const B128, dst: *mut __m512i) {
+    unsafe fn transpose_tile(src: *const B128, dst: *mut __m512i, sw: &[__m512i; 8]) {
         let mut z: [__m512i; 16] = core::array::from_fn(|i| {
             _mm512_loadu_si512((src as *const u8).add(64 * i) as *const __m512i)
         });
         macro_rules! pair {
-            ($a:literal, $b:literal, $i0:ident, $i1:ident) => {{
+            ($a:literal, $b:literal, $i0:expr, $i1:expr) => {{
                 let (a, b) = (z[$a], z[$b]);
                 z[$a] = _mm512_permutex2var_epi8(a, $i0, b);
                 z[$b] = _mm512_permutex2var_epi8(a, $i1, b);
             }};
         }
-        let i0 = _mm512_load_si512(SWAPS.0[0][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[0][1].as_ptr() as *const __m512i);
-        pair!(0, 8, i0, i1); pair!(1, 9, i0, i1); pair!(2, 10, i0, i1); pair!(3, 11, i0, i1);
-        pair!(4, 12, i0, i1); pair!(5, 13, i0, i1); pair!(6, 14, i0, i1); pair!(7, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[1][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[1][1].as_ptr() as *const __m512i);
-        pair!(0, 4, i0, i1); pair!(1, 5, i0, i1); pair!(2, 6, i0, i1); pair!(3, 7, i0, i1);
-        pair!(8, 12, i0, i1); pair!(9, 13, i0, i1); pair!(10, 14, i0, i1); pair!(11, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[2][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[2][1].as_ptr() as *const __m512i);
-        pair!(0, 2, i0, i1); pair!(1, 3, i0, i1); pair!(4, 6, i0, i1); pair!(5, 7, i0, i1);
-        pair!(8, 10, i0, i1); pair!(9, 11, i0, i1); pair!(12, 14, i0, i1); pair!(13, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[3][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[3][1].as_ptr() as *const __m512i);
-        pair!(0, 1, i0, i1); pair!(2, 3, i0, i1); pair!(4, 5, i0, i1); pair!(6, 7, i0, i1);
-        pair!(8, 9, i0, i1); pair!(10, 11, i0, i1); pair!(12, 13, i0, i1); pair!(14, 15, i0, i1);
+        pair!(0, 8, sw[0], sw[1]); pair!(1, 9, sw[0], sw[1]); pair!(2, 10, sw[0], sw[1]); pair!(3, 11, sw[0], sw[1]);
+        pair!(4, 12, sw[0], sw[1]); pair!(5, 13, sw[0], sw[1]); pair!(6, 14, sw[0], sw[1]); pair!(7, 15, sw[0], sw[1]);
+        pair!(0, 4, sw[2], sw[3]); pair!(1, 5, sw[2], sw[3]); pair!(2, 6, sw[2], sw[3]); pair!(3, 7, sw[2], sw[3]);
+        pair!(8, 12, sw[2], sw[3]); pair!(9, 13, sw[2], sw[3]); pair!(10, 14, sw[2], sw[3]); pair!(11, 15, sw[2], sw[3]);
+        pair!(0, 2, sw[4], sw[5]); pair!(1, 3, sw[4], sw[5]); pair!(4, 6, sw[4], sw[5]); pair!(5, 7, sw[4], sw[5]);
+        pair!(8, 10, sw[4], sw[5]); pair!(9, 11, sw[4], sw[5]); pair!(12, 14, sw[4], sw[5]); pair!(13, 15, sw[4], sw[5]);
+        pair!(0, 1, sw[6], sw[7]); pair!(2, 3, sw[6], sw[7]); pair!(4, 5, sw[6], sw[7]); pair!(6, 7, sw[6], sw[7]);
+        pair!(8, 9, sw[6], sw[7]); pair!(10, 11, sw[6], sw[7]); pair!(12, 13, sw[6], sw[7]); pair!(14, 15, sw[6], sw[7]);
         for i in 0..16 {
             _mm512_store_si512(dst.add(i), z[i]);
         }
@@ -1650,11 +1642,35 @@ mod bitsliced {
     unsafe fn slice(words: *const B128, out: *mut __m512i, next: *const B128) {
         let mut tiles = core::mem::MaybeUninit::<[[__m512i; 16]; 8]>::uninit();
         let tiles_ptr = tiles.as_mut_ptr() as *mut __m512i;
+        let swaps: [__m512i; 8] = [
+            _mm512_load_si512(SWAPS.0[0][0].as_ptr() as *const __m512i),
+            _mm512_load_si512(SWAPS.0[0][1].as_ptr() as *const __m512i),
+            _mm512_load_si512(SWAPS.0[1][0].as_ptr() as *const __m512i),
+            _mm512_load_si512(SWAPS.0[1][1].as_ptr() as *const __m512i),
+            _mm512_load_si512(SWAPS.0[2][0].as_ptr() as *const __m512i),
+            _mm512_load_si512(SWAPS.0[2][1].as_ptr() as *const __m512i),
+            _mm512_load_si512(SWAPS.0[3][0].as_ptr() as *const __m512i),
+            _mm512_load_si512(SWAPS.0[3][1].as_ptr() as *const __m512i),
+        ];
         for t in 0..8 {
-            for i in 0..16 {
-                _mm_prefetch::<{ _MM_HINT_T0 }>((next as *const i8).add(1024 * t + 64 * i));
-            }
-            transpose_tile(words.add(64 * t), tiles_ptr.add(16 * t));
+            let next_p = (next as *const i8).add(1024 * t);
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p);
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(64));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(128));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(192));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(256));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(320));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(384));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(448));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(512));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(576));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(640));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(704));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(768));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(832));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(896));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(next_p.add(960));
+            transpose_tile(words.add(64 * t), tiles_ptr.add(16 * t), &swaps);
         }
         let perm = _mm512_load_si512(PERM.0.as_ptr() as *const __m512i);
         let ident = _mm512_set1_epi64(bitmat::GF_IDENT);

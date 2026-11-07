@@ -186,11 +186,6 @@ impl Output {
             for offset in (0..bytes).step_by(4096) {
                 unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
             }
-            // Fault the whole proof mapping while the table read still runs on the other
-            // cores: the write phase then only has to encode, not populate file pages.
-            if let Some(state) = &state {
-                for i in 0..state.layout.len().div_ceil(CHUNK) { state.populate(i); }
-            }
         });
         Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
     }

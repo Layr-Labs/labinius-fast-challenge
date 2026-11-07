@@ -645,7 +645,7 @@ unsafe fn sums(
                 indices(&at, nib);
                 let x = &mut xs[i];
                 pass_lut::<PB>(nib, x, kern);
-                pass_c::<PB>(x, kern);
+                pass_c::<4>(x, kern);
                 pass_d::<PB, false>(x, kern, &[], &mut []);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);

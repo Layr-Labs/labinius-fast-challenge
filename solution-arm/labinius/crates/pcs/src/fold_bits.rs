@@ -1098,8 +1098,8 @@ pub mod neon {
     const SLOTS: usize = 243;
     /// Slot pairs; the odd slot of the last pair (243) is a dummy.
     const PAIRS: usize = SLOTS.div_ceil(2);
-    /// Columns per group.
-    pub const GROUP: usize = 24;
+    /// Columns per group. Thirty is the largest group whose biased byte offsets fit u16.
+    pub const GROUP: usize = 30;
     /// Zero planes in front of the first column (plane 1 is column 0's leading guard).
     const GUARD: usize = 2;
     /// Planes per column: 128 and the trailing zero guard (the next column's leading guard).

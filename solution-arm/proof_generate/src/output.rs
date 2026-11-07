@@ -167,6 +167,7 @@ impl State {
 pub(super) struct Output {
     state: Arc<State>,
     setup: Mutex<Option<std::thread::JoinHandle<()>>>,
+    prefault: Mutex<Option<std::thread::JoinHandle<()>>>,
     populate: OnceLock<&'static par::IdleJob>,
     commitment: Mutex<Option<Vec<u8>>>,
 }
@@ -186,13 +187,23 @@ impl Output {
             for offset in (0..bytes).step_by(4096) {
                 unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
             }
-            // Fault the whole proof mapping while the table read still runs on the other
-            // cores: the write phase then only has to encode, not populate file pages.
-            if let Some(state) = &state {
-                for i in 0..state.layout.len().div_ceil(CHUNK) { state.populate(i); }
-            }
         });
-        Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
+        // Population is independent of the commitment and the table read. Keep it on its own
+        // thread so it overlaps them and the 200 ms commit instead of delaying `wait_setup`.
+        let prefault_worker = Arc::downgrade(&state);
+        let prefault = std::thread::spawn(move || {
+            let Some(state) = prefault_worker.upgrade() else { return; };
+            if state.mapped().is_none() { return; }
+            // The write phase then only has to encode, not populate file pages.
+            for i in 0..state.layout.len().div_ceil(CHUNK) { state.populate(i); }
+        });
+        Self {
+            state,
+            setup: Mutex::new(Some(setup)),
+            prefault: Mutex::new(Some(prefault)),
+            populate: OnceLock::new(),
+            commitment: Mutex::new(Some(commitment)),
+        }
     }
     pub fn wait_setup(&self) {
         self.finish_setup();
@@ -200,6 +211,11 @@ impl Output {
     fn finish_setup(&self) {
         if let Some(thread) = self.setup.lock().unwrap().take() {
             thread.join().expect("output preparation thread panicked");
+        }
+    }
+    fn finish_prefault(&self) {
+        if let Some(thread) = self.prefault.lock().unwrap().take() {
+            thread.join().expect("output prefault thread panicked");
         }
     }
     pub fn commitment_buffer(&self) -> Vec<u8> {
@@ -231,6 +247,7 @@ impl Output {
     }
     fn quiesce(&self) {
         self.finish_setup();
+        self.finish_prefault();
         if let Some(job) = self.populate.get() { par::pool().quiesce(job); }
     }
 }

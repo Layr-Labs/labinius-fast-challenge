@@ -168,35 +168,24 @@ pub(super) struct Output {
     state: Arc<State>,
     setup: Mutex<Option<std::thread::JoinHandle<()>>>,
     populate: OnceLock<&'static par::IdleJob>,
-    commitment: Mutex<Option<Vec<u8>>>,
 }
 impl Output {
     pub fn start(path: &str, q: u128) -> Self {
         let layout = Layout::instance(q);
         let state = Arc::new(State { path: path.to_owned(), layout, map: OnceLock::new() });
-        let mut commitment = vec![0u8; layout.commitment];
-        let addr = commitment.as_mut_ptr() as usize;
-        let bytes = commitment.len();
         let worker = Arc::downgrade(&state);
         // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
         // disturbs its placement; one short setup thread completes during the commitment.
         let setup = std::thread::spawn(move || {
             if let Some(state) = worker.upgrade() { let _ = state.mapped(); }
             labinius::challenge::warm();
-            for offset in (0..bytes).step_by(4096) {
-                unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
-            }
         });
-        Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
+        Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new() }
     }
     fn finish_setup(&self) {
         if let Some(thread) = self.setup.lock().unwrap().take() {
             thread.join().expect("output preparation thread panicked");
         }
-    }
-    pub fn commitment_buffer(&self) -> Vec<u8> {
-        self.finish_setup();
-        self.commitment.lock().unwrap().take().expect("commitment buffer used once")
     }
     /// Called before transcript absorb, while the caller is about to run alone. Avoid file
     /// population chunks at commitment dispatch: they can delay a coarse commitment task.
@@ -324,7 +313,6 @@ mod tests {
             state: Arc::new(State { path: path.to_owned(), layout, map }),
             setup: Mutex::new(None),
             populate: OnceLock::new(),
-            commitment: Mutex::new(None),
         }
     }
 

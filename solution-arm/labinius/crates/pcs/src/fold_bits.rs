@@ -1514,6 +1514,20 @@ pub mod neon {
         }
         macro_rules! four { ($off:expr, $neg:literal) => { level!(1, two, $off, $neg) }; }
         macro_rules! eight { ($off:expr, $neg:literal) => { level!(2, four, $off, $neg) }; }
+        // Two consecutive eight-entry subtrees. Start both trees before closing either one so
+        // that the independent lower halves can overlap, while the returned carries retain the
+        // list's subtree order.
+        macro_rules! eight2 {
+            ($off:expr, $neg:literal) => {{
+                let (a0, a1) = four!($off, $neg);
+                let (b0, b1) = four!($off + SUB, $neg);
+                let (c0, c1) = four!($off + SUB / 2, $neg);
+                let x = (fa(&mut s0[2], a0, c0), fa(&mut s1[2], a1, c1));
+                let (d0, d1) = four!($off + SUB + SUB / 2, $neg);
+                let y = (fa(&mut s0[2], b0, d0), fa(&mut s1[2], b1, d1));
+                (x, y)
+            }};
+        }
         // The true carry of a tree.
         macro_rules! fix {
             ($c:expr, $neg:literal) => {
@@ -1548,12 +1562,10 @@ pub mod neon {
                 // whose carry (weight 64) goes into `h`.
                 macro_rules! tree32 {
                     () => {{
-                        let (a0, a1) = eight!(0, $neg);
-                        let (b0, b1) = eight!(SUB, $neg);
+                        let ((a0, a1), (b0, b1)) = eight2!(0, $neg);
                         let d0 = fa(&mut s0[3], a0, b0);
                         let d1 = fa(&mut s1[3], a1, b1);
-                        let (a0, a1) = eight!(2 * SUB, $neg);
-                        let (b0, b1) = eight!(3 * SUB, $neg);
+                        let ((a0, a1), (b0, b1)) = eight2!(2 * SUB, $neg);
                         let f0 = fa(&mut s0[3], a0, b0);
                         let f1 = fa(&mut s1[3], a1, b1);
                         let e = (fa(&mut s0[4], d0, f0), fa(&mut s1[4], d1, f1));
@@ -1589,11 +1601,12 @@ pub mod neon {
                 // Up to three more subtrees of eight.
                 let left = $n8 % 4;
                 if left != 0 {
-                    (p30, p31) = eight!(0, $neg);
-                    t = t.add(SUB);
-                    if left != 1 {
-                        let (c0, c1) = eight!(0, $neg);
-                        t = t.add(SUB);
+                    if left == 1 {
+                        (p30, p31) = eight!(0, $neg);
+                    } else {
+                        let ((a0, a1), (c0, c1)) = eight2!(0, $neg);
+                        t = t.add(2 * SUB);
+                        (p30, p31) = (a0, a1);
                         p40 = fa(&mut s0[3], p30, c0);
                         p41 = fa(&mut s1[3], p31, c1);
                         (p30, p31) = (none, none);
@@ -1853,6 +1866,79 @@ pub mod neon {
             for l in 0..LANES {
                 let want: u16 = (0..16).map(|w| (((pb[w][l / 8] >> (l % 8)) & 1) as u16) << w).sum();
                 assert_eq!(got[l / 8][l % 8], want, "lane {l}");
+            }
+        }
+
+        /// Paired subtrees, odd leftovers, both 32-tree paths, and padded tails against scalar
+        /// counting, independently of schedule construction and ring reduction.
+        #[test]
+        fn pass_paired_eights_match_scalar_counts() {
+            const DATA: usize = 19;
+            let mut x = 0xE1A2_4839_5B6C_7D8Fu128;
+            let mut planes: Vec<V> = (0..2 * DATA)
+                .map(|_| unsafe { core::mem::transmute(next(&mut x).to_le_bytes()) })
+                .collect();
+            let zero = planes.len() / 2;
+            planes.extend([unsafe { vdupq_n_u8(0) }; 2]);
+            let ones = planes.len() / 2;
+            planes.extend([unsafe { vdupq_n_u8(0xFF) }; 2]);
+            let offset = |i: usize| (32 * i) as u16;
+            let plane_bytes = |i: usize, slot: usize| -> [u8; 16] {
+                unsafe { core::mem::transmute(planes[2 * i + slot]) }
+            };
+            for &(pos8, neg8) in
+                &[(0, 0), (1, 2), (2, 3), (3, 4), (4, 5), (7, 8), (8, 9), (9, 10)]
+            {
+                let pos: Vec<u16> = (0..SUB * pos8).map(|i| offset((3 * i + 1) % DATA)).collect();
+                let neg: Vec<u16> = (0..SUB * neg8).map(|i| offset((5 * i + 2) % DATA)).collect();
+                let mut tail = [[offset(zero); SUB], [offset(ones); SUB]];
+                for (i, o) in tail[0][..3].iter_mut().enumerate() {
+                    *o = offset((7 * i + 4) % DATA);
+                }
+                for (i, o) in tail[1][..5].iter_mut().enumerate() {
+                    *o = offset((11 * i + 3) % DATA);
+                }
+                let mut lo = [unsafe { vdupq_n_u8(0) }; 2 * LO];
+                let mut hi = [unsafe { vdupq_n_u8(0) }; 2 * HI];
+                unsafe {
+                    pass(
+                        planes.as_ptr() as *const u8,
+                        pos.as_ptr(),
+                        pos8,
+                        neg.as_ptr(),
+                        neg8,
+                        &tail,
+                        lo.as_mut_ptr(),
+                        hi.as_mut_ptr(),
+                    );
+                }
+                let pos_terms = pos.iter().copied().chain(tail[0][..3].iter().copied());
+                let neg_terms = neg.iter().copied().chain(tail[1][..5].iter().copied());
+                for slot in 0..2 {
+                    let low: [[u8; 16]; LO] =
+                        core::array::from_fn(|b| unsafe { core::mem::transmute(lo[slot * LO + b]) });
+                    let high: [[u8; 16]; HI] =
+                        core::array::from_fn(|b| unsafe { core::mem::transmute(hi[slot * HI + b]) });
+                    for lane in 0..LANES {
+                        let got = (0..LO)
+                            .map(|b| (((low[b][lane / 8] >> (lane % 8)) & 1) as usize) << b)
+                            .chain((0..HI).map(|b| {
+                                (((high[b][lane / 8] >> (lane % 8)) & 1) as usize) << (LO + b)
+                            }))
+                            .sum::<usize>();
+                        let want_pos = pos_terms
+                            .clone()
+                            .map(|o| (plane_bytes(o as usize / 32, slot)[lane / 8] >> (lane % 8)) & 1)
+                            .map(usize::from)
+                            .sum::<usize>();
+                        let want_neg = neg_terms
+                            .clone()
+                            .map(|o| 1 - ((plane_bytes(o as usize / 32, slot)[lane / 8] >> (lane % 8)) & 1))
+                            .map(usize::from)
+                            .sum::<usize>();
+                        assert_eq!(got, want_pos + want_neg, "pos8 {pos8} neg8 {neg8} slot {slot} lane {lane}");
+                    }
+                }
             }
         }
 

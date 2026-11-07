@@ -659,7 +659,12 @@ unsafe fn sums(
             // words and their key lanes are zero, so those lanes contribute nothing.
             let l = SWEEP.min(end - e);
             let groups = l.div_ceil(LOCK);
+            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            let key_bytes = groups * N * ROWS * LOCK * core::mem::size_of::<i16>();
+            let slice = key_bytes.div_ceil(groups * LOCK).next_multiple_of(64);
             for i in 0..groups * LOCK {
+                let from = i * slice;
+                prefetch_l2((keys as *const u8).wrapping_add(from), slice.min(key_bytes.saturating_sub(from)));
                 let at = pass_words(words, a.elements, e, i);
                 indices(&at, nib);
                 let x = &mut xs[i];
@@ -667,7 +672,6 @@ unsafe fn sums(
                 pass_c::<PB>(x, kern);
                 pass_d::<PB, false>(x, kern, &[], &mut []);
             }
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             // the chunk's first sweep starts the digit rows' sums afresh
             if e % CHUNK == 0 {
                 sink::<true>(xs, keys, acc, groups);
@@ -683,6 +687,13 @@ unsafe fn sums(
     }
     narrow(acc, 0, y);
     super::inverse_folded::<PB>(y);
+}
+
+#[inline(always)]
+unsafe fn prefetch_l2(p: *const u8, bytes: usize) {
+    for off in (0..bytes).step_by(64) {
+        core::arch::asm!("prfm pldl2keep, [{p}]", p = in(reg) p.wrapping_add(off), options(nostack, preserves_flags, readonly));
+    }
 }
 
 #[inline]

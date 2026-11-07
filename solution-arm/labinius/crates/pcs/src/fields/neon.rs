@@ -576,13 +576,15 @@ pub(super) fn partial_evals_sets_tiled(
             for x in 0..count {
                 combinations(tile.as_ptr().add(GROUP * x), &mut tabs[x]);
             }
+            const AHEAD: usize = 4;
             let next = base + GROUP * PASS < end;
+            let next_bytes = 16 * GROUP * ((end.saturating_sub(base + GROUP * PASS)) / GROUP).min(PASS);
             for (q, sum) in sums.iter_mut().enumerate() {
-                // This block's next tile into L2: 64 blocks 4 MiB apart, 1 KiB each per tile, are more
-                // streams than the hardware prefetchers follow.
-                let row = words.as_ptr().add(q * stride + base) as *const u8;
-                if next {
-                    prefetch_l2(row.add(16 * GROUP * PASS), 16 * GROUP * PASS);
+                let ahead = q + AHEAD;
+                if ahead < blocks {
+                    prefetch_l2(words.as_ptr().add(ahead * stride + base) as *const u8, 16 * GROUP * count);
+                } else if next && ahead - blocks < blocks {
+                    prefetch_l2(words.as_ptr().add((ahead - blocks) * stride + base + GROUP * PASS) as *const u8, next_bytes);
                 }
                 for x in 0..count {
                     patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);

@@ -248,6 +248,9 @@ mod huge {
                 CARVE.lock.unlock();
                 return (core::ptr::null_mut(), false);
             }
+            // Fault the fresh chunk before publishing blocks from it to several workers.
+            // The zero store preserves alloc_zeroed's fresh-mapping contract.
+            core::ptr::write_volatile(chunk as *mut u8, 0);
             at = chunk;
             *CARVE.end.get() = chunk + HUGE;
         }
@@ -1471,17 +1474,26 @@ impl Output {
     ///
     /// `first` are anonymous regions to fault in before the file, one chunk each (writable,
     /// and only ever populated: `MADV_POPULATE_WRITE` leaves what they hold as it is).
-    fn populate(&self, first: Vec<(usize, usize)>) {
+    fn populate(&self, first: Vec<(usize, usize)>, release: Vec<(usize, usize)>) {
         let chunks = self.state.layout.len().div_ceil(POPULATE_CHUNK);
         let worker_state = self.state.clone();
-        let job = labinius::par::pool().idle(first.len() + chunks, move |i| match first.get(i) {
-            #[cfg(target_os = "linux")]
-            Some(&(addr, len)) => unsafe {
-                sys::madvise(addr as *mut _, len, sys::MADV_POPULATE_WRITE);
-            },
-            #[cfg(not(target_os = "linux"))]
-            Some(_) => {}
-            None => worker_state.chunk(i - first.len() + 1),
+        let (nf, nr) = (first.len(), release.len());
+        let job = labinius::par::pool().idle(nf + nr + chunks, move |i| {
+            if let Some(&(addr, len)) = first.get(i) {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    sys::madvise(addr as *mut _, len, sys::MADV_POPULATE_WRITE);
+                }
+                let _ = (addr, len);
+            } else if let Some(&(addr, len)) = release.get(i - nf) {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    sys::madvise(addr as *mut _, len, sys::MADV_DONTNEED);
+                }
+                let _ = (addr, len);
+            } else {
+                worker_state.chunk(i - nf - nr + 1);
+            }
         });
         let _ = self.populate.set(job);
     }
@@ -1729,7 +1741,10 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
             let (addr, _) = p.region();
             (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
         });
-        output.populate(first.collect());
+        let at = image.as_ptr() as usize;
+        let (lo, hi) = ((at + 4095) & !4095, (at + image.len()) & !4095);
+        let release = (lo..hi.max(lo)).step_by(POPULATE_CHUNK).map(|o| (o, POPULATE_CHUNK.min(hi - o)));
+        output.populate(first.collect(), release.collect());
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
@@ -1783,7 +1798,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // written. The emptied mapping itself is left to the exit.
     #[cfg(target_os = "linux")]
     if let Table::Mapped { .. } = table {
-        release_words(values, image, workers);
+        release_words(values, if output.is_some() { &[] } else { image }, workers);
     }
     std::mem::forget(table);
     let proof = ProofParts {

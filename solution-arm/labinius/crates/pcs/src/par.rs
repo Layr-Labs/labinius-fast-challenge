@@ -184,7 +184,7 @@ use std::time::{Duration, Instant};
 
 /// Spin durations inherited from the x86 pool. Tune on Graviton4, not the GB10 host.
 /// How long an idle worker spins for the next dispatch before it parks.
-const WORKER_SPIN: Duration = Duration::from_millis(2);
+const WORKER_SPIN: Duration = Duration::from_millis(20);
 /// How long the dispatching thread spins for the last tasks of its dispatch before it parks.
 const MAIN_SPIN: Duration = Duration::from_millis(10);
 /// Spins between two clock reads; every 16th read also yields the CPU, so that a spinning

@@ -178,27 +178,20 @@ impl Stream {
         }
         debug_assert_eq!(at, x);
         let plain = &self.tail;
-        let cvs: Vec<ChainingValue> = crate::par::map_blocks(pieces.len(), threads.min(pieces.len()), 1, |_t, lo, hi| {
-            (lo..hi)
-                .map(|i| {
-                    let (start, len) = pieces[i];
-                    if start == 0 {
-                        // The first piece continues the stream absorbed so far.
-                        let mut h = plain.clone();
-                        h.update(&bytes[..(len - head) as usize]);
-                        h.finalize_non_root()
-                    } else {
-                        let mut h = Hasher::new();
-                        h.set_input_offset(start);
-                        h.update(&bytes[(start - head) as usize..(start + len - head) as usize]);
-                        h.finalize_non_root()
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .flatten()
-        .collect();
+        let cvs: Vec<ChainingValue> = crate::par::pool().map(pieces.len(), |i| {
+            let (start, len) = pieces[i];
+            if start == 0 {
+                // The first piece continues the stream absorbed so far.
+                let mut h = plain.clone();
+                h.update(&bytes[..(len - head) as usize]);
+                h.finalize_non_root()
+            } else {
+                let mut h = Hasher::new();
+                h.set_input_offset(start);
+                h.update(&bytes[(start - head) as usize..(start + len - head) as usize]);
+                h.finalize_non_root()
+            }
+        });
         let mut left = [[0u8; 32]; MAX_DEPTH];
         for (d, &(first, count)) in subtrees.iter().enumerate() {
             // Aligned siblings merge pairwise up to the subtree's root; more input follows.
@@ -714,24 +707,16 @@ pub fn sample_short_challenges(
     let base = t.counter;
     let state = &t.state;
     let bound_sq = bound * bound + 1e-12;
-    let parts = crate::par::workers(n, 32);
-    let out: Vec<ShortChallenge> = crate::par::map_blocks(n, parts, 1, |_, s, e| {
+    let out: Vec<ShortChallenge> = crate::par::pool().map(n, |i| {
         let mut perm = [0u8; N162];
-        (s..e)
-            .map(|i| {
-                let mut x = Xof::new(derive(state, base + i as u64, LABEL));
-                loop {
-                    let c = attempt(&mut x, weight, &mut perm).signed();
-                    if within(&c, bound_sq) {
-                        return c;
-                    }
-                }
-            })
-            .collect::<Vec<_>>()
-    })
-    .into_iter()
-    .flatten()
-    .collect();
+        let mut x = Xof::new(derive(state, base + i as u64, LABEL));
+        loop {
+            let c = attempt(&mut x, weight, &mut perm).signed();
+            if within(&c, bound_sq) {
+                return c;
+            }
+        }
+    });
     t.counter += n as u64;
     out
 }

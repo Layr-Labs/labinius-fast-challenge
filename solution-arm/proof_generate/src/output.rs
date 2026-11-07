@@ -252,14 +252,32 @@ pub(super) fn pack_commitment(values: &[u128], q: u128, mut bytes: Vec<u8>) -> V
     std::thread::scope(|scope| {
         for (dst, values) in bytes.chunks_mut(per * width).zip(values.chunks(per)) {
             scope.spawn(move || {
-                for (slot, &x) in dst.chunks_exact_mut(width).zip(values) {
-                    debug_assert!(x < q, "a coefficient is not reduced");
-                    slot.copy_from_slice(&x.to_le_bytes()[..width]);
+                match width {
+                    5 => pack_fixed::<5>(dst, values, q),
+                    6 => pack_fixed::<6>(dst, values, q),
+                    7 => pack_fixed::<7>(dst, values, q),
+                    8 => pack_fixed::<8>(dst, values, q),
+                    _ => {
+                        for (slot, &x) in dst.chunks_exact_mut(width).zip(values) {
+                            debug_assert!(x < q, "a coefficient is not reduced");
+                            slot.copy_from_slice(&x.to_le_bytes()[..width]);
+                        }
+                    }
                 }
             });
         }
     });
     bytes
+}
+
+#[inline(always)]
+fn pack_fixed<const W: usize>(dst: &mut [u8], values: &[u128], q: u128) {
+    let (slots, _) = dst.as_chunks_mut::<W>();
+    for (slot, &x) in slots.iter_mut().zip(values) {
+        debug_assert!(x < q, "a coefficient is not reduced");
+        let bytes = x.to_le_bytes();
+        *slot = core::array::from_fn(|i| bytes[i]);
+    }
 }
 
 #[cfg(test)]

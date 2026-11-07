@@ -973,18 +973,21 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
                     if other.load(Ordering::Acquire) + PAIR_LEAD >= d {
                         return;
                     }
-                    let start = std::time::Instant::now();
                     let mut spins = 0u32;
+                    let mut start: Option<std::time::Instant> = None;
                     while other.load(Ordering::Acquire) + PAIR_LEAD < d {
                         core::hint::spin_loop();
                         spins += 1;
-                        if spins % 64 == 0 && start.elapsed() > SIBLING_WAIT {
-                            coupled.store(false, Ordering::Relaxed);
-                            let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
-                            if k < 16 {
-                                DECOUPLED_AT[k].store(((t0.elapsed().as_micros() as u32) << 4) | worker as u32, Ordering::Relaxed);
+                        if spins % 1024 == 0 {
+                            let s = *start.get_or_insert_with(std::time::Instant::now);
+                            if s.elapsed() > SIBLING_WAIT {
+                                coupled.store(false, Ordering::Relaxed);
+                                let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
+                                if k < 16 {
+                                    DECOUPLED_AT[k].store(((t0.elapsed().as_micros() as u32) << 4) | worker as u32, Ordering::Relaxed);
+                                }
+                                return;
                             }
-                            return;
                         }
                     }
                 })

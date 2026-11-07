@@ -158,10 +158,7 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
                 let bpj = os[h];
                 tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
             }
-        }
-        for j in 0..6 {
-            let kk = 6 * k + j;
-            sink.rows(kk, ro(buf(kk)), 0, 27);
+            sink.rows(kk, ro(os), 0, 27);
         }
     }
 }

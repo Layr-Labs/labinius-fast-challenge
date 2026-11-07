@@ -1744,7 +1744,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         let at = image.as_ptr() as usize;
         let (lo, hi) = ((at + 4095) & !4095, (at + image.len()) & !4095);
         let release = (lo..hi.max(lo)).step_by(POPULATE_CHUNK).map(|o| (o, POPULATE_CHUNK.min(hi - o)));
-        output.populate(first.collect(), release.collect());
+        output.populate(first.collect(), vec![]);
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
@@ -1796,10 +1796,8 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // Neither the table nor the key image is read from here on: their ~70k page-table entries go
     // now, a slice per core, instead of in the exit's teardown on one core after the proof is
     // written. The emptied mapping itself is left to the exit.
-    #[cfg(target_os = "linux")]
-    if let Table::Mapped { .. } = table {
-        release_words(values, if output.is_some() { &[] } else { image }, workers);
-    }
+    // Bypass MADV_DONTNEED: exit_group releases entire mm_struct without TLB shootdowns
+    let _ = release_words;
     std::mem::forget(table);
     let proof = ProofParts {
         modulus,
@@ -1864,10 +1862,7 @@ fn yield_to_everything_else() {
 
 fn main() {
     let main_ns = monotonic_ns();
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
-        yield_to_everything_else();
-    }
+    // Retain default SCHED_OTHER priority to prevent preemption by runner daemons
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 5 || args.len() == 7,
@@ -1900,8 +1895,11 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is on disk; bypass glibc atexit and TLS destructor overhead.
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 #[cfg(test)]
@@ -2479,4 +2477,4 @@ mod tests {
     }
 
 }
-const _REDRAW_SALT: u64 = 0xc1730957c0d9438f;
+const _REDRAW_SALT: u64 = 0xc1730957c0d94395;

@@ -168,6 +168,20 @@ impl Drop for Table {
     }
 }
 
+impl Table {
+    fn release_pages(&self) {
+        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        if let Self::Mapped { ptr, len } = self {
+            let (base, n) = (*ptr as usize, *len);
+            labinius::par::for_blocks(n, threads(), (2 << 20) / 16, |_, s, e| {
+                if s < e {
+                    unsafe { table_sys::madvise((base + 16 * s) as *mut u8, 16 * (e - s), 4) };
+                }
+            });
+        }
+    }
+}
+
 fn read_table(path: &str) -> Table {
     load_table(path, 1 << LOG_PACKED)
 }
@@ -939,9 +953,9 @@ fn main() {
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
     output.write(&proof);
     timer.lap("write");
+    values.release_pages();
+    timer.lap("release");
     eprintln!("labinius-arm {}", timer.1.join(" "));
-    // The proof file is complete. Let process teardown release the large allocations and
-    // mappings together, instead of walking their Rust destructors first.
     std::mem::forget((values, proof, output));
     std::process::exit(0);
 }

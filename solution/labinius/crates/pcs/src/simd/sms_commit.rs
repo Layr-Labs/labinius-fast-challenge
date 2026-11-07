@@ -864,7 +864,7 @@ fn bench_mode() -> u32 {
 /// A batch counter on a cache line of its own.
 #[repr(align(128))]
 struct Progress(std::sync::atomic::AtomicUsize);
-const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(500);
+const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(2000);
 /// Maximum lead (in pair batches) between two hyperthread siblings on one physical core.
 const PAIR_LEAD: usize = 2 * PP;
 

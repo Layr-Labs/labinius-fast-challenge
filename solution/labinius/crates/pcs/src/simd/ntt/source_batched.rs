@@ -156,11 +156,12 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
                 ) };
             for h in 0..core::hint::black_box(H) {
                 let bpj = os[h];
-                tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
+                if Q == 9721 {
+                    tail27_mem_b(bpj, os[h], t4, t5, t6, cv);
+                } else {
+                    tail27_p(bpj, os[h], t4, t5, t6, cv);
+                }
             }
-        }
-        for j in 0..6 {
-            let kk = 6 * k + j;
             sink.rows(kk, ro(buf(kk)), 0, 27);
         }
     }

@@ -713,7 +713,12 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
-    for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
+    let batches = columns.div_ceil(LANES);
+    let workers = workers.clamp(1, batches.max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out_addr = out.as_mut_ptr() as usize;
+    let next = &next;
+    let work = || unsafe {
         let mut m = Box::new([vdupq_n_s16(0); BITS]);
         let mut nib = Box::new([vdupq_n_u8(0); N / 4]);
         let mut xs = Box::new([[vdupq_n_s16(0); N]; SWEEP]);
@@ -724,10 +729,14 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
         // the eight columns' tails, `i64` per lane (41 KiB, off the stack)
         let mut tail = Box::new([[0i64; LANES]; N]);
         let p = P1 as i16;
-        let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
-            let col0 = first + LANES * b;
-            let here = (count - LANES * b).min(LANES);
+        loop {
+            let b = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if b >= batches {
+                break;
+            }
+            let col0 = LANES * b;
+            let here = (columns - col0).min(LANES);
+            let target = core::slice::from_raw_parts_mut((out_addr as *mut u128).add(col0 * N), here * N);
             let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
                 if c < here {
                     (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
@@ -778,6 +787,11 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     *o = crt(base[k][c] as u32, tail[k][c].rem_euclid(TAIL as i64) as u32);
                 }
             }
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(&work);
         }
     });
     out

@@ -368,11 +368,9 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
     }
 }
 
-/// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 4;
-/// Elements transformed per sweep: up to four tiles, each accumulator read and written once.
+const SINK: usize = 8;
 const SWEEP: usize = SINK * LOCK;
-const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP == 2 * PASS);
+const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
 
 /// [`slot_sink`]'s body; `$rows13` and `$rows46` start rows 1-3 (v20-v31) and rows 4-6
 /// (v16-v27): loaded from `acc`, or zeroed for a chunk's first sweep ([`slot_sink_fresh`]).
@@ -655,7 +653,6 @@ unsafe fn sums(
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
         while e < end {
-            // Up to four tiles per sweep, never across a chunk end (chunks are whole tiles). A short
             // tile only occurs at the end of the column, where the missing elements read zero
             // words and their key lanes are zero, so those lanes contribute nothing.
             let l = SWEEP.min(end - e);
@@ -887,7 +884,6 @@ mod tests {
 
     /// A fresh sweep ([`sink`]`::<true>`) over accumulators holding garbage in the digit rows equals
     /// an accumulating sweep over the same accumulators with those rows zeroed, bit for bit, and the
-    /// base row accumulates in both: one to four tiles, random keys and transforms.
     #[test]
     fn fresh_sweep_overwrites_the_digit_rows() {
         use core::arch::aarch64::*;

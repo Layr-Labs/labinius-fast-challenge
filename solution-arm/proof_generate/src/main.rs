@@ -143,6 +143,38 @@ mod table_sys {
     }
 }
 
+///
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+unsafe fn map_aligned(bytes: usize, fd: i32) -> *mut u8 {
+    const ALIGN: usize = 2 << 20;
+    const PROT_NONE: i32 = 0;
+    const PROT_READ: i32 = 1;
+    const MAP_PRIVATE: i32 = 0x02;
+    const MAP_FIXED: i32 = 0x10;
+    const MAP_ANONYMOUS: i32 = 0x20;
+    let plain = || unsafe { table_sys::mmap(std::ptr::null_mut(), bytes, PROT_READ, MAP_PRIVATE, fd, 0) };
+    let span = bytes + ALIGN;
+    let reserve = table_sys::mmap(std::ptr::null_mut(), span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if reserve as isize == -1 {
+        return plain();
+    }
+    let first = reserve as usize;
+    let start = (first + ALIGN - 1) & !(ALIGN - 1);
+    let (end, last) = (start + bytes, first + span);
+    if start > first {
+        table_sys::munmap(first as *mut u8, start - first);
+    }
+    if last > end {
+        table_sys::munmap(end as *mut u8, last - end);
+    }
+    let ptr = table_sys::mmap(start as *mut u8, bytes, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+    if ptr as isize == -1 {
+        table_sys::munmap(start as *mut u8, bytes);
+        return plain();
+    }
+    ptr
+}
+
 impl std::ops::Deref for Table {
     type Target = [B128];
 
@@ -180,8 +212,7 @@ fn load_table(path: &str, n: usize) -> Table {
     #[cfg(all(target_os = "linux", target_endian = "little"))]
     if n != 0 {
         use std::os::fd::AsRawFd;
-        // PROT_READ | MAP_PRIVATE: the trusted input is never writable.
-        let ptr = unsafe { table_sys::mmap(std::ptr::null_mut(), 16 * n, 1, 2, file.as_raw_fd(), 0) };
+        let ptr = unsafe { map_aligned(16 * n, file.as_raw_fd()) };
         if ptr as isize != -1 {
             let base = ptr as usize;
             // The range boundaries are 2 MiB aligned, also valid on 4/16/64 KiB kernels.

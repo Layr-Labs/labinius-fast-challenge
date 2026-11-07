@@ -1271,7 +1271,7 @@ unsafe fn commit_limbs_core(
 /// columns — 5 MB per limb — dropping them costs 0.5 ms. The crossover on this core is a few MB;
 /// 4 MB is the threshold, and the whole batch loop is compiled both ways around it.
 pub const BATCH_BYTES: usize = 32 * N * 2;
-pub const A_PREFETCH_BYTES: usize = 4 << 20;
+pub const A_PREFETCH_BYTES: usize = 16 << 20;
 
 /// The batch loop: for every batch, one slicing pass and one kernel pass per limb per column of
 /// the group, each into that column's own accumulator.

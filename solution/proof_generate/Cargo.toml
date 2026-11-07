@@ -29,6 +29,7 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+strip = true
 
 # The build script runs the library's kernels to precompute the key; compile them optimised.
 [profile.release.build-override]

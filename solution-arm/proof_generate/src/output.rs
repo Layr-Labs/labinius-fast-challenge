@@ -179,7 +179,6 @@ impl Output {
         let bytes = commitment.len();
         let worker = Arc::downgrade(&state);
         // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
-        // disturbs its placement; one short setup thread completes during the commitment.
         let setup = std::thread::spawn(move || {
             if let Some(state) = worker.upgrade() { let _ = state.mapped(); }
             labinius::challenge::warm();
@@ -193,6 +192,9 @@ impl Output {
         if let Some(thread) = self.setup.lock().unwrap().take() {
             thread.join().expect("output preparation thread panicked");
         }
+    }
+    pub fn wait_setup(&self) {
+        self.finish_setup();
     }
     pub fn commitment_buffer(&self) -> Vec<u8> {
         self.finish_setup();

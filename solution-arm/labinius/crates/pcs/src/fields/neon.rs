@@ -490,6 +490,11 @@ pub(super) fn partial_evals_sets(words: &[B128], eq: &[B128], start: usize, end:
     })
 }
 
+#[inline(always)]
+unsafe fn prefetch_l2(p: *const B128) {
+    core::arch::asm!("prfm pldl2keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+}
+
 pub(super) fn partial_evals_sets_tiled(
     words: &[B128], stride: usize, start: usize, end: usize,
     mut fill: impl FnMut(usize, &mut [B128]),
@@ -509,6 +514,12 @@ pub(super) fn partial_evals_sets_tiled(
                 combinations(tile.as_ptr().add(GROUP * x), &mut tabs[x]);
             }
             for (q, sum) in sums.iter_mut().enumerate() {
+                let next = base + GROUP * PASS;
+                if next + GROUP * PASS <= end {
+                    for l in 0..GROUP * PASS / 4 {
+                        prefetch_l2(words.as_ptr().add(q * stride + next + 4 * l));
+                    }
+                }
                 for x in 0..count {
                     patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);
                 }
@@ -565,6 +576,12 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
         let pairs = ((len - first) / 2).min(PAIRS);
         for (group, ws) in wk.chunks(8).enumerate() {
             for i in 0..pairs {
+                let ahead = first + 2 * PAIRS + 2 * i;
+                if i % 2 == 0 && ahead + 4 <= len {
+                    for g in 0..ws.len() {
+                        prefetch_l2(words.as_ptr().add((8 * group + g) * stride + start + ahead));
+                    }
+                }
                 let mut acc = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
                 for (g, w) in ws.iter().enumerate() {
                     let q = 8 * group + g;

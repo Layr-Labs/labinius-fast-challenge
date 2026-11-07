@@ -10,7 +10,7 @@
 //! product. The field switch, row evaluation, and fold follow the checker's reference prover.
 mod hugealloc;
 mod output;
-use output::{Output, ProofParts};
+use output::{Folded, Output, ProofParts};
 mod ntt;
 
 #[global_allocator]
@@ -635,19 +635,41 @@ fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
 /// plain-op full adders, the elements written in place.
 #[cfg(target_arch = "aarch64")]
 fn fold_neon(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
+    labinius::fold_bits::neon::fold(table_words(values), COLUMN_LEN, &neon_challenges(challenges), threads())
+}
+
+fn fold_output(values: &[B128], challenges: &[ShortChallenge], output: &Output) -> Folded {
+    #[cfg(target_arch = "aarch64")]
+    if challenges.iter().map(|c| c.weight).sum::<usize>() < 1 << 15 {
+        if let Some(target) = output.folded_target(RING_ELEMENTS) {
+            unsafe {
+                labinius::fold_bits::neon::fold_wide(table_words(values), COLUMN_LEN, &neon_challenges(challenges), threads(), target);
+            }
+            return Folded::Written(RING_ELEMENTS);
+        }
+    }
+    let _ = output;
+    Folded::Elements(FoldedWitness::of(fold(values, challenges)))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn neon_challenges(challenges: &[ShortChallenge]) -> Vec<labinius::fold_bits::Challenge> {
     use labinius::fold_bits as fb;
     const _: () = assert!(COLUMN_LEN % fb::neon::LANES == 0 && fb::N == rq::N);
-    let cs: Vec<fb::Challenge> = challenges
+    challenges
         .iter()
         .map(|c| fb::Challenge {
             positions: c.positions,
             signs: c.signs,
             weight: c.weight,
         })
-        .collect();
+        .collect()
+}
+
+#[cfg(target_arch = "aarch64")]
+fn table_words(values: &[B128]) -> &[u128] {
     // SAFETY: `B128` is `repr(transparent)` over `u128`.
-    let words = unsafe { core::slice::from_raw_parts(values.as_ptr() as *const u128, values.len()) };
-    fb::neon::fold(words, COLUMN_LEN, &cs, threads())
+    unsafe { core::slice::from_raw_parts(values.as_ptr() as *const u128, values.len()) }
 }
 
 /// The x86 track's scheduled bit-sliced fold (`fold_bits2`) on NEON, written straight into the
@@ -892,7 +914,7 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
     let row = RowEvaluation::of(row_evaluate(values, &p0));
     timer.lap("row");
     let challenges = folding_challenges(&mut t, &row);
-    let folded = FoldedWitness::of(fold(values, &challenges));
+    let folded = fold_output(values, &challenges, output);
     timer.lap("fold");
     ProofParts {
         modulus,

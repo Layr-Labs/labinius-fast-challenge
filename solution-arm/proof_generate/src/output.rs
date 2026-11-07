@@ -12,7 +12,21 @@ pub(super) struct ProofParts {
     pub rounds: Vec<[[u64; 3]; 2]>,
     pub opened: [u64; 3],
     pub row: Vec<u8>,
-    pub folded: FoldedWitness,
+    pub folded: Folded,
+}
+
+pub(super) enum Folded {
+    Elements(FoldedWitness),
+    Written(usize),
+}
+
+impl Folded {
+    fn count(&self) -> usize {
+        match self {
+            Self::Elements(f) => f.elements().len(),
+            Self::Written(n) => *n,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +55,7 @@ impl Layout {
             partials: p.partials.len(),
             rounds: p.rounds.len(),
             row: p.row.len(),
-            folded: 4 * rq::N * p.folded.elements().len(),
+            folded: 4 * rq::N * p.folded.count(),
         }
     }
     fn middle_at(self) -> usize { Self::HEAD + self.commitment }
@@ -77,7 +91,10 @@ unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
     put(&mut at, &(layout.folded as u64).to_le_bytes());
     assert_eq!(at, layout.folded_at());
 
-    let elements = p.folded.elements();
+    let elements: &[_] = match &p.folded {
+        Folded::Elements(f) => f.elements(),
+        Folded::Written(_) => &[],
+    };
     assert!(elements.iter().all(|e| e.representation == Representation::Coefficients));
     let addr = out as usize;
     let ctasks = if p.commitment.is_empty() { 0 } else { 4 };
@@ -210,6 +227,14 @@ impl Output {
         });
         assert!(self.populate.set(job).is_ok(), "output populated once");
     }
+    pub fn folded_target(&self, elements: usize) -> Option<*mut u8> {
+        let layout = self.state.layout;
+        if layout.folded != 4 * rq::N * elements {
+            return None;
+        }
+        self.finish_setup();
+        self.state.mapped().map(|map| (map.addr + layout.folded_at()) as *mut u8)
+    }
     pub fn write(&self, p: &ProofParts) {
         self.quiesce();
         let layout = Layout::parts(p);
@@ -219,6 +244,7 @@ impl Output {
                 return;
             }
         }
+        assert!(matches!(p.folded, Folded::Elements(_)), "the folded witness was written for the instance layout");
         // A generic modulus/layout or unsupported file mapping still gets exactly the codec.
         // Ordinary write shares the harness's persistence contract: neither path calls fsync.
         std::fs::write(&self.state.path, encode_vec(p)).expect("write proof");
@@ -282,12 +308,12 @@ mod tests {
             rounds: (0..n + 1).map(|_| [[next(), next(), next()], [next(), next(), next()]]).collect(),
             opened: [next(), next(), next()],
             row: (0..n * 13 + 1).map(|_| next() as u8).collect(),
-            folded: FoldedWitness::of(elements),
+            folded: Folded::Elements(FoldedWitness::of(elements)),
         };
         let reference = Proof {
             version: 1, modulus: p.modulus, commitment: p.commitment.clone(),
             partials: p.partials.clone(), rounds: p.rounds.clone(), opened: p.opened,
-            row: p.row.clone(), folded: pack_folded(&p.folded),
+            row: p.row.clone(), folded: match &p.folded { Folded::Elements(f) => pack_folded(f), Folded::Written(_) => unreachable!() },
         };
         let bytes = codec().serialize(&reference).unwrap();
         (p, bytes)

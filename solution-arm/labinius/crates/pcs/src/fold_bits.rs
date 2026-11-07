@@ -1601,9 +1601,8 @@ pub mod neon {
     /// # Safety
     /// `words` holds the groups' columns of `column_words` words (a multiple of 128) with
     /// `128 block + 128 <= column_words`, and so for any block `claim` returns; `out` addresses
-    /// 32 writable (possibly uninitialized) ring elements.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn fold_block(
+    pub unsafe fn fold_block<const WIDE: bool>(
         words: *const u128,
         column_words: usize,
         groups: &[&Group],
@@ -1611,7 +1610,7 @@ pub mod neon {
         block: usize,
         claim: &mut dyn FnMut() -> Option<usize>,
         ws: &mut Workspace,
-        out: *mut RingElement,
+        out: *mut u8,
     ) -> Option<usize> {
         let z = vdupq_n_u8(0);
         ws.lo.fill(z);
@@ -1672,8 +1671,11 @@ pub mod neon {
             ws.counts[s] = unslice(p);
         }
         // Reduction modulo `Y^162 - Y^81 + 1`, the bias, and the elements.
-        for e in 0..BLOCK_ELEMENTS {
-            core::ptr::addr_of_mut!((*out.add(e)).representation).write(Representation::Coefficients);
+        let ring = out as *mut RingElement;
+        if !WIDE {
+            for e in 0..BLOCK_ELEMENTS {
+                core::ptr::addr_of_mut!((*ring.add(e)).representation).write(Representation::Coefficients);
+            }
         }
         let mut overflow = vdupq_n_s16(0);
         for s in 0..Q162 {
@@ -1691,10 +1693,17 @@ pub mod neon {
                     (vaddq_s16(x, y), vqaddq_s16(x, y))
                 };
                 overflow = vorrq_s16(overflow, veorq_s16(v, sat));
-                let d0 = (core::ptr::addr_of_mut!((*out.add(2 * r)).v) as *mut i16).add(4 * s);
-                let d1 = (core::ptr::addr_of_mut!((*out.add(2 * r + 1)).v) as *mut i16).add(4 * s);
-                vst1_s16(d0, vget_low_s16(v));
-                vst1_s16(d1, vget_high_s16(v));
+                if WIDE {
+                    let d0 = (out as *mut i32).add(N * 2 * r + 4 * s);
+                    let d1 = (out as *mut i32).add(N * (2 * r + 1) + 4 * s);
+                    vst1q_s32(d0, vmovl_s16(vget_low_s16(v)));
+                    vst1q_s32(d1, vmovl_high_s16(v));
+                } else {
+                    let d0 = (core::ptr::addr_of_mut!((*ring.add(2 * r)).v) as *mut i16).add(4 * s);
+                    let d1 = (core::ptr::addr_of_mut!((*ring.add(2 * r + 1)).v) as *mut i16).add(4 * s);
+                    vst1_s16(d0, vget_low_s16(v));
+                    vst1_s16(d1, vget_high_s16(v));
+                }
             }
         }
         assert!(
@@ -1707,12 +1716,27 @@ pub mod neon {
 
     /// `v = sum_j c_j W_j` for every ring element of the `columns` columns of `column_words`
     pub fn fold(words: &[u128], column_words: usize, challenges: &[Challenge], threads: usize) -> Vec<RingElement> {
+        let elements = column_words / 4;
+        let mut out: Vec<RingElement> = Vec::with_capacity(elements);
+        unsafe {
+            run::<false>(words, column_words, challenges, threads, out.as_mut_ptr() as *mut u8);
+            out.set_len(elements);
+        }
+        out
+    }
+
+    ///
+    /// # Safety
+    pub unsafe fn fold_wide(words: &[u128], column_words: usize, challenges: &[Challenge], threads: usize, out: *mut u8) {
+        run::<true>(words, column_words, challenges, threads, out);
+    }
+
+    unsafe fn run<const WIDE: bool>(words: &[u128], column_words: usize, challenges: &[Challenge], threads: usize, out: *mut u8) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::OnceLock;
         assert!(column_words % LANES == 0, "a column is whole blocks");
         assert_eq!(words.len(), challenges.len() * column_words, "one challenge per column");
         assert!(fits(challenges), "the counters would overflow");
-        let elements = column_words / 4;
         let blocks = column_words / LANES;
         let ngroups = groups(challenges.len());
         let built: Vec<OnceLock<Group>> = (0..ngroups).map(|_| OnceLock::new()).collect();
@@ -1723,8 +1747,8 @@ pub mod neon {
         });
         let groups: Vec<&Group> = built.iter().map(|g| g.get().expect("every group is built")).collect();
         let bias = bias(groups.iter().copied());
-        let mut out: Vec<RingElement> = Vec::with_capacity(elements);
-        let out_addr = out.as_mut_ptr() as usize;
+        let element_bytes = if WIDE { 4 * N } else { core::mem::size_of::<RingElement>() };
+        let out_addr = out as usize;
         let words_addr = words.as_ptr() as usize;
         let next = AtomicUsize::new(0);
         let (groups, bias) = (&groups, &bias);
@@ -1736,9 +1760,8 @@ pub mod neon {
             };
             let mut block = claim();
             while let Some(b) = block {
-                // SAFETY: blocks are disjoint runs of 32 elements of `out`'s capacity.
                 block = unsafe {
-                    fold_block(
+                    fold_block::<WIDE>(
                         words_addr as *const u128,
                         column_words,
                         groups,
@@ -1746,14 +1769,11 @@ pub mod neon {
                         b,
                         &mut claim,
                         &mut ws,
-                        (out_addr as *mut RingElement).add(b * BLOCK_ELEMENTS),
+                        (out_addr as *mut u8).add(b * BLOCK_ELEMENTS * element_bytes),
                     )
                 };
             }
         });
-        // SAFETY: every block wrote all fields of its 32 elements.
-        unsafe { out.set_len(elements) };
-        out
     }
 
     #[cfg(test)]
@@ -1804,6 +1824,12 @@ pub mod neon {
                 let want = reference_element(&words, columns, column_words, &challenges, m);
                 assert_eq!(got[m].v[..], want[..], "columns {columns} element {m}");
                 assert_eq!(got[m].representation, Representation::Coefficients);
+            }
+            let mut wide = vec![0x5a5a_5a5au32 as i32; column_words / 4 * N];
+            unsafe { fold_wide(&words, column_words, &challenges, 3, wide.as_mut_ptr() as *mut u8) };
+            for (m, element) in got.iter().enumerate() {
+                let want: Vec<i32> = element.v.iter().map(|&c| c as i32).collect();
+                assert_eq!(wide[m * N..(m + 1) * N], want[..], "wide, columns {columns} element {m}");
             }
         }
 

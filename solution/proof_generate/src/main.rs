@@ -1010,16 +1010,20 @@ static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env
 const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();
 static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")));
 
+const SMS_MASKS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-fold-masks.bin")).len();
+static SMS_MASKS:Aligned64<[u8;SMS_MASKS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-fold-masks.bin")));
+
 /// The embedded single-transform keys, read in place, if the build host made them for this
 /// shape.
 fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     use labinius::simd::commit::sms;
     let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
-    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 4 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N {
+    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 4 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N || SMS_MASKS.0.len() != 4 * sms::fold_mask_len(RING_ELEMENTS) {
         return None;
     }
     unsafe {
         Some(sms::SmsKeys {
+            masks: std::slice::from_raw_parts(SMS_MASKS.0.as_ptr() as *const u32, sms::fold_mask_len(RING_ELEMENTS)),
             pairs: std::slice::from_raw_parts(SMS_PAIRS.0.as_ptr() as *const u32, words),
             mur: std::slice::from_raw_parts(SMS_MUR.0.as_ptr() as *const i32, sms::mur_len(RING_ELEMENTS)),
             mu: std::slice::from_raw_parts(SMS_MU.0.as_ptr() as *const u32, N),

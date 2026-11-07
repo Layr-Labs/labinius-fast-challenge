@@ -1,7 +1,9 @@
+// SPARSE512 requires factory coefficient bits512..648 zero. SMS transpose satisfies this;
+// generic/raw full648 mode uses false and retains uniform bounded leaf.
 // A batched binary NTT with an input factory. Each input's first prefix can
 // consume its newly converted indices while they are still warm in L1.
-// The prefix shares the callback scratch; tail arithmetic and all 24 callbacks
-// are unchanged. Each leaf reads its entire input before its first store.
+// The prefix shares the callback scratch; the SMS tails use relocated
+// reductions with output bound SMS_SOURCE_BOUND. All 24 callbacks are preserved. Each leaf reads its entire input before its first store.
 // Keeping this producer out of line prevents duplication in the SMS worker.
 //
 // Safety: idx addresses H aligned BinaryIndex32 slots, and wbuf addresses
@@ -17,6 +19,7 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
     const Q: u16,
     const H: usize,
     const FUSED: bool,
+    const SPARSE512:bool,
     S: SliceSink<H>,
     F: FnMut(usize, *mut BinaryIndex32),
 >(
@@ -156,7 +159,7 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
                 ) };
             for h in 0..core::hint::black_box(H) {
                 let bpj = os[h];
-                tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
+                if Q==9721 {if SPARSE512&&(6195878u32>>kk)&1!=0 {tail27_relocated_prefix_leaf(bpj,os[h],t4,t5,t6,cv);}else{tail27_relocated_leaf(bpj,os[h],t4,t5,t6,cv);}} else {tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);}
             }
         }
         for j in 0..6 {
@@ -167,8 +170,8 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
 }
 
 
-#[cfg(test)]mod sourced_batched_tests{use super::*;#[repr(C,align(64))]struct Out([i16;648*32]);struct Collect<const H:usize>(Vec<Out>);impl<const H:usize>SliceSink<H>for Collect<H>{unsafe fn rows(&mut self,blk:usize,w:[*const i16;H],r0:usize,r1:usize){for h in 0..H{for i in r0..r1{core::ptr::copy_nonoverlapping(w[h].add(32*i),self.0[h].0.as_mut_ptr().add((27*blk+i)*32),32);}}}}
-unsafe fn collect<const Q:u16,const H:usize,const MODE:usize>(ins:&[BinaryIndex32])->Vec<Out>{let mut out=Collect::<H>((0..H).map(|_|Out([0;648*32])).collect());let poison=_mm512_set1_epi32(0x5a196ab3);let mut w=vec![poison;6*H*27+2];let mut idx:Vec<BinaryIndex32>=(0..H).map(|_|BinaryIndex32::zero()).collect();let mut count=[0usize;H];let mut fill=|h:usize,dst:*mut BinaryIndex32|{count[h]+=1;core::ptr::copy_nonoverlapping(&ins[h],dst,1);};if MODE==0{let refs=core::array::from_fn(|h|&ins[h]);ntt_bin_batch32_batched::<Q,H,_>(refs,w.as_mut_ptr().add(1).cast(),&mut out);}else if MODE==1{ntt_bin_batch32_batched_source::<Q,H,false,_,_>(idx.as_mut_ptr(),w.as_mut_ptr().add(1).cast(),&mut out,&mut fill);}else{ntt_bin_batch32_batched_source::<Q,H,true,_,_>(idx.as_mut_ptr(),w.as_mut_ptr().add(1).cast(),&mut out,&mut fill);}if MODE!=0{assert!(count.iter().all(|&v|v==1));}assert_eq!(_mm512_cmpeq_epi32_mask(w[0],poison),65535);assert_eq!(_mm512_cmpeq_epi32_mask(w[w.len()-1],poison),65535);out.0}
-unsafe fn check<const Q:u16,const H:usize>(){let mut state=0xc21843ea937u64;for fixture in 0..10{let mut inputs:Vec<BinaryIndex32>=(0..H).map(|_|BinaryIndex32::zero()).collect();for(h,input)in inputs.iter_mut().enumerate(){for i in 0..162{for lane in 0..32{let mut n=0;for bit in 0..4{let coef=i+162*bit;state^=state<<13;state^=state>>7;state^=state<<17;let set=match fixture{0=>false,1=>true,2=>(coef+lane+h)%2==0,3=>coef==0,4=>coef==511,5=>coef==(lane+13*h)%512,_=>state&1!=0};if coef<512&&set{n|=1<<bit;}}input.rows[i][2*lane]=n;input.rows[i][2*lane+1]=n+16;}}}let a=collect::<Q,H,0>(&inputs);for(mode,b)in[(1,collect::<Q,H,1>(&inputs)),(2,collect::<Q,H,2>(&inputs))]{for h in 0..H{assert_eq!(a[h].0,b[h].0,"q={Q} h={H} fixture={fixture} batch={h} mode={mode}");}}}}
-#[test]fn sourced_batched_matches_original_with_guards(){unsafe{check::<3889,1>();check::<3889,2>();check::<3889,4>();check::<3889,8>();check::<3889,16>();check::<9721,1>();check::<9721,2>();check::<9721,4>();check::<9721,8>();check::<9721,16>();}}
+#[cfg(test)]mod relocated_ntt_tests{use super::*;#[repr(C,align(64))]struct Out([i16;648*32]);struct Collect<const H:usize>(Vec<Out>,usize);impl<const H:usize>SliceSink<H>for Collect<H>{unsafe fn rows(&mut self,blk:usize,w:[*const i16;H],r0:usize,r1:usize){assert_eq!(blk,self.1);self.1+=1;assert_eq!((r0,r1),(0,27));for h in 0..H{for i in r0..r1{core::ptr::copy_nonoverlapping(w[h].add(32*i),self.0[h].0.as_mut_ptr().add((27*blk+i)*32),32);}}}}
+unsafe fn collect<const Q:u16,const H:usize,const MODE:usize>(ins:&[BinaryIndex32],sparse:bool)->Vec<Out>{let mut out=Collect::<H>((0..H).map(|_|Out([0;648*32])).collect(),0);let poison=_mm512_set1_epi32(0x5a196ab3);let mut w=vec![poison;6*H*27+2];let mut idx:Vec<BinaryIndex32>=(0..H).map(|_|BinaryIndex32::zero()).collect();let mut count=[0usize;H];let mut fill=|h:usize,dst:*mut BinaryIndex32|{count[h]+=1;core::ptr::copy_nonoverlapping(&ins[h],dst,1);};if MODE==0{let refs=core::array::from_fn(|h|&ins[h]);ntt_bin_batch32_batched::<Q,H,_>(refs,w.as_mut_ptr().add(1).cast(),&mut out);}else if MODE==1{if sparse {ntt_bin_batch32_batched_source::<Q,H,false,true,_,_>(idx.as_mut_ptr(),w.as_mut_ptr().add(1).cast(),&mut out,&mut fill);}else{ntt_bin_batch32_batched_source::<Q,H,false,false,_,_>(idx.as_mut_ptr(),w.as_mut_ptr().add(1).cast(),&mut out,&mut fill);}}else{if sparse {ntt_bin_batch32_batched_source::<Q,H,true,true,_,_>(idx.as_mut_ptr(),w.as_mut_ptr().add(1).cast(),&mut out,&mut fill);}else{ntt_bin_batch32_batched_source::<Q,H,true,false,_,_>(idx.as_mut_ptr(),w.as_mut_ptr().add(1).cast(),&mut out,&mut fill);}}assert_eq!(out.1,24);if MODE!=0{assert!(count.iter().all(|&v|v==1));}assert_eq!(_mm512_cmpeq_epi32_mask(w[0],poison),65535);assert_eq!(_mm512_cmpeq_epi32_mask(w[w.len()-1],poison),65535);out.0}
+unsafe fn check<const Q:u16,const H:usize>(){let mut state=0xc21843ea937u64;for fixture in 0..12{let mut inputs:Vec<BinaryIndex32>=(0..H).map(|_|BinaryIndex32::zero()).collect();for(h,input)in inputs.iter_mut().enumerate(){for i in 0..162{for lane in 0..32{let mut n=0;for bit in 0..4{let coef=i+162*bit;state^=state<<13;state^=state>>7;state^=state<<17;let set=match fixture{0=>false,1|10=>true,2=>(coef+lane+h)%2==0,3=>coef==0,4=>coef==511,5=>coef==(lane+13*h)%512,_=>state&1!=0};if (coef<512||fixture>=10)&&set{n|=1<<bit;}}input.rows[i][2*lane]=n;input.rows[i][2*lane+1]=n+16;}}}let a=collect::<Q,H,0>(&inputs,fixture<10);for(mode,b)in[(1,collect::<Q,H,1>(&inputs,fixture<10)),(2,collect::<Q,H,2>(&inputs,fixture<10))]{for h in 0..H{for i in 0..648*32{assert_eq!((a[h].0[i]as i32-b[h].0[i]as i32)%(Q as i32),0,"q={Q} h={H} fixture={fixture} batch={h} mode={mode} i={i}");assert!((b[h].0[i]as i32).abs()<=if Q==9721{30376}else{32767});}}}}}
+#[test]fn relocated_matches_original_with_guards(){unsafe{check::<3889,1>();check::<3889,2>();check::<3889,3>();check::<3889,4>();check::<3889,8>();check::<3889,16>();check::<9721,1>();check::<9721,2>();check::<9721,3>();check::<9721,4>();check::<9721,8>();check::<9721,16>();}}
 }

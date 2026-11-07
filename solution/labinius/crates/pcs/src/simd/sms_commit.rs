@@ -796,8 +796,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         // enough zero words for all LOCK pointer advances.
         let mut source = |_h: usize, out: *mut BinaryIndex32| {
             // Prefetch the next pair batch while converting this batch and
-            // computing its first prefix. The final batch needs no lookahead.
-            if _h + 1 < LOCK {
+            if _h + 1 < LOCK || b + LOCK < range.end {
                 for l in 0..g {
                     let p = cols16[l].wrapping_add(8).cast::<i8>();
                     _mm_prefetch::<_MM_HINT_T0>(p);

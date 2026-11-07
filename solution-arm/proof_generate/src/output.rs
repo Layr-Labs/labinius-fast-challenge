@@ -178,7 +178,6 @@ impl Output {
         let addr = commitment.as_mut_ptr() as usize;
         let bytes = commitment.len();
         let worker = Arc::downgrade(&state);
-        // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
         let setup = std::thread::spawn(move || {
             if let Some(state) = worker.upgrade() { let _ = state.mapped(); }
             labinius::challenge::warm();
@@ -243,14 +242,10 @@ pub(super) fn pack_commitment(values: &[u128], q: u128, mut bytes: Vec<u8>) -> V
     let width = rq::coefficient_bytes(q);
     assert_eq!(bytes.len(), width * values.len());
     let per = values.len().div_ceil(par::threads()).max(1);
-    std::thread::scope(|scope| {
-        for (dst, values) in bytes.chunks_mut(per * width).zip(values.chunks(per)) {
-            scope.spawn(move || {
-                for (slot, &x) in dst.chunks_exact_mut(width).zip(values) {
-                    debug_assert!(x < q, "a coefficient is not reduced");
-                    slot.copy_from_slice(&x.to_le_bytes()[..width]);
-                }
-            });
+    par::for_each(bytes.chunks_mut(per * width).zip(values.chunks(per)), |(dst, values)| {
+        for (slot, &x) in dst.chunks_exact_mut(width).zip(values) {
+            debug_assert!(x < q, "a coefficient is not reduced");
+            slot.copy_from_slice(&x.to_le_bytes()[..width]);
         }
     });
     bytes

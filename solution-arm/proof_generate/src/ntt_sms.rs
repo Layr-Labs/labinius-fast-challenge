@@ -750,14 +750,24 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
-    for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
+    let batches = columns.div_ceil(LANES);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out_addr = out.as_mut_ptr() as usize;
+    let next = &next;
+    std::thread::scope(|scope| {
+    for _ in 0..workers.clamp(1, batches.max(1)) {
+    scope.spawn(move || unsafe {
         let arena = Arena::new();
         let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
-        let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
-            let col0 = first + LANES * b;
-            let here = (count - LANES * b).min(LANES);
+        loop {
+            let b = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if b >= batches {
+                break;
+            }
+            let col0 = LANES * b;
+            let here = (columns - col0).min(LANES);
+            let target = core::slice::from_raw_parts_mut((out_addr as *mut u128).add(col0 * N), here * N);
             let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
                 if c < here {
                     (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
@@ -812,6 +822,8 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             }
         }
+    });
+    }
     });
     out
 }

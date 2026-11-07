@@ -4,7 +4,7 @@ use super::scalar::{B128, F162};
 use crate::par;
 
 const PACK: usize = 128;
-const PREFIX: usize = 6;
+const PREFIX: usize = 8;
 const PLANE_RESERVE: usize = 4 << 20;
 
 fn inverse(x: B128) -> B128 {

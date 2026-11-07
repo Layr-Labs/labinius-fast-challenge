@@ -1651,9 +1651,11 @@ mod bitsliced {
         let mut tiles = core::mem::MaybeUninit::<[[__m512i; 16]; 8]>::uninit();
         let tiles_ptr = tiles.as_mut_ptr() as *mut __m512i;
         for t in 0..8 {
-            for i in 0..16 {
-                _mm_prefetch::<{ _MM_HINT_T0 }>((next as *const i8).add(1024 * t + 64 * i));
-            }
+            let base = (next as *const i8).add(1024 * t);
+            _mm_prefetch::<{ _MM_HINT_T0 }>(base);
+            _mm_prefetch::<{ _MM_HINT_T0 }>(base.add(256));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(base.add(512));
+            _mm_prefetch::<{ _MM_HINT_T0 }>(base.add(768));
             transpose_tile(words.add(64 * t), tiles_ptr.add(16 * t));
         }
         let perm = _mm512_load_si512(PERM.0.as_ptr() as *const __m512i);

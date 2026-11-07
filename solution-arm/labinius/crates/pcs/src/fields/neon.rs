@@ -141,17 +141,17 @@ pub(super) struct ByteTables {
 impl ByteTables {
     pub(super) fn new(batch: &[F162]) -> Self {
         assert_eq!(batch.len(), 128);
-        let mut lo = vec![0u128; 16 * 256];
-        let mut top = vec![0u64; 16 * 256];
+        let mut lo = Vec::<u128>::with_capacity(16 * 256);
+        let mut top = Vec::<u64>::with_capacity(16 * 256);
         for b in 0..16 {
-            let mut t = [F162::ZERO; 256];
+            let base = 256 * b;
+            lo.push(0);
+            top.push(0);
             for s in 1..256usize {
-                let i = s.trailing_zeros() as usize;
-                t[s] = t[s & (s - 1)] + batch[8 * b + i];
-            }
-            for (s, x) in t.iter().enumerate() {
-                lo[256 * b + s] = x.0[0] as u128 | (x.0[1] as u128) << 64;
-                top[256 * b + s] = x.0[2];
+                let x = batch[8 * b + s.trailing_zeros() as usize].0;
+                let p = base + (s & (s - 1));
+                lo.push(lo[p] ^ (x[0] as u128 | (x[1] as u128) << 64));
+                top.push(top[p] ^ x[2]);
             }
         }
         Self { lo, top }

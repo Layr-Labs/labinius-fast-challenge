@@ -1031,6 +1031,30 @@ mod tests {
             assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
         }
     }
+    /// The dynamically balanced SMS commitment's split last round (batches cut into chunks whose
+    /// sums are added by the last finisher) agrees with the schoolbook commitment and with the
+    /// unsplit single worker: full size with a partial split batch, and short shapes with a short
+    /// last chunk, a partial batch and more workers than split batches can keep busy.
+    #[test]
+    fn sms_split_commit_matches_reference() {
+        use ntt::neon::sms;
+        let q = sms::MODULUS;
+        let values: Vec<B128> = (0..17).flat_map(|s| column(300 + s)).collect();
+        let matrix = rq::ajtai_matrix(q, RING_ELEMENTS);
+        let want = commit_reference(&values, &matrix, q);
+        let a = sms::matrix(RING_ELEMENTS, 8);
+        for workers in [2, 3] {
+            assert!(sms::commit(&values, &a, workers) == want, "full size, workers {workers}");
+        }
+        for (elements, cols, workers) in [(301usize, 25usize, 2usize), (600, 40, 3), (512, 33, 4), (257, 26, 3), (1000, 72, 8)] {
+            let values: Vec<B128> = (0..cols).flat_map(|s| column(400 + s as u64)).take(cols * 4 * elements).collect();
+            let matrix = rq::ajtai_matrix(q, elements);
+            let want = commit_reference(&values, &matrix, q);
+            let a = sms::matrix(elements, 3);
+            assert!(sms::commit(&values, &a, 1) == want, "{elements} elements, one worker");
+            assert!(sms::commit(&values, &a, workers) == want, "{elements} elements, {cols} columns, {workers} workers");
+        }
+    }
     #[test]
     fn encoding_matches_bincode() {
         use bincode::Options;

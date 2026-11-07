@@ -635,8 +635,10 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
     vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
 }
 
-/// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
-/// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients.
+/// The batch's pass over the elements `from .. to` (chunk boundaries): each chunk's digit sums
+/// inverted to canonical coefficients and their deviations summed into `dev`; on return the base
+/// row's integer sums over those elements are in `acc` (row 0). [`commit`] narrows and inverts the
+/// base row once the sums of all of a batch's elements are in, see [`base_row`].
 #[inline(never)]
 unsafe fn sums(
     words: &[(*const u8, usize); LANES],
@@ -647,11 +649,19 @@ unsafe fn sums(
     acc: &mut [int64x2_t],
     y: &mut [int16x8_t; N],
     dev: &mut [int32x4_t],
+    from: usize,
+    to: usize,
 ) {
+    debug_assert!(from % CHUNK == 0 && (to % CHUNK == 0 || to == a.elements) && to <= a.elements);
+    let _ = m;
     let kern = &kernels()[PB];
-    acc.fill(vdupq_n_s64(0));
-    let mut e = 0usize;
-    while e < a.elements {
+    // Only the base row needs clearing: each chunk's first sweep writes the digit rows afresh
+    // (`sink::<true>`, see `fresh_sweep_overwrites_the_digit_rows`).
+    for s in 0..N {
+        acc[idx(s, 0)..idx(s, 0) + 4].fill(vdupq_n_s64(0));
+    }
+    let mut e = from;
+    while e < to {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
         while e < end {
             // Up to eight tiles per sweep, never across a chunk end (chunks are whole tiles). A short
@@ -681,6 +691,11 @@ unsafe fn sums(
             chunk_row(acc, 1 + d, a.mean_residues(c, d), &mut dev[d * 2 * N..][..2 * N], y);
         }
     }
+}
+
+/// The base row's coefficients in `y` from its integer sums in `acc` (row 0).
+#[inline(never)]
+unsafe fn base_row(acc: &[int64x2_t], y: &mut [int16x8_t; N]) {
     narrow(acc, 0, y);
     super::inverse_folded::<PB>(y);
 }
@@ -743,76 +758,180 @@ impl Drop for Arena {
     }
 }
 
+/// A split batch's sums so far (see [`commit`]): the base row's integer sums, slot-major as in
+/// `acc` row 0, and the digit rows' deviation sums as in `dev`.
+#[repr(C, align(64))]
+struct Partial {
+    base: [int64x2_t; 4 * N],
+    dev: [int32x4_t; DIGITS * 2 * N],
+}
+
+/// The `LANES` column pointers of batch `b` (zero words past the last column) and how many of its
+/// columns exist.
+#[inline]
+fn batch_words(values: &[B128], len: usize, columns: usize, b: usize) -> ([(*const u8, usize); LANES], usize) {
+    let col0 = LANES * b;
+    let here = (columns - col0).min(LANES);
+    let words = core::array::from_fn(|c| {
+        if c < here {
+            (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
+        } else {
+            (ZERO_WORDS.as_ptr() as *const u8, 0)
+        }
+    });
+    (words, here)
+}
+
+/// A batch's commitments from its base row's coefficients `y` and digit deviation sums `dev`:
+/// `target` holds its `here` columns' `N` coefficients each.
+#[inline(never)]
+unsafe fn finish(a: &SmsMatrix, y: &[int16x8_t; N], dev: &[int32x4_t], tail: &mut [[i64; LANES]; N], target: &mut [u128]) {
+    let p = P1 as i16;
+    // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
+    // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
+    let pv = vdupq_n_s16(p);
+    let mut base = [[0u16; LANES]; N];
+    for (k, b) in base.iter_mut().enumerate() {
+        let v = y[k];
+        let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+        vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
+    }
+    // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
+    for k in 0..N / 2 {
+        let h = k + N / 2;
+        let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
+        let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
+        for d in 0..DIGITS {
+            let (u, v) = lattice::WEIGHTS[d];
+            let w = u + v;
+            for half in 0..2 {
+                let x = dev[d * 2 * N + 2 * k + half];
+                let y = dev[d * 2 * N + 2 * h + half];
+                let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
+                let (i, j) = (2 * half, 2 * half + 1);
+                lo[i] = vmlal_n_s32(lo[i], xl, u);
+                lo[j] = vmlal_high_n_s32(lo[j], x, u);
+                lo[i] = vmlsl_n_s32(lo[i], yl, v);
+                lo[j] = vmlsl_high_n_s32(lo[j], y, v);
+                hi[i] = vmlal_n_s32(hi[i], xl, v);
+                hi[j] = vmlal_high_n_s32(hi[j], x, v);
+                hi[i] = vmlal_n_s32(hi[i], yl, w);
+                hi[j] = vmlal_high_n_s32(hi[j], y, w);
+            }
+        }
+        for q in 0..4 {
+            vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
+            vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
+        }
+    }
+    // a partial batch has fewer than eight columns in `target`: only those lanes are written
+    for (c, column) in target.chunks_exact_mut(N).enumerate() {
+        for (k, o) in column.iter_mut().enumerate() {
+            *o = crt(base[k][c] as u32, tail[k][c]);
+        }
+    }
+}
+
 /// The commitment of every column of `values` (columns of `4 a.elements` words) modulo
 /// [`MODULUS`].
+///
+/// Work goes out dynamically, in two phases. First whole batches of [`LANES`] columns, one at a
+/// time to whichever worker is free; then the last `workers` batches, cut into their chunks of
+/// [`CHUNK`] elements. A chunk's integer sums (the base row's and the digit deviations) are
+/// exact and additive: each chunk adds its sums into its batch's [`Partial`], and the worker that
+/// adds a batch's last chunk completes the batch: the same commitment, bit for bit. A static split
+/// of whole batches waits for its slowest worker; this one ends within about one chunk of the
+/// mean, so time a core loses to other work is shared by all of them instead of lengthening the
+/// phase.
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
-    for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
-        let arena = Arena::new();
-        let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;
-        let p = P1 as i16;
-        let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
-            let col0 = first + LANES * b;
-            let here = (count - LANES * b).min(LANES);
-            let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
-                if c < here {
-                    (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
-                } else {
-                    (ZERO_WORDS.as_ptr() as *const u8, 0)
+    let batches = columns.div_ceil(LANES);
+    let chunks = a.elements.div_ceil(CHUNK);
+    let workers = workers.clamp(1, batches.max(1));
+    // the batches split into chunks: the last round, when there is more than one
+    let split = if workers > 1 && chunks > 1 && batches > workers { workers } else { 0 };
+    let whole = batches - split;
+    let units = split * chunks;
+    // the split batches' sums, zeroed, each added to under its lock
+    let layout = std::alloc::Layout::array::<Partial>(split.max(1)).expect("the partial sums' layout");
+    // SAFETY: a nonzero size; `Partial` is plain integers, valid when zeroed.
+    let parts = unsafe { std::alloc::alloc_zeroed(layout) } as usize;
+    if parts == 0 {
+        std::alloc::handle_alloc_error(layout);
+    }
+    let locks: Vec<AtomicBool> = (0..split).map(|_| AtomicBool::new(false)).collect();
+    let left: Vec<AtomicUsize> = (0..split).map(|_| AtomicUsize::new(chunks)).collect();
+    let (next_whole, next_unit) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    /// Batch `b`'s `here` columns of the output at `out`.
+    /// SAFETY: batches own disjoint column ranges of `out`, each completed exactly once.
+    unsafe fn target_of<'a>(out: usize, b: usize, here: usize) -> &'a mut [u128] {
+        core::slice::from_raw_parts_mut((out as *mut u128).add(LANES * b * N), here * N)
+    }
+    let out_addr = out.as_mut_ptr() as usize;
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let (locks, left, next_whole, next_unit) = (&locks, &left, &next_whole, &next_unit);
+            scope.spawn(move || unsafe {
+                let arena = Arena::new();
+                let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;
+                loop {
+                    let b = next_whole.fetch_add(1, Ordering::Relaxed);
+                    if b >= whole {
+                        break;
+                    }
+                    let (words, here) = batch_words(values, len, columns, b);
+                    dev.fill(vdupq_n_s32(0));
+                    sums(&words, a, m, nib, xs, acc, y, dev, 0, a.elements);
+                    base_row(acc, y);
+                    finish(a, y, dev, tail, target_of(out_addr, b, here));
+                }
+                loop {
+                    let u = next_unit.fetch_add(1, Ordering::Relaxed);
+                    if u >= units {
+                        break;
+                    }
+                    // chunk-major: the workers take the same chunk of different batches together
+                    let (k, c) = (u % split, u / split);
+                    let b = whole + k;
+                    let (words, here) = batch_words(values, len, columns, b);
+                    dev.fill(vdupq_n_s32(0));
+                    sums(&words, a, m, nib, xs, acc, y, dev, c * CHUNK, ((c + 1) * CHUNK).min(a.elements));
+                    while locks[k].swap(true, Ordering::Acquire) {
+                        core::hint::spin_loop();
+                    }
+                    // SAFETY: batch `k`'s sums are only touched under its lock, and read after it
+                    // only by the worker that added its last chunk (after every other chunk's
+                    // release of `left[k]`).
+                    let total = &mut *(parts as *mut Partial).add(k);
+                    for s in 0..N {
+                        for q in 0..4 {
+                            total.base[4 * s + q] = vaddq_s64(total.base[4 * s + q], acc[idx(s, 0) + q]);
+                        }
+                    }
+                    for (t, &d) in total.dev.iter_mut().zip(dev.iter()) {
+                        *t = vaddq_s32(*t, d);
+                    }
+                    locks[k].store(false, Ordering::Release);
+                    if left[k].fetch_sub(1, Ordering::AcqRel) != 1 {
+                        continue;
+                    }
+                    // the batch's last chunk: complete the batch from its total sums
+                    for s in 0..N {
+                        acc[idx(s, 0)..idx(s, 0) + 4].copy_from_slice(&total.base[4 * s..4 * s + 4]);
+                    }
+                    dev.copy_from_slice(&total.dev);
+                    base_row(acc, y);
+                    finish(a, y, dev, tail, target_of(out_addr, b, here));
                 }
             });
-            dev.fill(vdupq_n_s32(0));
-            sums(&words, a, m, nib, xs, acc, y, dev);
-            // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
-            // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
-            let pv = vdupq_n_s16(p);
-            let mut base = [[0u16; LANES]; N];
-            for (k, b) in base.iter_mut().enumerate() {
-                let v = y[k];
-                let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
-                vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
-            }
-            // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
-            let tail = &mut *tail;
-            for k in 0..N / 2 {
-                let h = k + N / 2;
-                let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
-                let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
-                for d in 0..DIGITS {
-                    let (u, v) = lattice::WEIGHTS[d];
-                    let w = u + v;
-                    for half in 0..2 {
-                        let x = dev[d * 2 * N + 2 * k + half];
-                        let y = dev[d * 2 * N + 2 * h + half];
-                        let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
-                        let (i, j) = (2 * half, 2 * half + 1);
-                        lo[i] = vmlal_n_s32(lo[i], xl, u);
-                        lo[j] = vmlal_high_n_s32(lo[j], x, u);
-                        lo[i] = vmlsl_n_s32(lo[i], yl, v);
-                        lo[j] = vmlsl_high_n_s32(lo[j], y, v);
-                        hi[i] = vmlal_n_s32(hi[i], xl, v);
-                        hi[j] = vmlal_high_n_s32(hi[j], x, v);
-                        hi[i] = vmlal_n_s32(hi[i], yl, w);
-                        hi[j] = vmlal_high_n_s32(hi[j], y, w);
-                    }
-                }
-                for q in 0..4 {
-                    vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
-                    vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
-                }
-            }
-            // a partial batch has fewer than eight columns in `target`: only those lanes are written
-            for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(base[k][c] as u32, tail[k][c]);
-                }
-            }
         }
     });
+    // SAFETY: allocated above with this layout; no worker holds a reference any more.
+    unsafe { std::alloc::dealloc(parts as *mut u8, layout) };
     out
 }
 

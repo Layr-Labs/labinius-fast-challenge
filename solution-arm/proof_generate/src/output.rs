@@ -235,20 +235,14 @@ fn encode_vec(p: &ProofParts) -> Vec<u8> {
     bytes
 }
 
-/// Pack commitment coefficients into the buffer faulted in by idle workers. The ring math and
-/// transcript absorb stay unchanged; chunks cover disjoint, whole coefficient encodings.
 pub(super) fn pack_commitment(values: &[u128], q: u128, mut bytes: Vec<u8>) -> Vec<u8> {
     let width = rq::coefficient_bytes(q);
     assert_eq!(bytes.len(), width * values.len());
     let per = values.len().div_ceil(par::threads()).max(1);
-    std::thread::scope(|scope| {
-        for (dst, values) in bytes.chunks_mut(per * width).zip(values.chunks(per)) {
-            scope.spawn(move || {
-                for (slot, &x) in dst.chunks_exact_mut(width).zip(values) {
-                    debug_assert!(x < q, "a coefficient is not reduced");
-                    slot.copy_from_slice(&x.to_le_bytes()[..width]);
-                }
-            });
+    par::for_each(bytes.chunks_mut(per * width).zip(values.chunks(per)), |(dst, values)| {
+        for (slot, &x) in dst.chunks_exact_mut(width).zip(values) {
+            debug_assert!(x < q, "a coefficient is not reduced");
+            slot.copy_from_slice(&x.to_le_bytes()[..width]);
         }
     });
     bytes

@@ -18,7 +18,7 @@ mod imp {
     use super::*;
 
     pub const HUGE: usize = 2 << 20;
-    pub const THRESHOLD: usize = 1 << 20;
+    pub const THRESHOLD: usize = 512 << 10;
     const PROT_READ_WRITE: i32 = 0x1 | 0x2;
     const MAP_PRIVATE_ANONYMOUS: i32 = 0x02 | 0x20;
     const MADV_HUGEPAGE: i32 = 14;

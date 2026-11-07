@@ -184,18 +184,8 @@ fn load_table(path: &str, n: usize) -> Table {
         let ptr = unsafe { table_sys::mmap(std::ptr::null_mut(), 16 * n, 1, 2, file.as_raw_fd(), 0) };
         if ptr as isize != -1 {
             let base = ptr as usize;
-            // The range boundaries are 2 MiB aligned, also valid on 4/16/64 KiB kernels.
-            labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
-                if s < e {
-                    let addr = (base + 16 * s) as *mut u8;
-                    // Linux 5.14+: install the page-cache pages in parallel. Older kernels
-                    // simply fault on access. MADV_HUGEPAGE is a best-effort hint for the file.
-                    unsafe {
-                        table_sys::madvise(addr, 16 * (e - s), 14);
-                        table_sys::madvise(addr, 16 * (e - s), 22);
-                    }
-                }
-            });
+            // Best-effort huge-page hint; the pages themselves fault in on first use.
+            unsafe { table_sys::madvise(base as *mut u8, 16 * n, 14); }
             return Table::Mapped { ptr, len: n };
         }
     }
@@ -873,7 +863,6 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 }
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
-    output.wait_setup();
     let coefficients = commit(values, modulus);
     let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
     std::mem::forget(coefficients);

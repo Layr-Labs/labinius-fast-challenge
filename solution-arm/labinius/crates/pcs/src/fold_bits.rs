@@ -1099,7 +1099,7 @@ pub mod neon {
     /// Slot pairs; the odd slot of the last pair (243) is a dummy.
     const PAIRS: usize = SLOTS.div_ceil(2);
     /// Most columns per group: the groups split the columns as evenly as they can.
-    pub const GROUP: usize = 27;
+    pub const GROUP: usize = 25;
     /// Zero planes in front of the first column (plane 1 is column 0's leading guard).
     const GUARD: usize = 2;
     /// Planes per column: 128 and the trailing zero guard (the next column's leading guard).

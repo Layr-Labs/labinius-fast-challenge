@@ -1242,25 +1242,22 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
     put(&mut at, &(parts.commitment.len() as u64).to_le_bytes());
     debug_assert_eq!(at, layout.commitment_at());
     let mut at = layout.middle_at();
-    let mut middle = Vec::with_capacity(layout.middle());
-    middle.extend_from_slice(&(parts.partials.len() as u64).to_le_bytes());
+    put(&mut at, &(parts.partials.len() as u64).to_le_bytes());
     for v in &parts.partials {
-        middle.extend_from_slice(&v.to_le_bytes());
+        put(&mut at, &v.to_le_bytes());
     }
-    middle.extend_from_slice(&(parts.rounds.len() as u64).to_le_bytes());
+    put(&mut at, &(parts.rounds.len() as u64).to_le_bytes());
     for r in &parts.rounds {
         for x in r.iter().flatten() {
-            middle.extend_from_slice(&x.to_le_bytes());
+            put(&mut at, &x.to_le_bytes());
         }
     }
     for x in &parts.opened {
-        middle.extend_from_slice(&x.to_le_bytes());
+        put(&mut at, &x.to_le_bytes());
     }
-    middle.extend_from_slice(&(parts.row.len() as u64).to_le_bytes());
-    middle.extend_from_slice(&parts.row);
-    middle.extend_from_slice(&(layout.folded_bytes as u64).to_le_bytes());
-    debug_assert_eq!(middle.len(), layout.middle());
-    put(&mut at, &middle);
+    put(&mut at, &(parts.row.len() as u64).to_le_bytes());
+    put(&mut at, &parts.row);
+    put(&mut at, &(layout.folded_bytes as u64).to_le_bytes());
     debug_assert_eq!(at, layout.folded_at());
     let elements = parts.folded.elements();
     assert!(
@@ -1270,8 +1267,8 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
         "a fold is in coefficient form"
     );
     // A few commitment slices and many folded runs, taken dynamically.
-    let ctasks = 4;
-    let cruns = labinius::par::ranges(parts.commitment.len(), ctasks, 4096);
+    // Slices and runs taken dynamically across all worker threads.
+    let ctasks = threads();
     let fruns = labinius::par::ranges(elements.len(), 4 * threads(), 1);
     let (addr, folded_at) = (out as usize, layout.folded_at());
     #[cfg(target_arch = "x86_64")]
@@ -1440,18 +1437,21 @@ impl Output {
         let mut commitment = vec![0u8; layout.commitment_bytes];
         let (addr, bytes) = (commitment.as_mut_ptr() as usize, commitment.len());
         let pages = bytes.div_ceil(POPULATE_CHUNK);
+        let file_chunks = layout.len().div_ceil(POPULATE_CHUNK);
         let worker_state = state.clone();
-        let job = labinius::par::pool().idle(3 + pages, move |i| match i {
+        let job = labinius::par::pool().idle(3 + pages + file_chunks, move |i| match i {
             0 => worker_state.chunk(0),
             1 => labinius::challenge::warm(),
             2 => labinius::par::warm_topology(),
-            // The buffer is not touched by anyone else before `write` or `commitment_buffer`
-            // quiesces this job; writing a zero where the fresh mapping already reads zero.
-            _ => unsafe {
+            i if i < 3 + pages => unsafe {
                 let at = (i - 3) * POPULATE_CHUNK;
                 core::ptr::write_volatile((addr + at) as *mut u8, 0);
                 core::ptr::write_volatile((addr + (at + POPULATE_CHUNK).min(bytes) - 1) as *mut u8, 0);
             },
+            i => {
+                let chunk_idx = i - (3 + pages) + 1;
+                worker_state.chunk(chunk_idx);
+            }
         });
         Output {
             state,

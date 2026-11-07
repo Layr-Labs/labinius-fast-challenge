@@ -313,6 +313,39 @@ pub(super) fn dot_lifted(a: &[F162], b: &[B128]) -> F162 {
     }
 }
 
+/// [`dot_lifted`] of `a` against two columns at once: `a` (the eq table) is loaded once per pair
+/// for both, halving its L2 traffic. Each column's products are summed in the same order as
+/// [`dot_lifted`]'s, so each result is the same field element.
+pub(super) fn dot_lifted2(a: &[F162], b0: &[B128], b1: &[B128]) -> [F162; 2] {
+    assert!(a.len() == b0.len() && a.len() == b1.len());
+    unsafe {
+        let mut acc0 = [vdupq_n_u64(0); 6];
+        let mut acc1 = [vdupq_n_u64(0); 6];
+        let pairs = a.len() / 2;
+        for i in 0..pairs {
+            let aa = vld3q_u64(a.as_ptr().add(2 * i) as *const u64);
+            let ka = [aa.0, aa.1, vdupq_n_u64(0), x2(aa.0, aa.1), x2(aa.0, aa.2), x2(aa.1, aa.2)];
+            let bb = vld2q_u64(b0.as_ptr().add(2 * i) as *const u64);
+            let kb = [bb.0, bb.1, vdupq_n_u64(0), x2(bb.0, bb.1), bb.0, bb.1];
+            let cc = vld2q_u64(b1.as_ptr().add(2 * i) as *const u64);
+            let kc = [cc.0, cc.1, vdupq_n_u64(0), x2(cc.0, cc.1), cc.0, cc.1];
+            for k in [0usize, 1, 3, 4, 5] {
+                acc0[k] = x2(acc0[k], pmul_lo(ka[k], kb[k]));
+                acc0[k] = x2(acc0[k], pmul_hi(ka[k], kb[k]));
+                acc1[k] = x2(acc1[k], pmul_lo(ka[k], kc[k]));
+                acc1[k] = x2(acc1[k], pmul_hi(ka[k], kc[k]));
+            }
+        }
+        let mut out0 = reduce(assemble(acc0.map(|x| to_u128(x))));
+        let mut out1 = reduce(assemble(acc1.map(|x| to_u128(x))));
+        if pairs * 2 < a.len() {
+            out0 += a[2 * pairs] * F162::from_b128(b0[2 * pairs]);
+            out1 += a[2 * pairs] * F162::from_b128(b1[2 * pairs]);
+        }
+        [out0, out1]
+    }
+}
+
 
 #[inline(always)]
 unsafe fn to_u128(x: uint64x2_t) -> u128 {
@@ -841,6 +874,8 @@ mod tests {
             let b: Vec<_> = (0..n).map(|_| B128(rng.next())).collect();
             let want = a.iter().zip(&b).fold(F162::ZERO, |sum, (&x, &y)| sum + x * F162::from_b128(y));
             assert_eq!(dot_lifted(&a, &b), want, "n={n}");
+            let c: Vec<_> = (0..n).map(|_| B128(rng.next())).collect();
+            assert_eq!(dot_lifted2(&a, &b, &c), [dot_lifted(&a, &b), dot_lifted(&a, &c)], "n={n}");
         }
     }
 

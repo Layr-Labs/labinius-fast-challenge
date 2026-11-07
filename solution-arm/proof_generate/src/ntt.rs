@@ -510,11 +510,18 @@ pub fn for_blocks<T: Send>(
             (s * unit, e * unit)
         })
         .collect();
-    let blocks = labinius::par::split_mut(out, &edges);
+    let mut blocks = labinius::par::split_mut(out, &edges);
     let f = &f;
+    // The last block runs on the calling thread, which keeps its core: spawning all `workers`
+    // while the caller still runs made a ninth runnable thread, and on the 8-vCPU board the
+    // scheduler sometimes left two workers sharing a core for ~10 ms (both finish late).
+    let last = blocks.pop();
     std::thread::scope(|scope| {
         for (block, &(s, _)) in blocks.into_iter().zip(&edges) {
             scope.spawn(move || f(s / unit, block));
+        }
+        if let Some(block) = last {
+            f(edges[edges.len() - 1].0 / unit, block);
         }
     });
 }

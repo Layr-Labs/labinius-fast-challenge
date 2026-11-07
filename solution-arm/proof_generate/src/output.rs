@@ -51,10 +51,14 @@ impl Layout {
     fn len(self) -> usize { self.folded_at() + self.folded }
 }
 
+/// No pool tasks beside the final encode.
+pub(super) const NOTHING: (usize, fn(usize)) = (0, |_| {});
+
 /// # Safety
 /// `out` is writable for exactly `layout.len()` bytes and does not overlap `p`'s storage.
 /// The caller must supply Layout::parts(p). Only disjoint output ranges are sent to workers.
-unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
+/// `beside` tasks run first in the same dispatch and must not touch `out`.
+unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8, beside: (usize, &(dyn Fn(usize) + Sync))) {
     assert_eq!(layout, Layout::parts(p));
     assert!(layout.len() as u64 <= LIMIT, "proof exceeds the size limit");
     let put = |at: &mut usize, bytes: &[u8]| {
@@ -82,7 +86,10 @@ unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
     let addr = out as usize;
     let ctasks = if p.commitment.is_empty() { 0 } else { 4 };
     let ftasks = if elements.is_empty() { 0 } else { 4 * par::threads() };
-    par::pool().run(ctasks + ftasks, |i| {
+    let (btasks, beside) = beside;
+    par::pool().run(btasks + ctasks + ftasks, |i| {
+        if i < btasks { return beside(i); }
+        let i = i - btasks;
         let out = addr as *mut u8;
         if i < ctasks {
             let (s, e) = par::block(p.commitment.len(), ctasks, i, 4096);
@@ -208,15 +215,18 @@ impl Output {
         });
         assert!(self.populate.set(job).is_ok(), "output populated once");
     }
-    pub fn write(&self, p: &ProofParts) {
+    /// Encode `p` into the proof file. The `beside` pool tasks (count, task) share the
+    /// encode's dispatch, so independent cleanup overlaps the write instead of following it.
+    pub fn write(&self, p: &ProofParts, beside: (usize, impl Fn(usize) + Sync)) {
         self.quiesce();
         let layout = Layout::parts(p);
         if layout == self.state.layout {
             if let Some(map) = self.state.mapped() {
-                unsafe { encode_into(p, layout, map.addr as *mut u8); }
+                unsafe { encode_into(p, layout, map.addr as *mut u8, (beside.0, &beside.1)); }
                 return;
             }
         }
+        par::pool().run(beside.0, beside.1);
         // A generic modulus/layout or unsupported file mapping still gets exactly the codec.
         // Ordinary write shares the harness's persistence contract: neither path calls fsync.
         std::fs::write(&self.state.path, encode_vec(p)).expect("write proof");
@@ -231,7 +241,7 @@ impl Drop for Output { fn drop(&mut self) { self.quiesce(); } }
 fn encode_vec(p: &ProofParts) -> Vec<u8> {
     let layout = Layout::parts(p);
     let mut bytes = vec![0; layout.len()];
-    unsafe { encode_into(p, layout, bytes.as_mut_ptr()); }
+    unsafe { encode_into(p, layout, bytes.as_mut_ptr(), (NOTHING.0, &NOTHING.1)); }
     bytes
 }
 
@@ -299,7 +309,7 @@ mod tests {
             assert_eq!(layout.len(), want.len());
             assert_eq!(encode_vec(&p), want, "elements {n}");
             let mut guarded = vec![0x5a; layout.len() + 34];
-            unsafe { encode_into(&p, layout, guarded.as_mut_ptr().add(17)); }
+            unsafe { encode_into(&p, layout, guarded.as_mut_ptr().add(17), (NOTHING.0, &NOTHING.1)); }
             assert_eq!(&guarded[..17], &[0x5a; 17]);
             assert_eq!(&guarded[17..17 + want.len()], &want);
             assert_eq!(&guarded[17 + want.len()..], &[0x5a; 17]);
@@ -336,7 +346,9 @@ mod tests {
             for force_write in [false, true] {
                 let output = test_output(path.to_str().unwrap(), Layout::parts(&p), force_write);
                 output.populate();
-                output.write(&p);
+                let ran: Vec<_> = (0..5).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
+                output.write(&p, (ran.len(), |i: usize| { ran[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }));
+                assert!(ran.iter().all(|r| r.load(std::sync::atomic::Ordering::Relaxed) == 1), "each beside task runs once");
                 #[cfg(target_os = "linux")]
                 if !force_write { assert!(output.state.mapped().is_some(), "test filesystem must support mapping"); }
                 assert_eq!(std::fs::read(&path).unwrap(), want, "n {n}, fallback {force_write}");
@@ -344,7 +356,7 @@ mod tests {
             }
             // A different runtime shape must also use the generic write path.
             let output = test_output(path.to_str().unwrap(), Layout::instance(p.modulus), false);
-            output.write(&p);
+            output.write(&p, NOTHING);
             assert_eq!(std::fs::read(&path).unwrap(), want);
         }
         std::fs::remove_file(path).unwrap();

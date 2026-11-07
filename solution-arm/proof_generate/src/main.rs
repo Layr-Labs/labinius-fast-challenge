@@ -168,6 +168,35 @@ impl Drop for Table {
     }
 }
 
+/// Bytes per table release task: one 2 MiB-aligned virtual range, so that concurrent tasks
+/// never share a page-table page (the mapping itself is only page aligned).
+const RELEASE: usize = 2 << 20;
+
+impl Table {
+    /// Pool tasks that drop the table's page mappings in [`RELEASE`] windows, to run beside the
+    /// final encode. Otherwise process exit tears the whole mapping down on one thread, inside
+    /// the measured time. MADV_DONTNEED on this read-only private file mapping only discards
+    /// page-table entries: the file pages stay cached, and a later read faults them back in
+    /// unchanged. The tasks borrow the table, so it cannot be unmapped while they may run.
+    fn release(&self) -> (usize, impl Fn(usize) + Sync + '_) {
+        let (start, end) = match self {
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            Self::Mapped { ptr, len } => (*ptr as usize, *ptr as usize + 16 * *len),
+            Self::Owned(_) => (0, 0),
+        };
+        let first = start & !(RELEASE - 1);
+        let tasks = if start == end { 0 } else { (end - first).div_ceil(RELEASE) };
+        (tasks, move |i: usize| {
+            let lo = start.max(first + i * RELEASE);
+            let hi = end.min(first + (i + 1) * RELEASE);
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            unsafe { table_sys::madvise(lo as *mut u8, hi - lo, 4) };
+            #[cfg(not(all(target_os = "linux", target_endian = "little")))]
+            let _ = (lo, hi);
+        })
+    }
+}
+
 fn read_table(path: &str) -> Table {
     load_table(path, 1 << LOG_PACKED)
 }
@@ -923,7 +952,7 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
-    output.write(&proof);
+    output.write(&proof, values.release());
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
     // The proof file is complete. Let process teardown release the large allocations and
@@ -948,6 +977,10 @@ mod tests {
             let table = load_table(path.to_str().unwrap(), n);
             assert_eq!(&*table, &words);
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            // Released pages read back unchanged.
+            let (tasks, release) = table.release();
+            labinius::par::pool().run(tasks, release);
+            assert_eq!(&*table, &words);
         }
         std::fs::remove_file(path).unwrap();
     }

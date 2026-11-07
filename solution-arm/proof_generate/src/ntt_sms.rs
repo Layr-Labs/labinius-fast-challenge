@@ -686,9 +686,8 @@ unsafe fn sums(
     super::inverse_folded::<PB>(y);
 }
 
-/// `r mod 9721` and `t mod M` into `[0, Q)`.
 #[inline]
-fn crt(r: u32, t: u32) -> u128 {
+fn crt(r: u32, t: i64) -> u128 {
     const INV: u64 = {
         // 9721^-1 mod M by the extended Euclidean algorithm
         let (mut a, mut b) = (P1 as i64, TAIL as i64);
@@ -702,8 +701,9 @@ fn crt(r: u32, t: u32) -> u128 {
         x0.rem_euclid(TAIL as i64) as u64
     };
     const _: () = assert!(P1 as u64 * INV % TAIL as u64 == 1);
-    let k = (t as u64 + TAIL as u64 - r as u64 % TAIL as u64) % TAIL as u64 * INV % TAIL as u64;
-    r as u128 + P1 as u128 * k as u128
+    const _: () = assert!(P1 < TAIL && MODULUS < 1 << 63);
+    let k = (t - r as i64).rem_euclid(TAIL as i64) as u64 * INV % TAIL as u64;
+    (r as u64 + P1 as u64 * k) as u128
 }
 
 /// The commitment of every column of `values` (columns of `4 a.elements` words) modulo
@@ -775,7 +775,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
             // a partial batch has fewer than eight columns in `target`: only those lanes are written
             for (c, column) in target.chunks_exact_mut(N).enumerate() {
                 for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(base[k][c] as u32, tail[k][c].rem_euclid(TAIL as i64) as u32);
+                    *o = crt(base[k][c] as u32, tail[k][c]);
                 }
             }
         }

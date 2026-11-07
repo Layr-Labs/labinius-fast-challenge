@@ -612,15 +612,19 @@ unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
 
 /// One digit row's chunk end in one go: the sums narrowed in [`super::inverse_lazy_io`]'s first
 /// pass, and the deviations `S - mean` (centered) summed into `dev` (the row's `2 N` lanes) in its
-/// last pass, instead of three passes over the slots.
 #[inline(always)]
-unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_t], y: &mut [int16x8_t; N]) {
+unsafe fn chunk_row<const FIRST: bool>(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_t], y: &mut [int16x8_t; N]) {
     let p = P1 as i16;
     let dv = dev.as_mut_ptr();
     super::inverse_lazy_io(y, |s| narrow_digit(acc, s, r), |s, x| {
         let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
-        *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
-        *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
+        if FIRST {
+            *dv.add(2 * s) = vmovl_s16(vget_low_s16(v));
+            *dv.add(2 * s + 1) = vmovl_high_s16(v);
+        } else {
+            *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
+            *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
+        }
     });
 }
 
@@ -649,7 +653,13 @@ unsafe fn sums(
     dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
-    acc.fill(vdupq_n_s64(0));
+    debug_assert!(acc.len() == ROWS * 4 * N);
+    for s in 0..N {
+        let at = acc.as_mut_ptr().add(idx(s, 0));
+        for q in 0..4 {
+            *at.add(q) = vdupq_n_s64(0);
+        }
+    }
     let mut e = 0usize;
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
@@ -678,7 +688,12 @@ unsafe fn sums(
         }
         let c = (end - 1) / CHUNK;
         for d in 0..DIGITS {
-            chunk_row(acc, 1 + d, a.mean_residues(c, d), &mut dev[d * 2 * N..][..2 * N], y);
+            let row = &mut dev[d * 2 * N..][..2 * N];
+            if c == 0 {
+                chunk_row::<true>(acc, 1 + d, a.mean_residues(c, d), row, y);
+            } else {
+                chunk_row::<false>(acc, 1 + d, a.mean_residues(c, d), row, y);
+            }
         }
     }
     narrow(acc, 0, y);
@@ -765,7 +780,6 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     (ZERO_WORDS.as_ptr() as *const u8, 0)
                 }
             });
-            dev.fill(vdupq_n_s32(0));
             sums(&words, a, m, nib, xs, acc, y, dev);
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
@@ -841,7 +855,7 @@ mod chunk_bench {
                 dev[2 * s] = vaddw_s16(dev[2 * s], vget_low_s16(v));
                 dev[2 * s + 1] = vaddw_high_s16(dev[2 * s + 1], v);
             }
-            chunk_row(&acc, 1, &mr, &mut dev2, &mut y);
+            chunk_row::<false>(&acc, 1, &mr, &mut dev2, &mut y);
         }
         let a: &[[i32; 4]] = unsafe { core::slice::from_raw_parts(dev.as_ptr() as *const [i32; 4], dev.len()) };
         let b: &[[i32; 4]] = unsafe { core::slice::from_raw_parts(dev2.as_ptr() as *const [i32; 4], dev2.len()) };
@@ -864,7 +878,7 @@ mod chunk_bench {
             let old = t.elapsed().as_nanos() as f64 / reps as f64;
             let t = std::time::Instant::now();
             for _ in 0..reps {
-                unsafe { chunk_row(&acc, 1, &mr, &mut dev2, &mut y) };
+                unsafe { chunk_row::<false>(&acc, 1, &mr, &mut dev2, &mut y) };
                 core::hint::black_box(&mut dev2);
             }
             let new = t.elapsed().as_nanos() as f64 / reps as f64;

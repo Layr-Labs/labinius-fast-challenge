@@ -231,7 +231,7 @@ fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
     t.absorb_u64(LOG_VARS as u64);
     t.absorb_u64(COLUMN_LOG as u64);
     t.absorb_bytes(&modulus.to_le_bytes());
-    t.absorb_bytes_parallel(commitment, labinius::par::threads());
+    t.absorb_bytes(commitment);
     t
 }
 

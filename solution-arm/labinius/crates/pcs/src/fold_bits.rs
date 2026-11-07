@@ -1239,29 +1239,60 @@ pub mod neon {
         bias
     }
 
-    /// A worker's buffers.
+    /// A worker's buffers, in one allocation.
+    #[repr(C)]
+    struct Buffers {
+        planes: [V; PLANES],
+        lo: [V; PAIRS * 2 * LO],
+        hi: [V; PAIRS * 2 * HI],
+        tmp: [V; WORD_BITS],
+        counts: [[uint16x8_t; 16]; SLOTS + 1],
+    }
+
+    /// Bytes requested for [`Buffers`]: the prover's allocator maps 4 MiB requests 2 MiB-aligned
+    /// with `MADV_HUGEPAGE` (`hugealloc`), so a worker's ~180 KB of planes and counters, read at
+    /// data-dependent offsets in the inner loop, share one huge page (one TLB entry, not ~45);
+    /// the commitment's scratch arena (fkiene a76d6283) is the same idea.
+    const ARENA: usize = 4 << 20;
+    const _: () = assert!(core::mem::size_of::<Buffers>() <= 2 << 20, "the buffers fit one huge page");
+
+    /// A worker's buffers (a zeroed [`Buffers`] in an [`ARENA`]-sized allocation).
     pub struct Workspace {
-        planes: Vec<V>,
-        lo: Vec<V>,
-        hi: Vec<V>,
-        tmp: Vec<V>,
-        counts: Vec<[uint16x8_t; 16]>,
+        buf: *mut Buffers,
     }
 
     impl Workspace {
+        fn layout() -> std::alloc::Layout {
+            std::alloc::Layout::from_size_align(ARENA.max(core::mem::size_of::<Buffers>()), core::mem::align_of::<Buffers>())
+                .expect("the fold buffers' layout")
+        }
+
         pub fn new() -> Workspace {
-            unsafe {
-                let mut planes = vec![vdupq_n_u8(0); PLANES];
-                planes[PAD_ONES] = vdupq_n_u8(0xFF);
-                planes[PAD_ONES + 1] = vdupq_n_u8(0xFF);
-                Workspace {
-                    planes,
-                    lo: vec![vdupq_n_u8(0); PAIRS * 2 * LO],
-                    hi: vec![vdupq_n_u8(0); PAIRS * 2 * HI],
-                    tmp: vec![vdupq_n_u8(0); WORD_BITS],
-                    counts: vec![[vdupq_n_u16(0); 16]; SLOTS + 1],
-                }
+            let layout = Self::layout();
+            // SAFETY: zero is a valid bit pattern for every field.
+            let buf = unsafe { std::alloc::alloc_zeroed(layout) } as *mut Buffers;
+            if buf.is_null() {
+                std::alloc::handle_alloc_error(layout);
             }
+            let mut ws = Workspace { buf };
+            let b = ws.b();
+            unsafe {
+                b.planes[PAD_ONES] = vdupq_n_u8(0xFF);
+                b.planes[PAD_ONES + 1] = vdupq_n_u8(0xFF);
+            }
+            ws
+        }
+
+        #[inline(always)]
+        fn b(&mut self) -> &mut Buffers {
+            // SAFETY: owned, valid for the workspace's life.
+            unsafe { &mut *self.buf }
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            unsafe { std::alloc::dealloc(self.buf as *mut u8, Self::layout()) }
         }
     }
 
@@ -1614,10 +1645,11 @@ pub mod neon {
         out: *mut RingElement,
     ) -> Option<usize> {
         let z = vdupq_n_u8(0);
-        ws.lo.fill(z);
-        ws.hi.fill(z);
-        let planes = ws.planes.as_mut_ptr();
-        let (lo, hi, tmp) = (ws.lo.as_mut_ptr(), ws.hi.as_mut_ptr(), ws.tmp.as_mut_ptr());
+        let b = ws.b();
+        b.lo.fill(z);
+        b.hi.fill(z);
+        let planes = b.planes.as_mut_ptr();
+        let (lo, hi, tmp) = (b.lo.as_mut_ptr(), b.hi.as_mut_ptr(), b.tmp.as_mut_ptr());
         let src = |column: usize, block: usize| words.add(column * column_words + block * LANES) as *const u8;
         let mut claimed = None;
         for (gi, g) in groups.iter().enumerate() {
@@ -1669,7 +1701,7 @@ pub mod neon {
                     z
                 }
             });
-            ws.counts[s] = unslice(p);
+            ws.b().counts[s] = unslice(p);
         }
         // Reduction modulo `Y^162 - Y^81 + 1`, the bias, and the elements.
         for e in 0..BLOCK_ELEMENTS {
@@ -1681,7 +1713,8 @@ pub mod neon {
             let t = if below { s + 162 } else { s + 81 };
             let bs = vdupq_n_s16(bias[s] as i16);
             let bt = vdupq_n_s16(bias[t] as i16);
-            let (cs, ct) = (&ws.counts[s], &ws.counts[t]);
+            let counts = &ws.b().counts;
+            let (cs, ct) = (&counts[s], &counts[t]);
             for r in 0..16 {
                 let x = vsubq_s16(vreinterpretq_s16_u16(cs[r]), bs);
                 let y = vsubq_s16(vreinterpretq_s16_u16(ct[r]), bt);

@@ -566,8 +566,28 @@ pub(super) fn partial_evals_sets_tiled(
     assert!(start <= end && end <= stride && start % GROUP == 0 && end % GROUP == 0);
     let blocks = words.len() / stride;
     unsafe {
-        let mut sums = vec![[vdupq_n_u8(0); 128]; blocks];
-        let mut tabs = vec![[vdupq_n_u8(0); 256]; PASS];
+        // The blocks' sums and the tables in one zeroed allocation of at least 4 MiB, which the
+        // prover's allocator maps 2 MiB-aligned with MADV_HUGEPAGE: ~160 KB read at data-dependent
+        // offsets (the lookups) on one huge page instead of ~40 small ones, beside the 64 blocks'
+        // word streams (the commitment's scratch arena, fkiene a76d6283, is the same idea).
+        let sums_bytes = blocks * core::mem::size_of::<[uint8x16_t; 128]>();
+        let tabs_bytes = PASS * core::mem::size_of::<[uint8x16_t; 256]>();
+        let layout = std::alloc::Layout::from_size_align((sums_bytes + tabs_bytes).max(4 << 20), 64)
+            .expect("the partial sets' scratch layout");
+        let raw = std::alloc::alloc_zeroed(layout);
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        struct Free(*mut u8, std::alloc::Layout);
+        impl Drop for Free {
+            fn drop(&mut self) {
+                unsafe { std::alloc::dealloc(self.0, self.1) }
+            }
+        }
+        let _free = Free(raw, layout);
+        // SAFETY: disjoint, in bounds, zeroed (a valid pattern), alive until `_free` drops.
+        let sums: &mut [[uint8x16_t; 128]] = core::slice::from_raw_parts_mut(raw as *mut [uint8x16_t; 128], blocks);
+        let tabs: &mut [[uint8x16_t; 256]] = core::slice::from_raw_parts_mut(raw.add(sums_bytes) as *mut [uint8x16_t; 256], PASS);
         let mut pats = [[0u8; 128]; PASS];
         let mut tile = [B128::ZERO; GROUP * PASS];
         for base in (start..end).step_by(GROUP * PASS) {
@@ -588,7 +608,7 @@ pub(super) fn partial_evals_sets_tiled(
                     patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);
                 }
                 if count == PASS {
-                    lookup_pass(&tabs, &pats, sum);
+                    lookup_pass(tabs, &pats, sum);
                     continue;
                 }
                 for k in 0..128 {
@@ -600,9 +620,9 @@ pub(super) fn partial_evals_sets_tiled(
                 }
             }
         }
-        sums.into_iter().map(|sum| {
+        sums.iter().map(|sum| {
             let mut out = vec![B128::ZERO; 128];
-            for (q, s) in sum.into_iter().enumerate() {
+            for (q, &s) in sum.iter().enumerate() {
                 vst1q_u8(&mut out[8 * (q % 16) + q / 16].0 as *mut u128 as *mut u8, s);
             }
             out

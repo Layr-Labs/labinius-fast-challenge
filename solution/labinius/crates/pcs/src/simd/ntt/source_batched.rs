@@ -42,7 +42,7 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
     // Prefix blocks use the callback buffer's block-major layout. A leaf loads
     // all 27 input vectors before storing any output, so its pointers may alias.
     let bps: [*mut i16; H] = core::array::from_fn(|h| wbuf.add(32 * 27 * h));
-    let buf = |kk: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk % 6) + h))) };
+    let buf = |j: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * j + h))) };
     let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
 
     for k in 0..4 {
@@ -144,7 +144,7 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
         let tail_blocks = core::hint::black_box(6usize);
         for j in 0..tail_blocks {
             let kk = 6 * k + j;
-            let os = buf(kk);
+            let os = buf(j);
             let (t4, t5, t6) = if Q == 9721 {
                 (SMS_TWIDDLES.t4.as_ptr().add(4 * kk).cast::<u32>(),
                 SMS_TWIDDLES.t5.as_ptr().add(12 * kk).cast::<u32>(),
@@ -161,7 +161,7 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
         }
         for j in 0..6 {
             let kk = 6 * k + j;
-            sink.rows(kk, ro(buf(kk)), 0, 27);
+            sink.rows(kk, ro(buf(j)), 0, 27);
         }
     }
 }

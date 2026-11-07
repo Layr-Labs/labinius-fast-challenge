@@ -649,7 +649,9 @@ unsafe fn sums(
     dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
-    acc.fill(vdupq_n_s64(0));
+    for s in 0..N {
+        acc[idx(s, 0)..][..4].fill(vdupq_n_s64(0));
+    }
     let mut e = 0usize;
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);

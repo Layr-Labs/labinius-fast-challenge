@@ -892,6 +892,7 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
     let row = RowEvaluation::of(row_evaluate(values, &p0));
     timer.lap("row");
     let challenges = folding_challenges(&mut t, &row);
+    output.populate_folded();
     let folded = FoldedWitness::of(fold(values, &challenges));
     timer.lap("fold");
     ProofParts {

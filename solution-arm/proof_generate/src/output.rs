@@ -168,6 +168,7 @@ pub(super) struct Output {
     state: Arc<State>,
     setup: Mutex<Option<std::thread::JoinHandle<()>>>,
     populate: OnceLock<&'static par::IdleJob>,
+    folded: Mutex<Option<std::thread::JoinHandle<()>>>,
     commitment: Mutex<Option<Vec<u8>>>,
 }
 impl Output {
@@ -180,19 +181,13 @@ impl Output {
         let worker = Arc::downgrade(&state);
         // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
         let setup = std::thread::spawn(move || {
-            let state = worker.upgrade();
-            if let Some(state) = &state { let _ = state.mapped(); }
+            if let Some(state) = worker.upgrade() { let _ = state.mapped(); }
             labinius::challenge::warm();
             for offset in (0..bytes).step_by(4096) {
                 unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
             }
-            // Fault the whole proof mapping while the table read still runs on the other
-            // cores: the write phase then only has to encode, not populate file pages.
-            if let Some(state) = &state {
-                for i in 0..state.layout.len().div_ceil(CHUNK) { state.populate(i); }
-            }
         });
-        Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
+        Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), folded: Mutex::new(None), commitment: Mutex::new(Some(commitment)) }
     }
     pub fn wait_setup(&self) {
         self.finish_setup();
@@ -216,8 +211,30 @@ impl Output {
         });
         assert!(self.populate.set(job).is_ok(), "output populated once");
     }
+    /// Fault the folded witness's range of the proof on a thread of its own while the fold
+    /// (which is compute-bound on every worker) runs. The page population then overlaps the
+    /// fold instead of the serial encode.
+    pub fn populate_folded(&self) {
+        let mut slot = self.folded.lock().unwrap();
+        if slot.is_some() { return; }
+        let worker = Arc::downgrade(&self.state);
+        *slot = Some(std::thread::spawn(move || {
+            if let Some(state) = worker.upgrade() {
+                let layout = state.layout;
+                for i in layout.folded_at() / CHUNK..layout.len().div_ceil(CHUNK) {
+                    state.populate(i);
+                }
+            }
+        }));
+    }
+    fn finish_folded(&self) {
+        if let Some(thread) = self.folded.lock().unwrap().take() {
+            thread.join().expect("folded population thread panicked");
+        }
+    }
     pub fn write(&self, p: &ProofParts) {
         self.quiesce();
+        self.finish_folded();
         let layout = Layout::parts(p);
         if layout == self.state.layout {
             if let Some(map) = self.state.mapped() {

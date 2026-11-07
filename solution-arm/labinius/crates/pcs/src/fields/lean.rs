@@ -4,7 +4,7 @@ use super::scalar::{B128, F162};
 use crate::par;
 
 const PACK: usize = 128;
-const PREFIX: usize = 6;
+const PREFIX: usize = 7;
 const PLANE_RESERVE: usize = 4 << 20;
 
 fn inverse(x: B128) -> B128 {
@@ -335,7 +335,7 @@ mod tests {
             state ^= state << 17;
             state
         };
-        for (log, prefix) in [(3, 0), (7, 1), (7, 4), (8, 5), (10, 4), (10, 6), (14, 6), (18, 4), (19, 6)] {
+        for (log, prefix) in [(3, 0), (7, 1), (7, 4), (8, 5), (10, 4), (10, 6), (10, 7), (14, 6), (14, 7), (18, 4), (19, 6), (19, 7)] {
             let words: Vec<_> = (0..1 << log).map(|_| B128(next())).collect();
             let r: Vec<_> = (0..log).map(|_| B128(next())).collect();
             let batch = eq_expand_f162(&(0..7).map(|_| F162::from_b128(B128(next()))).collect::<Vec<_>>());

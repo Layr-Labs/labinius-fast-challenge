@@ -578,7 +578,6 @@ pub(super) fn partial_evals_sets_tiled(
             }
             let next = base + GROUP * PASS < end;
             for (q, sum) in sums.iter_mut().enumerate() {
-                // This block's next tile into L2: 64 blocks 4 MiB apart, 1 KiB each per tile, are more
                 // streams than the hardware prefetchers follow.
                 let row = words.as_ptr().add(q * stride + base) as *const u8;
                 if next {

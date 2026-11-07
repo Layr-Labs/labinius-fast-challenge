@@ -29,8 +29,7 @@ fn scales(ratios: &[B128]) -> Vec<B128> {
         .collect()
 }
 
-fn compose(images: &[F162], d: B128) -> Vec<F162> {
-    let map = ByteTables::new(images);
+fn compose(map: &ByteTables, d: B128) -> Vec<F162> {
     (0..PACK).map(|i| map.apply(B128(1u128 << i) * d)).collect()
 }
 
@@ -126,7 +125,7 @@ pub struct Switch<'a> {
 
 impl<'a> Switch<'a> {
     pub fn new(words: &'a [B128], prepared: Prepared, batch: &[F162]) -> Self {
-        let lp = compose(batch, prepared.inverses[0]);
+        let lp = compose(&ByteTables::new(batch), prepared.inverses[0]);
         let prefix_r = vec![F162::ZERO; prepared.prefix];
         let mut out = Self {
             words,
@@ -223,8 +222,9 @@ impl<'a> Switch<'a> {
         for (l, &lp) in self.l.iter_mut().zip(&self.lp) {
             *l += r * lp;
         }
+        let lt = ByteTables::new(&self.l);
         if self.round + 1 < self.prepared.inverses.len() {
-            self.lp = compose(&self.l, self.prepared.inverses[self.round + 1]);
+            self.lp = compose(&lt, self.prepared.inverses[self.round + 1]);
         }
         if self.round < self.prepared.prefix {
             self.prefix_r[self.round] = r;
@@ -238,14 +238,13 @@ impl<'a> Switch<'a> {
             let (l2, h2) = p2.split_at_mut(1);
             unsafe { neon::fold_share([l0, l1, l2], [&h0[..1], &h1[..1], &h2[..1]], r); }
         } else {
-            self.pending = Some(self.fold_message(r));
+            self.pending = Some(self.fold_message(r, &lt));
         }
         self.round += 1;
     }
 
-    fn fold_message(&mut self, r: F162) -> [F162; 2] {
+    fn fold_message(&mut self, r: F162, l: &ByteTables) -> [F162; 2] {
         let hh = self.half / 2;
-        let l = ByteTables::new(&self.l);
         let lp = ByteTables::new(&self.lp);
         let eq = &self.prepared.eq;
         let parts = par::workers(hh, 1 << 10);
@@ -275,7 +274,7 @@ impl<'a> Switch<'a> {
                     [ &mut a1[offset..offset + count], &mut b1[offset..offset + count], &mut c1[offset..offset + count] ],
                     [&ah0[base..base + count], &bh0[base..base + count], &ch0[base..base + count]],
                     [&ah1[base..base + count], &bh1[base..base + count], &ch1[base..base + count]],
-                    r, &l, &lp,
+                    r, l, &lp,
                 );
                 out[0] += m[0]; out[1] += m[1];
             }

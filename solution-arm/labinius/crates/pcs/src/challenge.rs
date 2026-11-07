@@ -326,11 +326,16 @@ impl Transcript {
     /// The same derivation as [`fill`](Self::fill), as a stream — for samplers that consume a
     /// number of bytes they do not know in advance.
     fn reader(&mut self, label: &[u8]) -> blake3::OutputReader {
+        let reader = self.reader_at(self.counter, label);
+        self.counter += 1;
+        reader
+    }
+
+    fn reader_at(&self, counter: u64, label: &[u8]) -> blake3::OutputReader {
         let mut state = self.state.clone();
-        state.update(&self.counter.to_le_bytes());
+        state.update(&counter.to_le_bytes());
         state.update(&(label.len() as u64).to_le_bytes());
         state.update(label);
-        self.counter += 1;
         state.finalize_xof()
     }
 }
@@ -696,26 +701,22 @@ fn attempt(x: &mut Xof, weight: usize, perm: &mut [u8; N162]) -> ShortChallenge 
 /// the bound needs; the per-attempt work is then the Fisher-Yates, the sign hash of the candidate,
 /// and the blocked evaluation, with no allocation.
 /// [`sample_short_challenge`] `n` times in a row. Each challenge reads only its own transcript
-/// derivation, so the derivations are taken here in order (one counter step each, as the loop of
-/// single calls takes them) and the rejection sampling runs on the workers: the challenges, and
-/// the transcript afterwards, are exactly those of the sequential loop.
 pub fn sample_short_challenges(
     t: &mut Transcript,
     n: usize,
     weight: usize,
     bound: f64,
 ) -> Vec<ShortChallenge> {
-    let readers: Vec<blake3::OutputReader> =
-        (0..n).map(|_| t.reader(b"short-challenge")).collect();
+    let first = t.counter;
+    t.counter += n as u64;
+    let t = &*t;
     let bound_sq = bound * bound + 1e-12;
     let parts = crate::par::workers(n, 32);
-    let readers = &readers;
     crate::par::map_blocks(n, parts, 1, |_, s, e| {
         let mut perm = [0u8; N162];
-        readers[s..e]
-            .iter()
-            .map(|r| {
-                let mut x = Xof::new(r.clone());
+        (s..e)
+            .map(|i| {
+                let mut x = Xof::new(t.reader_at(first + i as u64, b"short-challenge"));
                 loop {
                     let c = attempt(&mut x, weight, &mut perm).signed();
                     if within(&c, bound_sq) {

@@ -627,6 +627,30 @@ const fn skip_lut5(n: usize) -> bool {
     MASK >> n & 1 != 0
 }
 
+/// Level-6 butterflies (two per [`Kernel::d`] entry `q`: `2 q` on slots `6 q..6 q + 3`, `2 q + 1`
+/// on `6 q + 3..6 q + 6`) whose first input needs no reduction after the 9721 table front: their
+/// outputs stay within [`LUT_LAZY6_BOUND`] for every admissible nibble pattern. Proven by
+/// `lazy_lut_intervals` below, which propagates exact value intervals through every level.
+#[inline(always)]
+const fn skip_lut6(n: usize) -> bool {
+    const NODES: [usize; 45] = [
+        13, 20, 21, 22, 23, 26, 27, 28, 32, 38, 41, 55, 56, 72, 73, 89, 100, 115, 119, 120, 122, 123, 125, 127, 130, 140, 156, 159, 160, 161, 167, 171, 172, 174, 181, 182, 192, 193, 194, 198, 199, 204, 207, 208, 209,
+    ];
+    const MASK: [u128; 2] = {
+        let mut mask = [0u128; 2];
+        let mut i = 0;
+        while i < NODES.len() { mask[NODES[i] / 128] |= 1 << (NODES[i] % 128); i += 1; }
+        mask
+    };
+    MASK[n / 128] >> (n % 128) & 1 != 0
+}
+
+/// The bound on the outputs of the table-fed 9721 transform with the level-6 reductions of
+/// [`skip_lut6`] omitted (`pass_d::<4>`), in place of [`super::lut_transform_bound`] (28330):
+/// the largest interval end `lazy_lut_intervals` proves.
+pub const LUT_LAZY6_BOUND: u32 = 32708;
+const _: () = assert!(LUT_LAZY6_BOUND <= i16::MAX as u32);
+
 /// Levels 4 and 5: per level-3 node (27 slots) and `j < 3`, the nine slots `j + 3 i`. All three
 /// `j` of a node in one block (arm-big): nine independent butterflies per level.
 /// `S == 4` uses prime 9721's table-front intervals to omit 99 first-input reductions.
@@ -702,7 +726,9 @@ unsafe fn mac6(acc: &mut [int32x4_t], base: usize, y: &[int16x8_t; 6], av: int16
 }
 
 /// Level 6 per two level-5 nodes (six slots); its outputs, within [`super::transform_bound`],
-/// are either multiplied into `acc` by the matrix row (`MAC`) or stored.
+/// are either multiplied into `acc` by the matrix row (`MAC`) or stored. `S == 4` is prime 9721
+/// after the table front and `pass_c::<4>`: the first-input reductions of [`skip_lut6`] are
+/// omitted and the outputs are within [`LUT_LAZY6_BOUND`].
 #[inline(always)]
 unsafe fn pass_d<const S: usize, const MAC: bool>(
     x: &mut [int16x8_t; N],
@@ -710,24 +736,45 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
     row: &[i16],
     acc: &mut [int32x4_t],
 ) {
-    let s: Schedule = schedule(S);
+    let s: Schedule = schedule(if S == 4 { 1 } else { S });
     let k = vld1q_s16(kern.k.as_ptr());
     debug_assert!(!MAC || (row.len() == ROW && acc.len() == 2 * N));
     #[inline(always)]
-    unsafe fn compute(x: &[int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, q: usize) -> [int16x8_t; 6] {
-        let t = vld1q_s16(kern.d[q].as_ptr());
-        let mut v: [int16x8_t; 6] = core::array::from_fn(|i| load(x, 6 * q + i));
-        reduce_inputs(&mut v, s.before[6], s.cheap, &[0, 3], k);
+    unsafe fn compute<const SS: usize, const Q: usize>(x: &[int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t) -> [int16x8_t; 6] {
+        let t = vld1q_s16(kern.d[Q].as_ptr());
+        let mut v: [int16x8_t; 6] = core::array::from_fn(|i| load(x, 6 * Q + i));
+        if SS == 4 {
+            // the 9721 table front: the first inputs proven small enough stay unreduced
+            if const { !skip_lut6(2 * Q) } {
+                v[0] = vmlsq_laneq_s16::<0>(v[0], vrshrq_n_s16::<13>(v[0]), k);
+            }
+            if const { !skip_lut6(2 * Q + 1) } {
+                v[3] = vmlsq_laneq_s16::<0>(v[3], vrshrq_n_s16::<13>(v[3]), k);
+            }
+        } else {
+            reduce_inputs(&mut v, s.before[6], s.cheap, &[0, 3], k);
+        }
         let (y0, y1, y2) = r3!(s, 0, 1, 2, 3, v[0], v[1], v[2], t, k);
         let (y3, y4, y5) = r3!(s, 4, 5, 6, 7, v[3], v[4], v[5], t, k);
         [y0, y1, y2, y3, y4, y5]
     }
-    // three groups per step, all computed before any is stored (arm-big); 108 = 36 * 3
-    for q in (0..N / 6).step_by(3) {
-        let ys = [compute(x, s, kern, k, q), compute(x, s, kern, k, q + 1), compute(x, s, kern, k, q + 2)];
+    // three groups per step, all computed before any is stored (arm-big); 108 = 36 * 3. The
+    // steps are unrolled over a const group index so that `skip_lut6` folds at compile time: a
+    // runtime test would split the block and stop the scheduler interleaving the three groups.
+    #[inline(always)]
+    unsafe fn step<const SS: usize, const MACC: bool, const Q0: usize, const Q1: usize, const Q2: usize>(
+        x: &mut [int16x8_t; N],
+        s: Schedule,
+        kern: &Kernel,
+        k: int16x8_t,
+        row: &[i16],
+        acc: &mut [int32x4_t],
+    ) {
+        const { assert!(Q1 == Q0 + 1 && Q2 == Q0 + 2) };
+        let ys = [compute::<SS, Q0>(x, s, kern, k), compute::<SS, Q1>(x, s, kern, k), compute::<SS, Q2>(x, s, kern, k)];
         for (d, y) in ys.iter().enumerate() {
-            let base = 6 * (q + d);
-            if MAC {
+            let base = 6 * (Q0 + d);
+            if MACC {
                 let av = vld1q_s16(row.as_ptr().add(base));
                 mac6(acc, base, y, av);
             } else {
@@ -737,6 +784,11 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
             }
         }
     }
+    macro_rules! steps {
+        ($(($a:literal $b:literal $c:literal))*) => { $( step::<S, MAC, $a, $b, $c>(x, s, kern, k, row, acc); )* };
+    }
+    const _: () = assert!(N / 6 == 108);
+    steps!((0 1 2) (3 4 5) (6 7 8) (9 10 11) (12 13 14) (15 16 17) (18 19 20) (21 22 23) (24 25 26) (27 28 29) (30 31 32) (33 34 35) (36 37 38) (39 40 41) (42 43 44) (45 46 47) (48 49 50) (51 52 53) (54 55 56) (57 58 59) (60 61 62) (63 64 65) (66 67 68) (69 70 71) (72 73 74) (75 76 77) (78 79 80) (81 82 83) (84 85 86) (87 88 89) (90 91 92) (93 94 95) (96 97 98) (99 100 101) (102 103 104) (105 106 107));
 }
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
@@ -759,8 +811,13 @@ pub unsafe fn transform_lut<const P: usize>(m: &[int16x8_t; BITS], idx: &mut [ui
     let kern = &kernels()[P];
     nibbles(m, idx);
     pass_lut::<P>(idx, x, kern);
-    if P == 1 { pass_c::<4>(x, kern); } else { pass_c::<P>(x, kern); }
-    pass_d::<P, false>(x, kern, &[], &mut []);
+    if P == 1 {
+        pass_c::<4>(x, kern);
+        pass_d::<4, false>(x, kern, &[], &mut []);
+    } else {
+        pass_c::<P>(x, kern);
+        pass_d::<P, false>(x, kern, &[], &mut []);
+    }
 }
 
 /// Levels 0 and 1 of a general transform: Barrett products, every value reduced in between
@@ -1444,15 +1501,20 @@ mod tests {
                 for (i, a) in pos.into_iter().zip(r3(v, t, k)) { x[i] = a; }
             }
         }
-        let bound = super::super::lut_transform_bound(9721, SCHEDULES[1]) as i32;
+        let bound = LUT_LAZY6_BOUND as i32;
+        assert!(bound <= 32767 && bound >= super::super::lut_transform_bound(9721, SCHEDULES[1]) as i32);
+        let mut worst = 0;
         for n in 0..216 {
             let mut v = core::array::from_fn(|i| x[3 * n + i]);
-            v[0] = red(v[0]);
+            if !skip_lut6(n) { v[0] = red(v[0]); }
             let t = &k.d[n / 2][4 * (n % 2)..];
             for a in r3(v, t, k) {
-                assert!(a.0 >= -bound && a.1 <= bound, "final {a:?} bound {bound}");
+                assert!(a.0 >= -bound && a.1 <= bound, "final {a:?} bound {bound} butterfly {n}");
+                worst = worst.max(a.0.abs().max(a.1.abs()));
             }
         }
+        // the constant is the proof's own figure, not a looser one
+        assert_eq!(worst, bound, "LUT_LAZY6_BOUND is the largest proven interval end");
     }
 
     fn lanes(v: int16x8_t) -> [i16; 8] {
@@ -1912,7 +1974,7 @@ mod tests {
                         _ => transform_lut::<1>(&m, &mut idx, &mut x),
                     }
                 }
-                let bound = super::super::lut_transform_bound(plan.p, SCHEDULES[i]);
+                let bound = if i == 1 { LUT_LAZY6_BOUND } else { super::super::lut_transform_bound(plan.p, SCHEDULES[i]) };
                 for c in 0..8 {
                     let b: Vec<B128> = words[c].iter().map(|&w| B128(w)).collect();
                     let mut s = [0u32; N];

@@ -574,8 +574,10 @@ unsafe fn narrow(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
     }
 }
 
-/// The largest product of a key slot (a centered residue) and a transform slot.
-const PRODUCT: u64 = (P1 as u64 - 1) / 2 * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64;
+/// The largest product of a key slot (a centered residue) and a transform slot (the lazy level 6
+/// of `pass_d::<4>`, [`super::LUT_LAZY6_BOUND`]).
+const PRODUCT: u64 = (P1 as u64 - 1) / 2 * super::LUT_LAZY6_BOUND as u64;
+const _: () = assert!(super::LUT_LAZY6_BOUND >= crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]));
 /// `2^16 mod p`, centered.
 const C16: i32 = centered(1 << 16, P1) as i32;
 /// `round(2^31 / p)`.
@@ -665,7 +667,7 @@ unsafe fn sums(
                 let x = &mut xs[i];
                 pass_lut::<PB>(nib, x, kern);
                 pass_c::<4>(x, kern);
-                pass_d::<PB, false>(x, kern, &[], &mut []);
+                pass_d::<4, false>(x, kern, &[], &mut []);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             // the chunk's first sweep starts the digit rows' sums afresh

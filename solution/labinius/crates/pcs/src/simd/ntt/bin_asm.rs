@@ -1551,3 +1551,107 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
 }
 
 include!("twiddle_expanded.rs");
+
+/// Conservative per-slot bounds for the exact 9721 binary-transform schedule.
+/// Montgomery products use the actual centered twiddle, rather than the largest
+/// possible field coefficient. The bounds describe every prefix lane in the
+/// generic level-3 range, independently of any seed or public commitment matrix.
+pub fn output_bounds_9721() -> [i32; 648] {
+    const Q: i64 = 9721;
+    fn mont(b: i32, w: u32) -> i32 {
+        ((b as i64 * (w as i16 as i64).abs() + 32768 * Q) / 65536) as i32
+    }
+    fn butterfly(a: [i32; 3], tw: &[u32; 4], omega: u32) -> [i32; 3] {
+        assert!(a.iter().all(|&v| (0..32768).contains(&v)));
+        let (b, c) = (mont(a[1], tw[0]), mont(a[2], tw[2]));
+        assert!(b + c < 32768);
+        let d = mont(b + c, omega);
+        // Register order is y0,y2,y1; the finishing stores put y1 before y2.
+        let out = [a[0] + b + c, a[0] + b + d, a[0] + c + d];
+        assert!(out.iter().all(|&v| v < 32768));
+        out
+    }
+    let t = tables::<9721>();
+    let omega = t.cv[1][0] as u16 as u32;
+    let prefix = 3 * (Q as i32 - 1);
+    // Two centered lookup entries feed each level-3 input. Its y0 is bounded
+    // by 3(q-1); y1,y2 are bounded by 2(q-1)+Mont(2(q-1),omega).
+    assert!(2 * (Q as i32 - 1) + mont(2 * (Q as i32 - 1), omega) <= prefix);
+    let mut bounds = [0; 648];
+    for block in 0..24 {
+        let l4 = butterfly([5625, prefix, prefix], &t.tw4[block], omega);
+        let mut r = [0; 27];
+        for i in 0..9 { r[i] = l4[0]; r[i + 9] = l4[1]; r[i + 18] = l4[2]; }
+        for i in 0..3 { for (base, root) in [(0, 0), (18, 1), (9, 2)] {
+            let ids = [base + i, base + i + 3, base + i + 6];
+            let out = butterfly([r[ids[0]], r[ids[1]], r[ids[2]]], &t.tw5[3 * block + root], omega);
+            for j in 0..3 { r[ids[j]] = out[j]; }
+        }}
+        for (node, base) in [0, 6, 3, 18, 24, 21, 9, 15, 12].into_iter().enumerate() {
+            // Exhaustive i16 reduction tests establish the two fixed normalizer bounds:
+            // lookup Barrett <=5625 at L4; multiply Barrett <=7864 at L6.
+            let out = butterfly([7864, r[base + 1], r[base + 2]], &t.tw6[9 * block + node], omega);
+            let j = 27 * block + 3 * node;
+            bounds[j] = out[0]; bounds[j + 1] = out[2]; bounds[j + 2] = out[1];
+        }
+    }
+    assert!(bounds.iter().all(|&v| v <= output_bound_milli_q(9721) as i32 * 9721 / 1000));
+    bounds
+}
+
+#[cfg(test)]
+mod output_bound_tests {
+    use super::*;
+    #[repr(align(64))]
+    struct Leaf([i16; 27 * 32]);
+    #[test]
+    fn leaf_slots_match_direct_evaluation_and_bounds() { unsafe {
+        const Q: i64 = 9721;
+        let bounds = output_bounds_9721();
+        let mut seed = 0xa3b81457231u64;
+        let mut input = Leaf([0; 27 * 32]);
+        let mut got = Leaf([0; 27 * 32]);
+        for block in 0..24 {
+            let mut weights = [[0i64; 27]; 27];
+            for node in 0..9 { for branch in 0..3 {
+                let mut x = Params::<9721>::ZETA_L6[9 * block + node] as i64;
+                for _ in 0..branch { x = x * Params::<9721>::OMEGA as i64 % Q; }
+                let row = 3 * node + branch;
+                weights[row][0] = 1;
+                for j in 1..27 { weights[row][j] = weights[row][j - 1] * x % Q; }
+            }}
+            for fixture in 0..64 {
+                for (i, a) in input.0.iter_mut().enumerate() {
+                    seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                    *a = match fixture { 0 => 0, 1 => 29160, 2 => -29160,
+                        3 => if i % 2 == 0 {29160} else {-29160},
+                        _ => ((seed % 58321) as i32 - 29160) as i16 };
+                }
+                tail27_mem_b(input.0.as_ptr(), got.0.as_mut_ptr(),
+                    SMS_TWIDDLES.t4.as_ptr().add(4 * block).cast(),
+                    SMS_TWIDDLES.t5.as_ptr().add(12 * block).cast(),
+                    SMS_TWIDDLES.t6.as_ptr().add(36 * block).cast(),
+                    tables::<9721>().cv.as_ptr().cast());
+                for j in 0..27 { for lane in 0..32 {
+                    let want: i64 = (0..27).map(|i| input.0[32 * i + lane] as i64 * weights[j][i]).sum();
+                    assert_eq!((got.0[32 * j + lane] as i64).rem_euclid(Q), want.rem_euclid(Q), "block={block} row={j} lane={lane} fixture={fixture}");
+                    assert!((got.0[32 * j + lane] as i32).abs() <= bounds[27 * block + j], "block={block} row={j} lane={lane} fixture={fixture}");
+                }}
+            }
+        }
+    }}
+}
+
+#[cfg(test)]
+#[test]
+fn output_bound_normalizers_cover_all_i16() {
+    for a in i16::MIN..=i16::MAX {
+        let lut = barrett_lut_i16(a, 9721) as i32;
+        let mul = crate::params::barrett_i16(a, 9721) as i32;
+        assert!(lut.abs() <= 5625 && mul.abs() <= 7864);
+        assert_eq!((a as i32 - lut) % 9721, 0);
+        assert_eq!((a as i32 - mul) % 9721, 0);
+    }
+}
+
+include!("source_batched.rs");

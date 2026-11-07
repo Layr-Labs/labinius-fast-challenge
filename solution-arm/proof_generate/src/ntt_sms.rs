@@ -98,7 +98,7 @@ static KEY: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new();
 static KEY_JOB: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
 
 /// `LABINIUS_KEY_IN_PLACE` set the key is read in place instead.
-pub fn prefetch_key(image: &'static [u8]) {
+pub fn prefetch_key(image: &'static [u8], workers: usize) {
     if image.is_empty() || std::env::var_os("LABINIUS_KEY_IN_PLACE").is_some() {
         return;
     }
@@ -108,15 +108,24 @@ pub fn prefetch_key(image: &'static [u8]) {
         let dst = v.as_mut_ptr() as usize;
         // pieces of whole 2 MiB pages, so that each thread faults in its own huge pages
         let piece = len.div_ceil(8).next_multiple_of(2 << 20);
-        std::thread::scope(|s| {
-            for start in (0..len).step_by(piece) {
-                let n = piece.min(len - start);
+        // Reuse the key-copy startup threads to prepare scratch. The commit workers then
+        // inherit writable physical pages rather than faulting huge pages on their first batch.
+        let arenas = std::thread::scope(|s| {
+            let jobs: Vec<_> = (0..len.div_ceil(piece).max(workers)).map(|i| {
                 s.spawn(move || {
-                    // SAFETY: disjoint ranges of the capacity and of the image.
-                    unsafe { core::ptr::copy_nonoverlapping(image.as_ptr().add(start), (dst as *mut u8).add(start), n) }
-                });
-            }
+                    let arena = (i < workers).then(Arena::prefaulted);
+                    let start = i * piece;
+                    if start < len {
+                        let n = piece.min(len - start);
+                        // SAFETY: disjoint ranges of the capacity and of the image.
+                        unsafe { core::ptr::copy_nonoverlapping(image.as_ptr().add(start), (dst as *mut u8).add(start), n) }
+                    }
+                    arena
+                })
+            }).collect();
+            jobs.into_iter().filter_map(|j| j.join().expect("key preparation worker panicked")).collect()
         });
+        *PREPARED_SCRATCH.lock().unwrap() = arenas;
         // SAFETY: every byte below `len` was written above.
         unsafe { v.set_len(len) };
         let _ = KEY.set((image.as_ptr() as usize, v));
@@ -719,7 +728,15 @@ struct Scratch {
 const ARENA: usize = 4 << 20;
 const _: () = assert!(core::mem::size_of::<Scratch>() <= 2 << 20, "the scratch fits one huge page");
 
-struct Arena(*mut Scratch);
+struct Arena {
+    ptr: *mut Scratch,
+    alloc: std::time::Duration,
+    touch: std::time::Duration,
+}
+// The allocation has one owner. Moving it to another thread transfers exclusive access;
+// references into it never outlive that owner, and Arena is deliberately not Sync.
+unsafe impl Send for Arena {}
+static PREPARED_SCRATCH: std::sync::Mutex<Vec<Arena>> = std::sync::Mutex::new(Vec::new());
 
 impl Arena {
     fn layout() -> std::alloc::Layout {
@@ -728,31 +745,100 @@ impl Arena {
     }
 
     fn new() -> Self {
+        let start = std::time::Instant::now();
         let layout = Self::layout();
         let p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut Scratch;
         if p.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
-        Arena(p)
+        Arena { ptr: p, alloc: start.elapsed(), touch: std::time::Duration::ZERO }
+    }
+
+    fn prefaulted() -> Self {
+        let mut arena = Self::new();
+        let start = std::time::Instant::now();
+        // A volatile store in every 4 KiB page ensures writable backing, including when THP
+        // is unavailable. Touch only Scratch, not the unused tail of the 4 MiB reservation.
+        // alloc_zeroed has already initialized the entire allocation; these stores preserve it.
+        for offset in (0..core::mem::size_of::<Scratch>()).step_by(4096) {
+            unsafe { core::ptr::write_volatile((arena.ptr as *mut u8).add(offset), 0); }
+        }
+        arena.touch = start.elapsed();
+        arena
     }
 }
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.0 as *mut u8, Self::layout()) }
+        unsafe { std::alloc::dealloc(self.ptr as *mut u8, Self::layout()) }
+    }
+}
+
+/// Coarse worker-boundary diagnostics, never sampled in a transform or sink loop.
+#[derive(Default)]
+pub struct CommitTiming {
+    pub out_alloc: std::time::Duration,
+    workers: Vec<WorkerTiming>,
+}
+
+struct WorkerTiming {
+    start: std::time::Duration,
+    alloc: std::time::Duration,
+    touch: std::time::Duration,
+    acquire: std::time::Duration,
+    prepared: bool,
+    first_batch: std::time::Duration,
+    span: std::time::Duration,
+    finish: std::time::Duration,
+}
+
+impl CommitTiming {
+    pub fn append(&self, fields: &mut Vec<String>) {
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        fields.push(format!("commit_out_alloc_ms={:.3}", ms(self.out_alloc)));
+        fields.push(format!("scratch_prepared_workers={}", self.workers.iter().filter(|w| w.prepared).count()));
+        let ranges: [(&str, fn(&WorkerTiming) -> std::time::Duration); 7] = [
+            ("worker_start", |w| w.start),
+            ("scratch_alloc", |w| w.alloc),
+            ("scratch_touch", |w| w.touch),
+            ("scratch_acquire", |w| w.acquire),
+            ("first_batch", |w| w.first_batch),
+            ("worker_span", |w| w.span),
+            ("worker_finish", |w| w.finish),
+        ];
+        for (name, get) in ranges {
+            let lo = self.workers.iter().map(get).min().unwrap_or_default();
+            let hi = self.workers.iter().map(get).max().unwrap_or_default();
+            fields.push(format!("{name}_min_ms={:.3} {name}_max_ms={:.3}", ms(lo), ms(hi)));
+            if name == "worker_start" {
+                fields.push(format!("worker_start_skew_ms={:.3}", ms(hi - lo)));
+            }
+        }
     }
 }
 
 /// The commitment of every column of `values` (columns of `4 a.elements` words) modulo
 /// [`MODULUS`].
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
+    commit_timed(values, a, workers).0
+}
+
+pub fn commit_timed(values: &[B128], a: &SmsMatrix, workers: usize) -> (Vec<u128>, CommitTiming) {
+    let epoch = std::time::Instant::now();
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
+    let out_alloc = epoch.elapsed();
+    let timings = std::sync::Mutex::new(Vec::with_capacity(workers.min(columns.div_ceil(LANES).max(1))));
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
-        let arena = Arena::new();
-        let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;
+        let start = epoch.elapsed();
+        let prepared = PREPARED_SCRATCH.lock().unwrap().pop();
+        let was_prepared = prepared.is_some();
+        let arena = prepared.unwrap_or_else(Arena::prefaulted);
+        let ready = epoch.elapsed();
+        let mut first_batch = std::time::Duration::ZERO;
+        let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.ptr;
         let p = P1 as i16;
         let count = block.len() / N;
         for (b, target) in block.chunks_mut(LANES * N).enumerate() {
@@ -811,9 +897,15 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                     *o = crt(base[k][c] as u32, tail[k][c]);
                 }
             }
+            if b == 0 { first_batch = epoch.elapsed() - ready; }
         }
+        let finish = epoch.elapsed();
+        timings.lock().unwrap().push(WorkerTiming {
+            start, alloc: arena.alloc, touch: arena.touch, acquire: ready - start,
+            prepared: was_prepared, first_batch, span: finish - ready, finish,
+        });
     });
-    out
+    (out, CommitTiming { out_alloc, workers: timings.into_inner().unwrap() })
 }
 
 #[cfg(test)]

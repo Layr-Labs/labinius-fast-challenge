@@ -188,9 +188,6 @@ impl Output {
         });
         Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
     }
-    pub fn wait_setup(&self) {
-        self.finish_setup();
-    }
     fn finish_setup(&self) {
         if let Some(thread) = self.setup.lock().unwrap().take() {
             thread.join().expect("output preparation thread panicked");

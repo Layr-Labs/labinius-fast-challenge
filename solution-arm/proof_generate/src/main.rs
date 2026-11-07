@@ -353,13 +353,17 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 /// registers, so the accumulator is read and written once per block instead of once per group.
 ///
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
-fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
+fn commit(values: &[B128], modulus: u128, timer: &mut Timer) -> Vec<u128> {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
         use ntt::neon::sms;
+        let wait = std::time::Instant::now();
         let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
-        return sms::commit(values, &matrix, threads());
+        timer.detail("key_wait", wait.elapsed());
+        let (out, timing) = sms::commit_timed(values, &matrix, threads());
+        timing.append(&mut timer.1);
+        return out;
     }
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::hybrid::MODULUS {
@@ -873,11 +877,19 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 }
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
-    output.wait_setup();
-    let coefficients = commit(values, modulus);
-    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
+    // The setup thread owns only the output mapping and packed-byte buffer. Commitment
+    // arithmetic is independent; commitment_buffer() joins before any bytes are packed.
+    let coefficients = commit(values, modulus, timer);
+    let setup = std::time::Instant::now();
+    let buffer = output.commitment_buffer();
+    timer.detail("setup_wait", setup.elapsed());
+    let pack = std::time::Instant::now();
+    let commitment = output::pack_commitment(&coefficients, modulus, buffer);
+    timer.detail("pack", pack.elapsed());
     std::mem::forget(coefficients);
+    let pool = std::time::Instant::now();
     labinius::par::pool();
+    timer.detail("pool", pool.elapsed());
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
     // round, and idle population workers measurably slowed it. The final encode faults the
@@ -909,6 +921,9 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
 struct Timer(std::time::Instant, Vec<String>);
 
 impl Timer {
+    fn detail(&mut self, phase: &str, elapsed: std::time::Duration) {
+        self.1.push(format!("{phase}_ms={:.3}", elapsed.as_secs_f64() * 1000.0));
+    }
     fn lap(&mut self, phase: &str) {
         self.1
             .push(format!("{phase}_ms={}", self.0.elapsed().as_millis()));
@@ -931,7 +946,7 @@ fn main() {
     } else {
         MODULUS
     };
-    #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS { ntt::neon::sms::prefetch_key(&SMS_DATA.0) }
+    #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS { ntt::neon::sms::prefetch_key(&SMS_DATA.0, threads().clamp(1, COLUMNS.div_ceil(8))) }
     let output = Output::start(&args[2], modulus);
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
@@ -1101,7 +1116,7 @@ mod tests {
                 }
             })
             .collect();
-        let fast = commit(&values, modulus);
+        let fast = commit(&values, modulus, &mut Timer(std::time::Instant::now(), Vec::new()));
         let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
         for j in 0..2 {
             let witness: Vec<F162> = values[j * COLUMN_LEN..][..COLUMN_LEN]

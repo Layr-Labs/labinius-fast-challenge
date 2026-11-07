@@ -142,7 +142,7 @@ const fn expanded<const Q:u16>()->ExpandedTwiddles{
  i=0;while i<864{t.t6[i]=[old.tw6[i/4][i%4]as i16;32];i+=1;}t
 }
 static SMS_TWIDDLES:ExpandedTwiddles=expanded::<9721>();
-#[inline(never)]
+#[inline]
 #[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 unsafe fn tail27_mem_b(
     bp: *const i16,

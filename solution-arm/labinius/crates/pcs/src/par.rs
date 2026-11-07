@@ -7,6 +7,22 @@
 
 use std::sync::OnceLock;
 
+
+/// Pin the calling thread to CPU `cpu` when the kernel allows it; best effort.
+#[cfg(target_os = "linux")]
+fn pin(cpu: usize) {
+    unsafe extern "C" {
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const u8) -> i32;
+    }
+    let mut mask = [0u8; 128];
+    if cpu < 1024 {
+        mask[cpu / 8] |= 1 << (cpu % 8);
+        unsafe { sched_setaffinity(0, mask.len(), mask.as_ptr()); }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn pin(_cpu: usize) {}
+
 /// Worker threads: `LABINIUS_THREADS` when it holds a positive integer, otherwise the available
 /// parallelism. The variable is a development knob for matching the scored machine's CPU count
 /// on a larger host; the scoring sandbox starts the prover with a cleared environment.
@@ -342,8 +358,9 @@ impl Pool {
         // a third of the runs.
         let start = epoch_of(shared.claim.load(Ordering::Acquire));
         let handles = (1..width)
-            .map(|_| std::thread::spawn(move || worker(shared, start)))
+            .map(|i| std::thread::spawn(move || { pin(i); worker(shared, start) }))
             .collect();
+        pin(0);
         Pool {
             shared,
             width,

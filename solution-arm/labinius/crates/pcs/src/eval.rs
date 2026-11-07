@@ -48,16 +48,28 @@ use crate::arch::*;
 
 /// `eq(ps, b) = prod_k (ps_k if bit k of b is 1 else 1 + ps_k)`, all `2^ps.len()` of them, by
 /// doubling: variable `k` is bit `k` of the index.
+///
 pub fn eq_table(ps: &[F162]) -> Vec<F162> {
-    let mut t = vec![F162::ONE];
+    const PARALLEL: usize = 4096;
+    const PIECE: usize = 1024;
+    let mut t = vec![F162::ZERO; 1 << ps.len()];
+    t[0] = F162::ONE;
+    let mut n = 1;
     for &p in ps {
-        let n = t.len();
-        t.resize(2 * n, F162::ZERO);
-        for b in 0..n {
-            let x = t[b];
-            t[b + n] = x * p;
-            t[b] = x * (F162::ONE + p);
+        let (lo, hi) = t[..2 * n].split_at_mut(n);
+        let level = |lo: &mut [F162], hi: &mut [F162]| {
+            for (x, y) in lo.iter_mut().zip(hi.iter_mut()) {
+                let xp = *x * p;
+                *y = xp;
+                *x += xp;
+            }
+        };
+        if n >= PARALLEL {
+            crate::par::for_each(lo.chunks_mut(PIECE).zip(hi.chunks_mut(PIECE)), |(a, b)| level(a, b));
+        } else {
+            level(lo, hi);
         }
+        n *= 2;
     }
     t
 }

@@ -34,6 +34,9 @@ const _: () = {
 };
 /// Pair batches per reconstruction chunk; the build checks the public matrix's margin.
 pub const CHUNK_PAIRS: usize = 128;
+const FOLD_PAIRS:usize=64;
+fn folds_in_chunk(np:usize,c:usize)->usize{let r=chunk_range(np,c);(r.end-r.start).div_ceil(FOLD_PAIRS)}
+fn folds_in_range(np:usize,r:core::ops::Range<usize>)->usize{let cph=chunks_per_half(np);(r.start/(np/2)*cph..r.end/(np/2)*cph).map(|c|folds_in_chunk(np,c)).sum()}
 /// Chunks of each half column: [`CHUNK_PAIRS`] pair batches each and a shorter last one, so
 /// that every chunk lies in one half (the commitment's work units are halves).
 pub const fn chunks_per_half(np: usize) -> usize {
@@ -72,26 +75,13 @@ const fn r16c(q: u16) -> i32 {
 const fn acc_after_reduce_c(q: u16) -> i64 {
     32768 * (1 + r16c(q).unsigned_abs() as i64)
 }
-/// One dword-product step: two products of a lazily reduced transform lane and a centered key.
-const fn pair_per_batch(q: u16) -> i64 {
-    2 * w_bound(q) * a_bound(q)
-}
-/// Pair batches between two fold-backs: the largest power of two `P` with
-/// `acc_after_reduce_c + P * pair_per_batch <= i32::MAX`.
-const fn pair_period(q: u16) -> usize {
-    let mut p = 1usize;
-    while acc_after_reduce_c(q) + 2 * (p as i64) * pair_per_batch(q) <= i32::MAX as i64 {
-        p *= 2;
-    }
-    p
-}
 /// [`red16`]'s bias: the largest multiple of q below 2^31.
 const fn bias(q: u16) -> i64 {
     ((1i64 << 31) / q as i64) * q as i64
 }
-pub const PP: usize = pair_period(P);
+// Eight pairs per native MAC step; the public-key certificate checks its L1 bound.
+pub const PP: usize = LOCK;
 const _: () = {
-    assert!(acc_after_reduce_c(P) + (PP as i64) * pair_per_batch(P) <= bias(P));
     // fold_bias is in [0,P); subtracting a centered mean adds at most P/2.
     // The existing per-period accumulator bound therefore covers the new starts.
     assert!(3 * P as i64 / 2 <= acc_after_reduce_c(P));
@@ -293,8 +283,9 @@ impl SmsKeyData {
                         // The base stream retains its original commitment encoding.
                         let scale = gen_small::sms_key_scales_9721()[usize::from(j >= N / 2)];
                         let scaled = |v: i16| -> u32 {
-                            if s == 0 { return v as u16 as u32; }
-                            let x = (v as i64 * scale as i64).rem_euclid(P as i64);
+                            let inverse=vb::SMS_SCALE_INVERSE[j/162]as i64;
+                            let multiplier=if s==0{inverse}else{scale as i64*inverse};
+                            let x=(v as i64*multiplier).rem_euclid(P as i64);
                             let centered = if x > (P / 2) as i64 { x - P as i64 } else { x };
                             centered as i16 as u16 as u32
                         };
@@ -305,6 +296,7 @@ impl SmsKeyData {
                 }
             }
         }
+        certify_relocated_pairs(&pairs);
         // Chunk moments: the ring elements of chunk `c` ([`chunk_range`]) of every column.
         let chunks = chunk_count(elements);
         let mut mean_residues = vec![0i16; mur_len(elements)];
@@ -365,7 +357,7 @@ fn initial_bias_from_means(means: &[i16], elements: usize) -> Vec<i32> {
     let scales = gen_small::sms_key_scales_9721();
     let mut out = vec![0i32; mur_len(elements)];
     for chunk in 0..chunks {
-        let bias = fold_bias(1);
+        let bias = fold_bias(folds_in_chunk(elements/2,chunk));
         for digit in 0..DIGITS {
             let mut batch = Batch32::zero(Representation::Coefficients);
             for m in 0..N {
@@ -427,17 +419,14 @@ const INPUT_PREFETCH: bool = false;
 
 const PREFETCH_SLOTS: usize = 10;
 
-/// The sink folds once per reconstruction chunk, in the chunk's last lockstep step. [`PP`] is the
-/// worst case over every witness: a key of the public matrix and a transform lane both at their
-/// bounds. The witness is uniformly random, so a chunk's 256 products per accumulator are a sum of
-/// independent centered terms whose standard deviation is about 2.2e8 against the 2.06e9 an i32
-/// has left: about 9.4 sigma, 1e-19 per accumulator and chunk, 1e-11 per proof. That is far below
-/// the reconstruction failure rate the build already accepts. An overflow can only make a proof
-/// fail verification, never make a wrong commitment verify. The commitment is unchanged.
-const _: () = assert!(LOCK <= PP || PP == 8);
+// Quarter-scaled witnesses and reciprocal public keys preserve every product.
+// The64-pair window retains the baseline's statistical accumulation strategy;
+// reset it at each128-pair reconstruction chunk. The public-key check certifies
+// an eight-pair interval after a fold, not a worst-case64-pair window.
+const _: () = assert!(FOLD_PAIRS % LOCK == 0 && FOLD_PAIRS <= CHUNK_PAIRS);
 
 /// The value stream `s` starts from so that its two-uop folds cancel by its next reset: `32768`
-/// per fold, modulo `P`. The base takes one fold per chunk of its range, each digit one fold.
+/// per fold, modulo `P`. Count the folds of each actual chunk, including short final chunks.
 fn fold_bias(folds: usize) -> i32 {
     (folds as u64 * 32768 % P as u64) as i32
 }
@@ -769,7 +758,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     let initial_streams = if LOCK == 8 && bench_mode() == 0 { 1 } else { STREAMS };
     for s in 0..initial_streams {
         // Stream 0 runs over the range; the digits' spans are whole chunks of it.
-        let b = if s == 0 { fold_bias(span / hl * chunks_per_half(np)) } else { fold_bias(1) };
+        let b = if s == 0 { fold_bias(folds_in_range(np,range.clone())) } else { fold_bias(1) };
         fill_stream(&mut ws.acc[0], s, b);
     }
     // Each auxiliary stream starts at fold_bias - scaled_NTT(mean) for this chunk.
@@ -811,8 +800,8 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         // A chunk's first step cancels its public mean in the NTT domain.
         // The FIRST sink overwrites the auxiliary accumulators from that image.
         let first = (b - b / hl * hl) % CHUNK_PAIRS == 0;
-        // The chunk's last step folds: every CHUNK_PAIRS pair batches into a half, and the half's end.
-        let fold_now = { let local = b + LOCK - (b / hl) * hl; local % CHUNK_PAIRS == 0 || local == hl };
+        // Fold every64 pairs within a chunk, and at every chunk/half end.
+        let fold_now = {let local=b+LOCK-(b/hl)*hl;let in_chunk=(b-(b/hl)*hl)%CHUNK_PAIRS+LOCK;in_chunk%FOLD_PAIRS==0||local%CHUNK_PAIRS==0||local==hl};
         let mode = bench_mode();
         if mode == 2 || mode == 4 {
             for h in 0..LOCK { source(h, idx.add(h)); }
@@ -821,18 +810,18 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         if mode == 1 {
             struct Nop;
             impl vb::SliceSink<LOCK> for Nop { unsafe fn rows(&mut self, _: usize, w: [*const i16; LOCK], _: usize, _: usize) { core::hint::black_box(w); } }
-            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Nop, &mut source);
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, true, _, _>(idx, w,&mut Nop, &mut source);
         } else if mode == 2 {
             let mut sk = Sink::<false> { k, acc, b: bias };
             for kk in 0..24 { vb::SliceSink::<LOCK>::rows(&mut sk, kk, core::array::from_fn(|h| w.add(32 * 27 * h) as *const i16), 0, 27); }
         } else if first && fold_now {
-            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<true, true> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true, true> { k, acc, b: bias }, &mut source);
         } else if first {
-            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<false, true> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false, true> { k, acc, b: bias }, &mut source);
         } else if fold_now {
-            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<true> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true> { k, acc, b: bias }, &mut source);
         } else {
-            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<false> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false> { k, acc, b: bias }, &mut source);
         }
         if (b + LOCK) % PP == 0 { sync(b + LOCK); }
         // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
@@ -1198,7 +1187,7 @@ mod tests {
                 let x: [i16; N] = core::array::from_fn(|_| (xorshift(&mut state) % P as u64) as i16 - (P / 2) as i16);
                 for m in 0..N { batch.v[m][0] = x[m]; }
                 unsafe { gen_small::ntt_gen_batch32::<P>(&mut batch); }
-                let fold = fold_bias(1);
+                let fold = fold_bias(folds_in_chunk(elements/2,chunk));
                 for slot in 0..N {
                     let value = batch.v[slot][0] as i64 * scales[usize::from(slot >= N / 2)] as i64
                         + (biases[(chunk * N + slot) * DIGITS + digit] - fold) as i64;
@@ -1336,4 +1325,25 @@ unsafe fn reduce_hi55(x:__m512i)->__m512i {
  let r=_mm512_sub_epi32(x,_mm512_mullo_epi32(q,m));
  let r=_mm512_mask_add_epi32(r,_mm512_cmplt_epi32_mask(r,_mm512_setzero_si512()),r,m);
  _mm512_mask_sub_epi32(r,_mm512_cmp_epi32_mask(r,m,_MM_CMPINT_NLT),r,m)
+}
+
+pub(crate) fn certify_relocated_pairs(pairs:&[u32]){assert_eq!(pairs.len()%LOCK,0);let max=pairs.chunks_exact(LOCK).map(|p|p.iter().map(|&x|(x as i16 as i64).abs()+((x>>16)as i16 as i64).abs()).sum::<i64>()).max().unwrap_or(0);assert!(vb::SMS_SOURCE_BOUND*max+acc_after_reduce_c(P)+32768<=bias(P),"public key exceeds relocated 8-pair step range");}
+
+#[cfg(test)]mod fold_window_tests {
+ use super::*;
+ #[test]fn counts_short_chunk_folds(){
+  assert_eq!(folds_in_chunk(320,0),2);
+  assert_eq!(folds_in_chunk(320,1),1);
+  assert_eq!(folds_in_chunk(320,2),2);
+  assert_eq!(folds_in_chunk(320,3),1);
+  assert_eq!(folds_in_range(320,0..160),3);
+  assert_eq!(folds_in_range(320,160..320),3);
+  assert_eq!(folds_in_range(320,0..320),6);
+  assert_eq!(folds_in_range(256,0..256),4);
+  assert_eq!(folds_in_range(512,0..512),8);
+ }
+ #[test]#[should_panic(expected="public key exceeds relocated 8-pair step range")]
+ fn rejects_insufficient_public_step_margin(){
+  certify_relocated_pairs(&[4860u32|(4860u32<<16);LOCK]);
+ }
 }

@@ -1,0 +1,277 @@
+// Private SMS producer tails. The ordinary batched binary NTT is unchanged.
+// For the fixed512-bit input layout, quarter-scaled lookup tables and inverse
+// public-key factors allow the same583-vector-op tail in all24 blocks.
+// Signed-word interval checks bound every scaled output by31296. The generic
+// full648-bit factory path retains the uniform604-op tail below (bound30376).
+// The SMS public-key builder certifies its eight-pair L1 step for this bound.
+pub(crate) const SMS_SOURCE_BOUND:i64=31296;
+
+macro_rules! tail27_relocated {
+    ($m4:ident, $m6:ident) => {
+        tail27_relocated!($m4, $m6, bfly)
+    };
+    ($m4:ident, $m6:ident, $finish:ident) => {
+        concat!(
+            level4_mem!($m4 0, 9, 18, 0, 576, 1152, 28),
+            level4_mem!($m4 3, 12, 21, 192, 768, 1344, 29),
+            bfly!(0, 9, 18, 28),
+            level4_mem!($m4 6, 15, 24, 384, 960, 1536, 28),
+            bfly!(3, 12, 21, 29),
+            level4_mem!($m4 1, 10, 19, 64, 640, 1216, 29),
+            bfly!(6, 15, 24, 28),
+            level4_mem!($m4 4, 13, 22, 256, 832, 1408, 28),
+            bfly!(1, 10, 19, 29),
+            level4_mem!($m4 7, 16, 25, 448, 1024, 1600, 29),
+            bfly!(4, 13, 22, 28),
+            level4_mem!($m4 2, 11, 20, 128, 704, 1280, 28),
+            bfly!(7, 16, 25, 29),
+            level4_mem!($m4 5, 14, 23, 320, 896, 1472, 29),
+            bfly!(2, 11, 20, 28),
+            level4_mem!($m4 8, 17, 26, 512, 1088, 1664, 28),
+            bfly!(5, 14, 23, 29),
+            bfly!(8, 17, 26, 28),
+            "vpsrlw zmm28, zmm0, 11\n",
+            "vpermw zmm28, zmm28, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm0, zmm0, zmm28\n",
+            mont_mem!("t5", "", 3, 6, 28),
+            "vpsrlw zmm29, zmm18, 11\n",
+            "vpermw zmm29, zmm29, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm18, zmm18, zmm29\n",
+            mont_mem!("t5", "+16", 21, 24, 29),
+            bfly!(0, 3, 6, 28),
+            "vpsrlw zmm28, zmm9, 11\n",
+            "vpermw zmm28, zmm28, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm9, zmm9, zmm28\n",
+            mont_mem!("t5", "+32", 12, 15, 28),
+            bfly!(18, 21, 24, 29),
+            mont_mem!("t5", "", 4, 7, 29),
+            bfly!(9, 12, 15, 28),
+            mont_mem!("t5", "+16", 22, 25, 28),
+            bfly!(1, 4, 7, 29),
+            mont_mem!("t5", "+32", 13, 16, 29),
+            bfly!(19, 22, 25, 28),
+            mont_mem!("t5", "", 5, 8, 28),
+            bfly!(10, 13, 16, 29),
+            mont_mem!("t5", "+16", 23, 26, 29),
+            bfly!(2, 5, 8, 28),
+            mont_mem!("t5", "+32", 14, 17, 28),
+            bfly!(20, 23, 26, 29),
+            bfly!(11, 14, 17, 28),
+            level6_mem!($m6 "", 0, 1, 2, 28),
+            level6_mem!($m6 "+16", 6, 7, 8, 29),
+            $finish!(0, 1, 2, 28, 0, 64, 128),
+            level6_mem!($m6 "+32", 3, 4, 5, 28),
+            $finish!(6, 7, 8, 29, 192, 256, 320),
+            level6_mem!($m6 "+48", 18, 19, 20, 29),
+            $finish!(3, 4, 5, 28, 384, 448, 512),
+            level6_mem!($m6 "+64", 24, 25, 26, 28),
+            $finish!(18, 19, 20, 29, 576, 640, 704),
+            level6_mem!($m6 "+80", 21, 22, 23, 29),
+            $finish!(24, 25, 26, 28, 768, 832, 896),
+            level6_mem!($m6 "+96", 9, 10, 11, 28),
+            $finish!(21, 22, 23, 29, 960, 1024, 1088),
+            level6_mem!($m6 "+112", 15, 16, 17, 29),
+            $finish!(9, 10, 11, 28, 1152, 1216, 1280),
+            level6_mem!($m6 "+128", 12, 13, 14, 28),
+            $finish!(15, 16, 17, 29, 1344, 1408, 1472),
+            $finish!(12, 13, 14, 28, 1536, 1600, 1664),
+        )
+    };
+}
+
+#[inline(never)]
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn tail27_relocated_leaf(
+    bp: *const i16,
+    op: *mut i16,
+    t4: *const u32,
+    t5: *const u32,
+    t6: *const u32,
+    cv: *const i16,
+) {
+    core::arch::asm!(
+        concat!(
+            "vmovdqa64 zmm27, [{c}]\n",
+            tail27_relocated!(lut, plain),
+        ),
+        i = in(reg) bp,
+        o = in(reg) op,
+        t4 = in(reg) t4,
+        t5 = in(reg) t5,
+        t6 = in(reg) t6,
+        c = in(reg) cv,
+        out("zmm0") _,
+        out("zmm1") _,
+        out("zmm2") _,
+        out("zmm3") _,
+        out("zmm4") _,
+        out("zmm5") _,
+        out("zmm6") _,
+        out("zmm7") _,
+        out("zmm8") _,
+        out("zmm9") _,
+        out("zmm10") _,
+        out("zmm11") _,
+        out("zmm12") _,
+        out("zmm13") _,
+        out("zmm14") _,
+        out("zmm15") _,
+        out("zmm16") _,
+        out("zmm17") _,
+        out("zmm18") _,
+        out("zmm19") _,
+        out("zmm20") _,
+        out("zmm21") _,
+        out("zmm22") _,
+        out("zmm23") _,
+        out("zmm24") _,
+        out("zmm25") _,
+        out("zmm26") _,
+        out("zmm27") _,
+        out("zmm28") _,
+        out("zmm29") _,
+        out("zmm30") _,
+        options(nostack)
+    );
+}
+
+pub(crate) const SMS_SCALE_ALPHA:[i32;4]=[9626,4010,1282,5655];
+pub(crate) const SMS_SCALE_INVERSE:[i32;4]=[4707,6955,8758,9513];
+#[repr(C,align(64))]struct ScaledSmsLut([[u8;64];48]);
+const fn scaled_sms_lut()->ScaledSmsLut{
+ let original=build_tables::<9721>();let mut output=[[0u8;64];48];let mut table=0;
+ while table<48{let mut n=0;while n<16{
+  let old=(original.lut[table][n]as u16|((original.lut[table][16+n]as u16)<<8))as i16 as i32;
+  let mut value=old*SMS_SCALE_ALPHA[table/12]%9721;if value<0{value+=9721;}if value>4860{value-=9721;}
+  output[table][n]=value as u16 as u8;output[table][16+n]=((value as u16)>>8)as u8;n+=1;
+ }table+=1;}ScaledSmsLut(output)
+}
+static SMS_SCALED_LUT:ScaledSmsLut=scaled_sms_lut();
+macro_rules! tail27_scaled {
+    ($m4:ident, $m6:ident) => {
+        tail27_scaled!($m4, $m6, bfly)
+    };
+    ($m4:ident, $m6:ident, $finish:ident) => {
+        concat!(
+            level4_mem!(plain 0, 9, 18, 0, 576, 1152, 28),
+            level4_mem!(plain 3, 12, 21, 192, 768, 1344, 29),
+            bfly!(0, 9, 18, 28),
+            level4_mem!(plain 6, 15, 24, 384, 960, 1536, 28),
+            bfly!(3, 12, 21, 29),
+            level4_mem!(lut 1, 10, 19, 64, 640, 1216, 29),
+            bfly!(6, 15, 24, 28),
+            level4_mem!(plain 4, 13, 22, 256, 832, 1408, 28),
+            bfly!(1, 10, 19, 29),
+            level4_mem!(plain 7, 16, 25, 448, 1024, 1600, 29),
+            bfly!(4, 13, 22, 28),
+            level4_mem!(lut 2, 11, 20, 128, 704, 1280, 28),
+            bfly!(7, 16, 25, 29),
+            level4_mem!(plain 5, 14, 23, 320, 896, 1472, 29),
+            bfly!(2, 11, 20, 28),
+            level4_mem!(plain 8, 17, 26, 512, 1088, 1664, 28),
+            bfly!(5, 14, 23, 29),
+            bfly!(8, 17, 26, 28),
+            "vpsrlw zmm28, zmm0, 11\n",
+            "vpermw zmm28, zmm28, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm0, zmm0, zmm28\n",
+            mont_mem!("t5", "", 3, 6, 28),
+            "vpsrlw zmm29, zmm18, 11\n",
+            "vpermw zmm29, zmm29, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm18, zmm18, zmm29\n",
+            mont_mem!("t5", "+16", 21, 24, 29),
+            bfly!(0, 3, 6, 28),
+            "vpsrlw zmm28, zmm9, 11\n",
+            "vpermw zmm28, zmm28, zmmword ptr [{c}+512]\n",
+            "vpaddw zmm9, zmm9, zmm28\n",
+            mont_mem!("t5", "+32", 12, 15, 28),
+            bfly!(18, 21, 24, 29),
+            mont_mem!("t5", "", 4, 7, 29),
+            bfly!(9, 12, 15, 28),
+            mont_mem!("t5", "+16", 22, 25, 28),
+            bfly!(1, 4, 7, 29),
+            mont_mem!("t5", "+32", 13, 16, 29),
+            bfly!(19, 22, 25, 28),
+            mont_mem!("t5", "", 5, 8, 28),
+            bfly!(10, 13, 16, 29),
+            mont_mem!("t5", "+16", 23, 26, 29),
+            bfly!(2, 5, 8, 28),
+            mont_mem!("t5", "+32", 14, 17, 28),
+            bfly!(20, 23, 26, 29),
+            bfly!(11, 14, 17, 28),
+            level6_mem!($m6 "", 0, 1, 2, 28),
+            level6_mem!($m6 "+16", 6, 7, 8, 29),
+            $finish!(0, 1, 2, 28, 0, 64, 128),
+            level6_mem!($m6 "+32", 3, 4, 5, 28),
+            $finish!(6, 7, 8, 29, 192, 256, 320),
+            level6_mem!($m6 "+48", 18, 19, 20, 29),
+            $finish!(3, 4, 5, 28, 384, 448, 512),
+            level6_mem!($m6 "+64", 24, 25, 26, 28),
+            $finish!(18, 19, 20, 29, 576, 640, 704),
+            level6_mem!($m6 "+80", 21, 22, 23, 29),
+            $finish!(24, 25, 26, 28, 768, 832, 896),
+            level6_mem!($m6 "+96", 9, 10, 11, 28),
+            $finish!(21, 22, 23, 29, 960, 1024, 1088),
+            level6_mem!($m6 "+112", 15, 16, 17, 29),
+            $finish!(9, 10, 11, 28, 1152, 1216, 1280),
+            level6_mem!($m6 "+128", 12, 13, 14, 28),
+            $finish!(15, 16, 17, 29, 1344, 1408, 1472),
+            $finish!(12, 13, 14, 28, 1536, 1600, 1664),
+        )
+    };
+}
+
+#[inline(never)]
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn tail27_scaled_leaf(
+    bp: *const i16,
+    op: *mut i16,
+    t4: *const u32,
+    t5: *const u32,
+    t6: *const u32,
+    cv: *const i16,
+) {
+    core::arch::asm!(
+        concat!(
+            "vmovdqa64 zmm27, [{c}]\n",
+            tail27_scaled!(lut, plain),
+        ),
+        i = in(reg) bp,
+        o = in(reg) op,
+        t4 = in(reg) t4,
+        t5 = in(reg) t5,
+        t6 = in(reg) t6,
+        c = in(reg) cv,
+        out("zmm0") _,
+        out("zmm1") _,
+        out("zmm2") _,
+        out("zmm3") _,
+        out("zmm4") _,
+        out("zmm5") _,
+        out("zmm6") _,
+        out("zmm7") _,
+        out("zmm8") _,
+        out("zmm9") _,
+        out("zmm10") _,
+        out("zmm11") _,
+        out("zmm12") _,
+        out("zmm13") _,
+        out("zmm14") _,
+        out("zmm15") _,
+        out("zmm16") _,
+        out("zmm17") _,
+        out("zmm18") _,
+        out("zmm19") _,
+        out("zmm20") _,
+        out("zmm21") _,
+        out("zmm22") _,
+        out("zmm23") _,
+        out("zmm24") _,
+        out("zmm25") _,
+        out("zmm26") _,
+        out("zmm27") _,
+        out("zmm28") _,
+        out("zmm29") _,
+        out("zmm30") _,
+        options(nostack)
+    );
+}

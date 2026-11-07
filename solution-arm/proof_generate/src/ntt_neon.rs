@@ -635,9 +635,9 @@ unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     let s: Schedule = schedule(if S == 4 { 1 } else { S });
     let k = vld1q_s16(kern.k.as_ptr());
     #[inline(always)]
-    unsafe fn lvl4<const SS: usize>(x: &[int16x8_t; N], s: Schedule, t0: int16x8_t, k: int16x8_t, at: usize, n: usize) -> [int16x8_t; 9] {
+    unsafe fn lvl4<const SS: usize, const R4: bool, const SKIP: u8>(x: &[int16x8_t; N], s: Schedule, t0: int16x8_t, k: int16x8_t, at: usize) -> [int16x8_t; 9] {
         let mut v: [int16x8_t; 9] = core::array::from_fn(|i| load(x, at + 3 * i));
-        if SS != 4 || (n != 1 && n != 15) {
+        if SS != 4 || R4 {
             reduce_inputs(&mut v, s.before[4], s.cheap, &[0, 1, 2], k);
         }
         for i in 0..3 {
@@ -646,7 +646,7 @@ unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
         }
         if SS == 4 {
             for g in 0..3 {
-                if !skip_lut5(3 * n + g) {
+                if SKIP >> g & 1 == 0 {
                     v[3 * g] = vmlsq_laneq_s16::<0>(v[3 * g], vrshrq_n_s16::<13>(v[3 * g]), k);
                 }
             }
@@ -668,17 +668,46 @@ unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
             store(x, at + 9 * g + 6, c);
         }
     }
-    for n in 0..24 {
+    #[inline(always)]
+    unsafe fn node<const SS: usize, const R4: bool, const SKIP: u8>(x: &mut [int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, n: usize) {
         let t0 = vld1q_s16(kern.c[n].as_ptr());
         let t1 = vld1q_s16(kern.c[n].as_ptr().add(8));
         let base = 27 * n;
-        let v0 = lvl4::<S>(x, s, t0, k, base, n);
-        let v1 = lvl4::<S>(x, s, t0, k, base + 1, n);
+        let v0 = lvl4::<SS, R4, SKIP>(x, s, t0, k, base);
+        let v1 = lvl4::<SS, R4, SKIP>(x, s, t0, k, base + 1);
         lvl5(x, s, v0, t0, t1, k, base);
-        let v2 = lvl4::<S>(x, s, t0, k, base + 2, n);
+        let v2 = lvl4::<SS, R4, SKIP>(x, s, t0, k, base + 2);
         lvl5(x, s, v1, t0, t1, k, base + 1);
         lvl5(x, s, v2, t0, t1, k, base + 2);
     }
+    if S == 4 {
+        // every node with its reductions as constants: none is a run-time branch in the pass
+        macro_rules! nodes {
+            ($($n:literal),*) => {
+                const { assert!([$($n),*].len() == 24) };
+                $(node::<S, { lut_node_kind($n).0 }, { lut_node_kind($n).1 }>(x, s, kern, k, $n);)*
+            };
+        }
+        nodes!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
+    } else {
+        for n in 0..24 {
+            node::<S, true, 0>(x, s, kern, k, n);
+        }
+    }
+}
+
+/// Node `n`'s reductions in `pass_c::<4>`: whether its level-4 inputs are reduced, and the `g`
+/// whose level-5 first input is not ([`skip_lut5`]) as bits.
+const fn lut_node_kind(n: usize) -> (bool, u8) {
+    let mut skip = 0u8;
+    let mut g = 0;
+    while g < 3 {
+        if skip_lut5(3 * n + g) {
+            skip |= 1 << g;
+        }
+        g += 1;
+    }
+    (n != 1 && n != 15, skip)
 }
 
 /// `acc[2 s..2 s + 2] -= a_s * y` for the six slots `s = base..base + 6`, `a_s` in lanes 0..6

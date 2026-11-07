@@ -745,19 +745,83 @@ impl Drop for Arena {
 
 /// The commitment of every column of `values` (columns of `4 a.elements` words) modulo
 /// [`MODULUS`].
+/// Runs `batches` work units on `workers` threads: worker `w` first takes its static share
+/// `par::block(batches, workers, w, 1)` front to back, then, once that is empty, takes the last
+/// remaining unit of whichever share has the most left, until every unit is taken. Each share is
+/// one `(front, back)` word changed only by compare-and-swap, so the owner (front) and a thief
+/// (back) never take the same unit. With equal-speed workers nothing is stolen and the split is
+/// the static one; a worker slowed down (a noisy neighbour, an interrupt, a slow core) no longer
+/// holds every other core idle at the end of the phase. `f` runs once per thread with `claim`,
+/// which returns the next unit or `None`.
+fn steal_batches<F: Fn(&dyn Fn() -> Option<usize>) + Sync>(batches: usize, workers: usize, f: F) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let workers = workers.clamp(1, batches.max(1));
+    let pack = |front: u64, back: u64| (front << 32) | back;
+    let unpack = |x: u64| (x >> 32, x & 0xffff_ffff);
+    let shares: Vec<AtomicU64> = (0..workers)
+        .map(|w| {
+            let (s, e) = labinius::par::block(batches, workers, w, 1);
+            AtomicU64::new(pack(s as u64, e as u64))
+        })
+        .collect();
+    let (shares, f) = (&shares, &f);
+    std::thread::scope(|scope| {
+        for w in 0..workers {
+            scope.spawn(move || {
+                let claim = move || -> Option<usize> {
+                    let own = &shares[w];
+                    loop {
+                        let cur = own.load(Ordering::Acquire);
+                        let (front, back) = unpack(cur);
+                        if front >= back {
+                            break;
+                        }
+                        if own.compare_exchange_weak(cur, pack(front + 1, back), Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                            return Some(front as usize);
+                        }
+                    }
+                    loop {
+                        let mut victim = None;
+                        let mut most = 0;
+                        for (v, share) in shares.iter().enumerate() {
+                            let (front, back) = unpack(share.load(Ordering::Acquire));
+                            if back > front && back - front > most {
+                                most = back - front;
+                                victim = Some(v);
+                            }
+                        }
+                        let share = &shares[victim?];
+                        let cur = share.load(Ordering::Acquire);
+                        let (front, back) = unpack(cur);
+                        if front < back
+                            && share.compare_exchange_weak(cur, pack(front, back - 1), Ordering::AcqRel, Ordering::Acquire).is_ok()
+                        {
+                            return Some((back - 1) as usize);
+                        }
+                    }
+                };
+                f(&claim);
+            });
+        }
+    });
+}
+
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
-    for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
+    let batches = columns.div_ceil(LANES);
+    let out_addr = out.as_mut_ptr() as usize;
+    steal_batches(batches, workers, |claim| unsafe {
         let arena = Arena::new();
         let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
-        let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
-            let col0 = first + LANES * b;
-            let here = (count - LANES * b).min(LANES);
+        while let Some(g) = claim() {
+            let col0 = LANES * g;
+            let here = (columns - col0).min(LANES);
+            // Batch `g` owns columns `col0 .. col0 + here` of `out`; no other batch writes them.
+            let target = core::slice::from_raw_parts_mut((out_addr as *mut u128).add(col0 * N), here * N);
             let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
                 if c < here {
                     (values[(col0 + c) * len..].as_ptr() as *const u8, 64)

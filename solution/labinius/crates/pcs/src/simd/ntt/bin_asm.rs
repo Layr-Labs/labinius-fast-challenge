@@ -1312,7 +1312,7 @@ pub unsafe fn ntt_bin_batch32_multi_sink<const Q: u16, const H: usize, S: MultiB
 }
 
 /// One 27-block tail as a call: a single copy of the 550-instruction block for every caller.
-#[inline(never)]
+#[inline(always)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 unsafe fn tail27_out_of_line<const Q: u16>(bp: *const i16, op: *mut i16, t4: *const u32, t5: *const u32, t6: *const u32, cv: *const i16) {
     if Q == 9721 {

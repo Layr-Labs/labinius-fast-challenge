@@ -497,10 +497,22 @@ unsafe fn table(t: &[i16; 16]) -> uint8x16x2_t {
     vld1q_u8_x2(t.as_ptr() as *const u8)
 }
 
+/// The first eight i16 entries, as a single byte-table register.
+#[inline(always)]
+unsafe fn table8(t: &[i16; 16]) -> uint8x16_t {
+    vld1q_u8(t.as_ptr() as *const u8)
+}
+
 /// Entry `v` of table `t` in every lane, `v` from the lane's index pair in `i`.
 #[inline(always)]
 unsafe fn look(t: uint8x16x2_t, i: uint8x16_t) -> int16x8_t {
     vreinterpretq_s16_u8(vqtbl2q_u8(t, i))
+}
+
+/// Entry from an eight-entry table; the encoded byte indices must be below 16.
+#[inline(always)]
+unsafe fn look8(t: uint8x16_t, i: uint8x16_t) -> int16x8_t {
+    vreinterpretq_s16_u8(vqtbx1q_u8(i, t, i))
 }
 
 /// The second child's radix-3 butterfly from the shared lookups. If `b` and
@@ -542,12 +554,16 @@ unsafe fn pass_lut<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_
     let ix = |i: usize| *idx.get_unchecked(i);
     for n in 0..4 {
         let l = &kern.lut[n];
-        let t: [uint8x16x2_t; 6] = core::array::from_fn(|i| table(&l[i]));
+        let t0 = table(&l[0]);
+        // A nibble at index i reads coefficients i + 162*b. For i >= 26,
+        // coefficient i + 486 is above the 512-bit input, so b=3 is zero.
+        // Only table 0 reaches indices 0..25; the other five need entries 0..7.
+        let t8: [uint8x16_t; 5] = core::array::from_fn(|i| table8(&l[i + 1]));
         let base = 162 * n;
         for j in 0..27 {
-            let (x0, y0) = (look(t[0], ix(j)), look(t[1], ix(j + 81)));
-            let (x1, y1) = (look(t[2], ix(j + 27)), look(t[3], ix(j + 108)));
-            let (x2, y2) = (look(t[4], ix(j + 54)), look(t[5], ix(j + 135)));
+            let (x0, y0) = (look(t0, ix(j)), look8(t8[0], ix(j + 81)));
+            let (x1, y1) = (look8(t8[1], ix(j + 27)), look8(t8[2], ix(j + 108)));
+            let (x2, y2) = (look8(t8[3], ix(j + 54)), look8(t8[4], ix(j + 135)));
             let (a0, b0) = (vaddq_s16(x0, y0), vsubq_s16(x0, y0));
             let (a1, b1) = (vaddq_s16(x1, y1), vsubq_s16(x1, y1));
             let (a2, b2) = (vaddq_s16(x2, y2), vsubq_s16(x2, y2));
@@ -1332,6 +1348,39 @@ mod tests {
     use super::super::{product_bound, reduced_bound, tests::xorshift};
     use super::*;
 
+    #[inline(always)]
+    unsafe fn pass_lut_full_reference<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_t; N], kern: &Kernel) {
+        let s: Schedule = schedule(S);
+        const { assert!(S < 3 && super::super::lut_transform_bound(PRIMES[S], SCHEDULES[S]) <= i16::MAX as u32) };
+        let k = vld1q_s16(kern.k.as_ptr());
+        let ix = |i: usize| *idx.get_unchecked(i);
+        for n in 0..4 {
+            let l = &kern.lut[n];
+            let t: [uint8x16x2_t; 6] = core::array::from_fn(|i| table(&l[i]));
+            let base = 162 * n;
+            for j in 0..27 {
+                let (x0, y0) = (look(t[0], ix(j)), look(t[1], ix(j + 81)));
+                let (x1, y1) = (look(t[2], ix(j + 27)), look(t[3], ix(j + 108)));
+                let (x2, y2) = (look(t[4], ix(j + 54)), look(t[5], ix(j + 135)));
+                let (a0, b0) = (vaddq_s16(x0, y0), vsubq_s16(x0, y0));
+                let (a1, b1) = (vaddq_s16(x1, y1), vsubq_s16(x1, y1));
+                let (a2, b2) = (vaddq_s16(x2, y2), vsubq_s16(x2, y2));
+                let (u, v) = match (s.reduce_d, s.cheap) {
+                    (false, _) => (radix3_twiddled::<0>(a0, a1, a2, k), radix3_sixth::<0>(b0, b1, b2, k)),
+                    (true, false) => (radix3_twiddled::<1>(a0, a1, a2, k), radix3_sixth::<1>(b0, b1, b2, k)),
+                    (true, true) => (radix3_twiddled::<2>(a0, a1, a2, k), radix3_sixth::<2>(b0, b1, b2, k)),
+                };
+                let at = base + j;
+                store(x, at, u.0);
+                store(x, at + 27, u.1);
+                store(x, at + 54, u.2);
+                store(x, at + 81, v.0);
+                store(x, at + 108, v.1);
+                store(x, at + 135, v.2);
+            }
+        }
+    }
+
     #[no_mangle]
     #[inline(never)]
     unsafe fn mca_pass_lut(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_t; N], kern: &Kernel) {
@@ -1731,6 +1780,85 @@ mod tests {
                 assert_eq!(got, want, "case {case} group {j}");
             }
         }
+    }
+
+
+    /// Literal signed-lane comparison with the original six-full-table front.
+    #[test]
+    fn threebit_lut_raw_identity() {
+        let mut state = 0x71b3_80f2_aa01_623du64;
+        let mut input_hash = blake3::Hasher::new();
+        let mut output_hash = blake3::Hasher::new();
+        let cases = 26 + BITS + 8 + 256;
+        let mut seen = [0u16; 5];
+        let mut seen_full_high = false;
+        for case in 0..cases {
+            let words: [[u128; 4]; 8] = core::array::from_fn(|c| {
+                let mut w = [0u128; 4];
+                if case < 26 + BITS {
+                    let bit = if case < 26 { 486 + case } else { (case - 26 + 37 * c) % BITS };
+                    w[bit % 4] = 1u128 << (bit / 4);
+                } else if case < 26 + BITS + 8 {
+                    let pat = (case - 26 - BITS + c) % 8;
+                    for i in 0..162 { for b in 0..3 {
+                        if pat >> b & 1 != 0 { let bit = i + 162 * b; w[bit % 4] |= 1u128 << (bit / 4); }
+                    }}
+                } else {
+                    for x in &mut w { *x = (xorshift(&mut state) as u128) | ((xorshift(&mut state) as u128) << 64); }
+                }
+                w
+            });
+            for w in words.iter().flatten() { input_hash.update(&w.to_le_bytes()); }
+            let ptrs = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
+            let mut idx = [unsafe { vdupq_n_u8(0) }; GROUPS];
+            let mut got = [unsafe { vdupq_n_s16(0x3210) }; N];
+            let mut want = [unsafe { vdupq_n_s16(0x1230) }; N];
+            unsafe {
+                indices(&ptrs, &mut idx);
+                for j in 26..GROUPS {
+                    let bytes: [u8; 16] = core::mem::transmute(idx[j]);
+                    assert!(bytes.iter().all(|&v| v < 16), "short index case{case} row{j}");
+                }
+                for j in 0..26 {
+                    let bytes: [u8; 16] = core::mem::transmute(idx[j]);
+                    seen_full_high |= bytes.iter().any(|&v| v >= 16);
+                }
+                for (table, off) in [81, 27, 108, 54, 135].into_iter().enumerate() {
+                    for j in 0..27 {
+                        let bytes: [u8; 16] = core::mem::transmute(idx[off + j]);
+                        for c in 0..8 { seen[table] |= 1 << (bytes[2 * c] / 2); }
+                    }
+                }
+                pass_lut::<1>(&idx, &mut got, &kernels()[1]);
+                pass_lut_full_reference::<1>(&idx, &mut want, &kernels()[1]);
+            }
+            for j in 0..N {
+                let actual = lanes(got[j]);
+                assert_eq!(actual, lanes(want[j]), "raw front case{case} slot{j}");
+                for x in actual { output_hash.update(&x.to_le_bytes()); }
+            }
+        }
+        assert_eq!(seen, [0xff; 5], "all eight entries in all five short tables engaged");
+        assert!(seen_full_high, "the first table must engage entries8..15");
+        println!("THREEBIT_RAW_IDENTITY cases={cases} lanes={} input_blake3={} output_blake3={} short_patterns={seen:?} full_high={seen_full_high}", cases * N * 8, input_hash.finalize(), output_hash.finalize());
+    }
+
+    #[test]
+    fn threebit_lut_first_table_high_bit_guard() {
+        let mut words = [[0u128; 4]; 8];
+        words[0][486 % 4] = 1u128 << (486 / 4);
+        let ptrs = core::array::from_fn(|c| words[c].as_ptr() as *const u8);
+        let mut idx = [unsafe { vdupq_n_u8(0) }; GROUPS];
+        let mut got = [unsafe { vdupq_n_s16(0) }; N];
+        let mut want = got;
+        unsafe {
+            indices(&ptrs, &mut idx);
+            let first: [u8; 16] = core::mem::transmute(idx[0]);
+            assert_eq!(&first[..2], &[16, 17]);
+            pass_lut::<1>(&idx, &mut got, &kernels()[1]);
+            pass_lut_full_reference::<1>(&idx, &mut want, &kernels()[1]);
+        }
+        for j in 0..N { assert_eq!(lanes(got[j]), lanes(want[j]), "source coefficient486 slot{j}"); }
     }
 
     /// The table-fed levels 0 to 3 ([`nibbles`], [`pass_lut`]) agree lane by lane with the scalar

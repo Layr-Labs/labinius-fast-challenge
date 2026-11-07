@@ -544,7 +544,7 @@ unsafe fn pass_lut<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_
         let l = &kern.lut[n];
         let t: [uint8x16x2_t; 6] = core::array::from_fn(|i| table(&l[i]));
         let base = 162 * n;
-        for j in 0..27 {
+        let mut step = |j: usize| {
             let (x0, y0) = (look(t[0], ix(j)), look(t[1], ix(j + 81)));
             let (x1, y1) = (look(t[2], ix(j + 27)), look(t[3], ix(j + 108)));
             let (x2, y2) = (look(t[4], ix(j + 54)), look(t[5], ix(j + 135)));
@@ -563,6 +563,18 @@ unsafe fn pass_lut<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_
             store(x, at + 81, v.0);
             store(x, at + 108, v.1);
             store(x, at + 135, v.2);
+        };
+        // nine `j` per block, so that the scheduler interleaves their lookups and butterflies
+        for j in (0..27).step_by(9) {
+            step(j);
+            step(j + 1);
+            step(j + 2);
+            step(j + 3);
+            step(j + 4);
+            step(j + 5);
+            step(j + 6);
+            step(j + 7);
+            step(j + 8);
         }
     }
 }

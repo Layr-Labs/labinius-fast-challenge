@@ -445,8 +445,13 @@ fn row_evaluate(values: &[B128], p0: &[F162]) -> Vec<F162> {
     labinius::par::for_each(
         out.chunks_mut(ROW_BATCH).zip(values.chunks(ROW_BATCH * COLUMN_LEN)),
         |(block, columns)| {
-            for (slot, column) in block.iter_mut().zip(columns.chunks_exact(COLUMN_LEN)) {
-                *slot = dot_lifted(eq, column);
+            for (slots, pair) in block.chunks_mut(2).zip(columns.chunks(2 * COLUMN_LEN)) {
+                if let [a, b] = slots {
+                    let (c0, c1) = pair.split_at(COLUMN_LEN);
+                    [*a, *b] = cf::dot_lifted2(eq, c0, c1);
+                } else {
+                    slots[0] = dot_lifted(eq, &pair[..COLUMN_LEN]);
+                }
             }
         },
     );

@@ -492,9 +492,6 @@ impl Matrix {
     }
 }
 
-/// Runs `f(first, block)` on `workers` scoped threads over contiguous blocks of `out`, whose
-/// items come in groups of `unit` (`first` counts groups), block edges on multiples of `align`
-/// groups.
 pub fn for_blocks<T: Send>(
     out: &mut [T],
     unit: usize,
@@ -510,11 +507,15 @@ pub fn for_blocks<T: Send>(
             (s * unit, e * unit)
         })
         .collect();
-    let blocks = labinius::par::split_mut(out, &edges);
+    let mut blocks = labinius::par::split_mut(out, &edges);
+    let last = blocks.pop();
     let f = &f;
     std::thread::scope(|scope| {
         for (block, &(s, _)) in blocks.into_iter().zip(&edges) {
             scope.spawn(move || f(s / unit, block));
+        }
+        if let Some(block) = last {
+            f(edges[workers - 1].0 / unit, block);
         }
     });
 }

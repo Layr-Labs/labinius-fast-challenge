@@ -491,7 +491,7 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             if PREFETCH_SLOTS > 0 {
                 let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
                 let hi = lo + STREAMS * LOCK * 4;
-                let mut p = (lo + 63) & !63;
+                let mut p = lo & !63;
                 while p < hi {
                     _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
                     p += 64;
@@ -881,7 +881,7 @@ fn bench_mode() -> u32 {
 /// A batch counter on a cache line of its own.
 #[repr(align(128))]
 struct Progress(std::sync::atomic::AtomicUsize);
-const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(3000);
+const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(2000);
 /// Maximum lead (in pair batches) between two hyperthread siblings on one physical core.
 const PAIR_LEAD: usize = 2 * PP;
 
@@ -978,7 +978,7 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
                     while other.load(Ordering::Acquire) + PAIR_LEAD < d {
                         core::hint::spin_loop();
                         spins += 1;
-                        if spins % 64 == 0 && start.elapsed() > SIBLING_WAIT {
+                        if spins % 256 == 0 && start.elapsed() > SIBLING_WAIT {
                             coupled.store(false, Ordering::Relaxed);
                             let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
                             if k < 16 {

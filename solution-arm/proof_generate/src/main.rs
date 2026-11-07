@@ -188,11 +188,14 @@ fn load_table(path: &str, n: usize) -> Table {
             labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
                 if s < e {
                     let addr = (base + 16 * s) as *mut u8;
-                    // Linux 5.14+: install the page-cache pages in parallel. Older kernels
-                    // simply fault on access. MADV_HUGEPAGE is a best-effort hint for the file.
+                    // MADV_HUGEPAGE is a best-effort hint for the file. The pages are not
+                    // installed up front (MADV_POPULATE_READ): on a kernel that serves the
+                    // file in 4 KiB pages that took 8 ms of the read phase, while the
+                    // commitment's first sweep faults them in with fault-around (16 pages per
+                    // fault) for about 3 ms spread over its workers. With large folios
+                    // mapped by PMDs both ways measure the same.
                     unsafe {
                         table_sys::madvise(addr, 16 * (e - s), 14);
-                        table_sys::madvise(addr, 16 * (e - s), 22);
                     }
                 }
             });

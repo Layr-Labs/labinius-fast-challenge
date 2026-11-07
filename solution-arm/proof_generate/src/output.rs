@@ -124,6 +124,8 @@ impl Drop for Mapped {
     }
 }
 const CHUNK: usize = 2 << 20;
+/// Write the proof with parallel `pwrite`s instead of through a shared file mapping.
+const PWRITE: bool = true;
 
 struct State {
     path: String,
@@ -180,7 +182,9 @@ impl Output {
         let worker = Arc::downgrade(&state);
         // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
         let setup = std::thread::spawn(move || {
-            if let Some(state) = worker.upgrade() { let _ = state.mapped(); }
+            if !PWRITE {
+                if let Some(state) = worker.upgrade() { let _ = state.mapped(); }
+            }
             labinius::challenge::warm();
             for offset in (0..bytes).step_by(4096) {
                 unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
@@ -213,6 +217,20 @@ impl Output {
     pub fn write(&self, p: &ProofParts) {
         self.quiesce();
         let layout = Layout::parts(p);
+        if PWRITE {
+            // Encode into anonymous memory (huge pages, few faults), then copy it into the file
+            // with `pwrite`: the kernel fills page-cache pages in batches instead of taking one
+            // fault per 4 KiB page of a shared mapping.
+            use std::os::unix::fs::FileExt;
+            let bytes = encode_vec(p);
+            let file = std::fs::OpenOptions::new().write(true).create(true).truncate(true)
+                .open(&self.state.path).expect("open the proof file");
+            // One writer: buffered ext4 writes take the inode lock, so parallel writers
+            // serialize and then contend (measured slower than one).
+            file.write_all_at(&bytes, 0).expect("write proof");
+            std::mem::forget(bytes);
+            return;
+        }
         if layout == self.state.layout {
             if let Some(map) = self.state.mapped() {
                 unsafe { encode_into(p, layout, map.addr as *mut u8); }
@@ -340,7 +358,8 @@ mod tests {
                 output.populate();
                 output.write(&p);
                 #[cfg(target_os = "linux")]
-                if !force_write { assert!(output.state.mapped().is_some(), "test filesystem must support mapping"); }
+                // (`mapped` would create the mapping now, truncating the file `pwrite` wrote.)
+                if !force_write && !PWRITE { assert!(output.state.mapped().is_some(), "test filesystem must support mapping"); }
                 assert_eq!(std::fs::read(&path).unwrap(), want, "n {n}, fallback {force_write}");
                 drop(output);
             }

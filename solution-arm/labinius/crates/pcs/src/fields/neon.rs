@@ -657,7 +657,7 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
     let len = o0.len();
     assert!(o1.len() == len && o2.len() == len && start + len <= stride && len % 2 == 0);
     let wk: Vec<_> = weights.iter().map(|w| kara(w.0.map(|x| vdupq_n_u64(x)))).collect();
-    const PAIRS: usize = 64;
+    const PAIRS: usize = 80;
     let z = vdupq_n_u64(0);
     let mut scratch = vec![[[z; 6]; 2]; PAIRS];
     for first in (0..len).step_by(2 * PAIRS) {

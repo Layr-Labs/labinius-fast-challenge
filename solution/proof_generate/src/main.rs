@@ -1887,21 +1887,29 @@ fn main() {
     let proof = prove(&seed, modulus, &args[4], Some(&output));
     let prove_return = output_clock.elapsed();
     output.write(proof);
-    let write_time = output_clock.elapsed() - prove_return;
-    let report = format!(
-        "{}labinius-output prove_return_us={} write_us={}\nlabinius-clock main_ns={} exit_ns={}\n",
-        PROFILE.get().map_or("", |p| p.as_str()),
-        prove_return.as_micros(),
-        write_time.as_micros(),
-        main_ns,
-        monotonic_ns()
-    );
+    // The proof is on disk; bypass unneeded report formatting and CRT exit handlers.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn _exit(status: i32) -> !;
+        }
+        _exit(0);
+    }
+    #[cfg(not(target_os = "linux"))]
     {
+        let write_time = output_clock.elapsed() - prove_return;
+        let report = format!(
+            "{}labinius-output prove_return_us={} write_us={}\nlabinius-clock main_ns={} exit_ns={}\n",
+            PROFILE.get().map_or("", |p| p.as_str()),
+            prove_return.as_micros(),
+            write_time.as_micros(),
+            main_ns,
+            monotonic_ns()
+        );
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
+        std::process::exit(0);
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
 }
 
 #[cfg(test)]

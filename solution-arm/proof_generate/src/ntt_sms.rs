@@ -636,21 +636,27 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
     vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
 }
 
-/// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
-/// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients.
+const BATCHES: usize = 2;
+
+struct Batch {
+    words: [(*const u8, usize); LANES],
+    acc: Vec<int64x2_t>,
+    dev: Vec<int32x4_t>,
+    y: Box<[int16x8_t; N]>,
+}
+
 #[inline(never)]
 unsafe fn sums(
-    words: &[(*const u8, usize); LANES],
+    batches: &mut [Batch],
     a: &SmsMatrix,
-    m: &mut [int16x8_t; BITS],
     nib: &mut [uint8x16_t; N / 4],
     xs: &mut [[int16x8_t; N]; SWEEP],
-    acc: &mut [int64x2_t],
-    y: &mut [int16x8_t; N],
-    dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
-    acc.fill(vdupq_n_s64(0));
+    for b in batches.iter_mut() {
+        b.acc.fill(vdupq_n_s64(0));
+        b.dev.fill(vdupq_n_s32(0));
+    }
     let mut e = 0usize;
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
@@ -660,30 +666,36 @@ unsafe fn sums(
             // words and their key lanes are zero, so those lanes contribute nothing.
             let l = SWEEP.min(end - e);
             let groups = l.div_ceil(LOCK);
-            for i in 0..groups * LOCK {
-                let at = pass_words(words, a.elements, e, i);
-                indices(&at, nib);
-                let x = &mut xs[i];
-                pass_lut::<PB>(nib, x, kern);
-                pass_c::<PB>(x, kern);
-                pass_d::<PB, false>(x, kern, &[], &mut []);
-            }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-            // the chunk's first sweep starts the digit rows' sums afresh
-            if e % CHUNK == 0 {
-                sink::<true>(xs, keys, acc, groups);
-            } else {
-                sink::<false>(xs, keys, acc, groups);
+            for b in batches.iter_mut() {
+                for i in 0..groups * LOCK {
+                    let at = pass_words(&b.words, a.elements, e, i);
+                    indices(&at, nib);
+                    let x = &mut xs[i];
+                    pass_lut::<PB>(nib, x, kern);
+                    pass_c::<PB>(x, kern);
+                    pass_d::<PB, false>(x, kern, &[], &mut []);
+                }
+                // the chunk's first sweep starts the digit rows' sums afresh
+                if e % CHUNK == 0 {
+                    sink::<true>(xs, keys, &mut b.acc, groups);
+                } else {
+                    sink::<false>(xs, keys, &mut b.acc, groups);
+                }
             }
             e += l;
         }
         let c = (end - 1) / CHUNK;
-        for d in 0..DIGITS {
-            chunk_row(acc, 1 + d, a.mean_residues(c, d), &mut dev[d * 2 * N..][..2 * N], y);
+        for b in batches.iter_mut() {
+            for d in 0..DIGITS {
+                chunk_row(&b.acc, 1 + d, a.mean_residues(c, d), &mut b.dev[d * 2 * N..][..2 * N], &mut *b.y);
+            }
         }
     }
-    narrow(acc, 0, y);
-    super::inverse_folded::<PB>(y);
+    for b in batches.iter_mut() {
+        narrow(&b.acc, 0, &mut *b.y);
+        super::inverse_folded::<PB>(&mut *b.y);
+    }
 }
 
 /// `r mod 9721` and `t mod M` into `[0, Q)`.
@@ -714,68 +726,76 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
-        let mut m = Box::new([vdupq_n_s16(0); BITS]);
         let mut nib = Box::new([vdupq_n_u8(0); N / 4]);
         let mut xs = Box::new([[vdupq_n_s16(0); N]; SWEEP]);
-        let mut y = Box::new([vdupq_n_s16(0); N]);
-        let mut acc = vec![vdupq_n_s64(0); ROWS * 4 * N];
-        // per digit, the chunk deviations S - mean summed over the chunks
-        let mut dev = vec![vdupq_n_s32(0); DIGITS * 2 * N];
+        let mut batches: Vec<Batch> = (0..BATCHES)
+            .map(|_| Batch {
+                words: [(ZERO_WORDS.as_ptr() as *const u8, 0); LANES],
+                acc: vec![vdupq_n_s64(0); ROWS * 4 * N],
+                dev: vec![vdupq_n_s32(0); DIGITS * 2 * N],
+                y: Box::new([vdupq_n_s16(0); N]),
+            })
+            .collect();
         // the eight columns' tails, `i64` per lane (41 KiB, off the stack)
         let mut tail = Box::new([[0i64; LANES]; N]);
         let p = P1 as i16;
         let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
-            let col0 = first + LANES * b;
-            let here = (count - LANES * b).min(LANES);
-            let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
-                if c < here {
-                    (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
-                } else {
-                    (ZERO_WORDS.as_ptr() as *const u8, 0)
+        for (g, group) in block.chunks_mut(BATCHES * LANES * N).enumerate() {
+            let n = group.len().div_ceil(LANES * N);
+            for (h, batch) in batches[..n].iter_mut().enumerate() {
+                let k = BATCHES * g + h;
+                let col0 = first + LANES * k;
+                let here = (count - LANES * k).min(LANES);
+                batch.words = core::array::from_fn(|c| {
+                    if c < here {
+                        (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
+                    } else {
+                        (ZERO_WORDS.as_ptr() as *const u8, 0)
+                    }
+                });
+            }
+            sums(&mut batches[..n], a, &mut nib, &mut xs);
+            for (batch, target) in batches[..n].iter().zip(group.chunks_mut(LANES * N)) {
+                // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
+                // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
+                let pv = vdupq_n_s16(p);
+                let mut base = [[0u16; LANES]; N];
+                for (k, b) in base.iter_mut().enumerate() {
+                    let v = batch.y[k];
+                    let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+                    vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
                 }
-            });
-            dev.fill(vdupq_n_s32(0));
-            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, &mut dev);
-            // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
-            // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
-            let pv = vdupq_n_s16(p);
-            let mut base = [[0u16; LANES]; N];
-            for (k, b) in base.iter_mut().enumerate() {
-                let v = y[k];
-                let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
-                vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
-            }
-            // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
-            // once (from 4381e86b / de004ec5): one pass per digit over the slots, not per column.
-            let devs: &[[i32; 4]] = core::slice::from_raw_parts(dev.as_ptr() as *const [i32; 4], dev.len());
-            let tail = &mut *tail;
-            for (t, &mu) in tail.iter_mut().zip(a.mu.iter()) {
-                *t = [mu as i64; LANES];
-            }
-            for d in 0..DIGITS {
-                let (u, v) = lattice::WEIGHTS[d];
-                let (u, v) = (u as i64, v as i64);
-                let e = |k: usize, c: usize| devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
-                for k in 0..N / 2 {
-                    for c in 0..LANES {
-                        let x = e(k, c);
-                        tail[k][c] += u * x;
-                        tail[k + N / 2][c] += v * x;
+                // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
+                // once (from 4381e86b / de004ec5): one pass per digit over the slots, not per column.
+                let devs: &[[i32; 4]] = core::slice::from_raw_parts(batch.dev.as_ptr() as *const [i32; 4], batch.dev.len());
+                let tail = &mut *tail;
+                for (t, &mu) in tail.iter_mut().zip(a.mu.iter()) {
+                    *t = [mu as i64; LANES];
+                }
+                for d in 0..DIGITS {
+                    let (u, v) = lattice::WEIGHTS[d];
+                    let (u, v) = (u as i64, v as i64);
+                    let e = |k: usize, c: usize| devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
+                    for k in 0..N / 2 {
+                        for c in 0..LANES {
+                            let x = e(k, c);
+                            tail[k][c] += u * x;
+                            tail[k + N / 2][c] += v * x;
+                        }
+                    }
+                    for k in N / 2..N {
+                        for c in 0..LANES {
+                            let x = e(k, c);
+                            tail[k - N / 2][c] -= v * x;
+                            tail[k][c] += (u + v) * x;
+                        }
                     }
                 }
-                for k in N / 2..N {
-                    for c in 0..LANES {
-                        let x = e(k, c);
-                        tail[k - N / 2][c] -= v * x;
-                        tail[k][c] += (u + v) * x;
+                // a partial batch has fewer than eight columns in `target`: only those lanes are written
+                for (c, column) in target.chunks_exact_mut(N).enumerate() {
+                    for (k, o) in column.iter_mut().enumerate() {
+                        *o = crt(base[k][c] as u32, tail[k][c].rem_euclid(TAIL as i64) as u32);
                     }
-                }
-            }
-            // a partial batch has fewer than eight columns in `target`: only those lanes are written
-            for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(base[k][c] as u32, tail[k][c].rem_euclid(TAIL as i64) as u32);
                 }
             }
         }

@@ -298,7 +298,7 @@ impl<'a> Switch<'a> {
         self.planes = core::array::from_fn(|_| vec![0; n]);
         let weights = eq_expand_f162(&self.prefix_r);
         let words = self.words;
-        let parts = par::workers(n, 1 << 12);
+        let parts = (n >> 12).clamp(1, 4 * par::threads());
         let edges: Vec<_> = (0..parts).map(|t| par::block(n, parts, t, 2)).collect();
         let [p0, p1, p2] = &mut self.planes;
         let chunks = par::split_mut(p0, &edges).into_iter()

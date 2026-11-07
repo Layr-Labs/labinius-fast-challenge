@@ -627,6 +627,95 @@ const fn skip_lut5(n: usize) -> bool {
     MASK >> n & 1 != 0
 }
 
+/// Level-5 nodes whose level-6 butterfly needs no first-input reduction after the 9721 LUT front,
+/// on top of [`skip_lut5`]: found by a greedy search over the same exact intervals, and proven
+/// for all admissible nibble patterns by `lazy_lut_intervals`. Their outputs stay within `i16`,
+/// not within the worst-case [`super::lut_transform_bound`], which is why `ntt_sms` bounds its
+/// products by `i16::MAX`.
+const SKIP_LUT6: [u64; 4] = {
+    const NODES: [usize; 45] = [
+        13, 20, 21, 22, 23, 26, 27, 28, 32, 38, 41, 55, 56, 72, 73, 89, 100, 115, 119, 120, 122, 123, 125,
+        127, 130, 140, 156, 159, 160, 161, 167, 171, 172, 174, 181, 182, 192, 193, 194, 198, 199, 204, 207,
+        208, 209,
+    ];
+    let mut mask = [0u64; 4];
+    let mut i = 0;
+    while i < NODES.len() {
+        mask[NODES[i] / 64] |= 1 << (NODES[i] % 64);
+        i += 1;
+    }
+    mask
+};
+#[inline(always)]
+const fn skip_lut6(n: usize) -> bool {
+    SKIP_LUT6[n / 64] >> (n % 64) & 1 != 0
+}
+
+/// The 108 level-6 groups sorted by which of their two first-input reductions they need, and the
+/// bounds of the four classes: a group's outputs land in its own slots, so the order is free, and
+/// one loop per class has no per-group branch to mispredict.
+const LUT6_ORDER: ([u8; N / 6], [usize; 5]) = {
+    let mut order = [0u8; N / 6];
+    let mut ends = [0usize; 5];
+    let mut at = 0;
+    let mut class = 0;
+    while class < 4 {
+        let mut q = 0;
+        while q < N / 6 {
+            if 2 * skip_lut6(2 * q) as usize + skip_lut6(2 * q + 1) as usize == class {
+                order[at] = q as u8;
+                at += 1;
+            }
+            q += 1;
+        }
+        ends[class + 1] = at;
+        class += 1;
+    }
+    (order, ends)
+};
+
+/// One level-6 group after the 9721 LUT front; `R0` and `R1` say which first inputs are reduced.
+#[inline(always)]
+unsafe fn lut6_group<const R0: bool, const R1: bool>(x: &[int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, q: usize) -> [int16x8_t; 6] {
+    let t = vld1q_s16(kern.d[q].as_ptr());
+    let mut v: [int16x8_t; 6] = core::array::from_fn(|i| load(x, 6 * q + i));
+    if R0 {
+        v[0] = vmlsq_laneq_s16::<0>(v[0], vrshrq_n_s16::<13>(v[0]), k);
+    }
+    if R1 {
+        v[3] = vmlsq_laneq_s16::<0>(v[3], vrshrq_n_s16::<13>(v[3]), k);
+    }
+    let (y0, y1, y2) = r3!(s, 0, 1, 2, 3, v[0], v[1], v[2], t, k);
+    let (y3, y4, y5) = r3!(s, 4, 5, 6, 7, v[3], v[4], v[5], t, k);
+    [y0, y1, y2, y3, y4, y5]
+}
+
+/// One class of [`LUT6_ORDER`]: three groups per step, all computed before any is stored, then
+/// whatever is left of the class one group at a time.
+#[inline(always)]
+unsafe fn lut6_class<const R0: bool, const R1: bool>(x: &mut [int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, list: &[u8]) {
+    let mut steps = list.chunks_exact(3);
+    for g in &mut steps {
+        let q = [g[0] as usize, g[1] as usize, g[2] as usize];
+        let ys = [
+            lut6_group::<R0, R1>(x, s, kern, k, q[0]),
+            lut6_group::<R0, R1>(x, s, kern, k, q[1]),
+            lut6_group::<R0, R1>(x, s, kern, k, q[2]),
+        ];
+        for (d, y) in ys.iter().enumerate() {
+            for (i, &v) in y.iter().enumerate() {
+                store(x, 6 * q[d] + i, v);
+            }
+        }
+    }
+    for &q in steps.remainder() {
+        let y = lut6_group::<R0, R1>(x, s, kern, k, q as usize);
+        for (i, &v) in y.iter().enumerate() {
+            store(x, 6 * q as usize + i, v);
+        }
+    }
+}
+
 /// Levels 4 and 5: per level-3 node (27 slots) and `j < 3`, the nine slots `j + 3 i`. All three
 /// `j` of a node in one block (arm-big): nine independent butterflies per level.
 /// `S == 4` uses prime 9721's table-front intervals to omit 99 first-input reductions.
@@ -710,9 +799,18 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
     row: &[i16],
     acc: &mut [int32x4_t],
 ) {
-    let s: Schedule = schedule(S);
+    let s: Schedule = schedule(if S == 4 { 1 } else { S });
     let k = vld1q_s16(kern.k.as_ptr());
     debug_assert!(!MAC || (row.len() == ROW && acc.len() == 2 * N));
+    if S == 4 {
+        debug_assert!(!MAC);
+        let (order, ends) = &LUT6_ORDER;
+        lut6_class::<true, true>(x, s, kern, k, &order[ends[0]..ends[1]]);
+        lut6_class::<true, false>(x, s, kern, k, &order[ends[1]..ends[2]]);
+        lut6_class::<false, true>(x, s, kern, k, &order[ends[2]..ends[3]]);
+        lut6_class::<false, false>(x, s, kern, k, &order[ends[3]..ends[4]]);
+        return;
+    }
     #[inline(always)]
     unsafe fn compute(x: &[int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, q: usize) -> [int16x8_t; 6] {
         let t = vld1q_s16(kern.d[q].as_ptr());
@@ -1444,14 +1542,12 @@ mod tests {
                 for (i, a) in pos.into_iter().zip(r3(v, t, k)) { x[i] = a; }
             }
         }
-        let bound = super::super::lut_transform_bound(9721, SCHEDULES[1]) as i32;
+        // Level 6: the lanes only have to stay within i16, which `r3` checks at every step.
         for n in 0..216 {
             let mut v = core::array::from_fn(|i| x[3 * n + i]);
-            v[0] = red(v[0]);
+            if !skip_lut6(n) { v[0] = red(v[0]); }
             let t = &k.d[n / 2][4 * (n % 2)..];
-            for a in r3(v, t, k) {
-                assert!(a.0 >= -bound && a.1 <= bound, "final {a:?} bound {bound}");
-            }
+            r3(v, t, k);
         }
     }
 

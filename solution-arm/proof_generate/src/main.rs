@@ -168,6 +168,23 @@ impl Drop for Table {
     }
 }
 
+/// Drops the table's page-table entries a 2 MiB slice per worker. `MADV_DONTNEED` takes the
+/// address-space lock for reading, so the slices are zapped in parallel; otherwise the process
+/// exit walks all of the table's ~65k 4 KiB entries on one core after the proof is written.
+/// The table is not read again: the proof file is already complete when this runs.
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+fn release_table(table: &Table) {
+    if let Table::Mapped { ptr, len } = table {
+        let (base, n) = (*ptr as usize, *len);
+        labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
+            if s < e {
+                // MADV_DONTNEED (4): the private read-only file mapping simply loses its entries.
+                unsafe { table_sys::madvise((base + 16 * s) as *mut u8, 16 * (e - s), 4) };
+            }
+        });
+    }
+}
+
 fn read_table(path: &str) -> Table {
     load_table(path, 1 << LOG_PACKED)
 }
@@ -940,6 +957,8 @@ fn main() {
     output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    release_table(&values);
     // The proof file is complete. Let process teardown release the large allocations and
     // mappings together, instead of walking their Rust destructors first.
     std::mem::forget((values, proof, output));

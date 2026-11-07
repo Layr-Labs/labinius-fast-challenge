@@ -483,49 +483,51 @@ unsafe fn sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *m
 impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
     #[inline(always)]
     unsafe fn rows_inline(&self, blk: usize, w0: *const i16, r0: usize, r1: usize) {
+        let f_ptr = FOLD.0.as_ptr();
+        let w_base = w0 as *const __m512i;
         for i in r0..r1 {
             let j = 27 * blk + i;
-            let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w0.add(32 * 27 * h) as *const __m512i).add(i)));
+            let wb = w_base.add(i);
+            let x0 = _mm512_load_si512(wb);
+            let x1 = _mm512_load_si512(wb.add(27));
+            let x2 = _mm512_load_si512(wb.add(54));
+            let x3 = _mm512_load_si512(wb.add(81));
+            let x4 = _mm512_load_si512(wb.add(108));
+            let x5 = _mm512_load_si512(wb.add(135));
+            let x6 = _mm512_load_si512(wb.add(162));
+            let x7 = _mm512_load_si512(wb.add(189));
             let k = self.k.add(j * STREAMS * LOCK);
             let a = self.acc.add(j * STREAMS * 16);
             if PREFETCH_SLOTS > 0 {
-                let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
-                let hi = lo + STREAMS * LOCK * 4;
-                let mut p = (lo + 63) & !63;
-                while p < hi {
-                    _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
-                    p += 64;
-                }
+                let p = (k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize & !63) as *const i8;
+                _mm_prefetch::<_MM_HINT_T0>(p);
+                _mm_prefetch::<_MM_HINT_T0>(p.add(64));
+                _mm_prefetch::<_MM_HINT_T0>(p.add(128));
+                _mm_prefetch::<_MM_HINT_T0>(p.add(192));
             }
             macro_rules! call {
-                ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
-                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
-                        $($xn = in(zmm_reg) x[$xi],)*
+                ($m:ident, $mode:ident) => {
+                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) f_ptr,
+                        x0 = in(zmm_reg) x0, x1 = in(zmm_reg) x1, x2 = in(zmm_reg) x2, x3 = in(zmm_reg) x3,
+                        x4 = in(zmm_reg) x4, x5 = in(zmm_reg) x5, x6 = in(zmm_reg) x6, x7 = in(zmm_reg) x7,
                         out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
                         out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
                 };
             }
             macro_rules! call_first {
-                ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
-                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                ($m:ident, $mode:ident) => {
+                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) f_ptr,
                         b = in(reg) self.b.add(j * DIGITS),
-                        $($xn = in(zmm_reg) x[$xi],)*
+                        x0 = in(zmm_reg) x0, x1 = in(zmm_reg) x1, x2 = in(zmm_reg) x2, x3 = in(zmm_reg) x3,
+                        x4 = in(zmm_reg) x4, x5 = in(zmm_reg) x5, x6 = in(zmm_reg) x6, x7 = in(zmm_reg) x7,
                         out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
                         out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
                 };
             }
-            if LOCK == 8 {
-                if RED && FIRST { call_first!(sms_slot8, reduce_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
-                else if FIRST { call_first!(sms_slot8, plain_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
-                else if RED { call!(sms_slot8, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
-                else { call!(sms_slot8, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
-            } else if LOCK == 16 {
-                call!(sms_slot16, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK,
-                    x8 = 8 % LOCK, x9 = 9 % LOCK, x10 = 10 % LOCK, x11 = 11 % LOCK, x12 = 12 % LOCK, x13 = 13 % LOCK, x14 = 14 % LOCK, x15 = 15 % LOCK)
-            } else {
-                if RED { call!(sms_slot4, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3) }
-                else { call!(sms_slot4, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3) }
-            }
+            if RED && FIRST { call_first!(sms_slot8, reduce_first) }
+            else if FIRST { call_first!(sms_slot8, plain_first) }
+            else if RED { call!(sms_slot8, reduce) }
+            else { call!(sms_slot8, plain) }
         }
     }
 }

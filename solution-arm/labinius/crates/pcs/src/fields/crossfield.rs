@@ -297,6 +297,15 @@ pub fn dot_lifted(eq: &[F162], xs: &[B128]) -> F162 {
         .fold(F162::ZERO, |acc, (&e, &x)| acc + e * F162::from_b128(x))
 }
 
+/// [`dot_lifted`] of `eq` against two columns, `eq` read once for both (same results).
+pub fn dot_lifted2(eq: &[F162], xs0: &[B128], xs1: &[B128]) -> [F162; 2] {
+    #[cfg(target_arch = "aarch64")]
+    if super::neon::pmull() {
+        return super::neon::dot_lifted2(eq, xs0, xs1);
+    }
+    [dot_lifted(eq, xs0), dot_lifted(eq, xs1)]
+}
+
 /// `pi0` in the sumcheck's layout: the bits of a `B128` are the low coefficients of an `F162`.
 fn poly_from_b128(pi0: &[B128], out: &mut super::sumcheck::Poly) {
     let n = pi0.len();

@@ -223,11 +223,11 @@ impl<'a> Switch<'a> {
     }
 
     pub fn fold(&mut self, r: F162) {
-        for (l, &lp) in self.l.iter_mut().zip(&self.lp) {
-            *l += r * lp;
-        }
-        self.lt = ByteTables::new(&self.l);
         if self.round + 1 < self.prepared.inverses.len() {
+            for (l, &lp) in self.l.iter_mut().zip(&self.lp) {
+                *l += r * lp;
+            }
+            self.lt = ByteTables::new(&self.l);
             self.lp = compose(&self.lt, self.prepared.inverses[self.round + 1]);
         }
         if self.round < self.prepared.prefix {

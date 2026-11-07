@@ -23,6 +23,10 @@ use crate::ntt::{centered, for_blocks};
 #[allow(dead_code)]
 mod lattice;
 
+#[cfg(target_feature = "sve")]
+#[path = "sms_pipeline.rs"]
+mod pipeline;
+
 /// The transform prime, by index into [`PRIMES`].
 const PB: usize = 1;
 const P1: u32 = PRIMES[PB];
@@ -368,7 +372,7 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 }
 
 /// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 16;
+const SINK: usize = 8;
 /// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
@@ -644,42 +648,62 @@ unsafe fn sums(
     m: &mut [int16x8_t; BITS],
     nib: &mut [uint8x16_t; N / 4],
     xs: &mut [[int16x8_t; N]; SWEEP],
+    ys: &mut [[int16x8_t; N]; SWEEP],
     acc: &mut [int64x2_t],
     y: &mut [int16x8_t; N],
     dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
     acc.fill(vdupq_n_s64(0));
-    let mut e = 0usize;
+    let (mut current, mut next) = (xs, ys);
+    // Prologue. Each buffer holds a complete sweep in the existing slot layout.
+    for i in 0..SWEEP.min(a.elements).div_ceil(LOCK) * LOCK {
+        indices(&pass_words(words, a.elements, 0, i), nib);
+        pass_lut::<PB>(nib, &mut current[i], kern);
+        pass_c::<4>(&mut current[i], kern);
+        pass_d::<PB, false>(&mut current[i], kern, &[], &mut []);
+    }
+    let mut e = 0;
     while e < a.elements {
-        let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
-        while e < end {
-            // Up to eight tiles per sweep, never across a chunk end (chunks are whole tiles). A short
-            // tile only occurs at the end of the column, where the missing elements read zero
-            // words and their key lanes are zero, so those lanes contribute nothing.
-            let l = SWEEP.min(end - e);
-            let groups = l.div_ceil(LOCK);
-            for i in 0..groups * LOCK {
-                let at = pass_words(words, a.elements, e, i);
-                indices(&at, nib);
-                let x = &mut xs[i];
-                pass_lut::<PB>(nib, x, kern);
-                pass_c::<4>(x, kern);
-                pass_d::<PB, false>(x, kern, &[], &mut []);
-            }
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-            // the chunk's first sweep starts the digit rows' sums afresh
+        let len = SWEEP.min(a.elements - e);
+        let groups = len.div_ceil(LOCK);
+        let after = e + len;
+        let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+        // A partial sweep can only be the epilogue. Padding of the next front
+        // reads zero words through pass_words, exactly as in the serial path.
+        let fused = cfg!(target_feature = "sve") && after < a.elements;
+        #[cfg(target_feature = "sve")]
+        if fused {
+            debug_assert_eq!(groups, SINK);
             if e % CHUNK == 0 {
-                sink::<true>(xs, keys, acc, groups);
+                pipeline::sink_front::<true>(current, keys, acc, words, a.elements, after, next, nib, m, kern);
             } else {
-                sink::<false>(xs, keys, acc, groups);
+                pipeline::sink_front::<false>(current, keys, acc, words, a.elements, after, next, nib, m, kern);
             }
-            e += l;
         }
-        let c = (end - 1) / CHUNK;
-        for d in 0..DIGITS {
-            chunk_row(acc, 1 + d, a.mean_residues(c, d), &mut dev[d * 2 * N..][..2 * N], y);
+        if !fused {
+            if e % CHUNK == 0 { sink::<true>(current, keys, acc, groups); }
+            else { sink::<false>(current, keys, acc, groups); }
         }
+        // Finish the current digit chunk before a fresh sink overwrites it.
+        if after % CHUNK == 0 || after == a.elements {
+            let c = (after - 1) / CHUNK;
+            for d in 0..DIGITS {
+                chunk_row(acc, 1 + d, a.mean_residues(c, d), &mut dev[d * 2 * N..][..2 * N], y);
+            }
+        }
+        if after < a.elements {
+            for i in 0..SWEEP.min(a.elements - after).div_ceil(LOCK) * LOCK {
+                if !fused {
+                    indices(&pass_words(words, a.elements, after, i), nib);
+                    pass_lut::<PB>(nib, &mut next[i], kern);
+                }
+                pass_c::<4>(&mut next[i], kern);
+                pass_d::<PB, false>(&mut next[i], kern, &[], &mut []);
+            }
+            core::mem::swap(&mut current, &mut next);
+        }
+        e = after;
     }
     narrow(acc, 0, y);
     super::inverse_folded::<PB>(y);
@@ -708,6 +732,7 @@ fn crt(r: u32, t: i64) -> u128 {
 #[repr(C)]
 struct Scratch {
     xs: [[int16x8_t; N]; SWEEP],
+    ys: [[int16x8_t; N]; SWEEP],
     acc: [int64x2_t; ROWS * 4 * N],
     dev: [int32x4_t; DIGITS * 2 * N],
     m: [int16x8_t; BITS],
@@ -752,7 +777,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
-        let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;
+        let Scratch { xs, ys, acc, dev, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / N;
         for (b, target) in block.chunks_mut(LANES * N).enumerate() {
@@ -766,7 +791,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             });
             dev.fill(vdupq_n_s32(0));
-            sums(&words, a, m, nib, xs, acc, y, dev);
+            sums(&words, a, m, nib, xs, ys, acc, y, dev);
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
             let pv = vdupq_n_s16(p);
@@ -888,6 +913,49 @@ mod chunk_bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fused schedule must preserve both independent outputs: all seven
+    /// accumulated rows and every unreduced level-3 value of the next sweep.
+    /// Include dirty digit accumulators and zero-padded final witness tiles.
+    #[cfg(target_feature = "sve")]
+    #[test]
+    fn fused_sink_front_matches_separate() {
+        unsafe fn check<const FRESH: bool>(elements: usize) {
+            let aa = Arena::new();
+            let bb = Arena::new();
+            let a = &mut *aa.0;
+            let b = &mut *bb.0;
+            let mut state = 0x243f6a8885a308d3u64;
+            let mut rand = || {
+                state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                state
+            };
+            let witness: Vec<u8> = (0..LANES * SWEEP * 64).map(|_| rand() as u8).collect();
+            let words = core::array::from_fn(|c| (witness.as_ptr().add(c * SWEEP * 64), 64));
+            for v in core::slice::from_raw_parts_mut(a.xs.as_mut_ptr().cast::<i16>(), SWEEP * N * LANES) { *v = rand() as i16; }
+            b.xs.copy_from_slice(&a.xs);
+            for v in core::slice::from_raw_parts_mut(a.acc.as_mut_ptr().cast::<i64>(), ROWS * LANES * N) { *v = (rand() as i32) as i64; }
+            b.acc.copy_from_slice(&a.acc);
+            let keys: Vec<i16> = (0..SINK * N * ROWS * LOCK).map(|_| rand() as i16).collect();
+            let kern = &kernels()[PB];
+            pipeline::sink_front::<FRESH>(&a.xs, keys.as_ptr(), &mut a.acc, &words, elements, 0, &mut a.ys, &mut a.nib, &mut a.m, kern);
+            sink::<FRESH>(&b.xs, keys.as_ptr(), &mut b.acc, SINK);
+            for i in 0..SWEEP {
+                indices(&pass_words(&words, elements, 0, i), &mut b.nib);
+                pass_lut::<PB>(&b.nib, &mut b.ys[i], kern);
+            }
+            let acc_lanes = |p: *const int64x2_t| core::slice::from_raw_parts(p.cast::<i64>(), ROWS * LANES * N);
+            let front_lanes = |p: *const [int16x8_t; N]| core::slice::from_raw_parts(p.cast::<i16>(), SWEEP * N * LANES);
+            assert!(acc_lanes(a.acc.as_ptr()) == acc_lanes(b.acc.as_ptr()), "sink: fresh={FRESH}, elements={elements}");
+            assert!(front_lanes(a.ys.as_ptr()) == front_lanes(b.ys.as_ptr()), "front: fresh={FRESH}, elements={elements}");
+        }
+        unsafe {
+            for elements in [SWEEP, SWEEP - 5, 5] {
+                check::<false>(elements);
+                check::<true>(elements);
+            }
+        }
+    }
 
     /// [`narrow_digits`] is congruent to the sum and within `p`, on the extremes of a chunk's sums
     /// (`+-CHUNK PRODUCT`), small and boundary values, and random values in range.

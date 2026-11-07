@@ -23,7 +23,7 @@ const RING_ELEMENTS: usize = 4096;
 
 fn main() {
     let dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    for f in ["build.rs", "src/ntt.rs", "src/ntt_neon.rs", "src/ntt_hybrid.rs", "src/ntt_sms.rs", "src/sms_lattice.rs", "src/rq.rs"] {
+    for f in ["build.rs", "src/ntt.rs", "src/ntt_neon.rs", "src/ntt_hybrid.rs", "src/ntt_sms.rs", "src/sms_lattice.rs", "src/sms_pipeline.rs", "src/rq.rs"] {
         println!("cargo:rerun-if-changed={f}");
     }
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");

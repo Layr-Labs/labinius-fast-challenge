@@ -141,8 +141,7 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
             }        }
 
         let cv = t.cv.as_ptr() as *const i16;
-        let tail_blocks = core::hint::black_box(6usize);
-        for j in 0..tail_blocks {
+        for j in 0..6 {
             let kk = 6 * k + j;
             let os = buf(kk);
             let (t4, t5, t6) = if Q == 9721 {
@@ -154,13 +153,14 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
                 t.tw5.as_ptr().add(3 * kk).cast::<u32>(),
                 t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
                 ) };
-            for h in 0..core::hint::black_box(H) {
+            for h in 0..H {
                 let bpj = os[h];
-                tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);
+                if Q == 9721 {
+                    tail27_mem_b(bpj, os[h], t4, t5, t6, cv);
+                } else {
+                    tail27_p(bpj, os[h], t4, t5, t6, cv);
+                }
             }
-        }
-        for j in 0..6 {
-            let kk = 6 * k + j;
             sink.rows(kk, ro(buf(kk)), 0, 27);
         }
     }

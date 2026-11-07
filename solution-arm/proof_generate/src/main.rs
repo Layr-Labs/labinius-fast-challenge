@@ -872,11 +872,25 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
     (partials, rounds, coords, opened)
 }
 
+fn commit_bytes(values: &[B128], modulus: u128, mut bytes: Vec<u8>) -> Vec<u8> {
+    #[cfg(target_arch = "aarch64")]
+    if modulus == ntt::neon::sms::MODULUS {
+        use ntt::neon::sms;
+        debug_assert_eq!(rq::coefficient_bytes(modulus), sms::WIRE_BYTES);
+        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
+            .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+        sms::commit_packed(values, &matrix, threads(), &mut bytes);
+        return bytes;
+    }
+    let coefficients = commit(values, modulus);
+    let bytes = output::pack_commitment(&coefficients, modulus, bytes);
+    std::mem::forget(coefficients);
+    bytes
+}
+
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
-    let coefficients = commit(values, modulus);
-    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
-    std::mem::forget(coefficients);
+    let commitment = commit_bytes(values, modulus, output.commitment_buffer());
     labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first

@@ -931,7 +931,7 @@ fn main() {
     } else {
         MODULUS
     };
-    #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS { ntt::neon::sms::prefetch_key(&SMS_DATA.0) }
+    #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS { ntt::neon::sms::prefetch_key(&SMS_DATA.0, RING_ELEMENTS) }
     let output = Output::start(&args[2], modulus);
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
@@ -1023,7 +1023,7 @@ mod tests {
         // a short last chunk and a short last lockstep group, partial batches; the last sweep of
         // the column with one to four tiles (whole and short), a column of one short tile, and a
         // column whose chunks are all whole sweeps
-        for (elements, cols) in [(301usize, 11usize), (5, 3), (229, 9), (240, 9), (241, 9), (250, 9), (256, 9), (448, 2)] {
+        for (elements, cols) in [(301usize, 11usize), (5, 3), (229, 9), (232, 9), (240, 9), (241, 9), (250, 9), (256, 9), (448, 2)] {
             let values: Vec<B128> = (0..cols).flat_map(|s| column(200 + s as u64)).take(cols * 4 * elements).collect();
             let matrix = rq::ajtai_matrix(q, elements);
             let want = commit_reference(&values, &matrix, q);
@@ -1201,3 +1201,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../build_backend.rs"]
+mod build_backend;

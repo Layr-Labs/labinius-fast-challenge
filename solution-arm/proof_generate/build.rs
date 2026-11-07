@@ -10,6 +10,8 @@
 use std::env;
 use std::path::PathBuf;
 
+mod build_backend;
+
 #[cfg(target_arch = "aarch64")]
 #[path = "src/ntt.rs"]
 mod ntt;
@@ -23,7 +25,27 @@ const RING_ELEMENTS: usize = 4096;
 
 fn main() {
     let dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    for f in ["build.rs", "src/ntt.rs", "src/ntt_neon.rs", "src/ntt_hybrid.rs", "src/ntt_sms.rs", "src/sms_lattice.rs", "src/rq.rs"] {
+    let features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    let detected = std::arch::is_aarch64_feature_detected!("sve2")
+        && std::arch::is_aarch64_feature_detected!("sve2-bitperm");
+    #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+    let detected = false;
+    let bdep = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() == Ok("little")
+        && build_backend::use_bdep(
+            &features,
+            &env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default(),
+            &env::var("HOST").expect("Cargo build host"),
+            &env::var("TARGET").expect("Cargo build target"),
+            detected,
+        );
+    if bdep {
+        println!("cargo:rustc-cfg=sms_native_bdep");
+    }
+    println!("cargo:warning=SMS key runtime backend: {}", if bdep { "packed14-bdep" } else { "expanded-blocked-i16" });
+    println!("cargo:warning=SMS bitperm selection: compiler={}, build_host={detected}", features.split(',').any(|feature| feature == "sve2-bitperm"));
+    for f in ["build.rs", "build_backend.rs", "src/ntt.rs", "src/ntt_neon.rs", "src/ntt_hybrid.rs", "src/ntt_sms.rs", "src/sms_key.rs", "src/sms_slot_bdep_rows03.inc", "src/sms_slot_bdep_rows46.inc", "src/sms_slot_neon.S", "src/sms_lattice.rs", "src/rq.rs"] {
         println!("cargo:rerun-if-changed={f}");
     }
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");

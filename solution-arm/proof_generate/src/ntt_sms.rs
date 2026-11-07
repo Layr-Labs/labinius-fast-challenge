@@ -23,6 +23,9 @@ use crate::ntt::{centered, for_blocks};
 #[allow(dead_code)]
 mod lattice;
 
+#[path = "sms_key.rs"]
+mod key;
+
 /// The transform prime, by index into [`PRIMES`].
 const PB: usize = 1;
 const P1: u32 = PRIMES[PB];
@@ -57,15 +60,13 @@ const TERMS: i64 = 836;
 // every chunk digit sum and its mean fit in i32 with room: |S| <= CHUNK * TERMS * 32
 const _: () = assert!((CHUNK as i64) * TERMS * (lattice::MAX_DIGIT_ABS as i64) * 4 < i32::MAX as i64);
 
-/// The SMS matrix: in the transform domain, slot `j` of row `r` of element `m` is
-/// `data[(((m / 8) N + j) ROWS + r) 8 + m % 8]`, centered residues, so that one vector holds the
-/// eight elements of a tile, each residue negated because the forward kernel transforms `-s` and
-/// multiplied by [`KEY_SCALE`] `= 324^-1` so that the inverses need no `1 / r`; per chunk and digit
-/// the centered residue
-/// of the mean modulo 9721; and the weighted sum of all means modulo `M`.
+/// The SMS matrix's exact signed14 transform residues, in sweep/slot/group-pair/row
+/// order. The packed image is consumed directly on Linux with SVE2 bit permutation;
+/// other targets expand it once to blocked i16 pairs. Key residues retain their
+/// negation and [`KEY_SCALE`] `= 324^-1`; all means and reconstruction bounds are unchanged.
 pub struct SmsMatrix {
     pub elements: usize,
-    pub data: std::borrow::Cow<'static, [i16]>,
+    pub data: std::borrow::Cow<'static, [key::KeyWord]>,
     /// `mean_residues[(c DIGITS + d) N + coefficient]`.
     pub mean_residues: std::borrow::Cow<'static, [i16]>,
     /// `sum_{d, c} W_d mean_{d,c} mod M`, by coefficient.
@@ -88,48 +89,64 @@ fn view<T>(image: &'static [u8], len: usize) -> Option<&'static [T]> {
     Some(unsafe { core::slice::from_raw_parts(image.as_ptr() as *const T, len) })
 }
 
-/// The key image copied out of the binary's read-only 4 KiB pages into anonymous memory, which
-/// the allocator (`hugealloc`, 4 MiB and up) maps 2 MiB-aligned with `MADV_HUGEPAGE`: about 19
-/// TLB entries for the 37 MB stream instead of 9,000, prefetch across page boundaries, and no
-/// dependence on the page cache. Started at process start by [`prefetch_key`] (the copy overlaps
-/// the table read); [`SmsMatrix::from_images`] waits for it and uses it when it matches the image.
-/// The source image (its address) and the copy.
-static KEY: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new();
+/// The public key prepared during startup. The image length identifies the source;
+/// the runtime word count can differ because the non-bitperm path expands to i16.
+struct PrefetchedKey {
+    source: usize,
+    image_bytes: usize,
+    elements: usize,
+    words: Vec<key::KeyWord>,
+}
+
+impl PrefetchedKey {
+    fn matches(&self, image: &[u8], elements: usize) -> bool {
+        self.source == image.as_ptr() as usize && self.image_bytes == image.len() && self.elements == elements
+    }
+}
+
+static KEY: std::sync::OnceLock<PrefetchedKey> = std::sync::OnceLock::new();
 static KEY_JOB: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
 
-/// `LABINIUS_KEY_IN_PLACE` set the key is read in place instead.
-pub fn prefetch_key(image: &'static [u8]) {
-    if image.is_empty() || std::env::var_os("LABINIUS_KEY_IN_PLACE").is_some() {
+/// Prepare the embedded public key once, inside process startup. Disabling background
+/// prefetch leaves bitperm images in place; other targets still need one expansion.
+pub fn prefetch_key(image: &'static [u8], elements: usize) {
+    if image.is_empty() || image.len() != key::packed_len(elements) || std::env::var_os("LABINIUS_KEY_IN_PLACE").is_some() {
         return;
     }
     let job = std::thread::spawn(move || {
-        let len = image.len();
-        let mut v: Vec<u8> = Vec::with_capacity(len);
-        let dst = v.as_mut_ptr() as usize;
-        // pieces of whole 2 MiB pages, so that each thread faults in its own huge pages
-        let piece = len.div_ceil(8).next_multiple_of(2 << 20);
-        std::thread::scope(|s| {
-            for start in (0..len).step_by(piece) {
-                let n = piece.min(len - start);
-                s.spawn(move || {
-                    // SAFETY: disjoint ranges of the capacity and of the image.
-                    unsafe { core::ptr::copy_nonoverlapping(image.as_ptr().add(start), (dst as *mut u8).add(start), n) }
-                });
-            }
-        });
-        // SAFETY: every byte below `len` was written above.
-        unsafe { v.set_len(len) };
-        let _ = KEY.set((image.as_ptr() as usize, v));
+        #[cfg(all(target_os = "linux", target_endian = "little", any(sms_native_bdep, target_feature = "sve2-bitperm")))]
+        let words = {
+            let len = image.len();
+            let mut v: Vec<u8> = Vec::with_capacity(len);
+            let dst = v.as_mut_ptr() as usize;
+            // Whole 2 MiB pieces retain the existing huge-page copy policy.
+            let piece = len.div_ceil(8).next_multiple_of(2 << 20);
+            std::thread::scope(|s| {
+                for start in (0..len).step_by(piece) {
+                    let n = piece.min(len - start);
+                    s.spawn(move || {
+                        // SAFETY: disjoint capacity ranges; both slices contain n bytes.
+                        unsafe { core::ptr::copy_nonoverlapping(image.as_ptr().add(start), (dst as *mut u8).add(start), n) }
+                    });
+                }
+            });
+            // SAFETY: the scoped copy initialized every byte below len.
+            unsafe { v.set_len(len) };
+            v
+        };
+        #[cfg(not(all(target_os = "linux", target_endian = "little", any(sms_native_bdep, target_feature = "sve2-bitperm"))))]
+        let words = key::expand_blocked(image, elements);
+        debug_assert_eq!(words.len(), key::runtime_len(elements));
+        let _ = KEY.set(PrefetchedKey { source: image.as_ptr() as usize, image_bytes: image.len(), elements, words });
     });
     *KEY_JOB.lock().unwrap() = Some(job);
 }
 
-/// The copy of [`prefetch_key`] of `image`, once it is done (waiting for it), if one was started.
-fn key_copy(image: &'static [u8]) -> Option<&'static [u8]> {
+fn key_copy(image: &'static [u8], elements: usize) -> Option<&'static [key::KeyWord]> {
     if let Some(job) = KEY_JOB.lock().unwrap().take() {
-        let _ = job.join();
+        job.join().expect("public-key preparation failed");
     }
-    KEY.get().filter(|(src, v)| *src == image.as_ptr() as usize && v.len() == image.len()).map(|(_, v)| &v[..])
+    KEY.get().filter(|key| key.matches(image, elements)).map(|key| key.words.as_slice())
 }
 
 impl SmsMatrix {
@@ -137,8 +154,7 @@ impl SmsMatrix {
     /// (i16) and `mu` (u32), little-endian, and `meta` = margin and column failure bound (f64).
     pub fn from_images(data: &'static [u8], means: &'static [u8], mu: &'static [u8], meta: &'static [u8], elements: usize) -> Option<SmsMatrix> {
         let chunks = elements.div_ceil(CHUNK);
-        let data = key_copy(data).unwrap_or(data);
-        let data = view::<i16>(data, ROWS * elements.div_ceil(LOCK) * LOCK * N)?;
+        if data.len() != key::packed_len(elements) { return None; }
         let mean_residues = view::<i16>(means, chunks * DIGITS * N)?;
         let mu = view::<u32>(mu, N)?;
         if meta.len() != 16 {
@@ -150,7 +166,15 @@ impl SmsMatrix {
             return None;
         }
         use std::borrow::Cow::Borrowed;
-        Some(SmsMatrix { elements, data: Borrowed(data), mean_residues: Borrowed(mean_residues), mu: Borrowed(mu), margin, column_failure })
+        let data = if let Some(words) = key_copy(data, elements) {
+            Borrowed(words)
+        } else {
+            #[cfg(all(target_os = "linux", target_endian = "little", any(sms_native_bdep, target_feature = "sve2-bitperm")))]
+            { Borrowed(data) }
+            #[cfg(not(all(target_os = "linux", target_endian = "little", any(sms_native_bdep, target_feature = "sve2-bitperm"))))]
+            { std::borrow::Cow::Owned(key::expand_blocked(data, elements)) }
+        };
+        Some(SmsMatrix { elements, data, mean_residues: Borrowed(mean_residues), mu: Borrowed(mu), margin, column_failure })
     }
 
     /// The four images [`SmsMatrix::from_images`] reads.
@@ -158,7 +182,7 @@ impl SmsMatrix {
         let mut meta = self.margin.to_le_bytes().to_vec();
         meta.extend_from_slice(&self.column_failure.to_le_bytes());
         [
-            self.data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            key::image(&self.data, self.elements),
             self.mean_residues.iter().flat_map(|v| v.to_le_bytes()).collect(),
             self.mu.iter().flat_map(|v| v.to_le_bytes()).collect(),
             meta,
@@ -306,6 +330,7 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
             }
         }
     });
+    let data = key::from_group_major(&data, elements);
     use std::borrow::Cow::Owned;
     SmsMatrix { elements, data: Owned(data), mean_residues: Owned(mean_residues), mu: Owned(mu), margin, column_failure }
 }
@@ -331,30 +356,49 @@ const fn idx(s: usize, r: usize) -> usize {
     (s * ROWS + r) * 4
 }
 
-/// `acc[q] += ` the four-term dot product per `i64` lane of `a[q]` with the low half of `key`, and
-/// of `b[q]` with the high half: SVE's indexed halfword `sdot`, eight products an instruction.
-/// With SVE the sums go through [`slot_sink`]; this is the reference for its operand order.
-#[cfg(target_feature = "sve")]
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: int16x8_t) {
-    let (mut s0, mut s1, mut s2, mut s3) = (*acc, *acc.add(1), *acc.add(2), *acc.add(3));
-    core::arch::asm!(
-        "sdot z0.d, z4.h, z12.h[0]", "sdot z1.d, z5.h, z12.h[0]",
-        "sdot z2.d, z6.h, z12.h[0]", "sdot z3.d, z7.h, z12.h[0]",
-        "sdot z0.d, z8.h, z12.h[1]", "sdot z1.d, z9.h, z12.h[1]",
-        "sdot z2.d, z10.h, z12.h[1]", "sdot z3.d, z11.h, z12.h[1]",
-        inout("v0") s0, inout("v1") s1, inout("v2") s2, inout("v3") s3,
-        in("v4") a[0], in("v5") a[1], in("v6") a[2], in("v7") a[3],
-        in("v8") b[0], in("v9") b[1], in("v10") b[2], in("v11") b[3],
-        in("v12") key,
-        options(pure, nomem, nostack, preserves_flags)
-    );
-    (*acc, *acc.add(1), *acc.add(2), *acc.add(3)) = (s0, s1, s2, s3);
+/// Key groups per accumulator sweep. CHUNK and the statistical recovery are unchanged.
+const SINK: usize = 16;
+const SWEEP: usize = SINK * LOCK;
+const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
+const _: () = assert!(N == key::SLOTS && ROWS == key::ROWS && LOCK == key::LANES && SINK == key::SINK);
+
+#[cfg(all(target_os = "linux", target_endian = "little", not(any(sms_native_bdep, target_feature = "sve2-bitperm"))))]
+core::arch::global_asm!(include_str!("sms_slot_neon.S"), options(raw));
+
+#[cfg(all(target_os = "linux", target_endian = "little", not(any(sms_native_bdep, target_feature = "sve2-bitperm"))))]
+extern "C" {
+    fn sms_slot_neon(z: *const i16, keys: *const key::KeyWord, acc: *mut i64, groups: usize, fresh: u32);
 }
 
-/// The same sums without SVE, for development on other AArch64 hosts.
-#[cfg(not(target_feature = "sve"))]
+#[cfg(all(target_os = "linux", target_endian = "little", any(sms_native_bdep, target_feature = "sve2-bitperm")))]
+macro_rules! bdep_slot {
+    ($z:expr, $keys:expr, $acc:expr, $groups:expr, $idx0:expr, $idx1:expr, $mask:expr,
+     [$($rows13:literal),*], [$($rows46:literal),*]) => {
+        core::arch::asm!(
+            "cbz x3, 8f",
+            "ldp q16, q17, [x2, #0]", "ldp q18, q19, [x2, #32]",
+            $($rows13,)*
+            include_str!("sms_slot_bdep_rows03.inc"),
+            $($rows46,)*
+            include_str!("sms_slot_bdep_rows46.inc"),
+            "8:",
+            in("x0") $z, in("x1") $keys, in("x2") $acc, in("x3") $groups,
+            in("x9") 4 * N * 16,
+            in("v8") $idx0, in("v9") $idx1, in("v10") $mask,
+            out("x5") _, out("x6") _, out("x7") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            options(raw, nostack)
+        )
+    };
+}
+
+/// The portable AArch64 path also consumes the once-expanded blocked i16 pairs.
+#[cfg(not(all(target_os = "linux", target_endian = "little")))]
 #[inline(always)]
 unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: int16x8_t) {
     let (k0, k1) = (vget_low_s16(key), vget_high_s16(key));
@@ -367,172 +411,49 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
     }
 }
 
-/// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 16;
-/// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
-const SWEEP: usize = SINK * LOCK;
-const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
-
-/// [`slot_sink`]'s body; `$rows13` and `$rows46` start rows 1-3 (v20-v31) and rows 4-6
-/// (v16-v27): loaded from `acc`, or zeroed for a chunk's first sweep ([`slot_sink_fresh`]).
-#[cfg(target_feature = "sve")]
-macro_rules! slot_sink_body {
-    ($acc:expr, $z:expr, $k:expr, $groups:expr, [$($rows13:literal),*], [$($rows46:literal),*]) => {
-        core::arch::asm!(
-        "ldp q16, q17, [{a}, #0]",
-        "ldp q18, q19, [{a}, #32]",
-        $($rows13,)*
-        "mov {zp}, {z}",
-        "mov {kp}, {k}",
-        "mov {n}, {g}",
-        "2:",
-        "ldp q0, q1, [{kp}]",
-        "ldp q2, q3, [{kp}, #32]",
-        "ldr q4, [{zp}]",
-        "ldr q5, [{zp}, #{xs1}]",
-        "ldr q6, [{zp}, #{xs2}]",
-        "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
-        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
-        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
-        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
-        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
-        "ldr q4, [{zp}]",
-        "ldr q5, [{zp}, #{xs1}]",
-        "ldr q6, [{zp}, #{xs2}]",
-        "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
-        "add {kp}, {kp}, {ks}",
-        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
-        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
-        "subs {n}, {n}, #1",
-        "b.ne 2b",
-        "stp q16, q17, [{a}, #0]",
-        "stp q18, q19, [{a}, #32]",
-        "stp q20, q21, [{a}, #64]",
-        "stp q22, q23, [{a}, #96]",
-        "stp q24, q25, [{a}, #128]",
-        "stp q26, q27, [{a}, #160]",
-        "stp q28, q29, [{a}, #192]",
-        "stp q30, q31, [{a}, #224]",
-        $($rows46,)*
-        "mov {zp}, {z}",
-        "mov {kp}, {k}",
-        "mov {n}, {g}",
-        "3:",
-        "ldp q0, q1, [{kp}, #64]",
-        "ldr q2, [{kp}, #96]",
-        "ldr q4, [{zp}]",
-        "ldr q5, [{zp}, #{xs1}]",
-        "ldr q6, [{zp}, #{xs2}]",
-        "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
-        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
-        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
-        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
-        "ldr q4, [{zp}]",
-        "ldr q5, [{zp}, #{xs1}]",
-        "ldr q6, [{zp}, #{xs2}]",
-        "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
-        "add {kp}, {kp}, {ks}",
-        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
-        "subs {n}, {n}, #1",
-        "b.ne 3b",
-        "stp q16, q17, [{a}, #256]",
-        "stp q18, q19, [{a}, #288]",
-        "stp q20, q21, [{a}, #320]",
-        "stp q22, q23, [{a}, #352]",
-        "stp q24, q25, [{a}, #384]",
-        "stp q26, q27, [{a}, #416]",
-            a = in(reg) $acc,
-            z = in(reg) $z,
-            k = in(reg) $k,
-            g = in(reg) $groups,
-            xs4 = in(reg) 4 * XS,
-            ks = in(reg) KS,
-            xs1 = const XS,
-            xs2 = const 2 * XS,
-            xs3 = const 3 * XS,
-            zp = out(reg) _,
-            kp = out(reg) _,
-            n = out(reg) _,
-            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
-            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
-            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
-            options(nostack)
-        )
-    };
-}
-
-/// The register-resident sink for one slot (from 4381e86b's `sve::slot_sink`, after arm-big's
-/// `slot_chunk`): `acc(s, r) +=` the slot's products summed over `groups` key tiles (eight
-/// elements each) of transforms starting at `z` (transform stride `XS`, the [`pass_words`] lane
-/// order), keys starting at `k` (tile stride `KS`). Rows 0-3, then rows 4-6, keep their sums in
-/// v16-v31 across all the tiles: one load and one store per sum per sweep. The key halves are
-/// `sdot`'s indexed operand exactly as in [`dot`]: transforms `0..4` of a tile with key elements
-/// `0..4` (`[0]`), transforms `4..8` with `4..8` (`[1]`). `groups >= 1`.
-#[cfg(target_feature = "sve")]
+/// The actual last sweep's group count determines its per-slot record stride.
+/// Linux keeps rows 0-3 and then 4-6 in registers across the complete sweep.
+#[cfg_attr(all(target_os = "linux", target_endian = "little", any(sms_native_bdep, target_feature = "sve2-bitperm")), target_feature(enable = "sve2-bitperm"))]
 #[inline(never)]
-unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
-    const XS: usize = N * 16;
-    const KS: usize = N * ROWS * LOCK * 2;
-    debug_assert!((1..=SINK).contains(&groups));
-    slot_sink_body!(acc, z, k, groups, ["ldp q20, q21, [{a}, #64]", "ldp q22, q23, [{a}, #96]", "ldp q24, q25, [{a}, #128]", "ldp q26, q27, [{a}, #160]", "ldp q28, q29, [{a}, #192]", "ldp q30, q31, [{a}, #224]"], ["ldp q16, q17, [{a}, #256]", "ldp q18, q19, [{a}, #288]", "ldp q20, q21, [{a}, #320]", "ldp q22, q23, [{a}, #352]", "ldp q24, q25, [{a}, #384]", "ldp q26, q27, [{a}, #416]"]);
-}
-
-/// [`slot_sink`] for a chunk's first sweep: the digit rows' sums (rows 1-6) start from zero instead
-/// of being loaded, and are stored as usual, so the chunk end needs no zeroing pass; the base
-/// row (row 0) accumulates as in [`slot_sink`].
-#[cfg(target_feature = "sve")]
-#[inline(never)]
-unsafe fn slot_sink_fresh(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
-    const XS: usize = N * 16;
-    const KS: usize = N * ROWS * LOCK * 2;
-    debug_assert!((1..=SINK).contains(&groups));
-    slot_sink_body!(acc, z, k, groups, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
-}
-
-/// `acc +=` the products of the first `groups` tiles of `xs` (transforms `8 g..8 g + 8` of tile
-/// `g`) with the key tiles at `keys` (`N ROWS LOCK` entries apart), every slot and row; the sums of
-/// [`dot`] per tile, in another order. A tile past the column's end has zero keys. With `FRESH` (a
-/// chunk's first sweep) the digit rows' sums are overwritten instead of added to, so the chunk end
-/// needs no zeroing pass; the base row always accumulates.
-#[inline(never)]
-unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const key::KeyWord, acc: &mut [int64x2_t], groups: usize) {
     debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
+    let pairs = groups.div_ceil(2);
     let accp = acc.as_mut_ptr();
-    #[cfg(target_feature = "sve")]
-    {
-        let z = xs.as_ptr() as *const int16x8_t;
-        for s in 0..N {
-            if FRESH {
-                slot_sink_fresh(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
-            } else {
-                slot_sink(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
-            }
+    #[cfg(all(target_os = "linux", target_endian = "little", any(sms_native_bdep, target_feature = "sve2-bitperm")))]
+    let (idx0, idx1, mask) = (
+        vld1q_u8([0, 1, 2, 3, 4, 5, 6, 255, 7, 8, 9, 10, 11, 12, 13, 255].as_ptr()),
+        vld1q_u8([2, 3, 4, 5, 6, 7, 8, 255, 9, 10, 11, 12, 13, 14, 15, 255].as_ptr()),
+        vdupq_n_u64(0xfffc_fffc_fffc_fffc),
+    );
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    for s in 0..N {
+        let z = (xs.as_ptr() as *const int16x8_t).add(s).cast::<i16>();
+        let k = keys.add(s * pairs * ROWS * key::RECORD_WORDS);
+        let a = accp.add(idx(s, 0)).cast::<i64>();
+        #[cfg(any(sms_native_bdep, target_feature = "sve2-bitperm"))]
+        if FRESH {
+            bdep_slot!(z, k, a, groups, idx0, idx1, mask,
+                ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"],
+                ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
+        } else {
+            bdep_slot!(z, k, a, groups, idx0, idx1, mask,
+                ["ldp q20, q21, [x2, #64]", "ldp q22, q23, [x2, #96]", "ldp q24, q25, [x2, #128]", "ldp q26, q27, [x2, #160]", "ldp q28, q29, [x2, #192]", "ldp q30, q31, [x2, #224]"],
+                ["ldp q16, q17, [x2, #256]", "ldp q18, q19, [x2, #288]", "ldp q20, q21, [x2, #320]", "ldp q22, q23, [x2, #352]", "ldp q24, q25, [x2, #384]", "ldp q26, q27, [x2, #416]"]);
         }
+        #[cfg(not(any(sms_native_bdep, target_feature = "sve2-bitperm")))]
+        sms_slot_neon(z, k, a, groups, FRESH as u32);
     }
-    #[cfg(not(target_feature = "sve"))]
+    #[cfg(not(all(target_os = "linux", target_endian = "little")))]
     for g in 0..groups {
-        let tile = keys.add(g * N * ROWS * LOCK);
         for s in 0..N {
             let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *xs[LOCK * g + i].get_unchecked(s));
             let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
             for r in 0..ROWS {
                 if FRESH && g == 0 && r > 0 {
-                    for q in 0..4 {
-                        *accp.add(idx(s, r) + q) = vdupq_n_s64(0);
-                    }
+                    for q in 0..4 { *accp.add(idx(s, r) + q) = vdupq_n_s64(0); }
                 }
-                dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
+                let at = ((s * pairs + g / 2) * ROWS + r) * key::DENSE_RECORD + (g % 2) * LOCK;
+                dot(accp.add(idx(s, r)), a, b, vld1q_s16(keys.add(at)));
             }
         }
     }
@@ -654,7 +575,7 @@ unsafe fn sums(
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
         while e < end {
-            // Up to eight tiles per sweep, never across a chunk end (chunks are whole tiles). A short
+            // Up to SINK tiles per sweep, never across a chunk end (chunks are whole tiles). A short
             // tile only occurs at the end of the column, where the missing elements read zero
             // words and their key lanes are zero, so those lanes contribute nothing.
             let l = SWEEP.min(end - e);
@@ -667,7 +588,7 @@ unsafe fn sums(
                 pass_c::<4>(x, kern);
                 pass_d::<PB, false>(x, kern, &[], &mut []);
             }
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            let keys = a.data.as_ptr().add(key::sweep_offset(e / LOCK));
             // the chunk's first sweep starts the digit rows' sums afresh
             if e % CHUNK == 0 {
                 sink::<true>(xs, keys, acc, groups);
@@ -889,6 +810,81 @@ mod chunk_bench {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sink_matches_scalar() {
+        let mut state = 0x9275u64;
+        let mut next = || crate::ntt::tests::xorshift(&mut state);
+        let witness: Vec<[i16; 8]> = (0..SWEEP * N)
+            .map(|_| core::array::from_fn(|_| next() as i16))
+            .collect();
+        let mut xs = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
+        for (x, lanes) in xs.iter_mut().flatten().zip(&witness) {
+            *x = unsafe { vld1q_s16(lanes.as_ptr()) };
+        }
+        for groups in 1..=SINK {
+            let dense: Vec<i16> = (0..groups * N * ROWS * LOCK)
+                .map(|i| match i % 17 {
+                    0 => -4860,
+                    1 => 4860,
+                    _ => (next() % 9721) as i16 - 4860,
+                })
+                .collect();
+            let key = key::from_group_major(&dense, groups * LOCK);
+            let initial: Vec<i64> = (0..N * ROWS * 8)
+                .map(|_| (next() >> 24) as i64 - (1 << 39))
+                .collect();
+            let mut products = vec![0i64; initial.len()];
+            for s in 0..N {
+                for r in 0..ROWS {
+                    for c in 0..8 {
+                        let mut sum = 0i64;
+                        for e in 0..groups * LOCK {
+                            let g = e / LOCK;
+                            let lane = e % LOCK;
+                            let x = witness[(g * LOCK + 4 * (lane / 4) + c / 2) * N + s]
+                                [4 * (c % 2) + lane % 4];
+                            let k = dense[((g * N + s) * ROWS + r) * LOCK + lane];
+                            sum += i64::from(x) * i64::from(k);
+                        }
+                        products[(s * ROWS + r) * 8 + c] = sum;
+                    }
+                }
+            }
+            for fresh in [false, true] {
+                let mut actual = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(initial.as_ptr(), actual.as_mut_ptr().cast::<i64>(), initial.len());
+                    if fresh {
+                        sink::<true>(&xs, key.as_ptr(), &mut actual, groups);
+                    } else {
+                        sink::<false>(&xs, key.as_ptr(), &mut actual, groups);
+                    }
+                }
+                let actual = unsafe { core::slice::from_raw_parts(actual.as_ptr().cast::<i64>(), initial.len()) };
+                for i in 0..initial.len() {
+                    let row = i / 8 % ROWS;
+                    let start = if fresh && row != 0 { 0 } else { initial[i] };
+                    assert_eq!(actual[i], start + products[i], "groups {groups}, fresh {fresh}, word {i}");
+                }
+            }
+        }
+    }
+
+
+    #[test]
+    fn prefetched_key_matches_packed_source_length() {
+        let elements = 232usize;
+        let dense = vec![1i16; elements.div_ceil(LOCK) * N * ROWS * LOCK];
+        let image = key::pack_group_major(&dense, elements);
+        let words = key::from_packed(image.clone(), elements);
+        let ready = PrefetchedKey { source: image.as_ptr() as usize, image_bytes: image.len(), elements, words };
+        assert!(ready.matches(&image, elements));
+        assert!(!ready.matches(&image, elements + 1));
+        assert_eq!(ready.words.len(), key::runtime_len(elements));
+        #[cfg(not(all(target_os = "linux", target_endian = "little", any(sms_native_bdep, target_feature = "sve2-bitperm"))))]
+        assert_ne!(ready.words.len() * core::mem::size_of::<key::KeyWord>(), image.len());
+    }
+
     /// [`narrow_digits`] is congruent to the sum and within `p`, on the extremes of a chunk's sums
     /// (`+-CHUNK PRODUCT`), small and boundary values, and random values in range.
     #[test]
@@ -942,6 +938,7 @@ mod tests {
                     zeroed[idx(s, r)..idx(s, r) + 4].fill(unsafe { vdupq_n_s64(0) });
                 }
             }
+            let keys = key::from_group_major(&keys, groups * LOCK);
             unsafe {
                 sink::<true>(&xs, keys.as_ptr(), &mut fresh, groups);
                 sink::<false>(&xs, keys.as_ptr(), &mut zeroed, groups);
@@ -975,7 +972,7 @@ mod tests {
     /// unscaled one ([`super::super::inverse`], the path before the fold), bit for bit, on every
     /// row of one chunk: random key vectors (centered residues, and the extremes `+-(p - 1) / 2`),
     /// random transforms over all of `i16`, [`CHUNK`]` / `[`SWEEP`] full sweeps through [`sink`] and
-    /// a last one of one to three tiles (on SVE hosts, [`slot_sink`]'s `sdot`), then [`narrow`] and
+    /// a last one of one to three tiles (through the real blocked sink), then [`narrow`] and
     /// the inverse.
     #[test]
     fn folded_key_matches_unscaled_path() {
@@ -1004,6 +1001,8 @@ mod tests {
                     });
                     *x = unsafe { vld1q_s16(v.as_ptr()) };
                 }
+                let old = key::from_group_major(&old, groups * LOCK);
+                let new = key::from_group_major(&new, groups * LOCK);
                 unsafe {
                     sink::<false>(&xs, old.as_ptr(), &mut old_acc, groups);
                     sink::<false>(&xs, new.as_ptr(), &mut new_acc, groups);

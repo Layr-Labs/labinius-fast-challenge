@@ -7,6 +7,9 @@ edition = "2021"
 [workspace]
 resolver = "2"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(sms_native_bdep)'] }
+
 [[bin]]
 name = "labinius-fast"
 path = "src/main.rs"

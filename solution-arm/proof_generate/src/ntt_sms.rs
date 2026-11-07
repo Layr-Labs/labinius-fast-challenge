@@ -649,7 +649,12 @@ unsafe fn sums(
     dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
-    acc.fill(vdupq_n_s64(0));
+    // Only the base row accumulates from zero: `sink::<true>` overwrites the digit rows at each
+    // chunk's first sweep, so zeroing them here would be dead work.
+    for s in 0..N {
+        let at = idx(s, 0);
+        acc[at..at + 4].fill(vdupq_n_s64(0));
+    }
     let mut e = 0usize;
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
@@ -749,7 +754,10 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
-    let mut out = vec![0u128; columns * N];
+    let mut out: Vec<u128> = Vec::with_capacity(columns * N);
+    // SAFETY: the loop below writes every coefficient of `out` (each column's whole ring
+    // element), so no uninitialised `u128` is ever read.
+    unsafe { out.set_len(columns * N) }
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
         let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;

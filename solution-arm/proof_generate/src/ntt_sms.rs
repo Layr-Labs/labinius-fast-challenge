@@ -97,7 +97,6 @@ fn view<T>(image: &'static [u8], len: usize) -> Option<&'static [T]> {
 static KEY: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new();
 static KEY_JOB: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
 
-/// Starts copying `image` (the SMS key data image) into [`KEY`] on four threads. With
 /// `LABINIUS_KEY_IN_PLACE` set the key is read in place instead.
 pub fn prefetch_key(image: &'static [u8]) {
     if image.is_empty() || std::env::var_os("LABINIUS_KEY_IN_PLACE").is_some() {
@@ -108,7 +107,7 @@ pub fn prefetch_key(image: &'static [u8]) {
         let mut v: Vec<u8> = Vec::with_capacity(len);
         let dst = v.as_mut_ptr() as usize;
         // pieces of whole 2 MiB pages, so that each thread faults in its own huge pages
-        let piece = len.div_ceil(4).next_multiple_of(2 << 20);
+        let piece = len.div_ceil(8).next_multiple_of(2 << 20);
         std::thread::scope(|s| {
             for start in (0..len).step_by(piece) {
                 let n = piece.min(len - start);
@@ -625,6 +624,17 @@ unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_
     });
 }
 
+#[inline(always)]
+unsafe fn chunk_row2(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: &mut [[int16x8_t; N]; 2]) {
+    let p = P1 as i16;
+    super::inverse_lazy_io2(y, |h, s| narrow_digit(acc, s, r + h), |h, s, x| {
+        let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr[h].as_ptr().add(s))), p);
+        let dv = dev[h];
+        *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
+        *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
+    });
+}
+
 /// `x` in `[-(p-1)/2, (p-1)/2]` for `|x| <= p + p/2`.
 #[inline(always)]
 unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
@@ -647,6 +657,7 @@ unsafe fn sums(
     xs: &mut [[int16x8_t; N]; SWEEP],
     acc: &mut [int64x2_t],
     y: &mut [int16x8_t; N],
+    y2: &mut [[int16x8_t; N]; 2],
     dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
@@ -665,7 +676,7 @@ unsafe fn sums(
                 indices(&at, nib);
                 let x = &mut xs[i];
                 pass_lut::<PB>(nib, x, kern);
-                pass_c::<PB>(x, kern);
+                pass_c::<4>(x, kern);
                 pass_d::<PB, false>(x, kern, &[], &mut []);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
@@ -678,8 +689,10 @@ unsafe fn sums(
             e += l;
         }
         let c = (end - 1) / CHUNK;
-        for d in 0..DIGITS {
-            chunk_row(acc, 1 + d, a.mean_residues(c, d), &mut dev[d * 2 * N..][..2 * N], y);
+        const { assert!(DIGITS % 2 == 0) };
+        let dp = dev.as_mut_ptr();
+        for d in (0..DIGITS).step_by(2) {
+            chunk_row2(acc, 1 + d, [a.mean_residues(c, d), a.mean_residues(c, d + 1)], [dp.add(d * 2 * N), dp.add((d + 1) * 2 * N)], y2);
         }
     }
     narrow(acc, 0, y);
@@ -718,6 +731,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
         let mut nib = Box::new([vdupq_n_u8(0); N / 4]);
         let mut xs = Box::new([[vdupq_n_s16(0); N]; SWEEP]);
         let mut y = Box::new([vdupq_n_s16(0); N]);
+        let mut y2 = Box::new([[vdupq_n_s16(0); N]; 2]);
         let mut acc = vec![vdupq_n_s64(0); ROWS * 4 * N];
         // per digit, the chunk deviations S - mean summed over the chunks
         let mut dev = vec![vdupq_n_s32(0); DIGITS * 2 * N];
@@ -736,7 +750,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             });
             dev.fill(vdupq_n_s32(0));
-            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, &mut dev);
+            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, &mut y2, &mut dev);
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
             let pv = vdupq_n_s16(p);
@@ -747,29 +761,32 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
             }
             // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
-            // once (from 4381e86b / de004ec5): one pass per digit over the slots, not per column.
-            let devs: &[[i32; 4]] = core::slice::from_raw_parts(dev.as_ptr() as *const [i32; 4], dev.len());
             let tail = &mut *tail;
-            for (t, &mu) in tail.iter_mut().zip(a.mu.iter()) {
-                *t = [mu as i64; LANES];
-            }
-            for d in 0..DIGITS {
-                let (u, v) = lattice::WEIGHTS[d];
-                let (u, v) = (u as i64, v as i64);
-                let e = |k: usize, c: usize| devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
-                for k in 0..N / 2 {
-                    for c in 0..LANES {
-                        let x = e(k, c);
-                        tail[k][c] += u * x;
-                        tail[k + N / 2][c] += v * x;
+            for k in 0..N / 2 {
+                let h = k + N / 2;
+                let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
+                let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
+                for d in 0..DIGITS {
+                    let (u, v) = lattice::WEIGHTS[d];
+                    let w = u + v;
+                    for half in 0..2 {
+                        let x = dev[d * 2 * N + 2 * k + half];
+                        let y = dev[d * 2 * N + 2 * h + half];
+                        let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
+                        let (i, j) = (2 * half, 2 * half + 1);
+                        lo[i] = vmlal_n_s32(lo[i], xl, u);
+                        lo[j] = vmlal_high_n_s32(lo[j], x, u);
+                        lo[i] = vmlsl_n_s32(lo[i], yl, v);
+                        lo[j] = vmlsl_high_n_s32(lo[j], y, v);
+                        hi[i] = vmlal_n_s32(hi[i], xl, v);
+                        hi[j] = vmlal_high_n_s32(hi[j], x, v);
+                        hi[i] = vmlal_n_s32(hi[i], yl, w);
+                        hi[j] = vmlal_high_n_s32(hi[j], y, w);
                     }
                 }
-                for k in N / 2..N {
-                    for c in 0..LANES {
-                        let x = e(k, c);
-                        tail[k - N / 2][c] -= v * x;
-                        tail[k][c] += (u + v) * x;
-                    }
+                for q in 0..4 {
+                    vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
+                    vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
                 }
             }
             // a partial batch has fewer than eight columns in `target`: only those lanes are written
@@ -847,7 +864,16 @@ mod chunk_bench {
                 core::hint::black_box(&mut *y);
             }
             let l = t.elapsed().as_nanos() as f64 / reps as f64;
-            println!("chunk-end row: record {old:.0} ns, fused {new:.0} ns ({:+.1}%); inverse_folded {f:.0} ns, inverse_lazy {l:.0} ns", 100.0 * (new / old - 1.0));
+            let mut y2 = Box::new([[unsafe { vdupq_n_s16(0) }; N]; 2]);
+            let mut dev3 = dev2.clone();
+            let mut dev4 = dev2.clone();
+            let t = std::time::Instant::now();
+            for _ in 0..reps / 2 {
+                unsafe { chunk_row2(&acc, 1, [&mr, &mr], [dev3.as_mut_ptr(), dev4.as_mut_ptr()], &mut y2) };
+                core::hint::black_box(&mut dev3);
+            }
+            let pair = t.elapsed().as_nanos() as f64 / reps as f64;
+            println!("chunk-end row: record {old:.0} ns, fused {new:.0} ns ({:+.1}%), paired {pair:.0} ns/row; inverse_folded {f:.0} ns, inverse_lazy {l:.0} ns", 100.0 * (new / old - 1.0));
         }
     }
 }

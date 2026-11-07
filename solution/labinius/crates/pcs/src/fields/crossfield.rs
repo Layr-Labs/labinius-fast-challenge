@@ -1775,7 +1775,7 @@ unsafe fn message_range(
 /// [`BIND_STRETCH`] outputs, the later sweeps adding their reduced sums to the stored ones
 /// (reduction is linear, so the values are the same).
 /// Words ahead of the current eight that [`materialize_prefix_range`] prefetches in each stream.
-const MATERIALIZE_AHEAD: usize = 64;
+const MATERIALIZE_AHEAD: usize = 32;
 
 #[inline(always)]
 unsafe fn bcast4(x: F162) -> [__m512i; 4] {
@@ -1861,11 +1861,10 @@ unsafe fn materialize_prefix_range(
     }
 }
 
-/// Blocks one sweep of the binding pass reads at once (see [`materialize_prefix_range`]). Few
-/// streams with long runs each (64 KB per block and sweep) suit the memory best, which pays for
-/// the extra reductions: 32 blocks over 2^19 outputs measured 5.0 ms at 2 x 4096, 5.1 ms at
-/// 4 x 4096, 6.3 ms at 16 x 512 and 16.5 ms in one sweep (pages faulted in beforehand).
-const BIND_WAYS: usize = 2;
+/// Blocks read per sweep. Four streams share each field reduction while retaining
+/// long sequential reads. On the 64-block path, a 32-word prefetch lead keeps the
+/// streams close enough to their consumers to avoid excess cache pressure.
+const BIND_WAYS: usize = 4;
 /// Outputs per sweep of the binding pass.
 const BIND_STRETCH: usize = 4096;
 

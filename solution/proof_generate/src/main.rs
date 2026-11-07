@@ -1003,6 +1003,8 @@ static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_by
 /// The single-transform modulus's public data (`labinius::simd::commit::sms`), precomputed by
 /// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
 /// lockstep layout, the digit chunks' centered mean residues and the means' total.
+const SMS_INVERSE_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/sms-inverse.bin")).len();
+static SMS_INVERSE: Aligned64<[u8; SMS_INVERSE_LEN]> = Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/sms-inverse.bin")));
 const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
 static SMS_PAIRS:Aligned2M<[u8;SMS_PAIRS_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
 const SMS_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")).len();
@@ -1015,11 +1017,12 @@ static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!(
 fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     use labinius::simd::commit::sms;
     let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
-    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 4 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N {
+    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 4 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N || (SMS_INVERSE_LEN != 0 && SMS_INVERSE_LEN != (sms::STREAMS - 1) * (N / 2) * 32) {
         return None;
     }
     unsafe {
         Some(sms::SmsKeys {
+            inverse: std::slice::from_raw_parts(SMS_INVERSE.0.as_ptr() as *const [i16; 16], SMS_INVERSE_LEN / 32),
             pairs: std::slice::from_raw_parts(SMS_PAIRS.0.as_ptr() as *const u32, words),
             mur: std::slice::from_raw_parts(SMS_MUR.0.as_ptr() as *const i32, sms::mur_len(RING_ELEMENTS)),
             mu: std::slice::from_raw_parts(SMS_MU.0.as_ptr() as *const u32, N),

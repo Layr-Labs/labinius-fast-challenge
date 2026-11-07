@@ -6,6 +6,7 @@
 use super::*;
 #[path="sms_lattice.rs"]mod lattice_code;
 use crate::simd::ntt::gen_small;
+#[path="sms_public_scale.rs"] mod public_scale;
 
 pub const P: u16 = 9721;
 pub const TAIL_MODULUS:u32=lattice_code::M as u32;
@@ -185,6 +186,9 @@ pub const LOCK_WORDS: usize = N * STREAMS * LOCK;
 /// The public data the commitment reads: the keys of all streams in the lockstep layout, the
 /// digit chunks' centered mean residues, and the total of the means.
 pub struct SmsKeys<'a> {
+    /// Empty for the generic eight-pair schedule; otherwise certified auxiliary
+    /// diagonal inverses, packed two NTT slots per entry, for sixteen-pair folds.
+    pub inverse: &'a [[i16; 16]],
     /// `pairs[(l * N + j) * STREAMS * LOCK + LOCK s + h]`: for lockstep step `l` (ring elements
     /// `2 LOCK l .. 2 LOCK (l + 1)` of every column), slot `j` and stream `s`, the dword of the
     /// stream's NTT-domain keys of ring elements `2 LOCK l + 2h` (low half) and `+ 1` (high half),
@@ -201,6 +205,7 @@ pub struct SmsKeys<'a> {
 
 /// Owned [`SmsKeys`] together with the statistical margin they were certified at.
 pub struct SmsKeyData {
+    pub inverse: Vec<[i16; 16]>,
     pub pairs: Vec<u32>,
     pub mur: Vec<i32>,
     pub mu: Vec<u32>,
@@ -213,7 +218,7 @@ pub struct SmsKeyData {
 
 impl SmsKeyData {
     pub fn keys(&self) -> SmsKeys<'_> {
-        SmsKeys { pairs: &self.pairs, mur: &self.mur, mu: &self.mu, elements: self.elements }
+        SmsKeys { inverse: &self.inverse, pairs: &self.pairs, mur: &self.mur, mu: &self.mu, elements: self.elements }
     }
 }
 
@@ -351,8 +356,9 @@ impl SmsKeyData {
             }
         }
         let mu=mu.into_iter().map(|v|v.rem_euclid(TAIL_MODULUS as i64) as u32).collect();
-        let mur = initial_bias_from_means(&mean_residues, elements);
-        SmsKeyData { pairs, mur, mu, elements, margin, margins }
+        let mut mur = initial_bias_from_means(&mean_residues, elements);
+        let inverse = public_scale::precondition(&mut pairs, &mut mur, elements);
+        SmsKeyData { inverse, pairs, mur, mu, elements, margin, margins }
     }
 }
 
@@ -436,9 +442,10 @@ const _: () = assert!(LOCK <= PP || PP == 8);
 /// The value stream `s` starts from so that its two-uop folds cancel by its next reset: `32768`
 /// per fold, modulo `P`. The base runs over the commitment range; each digit
 /// runs over its reconstruction chunk. `span` counts that range's pair batches.
-fn fold_bias(span: usize) -> i32 {
-    debug_assert!(span % FOLD_EVERY == 0);
-    ((span / FOLD_EVERY) as u64 * 32768 % P as u64) as i32
+fn fold_bias(span: usize) -> i32 { fold_bias_period(span, FOLD_EVERY) }
+fn fold_bias_period(span: usize, period: usize) -> i32 {
+    debug_assert!(span % period == 0);
+    ((span / period) as u64 * 32768 % P as u64) as i32
 }
 
 /// Every slot of stream `s` set to `v`.
@@ -452,7 +459,8 @@ unsafe fn fill_stream(a: &mut SAcc, s: usize, v: i32) {
 }
 
 /// The eight-batch lockstep sink:27-slot blocks are staged in L1 and the seven
-/// accumulators take all eight products in one read-modify-write, folded back when `RED`.
+/// accumulators take all eight products in one read-modify-write. Base folds at
+/// every call; `RED` also folds auxiliaries at their certified window boundary.
 ///
 /// `FIRST` starts auxiliary streams from their per-slot public bias. It cancels
 /// both the fold-back constants and the scaled NTT of the integer chunk mean.
@@ -515,9 +523,9 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             }
             if LOCK == 8 {
                 if RED && FIRST { call_first!(sms_slot8, reduce_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
-                else if FIRST { call_first!(sms_slot8, plain_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                else if FIRST { call_first!(sms_slot8, base_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
                 else if RED { call!(sms_slot8, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
-                else { call!(sms_slot8, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                else { call!(sms_slot8, base, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
             } else if LOCK == 16 {
                 call!(sms_slot16, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK,
                     x8 = 8 % LOCK, x9 = 9 % LOCK, x10 = 10 % LOCK, x11 = 11 % LOCK, x12 = 12 % LOCK, x13 = 13 % LOCK, x14 = 14 % LOCK, x15 = 15 % LOCK)
@@ -544,6 +552,31 @@ unsafe fn finish_stream(a: &mut SAcc, s: usize, out: &mut Batch32, half: usize) 
         let x0 = _mm512_load_si512(p.add(STREAMS * j));
         let x1 = _mm512_load_si512(p.add(STREAMS * (j + 1)));
         let packed = _mm512_packs_epi32(red_folded(x0), red_folded(x1));
+        let u = _mm512_permutexvar_epi64(perm, packed);
+        _mm256_storeu_si256(out.v[j].as_mut_ptr().add(l0) as *mut __m256i, _mm512_castsi512_si256(u));
+        _mm256_storeu_si256(out.v[j + 1].as_mut_ptr().add(l0) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(u));
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn finish_stream_preconditioned(keys: &SmsKeys, a: &mut SAcc, s: usize, out: &mut Batch32, half: usize) {
+    if keys.inverse.is_empty() { return finish_stream(a, s, out, half); }
+    let p = (a.v.as_mut_ptr() as *mut __m512i).add(s);
+    let perm = _mm512_loadu_si512(PAIR_PACK_PERM.as_ptr() as *const __m512i);
+    let l0 = 16 * half;
+    for k in 0..N / 2 {
+        let j = 2 * k;
+        let x0 = _mm512_load_si512(p.add(STREAMS * j));
+        let x1 = _mm512_load_si512(p.add(STREAMS * (j + 1)));
+        let packed = _mm512_packs_epi32(red_folded(x0), red_folded(x1));
+        // packs_epi32 interleaves four lanes from each of the two slots per
+        // 128-bit quarter. Repeat the corresponding public inverse pair four times.
+        let constants = &keys.inverse[(s - 1) * (N / 2) + k];
+        let cw = _mm512_broadcast_i32x4(_mm_loadu_si128(constants.as_ptr().cast()));
+        let cp = _mm512_broadcast_i32x4(_mm_loadu_si128(constants.as_ptr().add(8).cast()));
+        let m = _mm512_mullo_epi16(packed, cp);
+        let packed = _mm512_sub_epi16(_mm512_mulhi_epi16(packed, cw),
+            _mm512_mulhi_epi16(m, _mm512_set1_epi16(P as i16)));
         let u = _mm512_permutexvar_epi64(perm, packed);
         _mm256_storeu_si256(out.v[j].as_mut_ptr().add(l0) as *mut __m256i, _mm512_castsi512_si256(u));
         _mm256_storeu_si256(out.v[j + 1].as_mut_ptr().add(l0) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(u));
@@ -762,13 +795,14 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     assert!(range.start % (np / 2) == 0 && (span == np || span == np / 2), "whole halves of the column");
     static ZERO8: [B128; 8] = [B128::ZERO; 8];
     let kbase = keys.pairs.as_ptr();
+    let aux_period = if keys.inverse.is_empty() { PP } else { 2 * PP };
     // LOCK=8's FIRST sink broadcasts each digit's bias and overwrites all
     // digit accumulators before use. Only the base stream needs a fill here.
     // Other lock sizes and diagnostic modes retain their original initialization.
     let initial_streams = if LOCK == 8 && bench_mode() == 0 { 1 } else { STREAMS };
     for s in 0..initial_streams {
         // Stream 0 runs over the range; the digits' spans are whole chunks of it.
-        let b = if s == 0 { fold_bias(span) } else { fold_bias(CHUNK_PAIRS.min(hl)) };
+        let b = if s == 0 { fold_bias(span) } else { fold_bias_period(CHUNK_PAIRS.min(hl), aux_period) };
         fill_stream(&mut ws.acc[0], s, b);
     }
     // Each auxiliary stream starts at fold_bias - scaled_NTT(mean) for this chunk.
@@ -807,17 +841,17 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         } else if mode == 2 {
             let mut sk = Sink::<false> { k, acc, b: bias };
             for kk in 0..24 { vb::SliceSink::<LOCK>::rows(&mut sk, kk, core::array::from_fn(|h| w.add(32 * 27 * h) as *const i16), 0, 27); }
-        } else if first && ((b + LOCK) % PP == 0 || LOCK > PP) {
+        } else if first && (((b + LOCK) & (aux_period - 1)) == 0 || LOCK > PP) {
             vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<true, true> { k, acc, b: bias });
-            sync(b + LOCK);
         } else if first {
             vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<false, true> { k, acc, b: bias });
-        } else if (b + LOCK) % PP == 0 || LOCK > PP {
+        } else if ((b + LOCK) & (aux_period - 1)) == 0 || LOCK > PP {
             vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<true> { k, acc, b: bias });
-            sync(b + LOCK);
         } else {
             vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<false> { k, acc, b: bias });
         }
+        // Sharing progress remains eight pairs even when auxiliary folds span sixteen.
+        sync(b + LOCK);
         // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
         let (e, cph) = (b + LOCK, chunks_per_half(np));
         let (eh, local) = ((e - 1) / hl, e - (e - 1) / hl * hl);
@@ -826,8 +860,8 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
             bias = keys.mur.as_ptr().add((chunk + 1) * N * DIGITS);
             for d in (0..CHUNKED-1).step_by(2) {
                 let pd = &mut ws.pend[0];
-                finish_stream(&mut ws.acc[0], 1 + d, pd, 0);
-                finish_stream(&mut ws.acc[0], 2 + d, pd, 1);
+                finish_stream_preconditioned(keys, &mut ws.acc[0], 1 + d, pd, 0);
+                finish_stream_preconditioned(keys, &mut ws.acc[0], 2 + d, pd, 1);
                 pd.representation = Representation::Ntt;
                 gen_small::intt_sms_scaled_batch32_9721(pd);
                 reconstruct(pd, d, chunk, d+1, chunk, keys, &mut ws.total[0]);
@@ -1200,7 +1234,7 @@ mod tests {
 
     #[test]
     fn paired_inverse_banks_match_scalar_reconstruction(){
-        let elements=1024;let chunks=chunk_count(elements);let mut seed=0xa2e78139ca040d65;let mur=vec![0i32;mur_len(elements)];let means=[0u32;N];let keys=SmsKeys{pairs:&[],mur:&mur,mu:&means,elements};let mut batch=zeroed_slice::<Batch32>(1);let mut total=zeroed_slice::<Total>(1);
+        let elements=1024;let chunks=chunk_count(elements);let mut seed=0xa2e78139ca040d65;let mur=vec![0i32;mur_len(elements)];let means=[0u32;N];let keys=SmsKeys{inverse:&[],pairs:&[],mur:&mur,mu:&means,elements};let mut batch=zeroed_slice::<Batch32>(1);let mut total=zeroed_slice::<Total>(1);
         for row in &mut total[0].t{for v in row{*v=(xorshift(&mut seed)&65535)as i32;}}for row in &mut total[0].hi{for v in row{*v=(xorshift(&mut seed)%2001)as i32-1000;}}
         for c in 0..chunks{for d in (0..DIGITS-1).step_by(2){for row in &mut batch[0].v{for v in row{*v=(xorshift(&mut seed)%P as u64)as i16-(P/2)as i16;}}let before=total[0].t.to_vec();let high=total[0].hi.to_vec();unsafe{reconstruct(&batch[0],d,c,d+1,c,&keys,&mut total[0]);}
             for m in 0..N/2{for col in 0..16{let(mut lo,mut hi)=(before[m][col]as i64+65536*high[m][col]as i64,before[m+N/2][col]as i64+65536*high[m+N/2][col]as i64);for bank in 0..2{let digit=d+bank;let delta=|j:usize|batch[0].v[j][col+16*bank]as i64;let(x,y)=(delta(m),delta(m+N/2));let(u,v)=digit_weight(digit);lo+=x*u as i64-y*v as i64;hi+=x*v as i64+y*(u+v)as i64;}assert_eq!(total[0].t[m][col]as i64+65536*total[0].hi[m][col]as i64,lo);assert_eq!(total[0].t[m+N/2][col]as i64+65536*total[0].hi[m+N/2][col]as i64,hi);}}
@@ -1212,6 +1246,7 @@ mod tests {
     fn commitment_matches_reference() {
         commitment_matches_reference_at(512, 7.5); // exact chunk boundary
         commitment_matches_reference_at(640, 7.5); // full and short chunks in each half
+        commitment_matches_reference_at(544, 7.5); // generic fallback: last auxiliary window has eight pairs
         commitment_matches_reference_at(1024, 7.5); // multiple full chunks
     }
 
@@ -1221,6 +1256,7 @@ mod tests {
         let a: Vec<u128> = (0..elements * N).map(|_| ((xorshift(&mut s) as u128) << 64 | xorshift(&mut s) as u128) % MODULUS).collect();
         let data = SmsKeyData::build(&a, elements);
         eprintln!("margin {}", data.margin);
+        assert_eq!(data.inverse.is_empty(), elements % 64 != 0, "exercise the selected fold schedule");
         assert!(data.margin > floor);
         let len = 4 * elements;
         let words: Vec<B128> = (0..len * ncols).map(|_| B128(((xorshift(&mut s) as u128) << 64) | xorshift(&mut s) as u128)).collect();

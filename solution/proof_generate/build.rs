@@ -36,19 +36,20 @@ fn main() {
     std::fs::write(dir.join("key.bin"), image).expect("write the key image");
     std::fs::write(dir.join("tail-key.bin"), tail).expect("write the auxiliary key image");
     std::fs::write(dir.join("hybrid-key.bin"), hybrid).expect("write the arranged hybrid key image");
-    let (pairs, mur, mu) = sms_images();
+    let (pairs, mur, mu, inverse) = sms_images();
     std::fs::write(dir.join("sms-pairs.bin"), pairs).expect("write the single-transform key image");
     std::fs::write(dir.join("sms-mur.bin"), mur).expect("write the chunk mean image");
     std::fs::write(dir.join("sms-mu.bin"), mu).expect("write the mean total image");
+    std::fs::write(dir.join("sms-inverse.bin"), inverse).expect("write the public diagonal inverse image");
 }
 
 /// For the single-transform modulus: the seven streams' keys in the lockstep layout, the digit
 /// chunks' mean residues and the means' total (`labinius::simd::commit::sms::SmsKeyData`), with
 /// the reconstruction margin checked here, at build time, from the public matrix alone.
 #[cfg(target_arch = "x86_64")]
-fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
     if !host_can_run() || parameters::MODULUS != modulus_choice::SMS_MODULUS {
-        return (Vec::new(), Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     }
     let matrix = rq::ajtai_matrix(parameters::MODULUS, parameters::RING_ELEMENTS);
     let data = labinius::simd::commit::sms::SmsKeyData::build(&matrix, parameters::RING_ELEMENTS);
@@ -56,6 +57,7 @@ fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     for (d, m) in data.margins.iter().enumerate() {
         println!("cargo:warning=digit {d}: margin {:.3} at chunk {} coefficient {} |mean| {}", m.0, m.1, m.2, m.3);
     }
+    println!("cargo:warning=public auxiliary diagonal inverse pairs {}", data.inverse.len());
     // Public lattice coefficient banks: certify every public chunk, digit and coefficient.
     // No instance data enters the key image or this reconstruction-margin check.
     assert!(data.margin >= 7.5, "the public matrix leaves too small a reconstruction margin");
@@ -63,12 +65,13 @@ fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         data.pairs.iter().flat_map(|w| w.to_le_bytes()).collect(),
         data.mur.iter().flat_map(|w| w.to_le_bytes()).collect(),
         data.mu.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        data.inverse.iter().flatten().flat_map(|w| w.to_le_bytes()).collect(),
     )
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    (Vec::new(), Vec::new(), Vec::new())
+fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    (Vec::new(), Vec::new(), Vec::new(), Vec::new())
 }
 
 #[cfg(target_arch = "x86_64")]

@@ -1551,3 +1551,4 @@ pub unsafe fn ntt_bin_batch32_pair<const Q: u16>(
 }
 
 include!("twiddle_expanded.rs");
+include!("source_batched.rs");

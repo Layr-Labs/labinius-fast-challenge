@@ -85,7 +85,7 @@ impl Prepared {
         let ratios = r.iter().zip(&inverses).map(|(&x, &d)| x * d).collect();
         let scale = r[..prefix].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
         let eq = EqFactors::new(&r[prefix..], scale);
-        let parts = par::workers(words.len(), 1 << 16).min(eq.len() / 8);
+        let parts = (2 * par::workers(words.len(), 1 << 16)).min(eq.len() / 8);
         let parts = par::map_blocks(eq.len(), parts, 64.min(eq.len()), |_, start, end| {
             neon::partial_evals_sets_tiled(words, eq.len(), start, end, |base, tile| eq.fill(base, tile))
         });

@@ -1113,9 +1113,9 @@ pub mod neon {
     /// Entries of a subtree: lists run in subtrees of eight, the last one padded.
     const SUB: usize = 8;
     /// Counter bits kept in registers during a pair's pass.
-    const LO: usize = 5;
+    const LO: usize = 6;
     /// Counter bits above them, in memory: counts stay below `2^15`.
-    const HI: usize = 10;
+    const HI: usize = 9;
     /// Planes added to every offset so that it is non-negative (positions are below 162).
     const BIAS_PLANES: usize = 160;
     const _: () = assert!(16 * (GUARD + (GROUP - 1) * STRIDE + BIAS_PLANES + WORD_BITS) <= u16::MAX as usize);
@@ -1393,42 +1393,33 @@ pub mod neon {
         t
     }
 
-    /// A full adder of `s` and two planes: the new sum in `s`, the carry returned. With `NEG`
-    /// the planes stand for their complements and the *complement* of the carry is returned.
+    /// A full adder of `s` and two planes: the new sum in `s`, the carry returned. On
+    /// complemented planes and a complemented `s` it computes the complemented sum and carry
+    /// (see [`pass`]).
     ///
     /// Three plain ops in an asm block: `t = a ^ b` (into `b`), the carry `BIT(a, s, t)` (into
     /// `a`, so no register copies) and `s ^= t`. Written as intrinsics, LLVM reassociates the
     /// chain of `s ^= t` into `EOR3`s, which Neoverse V2 issues on one pipe only.
     #[inline(always)]
-    unsafe fn fa<const NEG: bool>(s: &mut V, mut a: V, b: V) -> V {
-        if NEG {
-            core::arch::asm!(
-                "eor {b:v}.16b, {a:v}.16b, {b:v}.16b",
-                "eor {s:v}.16b, {s:v}.16b, {b:v}.16b",
-                "bit {a:v}.16b, {s:v}.16b, {b:v}.16b",
-                a = inout(vreg) a, b = inout(vreg) b => _, s = inout(vreg) *s,
-                options(pure, nomem, nostack, preserves_flags)
-            );
-        } else {
-            core::arch::asm!(
-                "eor {b:v}.16b, {a:v}.16b, {b:v}.16b",
-                "bit {a:v}.16b, {s:v}.16b, {b:v}.16b",
-                "eor {s:v}.16b, {s:v}.16b, {b:v}.16b",
-                a = inout(vreg) a, b = inout(vreg) b => _, s = inout(vreg) *s,
-                options(pure, nomem, nostack, preserves_flags)
-            );
-        }
+    unsafe fn fa(s: &mut V, mut a: V, b: V) -> V {
+        core::arch::asm!(
+            "eor {b:v}.16b, {a:v}.16b, {b:v}.16b",
+            "bit {a:v}.16b, {s:v}.16b, {b:v}.16b",
+            "eor {s:v}.16b, {s:v}.16b, {b:v}.16b",
+            a = inout(vreg) a, b = inout(vreg) b => _, s = inout(vreg) *s,
+            options(pure, nomem, nostack, preserves_flags)
+        );
         a
     }
 
-    /// Bits of the register counter `h` above the `LO` bits (weights `2^5 .. 2^8`), added into
+    /// Bits of the register counter `h` above the `LO` bits (weights `2^6 .. 2^8`), added into
     /// the memory bits at the end of a pass, or within it once the trees have added
     /// `H_MAX - 1` carries.
-    const HB: usize = 4;
-    /// Carries of weight 32 that `h` holds.
+    const HB: usize = 3;
+    /// Carries of weight 64 that `h` holds.
     const H_MAX: usize = (1 << HB) - 1;
 
-    /// `hi += h`: the four-bit counter `h` (weights `2^5 .. 2^8`) into the ten upper counter
+    /// `hi += h`: the three-bit counter `h` (weights `2^6 .. 2^8`) into the nine upper counter
     /// bits at `p`.
     #[inline(always)]
     unsafe fn flush(p: *mut V, h: &[V; HB]) {
@@ -1474,6 +1465,8 @@ pub mod neon {
         let ones = vdupq_n_u8(0xFF);
         let mut s0: [V; LO] = core::array::from_fn(|b| *lo.add(b));
         let mut s1: [V; LO] = core::array::from_fn(|b| *lo.add(LO + b));
+        // The second bit-0 counters of the two slots, zero at the pass's start.
+        let (mut r0, mut r1) = (z, z);
         let mut h0 = [z; HB];
         let mut h1 = [z; HB];
         // Carries in `h`: the trees' carries flush it at `H_MAX - 1`, which leaves room for
@@ -1496,20 +1489,27 @@ pub mod neon {
         }
         macro_rules! two {
             ($off:expr, $neg:literal) => {{
-                let o0 = *t.add($off) as usize;
-                let o1 = *t.add($off + 1) as usize;
+                // Four offsets per 64-bit load (one per four entries), split with shifts.
+                let w = (t.add($off & !3) as *const u64).read_unaligned();
+                let o0 = (w >> (16 * ($off % 4))) as u16 as usize;
+                let o1 = (w >> (16 * ($off % 4 + 1))) as u16 as usize;
                 let a0 = vld1q_u8(be.add(o0));
                 let a1 = vld1q_u8(bo.add(o0));
                 let b0 = vld1q_u8(be.add(o1));
                 let b1 = vld1q_u8(bo.add(o1));
-                (fa::<$neg>(&mut s0[0], a0, b0), fa::<$neg>(&mut s1[0], a1, b1))
+                // Alternate leaf pairs go to a second bit-0 counter, halving that chain.
+                if ($off / 2) % 2 == 0 {
+                    (fa(&mut s0[0], a0, b0), fa(&mut s1[0], a1, b1))
+                } else {
+                    (fa(&mut r0, a0, b0), fa(&mut r1, a1, b1))
+                }
             }};
         }
         macro_rules! level {
             ($bit:literal, $lower:ident, $off:expr, $neg:literal) => {{
                 let (x0, x1) = $lower!($off, $neg);
                 let (y0, y1) = $lower!($off + (1 << $bit), $neg);
-                (fa::<$neg>(&mut s0[$bit], x0, y0), fa::<$neg>(&mut s1[$bit], x1, y1))
+                (fa(&mut s0[$bit], x0, y0), fa(&mut s1[$bit], x1, y1))
             }};
         }
         macro_rules! four { ($off:expr, $neg:literal) => { level!(1, two, $off, $neg) }; }
@@ -1522,34 +1522,69 @@ pub mod neon {
         }
         // A list: subtrees of eight, their carries paired at bits 3 and 4 (`p3`, `p4` hold the
         // one waiting, or nothing: zero, all-ones for the complemented carries of `NEG`).
+        // A weight-32 carry (true value) into counter bit 5, its carry (weight 64) into `h`. In
+        // the negative list bit 5 is held complemented: `S ^ e` stays the complemented sum and
+        // the true carry is `e & ~S`.
+        macro_rules! half5 {
+            ($e0:expr, $e1:expr, $neg:literal) => {{
+                let (e0, e1) = ($e0, $e1);
+                let (c0, c1) = if $neg {
+                    (vbicq_u8(e0, s0[5]), vbicq_u8(e1, s1[5]))
+                } else {
+                    (vandq_u8(e0, s0[5]), vandq_u8(e1, s1[5]))
+                };
+                s0[5] = veorq_u8(s0[5], e0);
+                s1[5] = veorq_u8(s1[5], e1);
+                add_h!(c0, c1);
+            }};
+        }
         macro_rules! entries {
             ($list:expr, $n8:expr, $tail:expr, $neg:literal) => {{
                 let none = if $neg { ones } else { z };
                 let (mut p30, mut p31) = (none, none);
                 let (mut p40, mut p41) = (none, none);
                 t = $list;
-                // Whole 32-entry trees, one branch each.
-                for _ in 0..$n8 / 4 {
-                    let (a0, a1) = eight!(0, $neg);
-                    let (b0, b1) = eight!(SUB, $neg);
-                    let d0 = fa::<$neg>(&mut s0[3], a0, b0);
-                    let d1 = fa::<$neg>(&mut s1[3], a1, b1);
-                    let (a0, a1) = eight!(2 * SUB, $neg);
-                    let (b0, b1) = eight!(3 * SUB, $neg);
-                    let f0 = fa::<$neg>(&mut s0[3], a0, b0);
-                    let f1 = fa::<$neg>(&mut s1[3], a1, b1);
-                    let e0 = fa::<$neg>(&mut s0[4], d0, f0);
-                    let e1 = fa::<$neg>(&mut s1[4], d1, f1);
-                    add_h!(fix!(e0, $neg), fix!(e1, $neg));
-                    t = t.add(4 * SUB);
-                    hn += 1;
-                    if hn >= H_MAX - 1 {
-                        flush(hi, &h0);
-                        flush(hi.add(HI), &h1);
-                        h0 = [z; HB];
-                        h1 = [z; HB];
-                        hn = 0;
-                    }
+                // Whole 32-entry trees in pairs: their weight-32 carries meet in counter bit 5,
+                // whose carry (weight 64) goes into `h`.
+                macro_rules! tree32 {
+                    () => {{
+                        let (a0, a1) = eight!(0, $neg);
+                        let (b0, b1) = eight!(SUB, $neg);
+                        let d0 = fa(&mut s0[3], a0, b0);
+                        let d1 = fa(&mut s1[3], a1, b1);
+                        let (a0, a1) = eight!(2 * SUB, $neg);
+                        let (b0, b1) = eight!(3 * SUB, $neg);
+                        let f0 = fa(&mut s0[3], a0, b0);
+                        let f1 = fa(&mut s1[3], a1, b1);
+                        let e = (fa(&mut s0[4], d0, f0), fa(&mut s1[4], d1, f1));
+                        t = t.add(4 * SUB);
+                        e
+                    }};
+                }
+                macro_rules! check_h {
+                    () => {{
+                        hn += 1;
+                        if hn >= H_MAX - 1 {
+                            flush(hi, &h0);
+                            flush(hi.add(HI), &h1);
+                            h0 = [z; HB];
+                            h1 = [z; HB];
+                            hn = 0;
+                        }
+                    }};
+                }
+                for _ in 0..$n8 / 8 {
+                    let (x0, x1) = tree32!();
+                    let (y0, y1) = tree32!();
+                    let c0 = fa(&mut s0[5], x0, y0);
+                    let c1 = fa(&mut s1[5], x1, y1);
+                    add_h!(fix!(c0, $neg), fix!(c1, $neg));
+                    check_h!();
+                }
+                if ($n8 / 4) % 2 == 1 {
+                    let (e0, e1) = tree32!();
+                    half5!(fix!(e0, $neg), fix!(e1, $neg), $neg);
+                    check_h!();
                 }
                 // Up to three more subtrees of eight.
                 let left = $n8 % 4;
@@ -1559,8 +1594,8 @@ pub mod neon {
                     if left != 1 {
                         let (c0, c1) = eight!(0, $neg);
                         t = t.add(SUB);
-                        p40 = fa::<$neg>(&mut s0[3], p30, c0);
-                        p41 = fa::<$neg>(&mut s1[3], p31, c1);
+                        p40 = fa(&mut s0[3], p30, c0);
+                        p41 = fa(&mut s1[3], p31, c1);
                         (p30, p31) = (none, none);
                         if left != 2 {
                             (p30, p31) = eight!(0, $neg);
@@ -1570,16 +1605,49 @@ pub mod neon {
                 // The tail, and whatever waits at bits 3 and 4, into `h`.
                 t = $tail.as_ptr();
                 let (c0, c1) = eight!(0, $neg);
-                let d0 = fa::<$neg>(&mut s0[3], p30, c0);
-                let d1 = fa::<$neg>(&mut s1[3], p31, c1);
-                let e0 = fa::<$neg>(&mut s0[4], p40, d0);
-                let e1 = fa::<$neg>(&mut s1[4], p41, d1);
-                add_h!(fix!(e0, $neg), fix!(e1, $neg));
+                let d0 = fa(&mut s0[3], p30, c0);
+                let d1 = fa(&mut s1[3], p31, c1);
+                let e0 = fa(&mut s0[4], p40, d0);
+                let e1 = fa(&mut s1[4], p41, d1);
+                half5!(fix!(e0, $neg), fix!(e1, $neg), $neg);
                 hn += 1;
             }};
         }
         entries!(pos, pos8, tail[0], false);
+        // The negative list's planes stand for complements, and so do its carries. With the
+        // counter bits complemented too, the positive full adder is exact for it: for
+        // `t = a ^ b` it returns `t ? ~s : ~a = ~(t ? s : a)` as the carry and `~s ^ t = ~(s ^ t)`
+        // as the sum. The carry does not wait for the new sum, which shortens the
+        // dependency chain of every full adder of the list.
+        for b in 0..LO {
+            s0[b] = vmvnq_u8(s0[b]);
+            s1[b] = vmvnq_u8(s1[b]);
+        }
+        (r0, r1) = (vmvnq_u8(r0), vmvnq_u8(r1));
         entries!(neg, neg8, tail[1], true);
+        for b in 0..LO {
+            s0[b] = vmvnq_u8(s0[b]);
+            s1[b] = vmvnq_u8(s1[b]);
+        }
+        (r0, r1) = (vmvnq_u8(r0), vmvnq_u8(r1));
+        // The second bit-0 counters into the first: a ripple through the `LO` bits, the carry
+        // out of the top into `h`.
+        let (mut c0, mut c1) = (r0, r1);
+        for b in 0..LO {
+            let (u0, u1) = (vandq_u8(s0[b], c0), vandq_u8(s1[b], c1));
+            s0[b] = veorq_u8(s0[b], c0);
+            s1[b] = veorq_u8(s1[b], c1);
+            (c0, c1) = (u0, u1);
+        }
+        if hn >= H_MAX {
+            flush(hi, &h0);
+            flush(hi.add(HI), &h1);
+            h0 = [z; HB];
+            h1 = [z; HB];
+            hn = 0;
+        }
+        add_h!(c0, c1);
+        hn += 1;
         debug_assert!(hn <= H_MAX);
         flush(hi, &h0);
         flush(hi.add(HI), &h1);

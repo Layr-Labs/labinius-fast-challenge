@@ -124,6 +124,8 @@ impl Drop for Mapped {
     }
 }
 const CHUNK: usize = 2 << 20;
+/// Write the proof with parallel `pwrite`s instead of through a shared file mapping.
+const PWRITE: bool = true;
 
 struct State {
     path: String,
@@ -180,7 +182,9 @@ impl Output {
         let worker = Arc::downgrade(&state);
         // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
         let setup = std::thread::spawn(move || {
-            if let Some(state) = worker.upgrade() { let _ = state.mapped(); }
+            if !PWRITE {
+                if let Some(state) = worker.upgrade() { let _ = state.mapped(); }
+            }
             labinius::challenge::warm();
             for offset in (0..bytes).step_by(4096) {
                 unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
@@ -213,6 +217,24 @@ impl Output {
     pub fn write(&self, p: &ProofParts) {
         self.quiesce();
         let layout = Layout::parts(p);
+        if PWRITE {
+            // Encode into anonymous memory (huge pages, few faults), then let eight threads
+            // copy their eighths into the file: the kernel fills page-cache pages in batches
+            // instead of taking one fault per 4 KiB page of a shared mapping.
+            use std::os::unix::fs::FileExt;
+            let bytes = encode_vec(p);
+            let file = std::fs::OpenOptions::new().write(true).create(true).truncate(true)
+                .open(&self.state.path).expect("open the proof file");
+            let per = bytes.len().div_ceil(par::threads()).next_multiple_of(4096);
+            std::thread::scope(|scope| {
+                for (i, chunk) in bytes.chunks(per).enumerate() {
+                    let file = &file;
+                    scope.spawn(move || file.write_all_at(chunk, (i * per) as u64).expect("write proof"));
+                }
+            });
+            std::mem::forget(bytes);
+            return;
+        }
         if layout == self.state.layout {
             if let Some(map) = self.state.mapped() {
                 unsafe { encode_into(p, layout, map.addr as *mut u8); }

@@ -627,6 +627,66 @@ const fn skip_lut5(n: usize) -> bool {
     MASK >> n & 1 != 0
 }
 
+/// Level-5 nodes whose level-6 butterfly needs no first-input reduction after the 9721 LUT front,
+/// on top of [`skip_lut5`]: found by a greedy search over the same exact intervals, and proven
+/// for all admissible nibble patterns by `lazy_lut_intervals`. Their outputs stay within `i16`,
+/// not within the worst-case [`super::lut_transform_bound`], which is why `ntt_sms` bounds its
+/// products by `i16::MAX`.
+const SKIP_LUT6: [u64; 4] = {
+    const NODES: [usize; 45] = [
+        13, 20, 21, 22, 23, 26, 27, 28, 32, 38, 41, 55, 56, 72, 73, 89, 100, 115, 119, 120, 122, 123, 125,
+        127, 130, 140, 156, 159, 160, 161, 167, 171, 172, 174, 181, 182, 192, 193, 194, 198, 199, 204, 207,
+        208, 209,
+    ];
+    let mut mask = [0u64; 4];
+    let mut i = 0;
+    while i < NODES.len() {
+        mask[NODES[i] / 64] |= 1 << (NODES[i] % 64);
+        i += 1;
+    }
+    mask
+};
+#[inline(always)]
+const fn skip_lut6(n: usize) -> bool {
+    SKIP_LUT6[n / 64] >> (n % 64) & 1 != 0
+}
+
+/// One level-6 group after the 9721 LUT front; `R0` and `R1` say which first inputs are reduced.
+#[inline(always)]
+unsafe fn lut6_group<const R0: bool, const R1: bool>(x: &[int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, q: usize) -> [int16x8_t; 6] {
+    let t = vld1q_s16(kern.d[q].as_ptr());
+    let mut v: [int16x8_t; 6] = core::array::from_fn(|i| load(x, 6 * q + i));
+    if R0 {
+        v[0] = vmlsq_laneq_s16::<0>(v[0], vrshrq_n_s16::<13>(v[0]), k);
+    }
+    if R1 {
+        v[3] = vmlsq_laneq_s16::<0>(v[3], vrshrq_n_s16::<13>(v[3]), k);
+    }
+    let (y0, y1, y2) = r3!(s, 0, 1, 2, 3, v[0], v[1], v[2], t, k);
+    let (y3, y4, y5) = r3!(s, 4, 5, 6, 7, v[3], v[4], v[5], t, k);
+    [y0, y1, y2, y3, y4, y5]
+}
+
+/// Level 6 after the 9721 LUT front, fully unrolled: three groups per step as in the generic loop,
+/// with each group's two reduction choices fixed at compile time from [`skip_lut6`], so the
+/// skipped reductions cost neither a branch nor a table load.
+macro_rules! lut6_unrolled {
+    ($x:ident, $s:ident, $kern:ident, $k:ident; $($a:literal $b:literal $c:literal),*) => {
+        $({
+            let ys = [
+                lut6_group::<{ !skip_lut6(2 * $a) }, { !skip_lut6(2 * $a + 1) }>($x, $s, $kern, $k, $a),
+                lut6_group::<{ !skip_lut6(2 * $b) }, { !skip_lut6(2 * $b + 1) }>($x, $s, $kern, $k, $b),
+                lut6_group::<{ !skip_lut6(2 * $c) }, { !skip_lut6(2 * $c + 1) }>($x, $s, $kern, $k, $c),
+            ];
+            for (d, y) in ys.iter().enumerate() {
+                for (i, &v) in y.iter().enumerate() {
+                    store($x, 6 * ($a + d) + i, v);
+                }
+            }
+        })*
+    };
+}
+
 /// Levels 4 and 5: per level-3 node (27 slots) and `j < 3`, the nine slots `j + 3 i`. All three
 /// `j` of a node in one block (arm-big): nine independent butterflies per level.
 /// `S == 4` uses prime 9721's table-front intervals to omit 99 first-input reductions.
@@ -739,9 +799,14 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
     row: &[i16],
     acc: &mut [int32x4_t],
 ) {
-    let s: Schedule = schedule(S);
+    let s: Schedule = schedule(if S == 4 { 1 } else { S });
     let k = vld1q_s16(kern.k.as_ptr());
     debug_assert!(!MAC || (row.len() == ROW && acc.len() == 2 * N));
+    if S == 4 {
+        debug_assert!(!MAC);
+        lut6_unrolled!(x, s, kern, k; 0 1 2, 3 4 5, 6 7 8, 9 10 11, 12 13 14, 15 16 17, 18 19 20, 21 22 23, 24 25 26, 27 28 29, 30 31 32, 33 34 35, 36 37 38, 39 40 41, 42 43 44, 45 46 47, 48 49 50, 51 52 53, 54 55 56, 57 58 59, 60 61 62, 63 64 65, 66 67 68, 69 70 71, 72 73 74, 75 76 77, 78 79 80, 81 82 83, 84 85 86, 87 88 89, 90 91 92, 93 94 95, 96 97 98, 99 100 101, 102 103 104, 105 106 107);
+        return;
+    }
     #[inline(always)]
     unsafe fn compute(x: &[int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, q: usize) -> [int16x8_t; 6] {
         let t = vld1q_s16(kern.d[q].as_ptr());
@@ -1473,14 +1538,12 @@ mod tests {
                 for (i, a) in pos.into_iter().zip(r3(v, t, k)) { x[i] = a; }
             }
         }
-        let bound = super::super::lut_transform_bound(9721, SCHEDULES[1]) as i32;
+        // Level 6: the lanes only have to stay within i16, which `r3` checks at every step.
         for n in 0..216 {
             let mut v = core::array::from_fn(|i| x[3 * n + i]);
-            v[0] = red(v[0]);
+            if !skip_lut6(n) { v[0] = red(v[0]); }
             let t = &k.d[n / 2][4 * (n % 2)..];
-            for a in r3(v, t, k) {
-                assert!(a.0 >= -bound && a.1 <= bound, "final {a:?} bound {bound}");
-            }
+            r3(v, t, k);
         }
     }
 

@@ -58,7 +58,8 @@ const TERMS: i64 = 836;
 const _: () = assert!((CHUNK as i64) * TERMS * (lattice::MAX_DIGIT_ABS as i64) * 4 < i32::MAX as i64);
 
 /// The SMS matrix: in the transform domain, slot `j` of row `r` of element `m` is
-/// `data[(((m / 8) N + j) ROWS + r) 8 + m % 8]`, centered residues, so that one vector holds the
+/// `data[((((m / SWEEP) N + j) SINK + (m % SWEEP) / LOCK) ROWS + r) LOCK + m % LOCK]`,
+/// centered residues, so that one vector holds the
 /// eight elements of a tile, each residue negated because the forward kernel transforms `-s` and
 /// multiplied by [`KEY_SCALE`] `= 324^-1` so that the inverses need no `1 / r`; per chunk and digit
 /// the centered residue
@@ -138,7 +139,7 @@ impl SmsMatrix {
     pub fn from_images(data: &'static [u8], means: &'static [u8], mu: &'static [u8], meta: &'static [u8], elements: usize) -> Option<SmsMatrix> {
         let chunks = elements.div_ceil(CHUNK);
         let data = key_copy(data).unwrap_or(data);
-        let data = view::<i16>(data, ROWS * elements.div_ceil(LOCK) * LOCK * N)?;
+        let data = view::<i16>(data, ROWS * elements.div_ceil(SWEEP) * SWEEP * N)?;
         let mean_residues = view::<i16>(means, chunks * DIGITS * N)?;
         let mu = view::<u32>(mu, N)?;
         if meta.len() != 16 {
@@ -306,6 +307,17 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
             }
         }
     });
+    // Keep every slot's key tiles consecutive within a sweep. The runtime sink
+    // visits one slot across all tiles before advancing to the next slot.
+    let mut packed = vec![0i16; elements.div_ceil(SWEEP) * SWEEP * N * ROWS];
+    for g in 0..elements.div_ceil(LOCK) {
+        for s in 0..N {
+            let source = (g * N + s) * ROWS * LOCK;
+            let dest = ((g / SINK * N + s) * SINK + g % SINK) * ROWS * LOCK;
+            packed[dest..dest + ROWS * LOCK].copy_from_slice(&data[source..source + ROWS * LOCK]);
+        }
+    }
+    let data = packed;
     use std::borrow::Cow::Owned;
     SmsMatrix { elements, data: Owned(data), mean_residues: Owned(mean_residues), mu: Owned(mu), margin, column_failure }
 }
@@ -475,7 +487,7 @@ macro_rules! slot_sink_body {
 /// The register-resident sink for one slot (from 4381e86b's `sve::slot_sink`, after arm-big's
 /// `slot_chunk`): `acc(s, r) +=` the slot's products summed over `groups` key tiles (eight
 /// elements each) of transforms starting at `z` (transform stride `XS`, the [`pass_words`] lane
-/// order), keys starting at `k` (tile stride `KS`). Rows 0-3, then rows 4-6, keep their sums in
+/// order), keys starting at `k` (contiguous tile stride `KS`). Rows 0-3, then rows 4-6, keep their sums in
 /// v16-v31 across all the tiles: one load and one store per sum per sweep. The key halves are
 /// `sdot`'s indexed operand exactly as in [`dot`]: transforms `0..4` of a tile with key elements
 /// `0..4` (`[0]`), transforms `4..8` with `4..8` (`[1]`). `groups >= 1`.
@@ -483,7 +495,7 @@ macro_rules! slot_sink_body {
 #[inline(never)]
 unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
     const XS: usize = N * 16;
-    const KS: usize = N * ROWS * LOCK * 2;
+    const KS: usize = ROWS * LOCK * 2;
     debug_assert!((1..=SINK).contains(&groups));
     slot_sink_body!(acc, z, k, groups, ["ldp q20, q21, [{a}, #64]", "ldp q22, q23, [{a}, #96]", "ldp q24, q25, [{a}, #128]", "ldp q26, q27, [{a}, #160]", "ldp q28, q29, [{a}, #192]", "ldp q30, q31, [{a}, #224]"], ["ldp q16, q17, [{a}, #256]", "ldp q18, q19, [{a}, #288]", "ldp q20, q21, [{a}, #320]", "ldp q22, q23, [{a}, #352]", "ldp q24, q25, [{a}, #384]", "ldp q26, q27, [{a}, #416]"]);
 }
@@ -495,13 +507,13 @@ unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, gro
 #[inline(never)]
 unsafe fn slot_sink_fresh(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
     const XS: usize = N * 16;
-    const KS: usize = N * ROWS * LOCK * 2;
+    const KS: usize = ROWS * LOCK * 2;
     debug_assert!((1..=SINK).contains(&groups));
     slot_sink_body!(acc, z, k, groups, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
 }
 
 /// `acc +=` the products of the first `groups` tiles of `xs` (transforms `8 g..8 g + 8` of tile
-/// `g`) with the key tiles at `keys` (`N ROWS LOCK` entries apart), every slot and row; the sums of
+/// `g`) with the key tiles at `keys` (`ROWS LOCK` entries apart for a fixed slot), every slot and row; the sums of
 /// [`dot`] per tile, in another order. A tile past the column's end has zero keys. With `FRESH` (a
 /// chunk's first sweep) the digit rows' sums are overwritten instead of added to, so the chunk end
 /// needs no zeroing pass; the base row always accumulates.
@@ -514,16 +526,16 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
         let z = xs.as_ptr() as *const int16x8_t;
         for s in 0..N {
             if FRESH {
-                slot_sink_fresh(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+                slot_sink_fresh(z.add(s), keys.add(s * SINK * ROWS * LOCK), accp.add(idx(s, 0)), groups);
             } else {
-                slot_sink(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+                slot_sink(z.add(s), keys.add(s * SINK * ROWS * LOCK), accp.add(idx(s, 0)), groups);
             }
         }
     }
     #[cfg(not(target_feature = "sve"))]
-    for g in 0..groups {
-        let tile = keys.add(g * N * ROWS * LOCK);
-        for s in 0..N {
+    for s in 0..N {
+        for g in 0..groups {
+            let tile = keys.add((s * SINK + g) * ROWS * LOCK);
             let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *xs[LOCK * g + i].get_unchecked(s));
             let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
             for r in 0..ROWS {
@@ -532,7 +544,7 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
                         *accp.add(idx(s, r) + q) = vdupq_n_s64(0);
                     }
                 }
-                dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
+                dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add(r * LOCK)));
             }
         }
     }
@@ -667,7 +679,7 @@ unsafe fn sums(
                 pass_c::<4>(x, kern);
                 pass_d::<PB, false>(x, kern, &[], &mut []);
             }
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            let keys = a.data.as_ptr().add(e / SWEEP * N * ROWS * SWEEP);
             // the chunk's first sweep starts the digit rows' sums afresh
             if e % CHUNK == 0 {
                 sink::<true>(xs, keys, acc, groups);
@@ -918,6 +930,51 @@ mod tests {
         }
     }
 
+    /// Pin the packed key addressing against an independent scalar dot product,
+    /// including partial sweeps, both accumulator modes, and arbitrary i16 inputs.
+    #[test]
+    fn packed_sink_matches_scalar() {
+        let mut state = 91u64;
+        let mut next = || crate::ntt::tests::xorshift(&mut state);
+        let mut xs = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
+        for x in xs.iter_mut().flatten() {
+            let lanes: [i16; 8] = core::array::from_fn(|_| next() as i16);
+            *x = unsafe { vld1q_s16(lanes.as_ptr()) };
+        }
+        let keys: Vec<i16> = (0..SINK * N * ROWS * LOCK)
+            .map(|_| (next() % P1 as u64) as i16 - (P1 / 2) as i16).collect();
+        let initial: Vec<[i64; 2]> = (0..ROWS * 4 * N)
+            .map(|_| core::array::from_fn(|_| (next() >> 24) as i64 - (1 << 39))).collect();
+        for groups in [1, 2, 3, 7, SINK] {
+            for fresh in [false, true] {
+                let mut acc: Vec<int64x2_t> = initial.iter()
+                    .map(|v| unsafe { vld1q_s64(v.as_ptr()) }).collect();
+                unsafe {
+                    if fresh { sink::<true>(&xs, keys.as_ptr(), &mut acc, groups); }
+                    else { sink::<false>(&xs, keys.as_ptr(), &mut acc, groups); }
+                }
+                for s in [0, 1, 143, 323, N - 1] {
+                    for row in 0..ROWS {
+                        for col in 0..LANES {
+                            let at = idx(s, row) + col / 2;
+                            let mut want = if fresh && row > 0 { 0 } else { initial[at][col % 2] };
+                            for g in 0..groups {
+                                for e in 0..LOCK {
+                                    let t = g * LOCK + 4 * (e / 4) + col / 2;
+                                    let v: [i16; 8] = unsafe { core::mem::transmute(xs[t][s]) };
+                                    let key = keys[((s * SINK + g) * ROWS + row) * LOCK + e];
+                                    want += v[4 * (col % 2) + e % 4] as i64 * key as i64;
+                                }
+                            }
+                            let got: [i64; 2] = unsafe { core::mem::transmute(acc[at]) };
+                            assert_eq!(got[col % 2], want, "groups {groups} fresh {fresh} slot {s} row {row} column {col}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A fresh sweep ([`sink`]`::<true>`) over accumulators holding garbage in the digit rows equals
     /// an accumulating sweep over the same accumulators with those rows zeroed, bit for bit, and the
     /// base row accumulates in both: one to four tiles, random keys and transforms.
@@ -928,7 +985,7 @@ mod tests {
         let mut next = move || crate::ntt::tests::xorshift(&mut state);
         let mut xs = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
         for groups in 1..=SINK {
-            let keys: Vec<i16> = (0..groups * N * ROWS * LOCK).map(|_| ((next() % 9721) as i64 - 4860) as i16).collect();
+            let keys: Vec<i16> = (0..SINK * N * ROWS * LOCK).map(|_| ((next() % 9721) as i64 - 4860) as i16).collect();
             for x in xs.iter_mut().flatten() {
                 let v: [i16; 8] = core::array::from_fn(|_| next() as i16);
                 *x = unsafe { vld1q_s16(v.as_ptr()) };
@@ -990,7 +1047,7 @@ mod tests {
             let mut new_acc = old_acc.clone();
             for sweep in 0..=CHUNK / SWEEP {
                 let groups = if sweep < CHUNK / SWEEP { SINK } else { 1 + case };
-                let old: Vec<i16> = (0..groups * N * ROWS * LOCK)
+                let old: Vec<i16> = (0..SINK * N * ROWS * LOCK)
                     .map(|_| match case {
                         1 => if next() & 1 == 0 { h as i16 } else { -h as i16 },
                         _ => ((next() % (2 * h as u64 + 1)) as i64 - h) as i16,

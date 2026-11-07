@@ -527,23 +527,9 @@ unsafe fn lookup_pass(tabs: &[[uint8x16_t; 256]], pats: &[[u8; 128]; PASS], sum:
 #[inline(always)]
 unsafe fn lookup_one<const KK: u32>(t: &[*const uint8x16_t; PASS], idx: &[u64; PASS], s: &mut uint8x16_t) {
     let v = |x: usize| *t[x].add(((idx[x] >> (8 * KK)) & 0xff) as usize);
-    // Two three-input `EOR3`s (one per cycle on Neoverse V2, on one pipe) and four plain `EOR`s
-    // instead of eight `EOR`s: fewer instructions in a loop that is issue-bound.
-    let a = eor3(v(0), v(1), v(2));
-    let b = eor3(v(3), v(4), v(5));
-    let c = eor_plain(v(6), v(7));
-    *s = eor_plain(*s, eor_plain(eor_plain(a, b), c));
-}
-
-/// `a ^ b ^ c` as one `EOR3`.
-#[inline(always)]
-unsafe fn eor3(mut a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> uint8x16_t {
-    core::arch::asm!(
-        "eor3 {a:v}.16b, {a:v}.16b, {b:v}.16b, {c:v}.16b",
-        a = inout(vreg) a, b = in(vreg) b, c = in(vreg) c,
-        options(pure, nomem, nostack, preserves_flags)
-    );
-    a
+    let a = eor_plain(eor_plain(v(0), v(1)), eor_plain(v(2), v(3)));
+    let b = eor_plain(eor_plain(v(4), v(5)), eor_plain(v(6), v(7)));
+    *s = eor_plain(*s, eor_plain(a, b));
 }
 
 /// `a ^ b` as one plain `EOR` that LLVM cannot fuse into `EOR3` (V0-only on Neoverse V2).

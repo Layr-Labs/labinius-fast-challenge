@@ -442,7 +442,7 @@ unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 
 /// The table indices of one element of eight columns. Coefficient `4 q + k`
 /// is bit `q` of word `k`; each result lane holds `(2 p, 2 p + 1)` for the
 /// four-bit pattern at `j + 162 t`, with coefficients above 511 zero.
-#[inline(always)]
+#[inline(never)]
 unsafe fn indices_pair<const P: usize>(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
     let mut bytes = [[vdupq_n_u8(0); 9]; 2];
     for (i, row) in bytes.iter_mut().enumerate() {
@@ -540,11 +540,14 @@ unsafe fn pass_lut<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_
     const { assert!(S < 3 && super::lut_transform_bound(PRIMES[S], SCHEDULES[S]) <= i16::MAX as u32) };
     let k = vld1q_s16(kern.k.as_ptr());
     let ix = |i: usize| *idx.get_unchecked(i);
-    for n in 0..4 {
-        let l = &kern.lut[n];
+    #[inline(always)]
+    unsafe fn node<const S: usize, const NN: usize>(ix: &impl Fn(usize) -> uint8x16_t, x: &mut [int16x8_t; N], kern: &Kernel, s: Schedule, k: int16x8_t) {
+        let l = &kern.lut[NN];
         let t: [uint8x16x2_t; 6] = core::array::from_fn(|i| table(&l[i]));
-        let base = 162 * n;
-        let mut step = |j: usize| {
+        let base = 162 * NN;
+        for j0 in (0..27).step_by(3) {
+        for d in 0..3 {
+            let j = j0 + d;
             let (x0, y0) = (look(t[0], ix(j)), look(t[1], ix(j + 81)));
             let (x1, y1) = (look(t[2], ix(j + 27)), look(t[3], ix(j + 108)));
             let (x2, y2) = (look(t[4], ix(j + 54)), look(t[5], ix(j + 135)));
@@ -563,20 +566,13 @@ unsafe fn pass_lut<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_
             store(x, at + 81, v.0);
             store(x, at + 108, v.1);
             store(x, at + 135, v.2);
-        };
-        // nine `j` per block, so that the scheduler interleaves their lookups and butterflies
-        for j in (0..27).step_by(9) {
-            step(j);
-            step(j + 1);
-            step(j + 2);
-            step(j + 3);
-            step(j + 4);
-            step(j + 5);
-            step(j + 6);
-            step(j + 7);
-            step(j + 8);
+        }
         }
     }
+    node::<S, 0>(&ix, x, kern, s, k);
+    node::<S, 1>(&ix, x, kern, s, k);
+    node::<S, 2>(&ix, x, kern, s, k);
+    node::<S, 3>(&ix, x, kern, s, k);
 }
 
 /// Levels 2 and 3: per level-1 node (162 slots) and `j < 27`, the six slots `j + 27 i`. Three

@@ -313,6 +313,34 @@ pub(super) fn dot_lifted(a: &[F162], b: &[B128]) -> F162 {
     }
 }
 
+pub(super) fn dot_lifted2(a: &[F162], b0: &[B128], b1: &[B128]) -> [F162; 2] {
+    assert!(a.len() == b0.len() && a.len() == b1.len());
+    unsafe {
+        let mut acc0 = [vdupq_n_u64(0); 6];
+        let mut acc1 = [vdupq_n_u64(0); 6];
+        let pairs = a.len() / 2;
+        for i in 0..pairs {
+            let aa = vld3q_u64(a.as_ptr().add(2 * i) as *const u64);
+            let ka = [aa.0, aa.1, vdupq_n_u64(0), x2(aa.0, aa.1), x2(aa.0, aa.2), x2(aa.1, aa.2)];
+            for (acc, b) in [(&mut acc0, b0), (&mut acc1, b1)] {
+                let bb = vld2q_u64(b.as_ptr().add(2 * i) as *const u64);
+                let kb = [bb.0, bb.1, vdupq_n_u64(0), x2(bb.0, bb.1), bb.0, bb.1];
+                for k in [0usize, 1, 3, 4, 5] {
+                    acc[k] = x2(acc[k], pmul_lo(ka[k], kb[k]));
+                    acc[k] = x2(acc[k], pmul_hi(ka[k], kb[k]));
+                }
+            }
+        }
+        let mut out = [reduce(assemble(acc0.map(|x| to_u128(x)))), reduce(assemble(acc1.map(|x| to_u128(x))))];
+        if pairs * 2 < a.len() {
+            let (e, j) = (a[2 * pairs], 2 * pairs);
+            out[0] += e * F162::from_b128(b0[j]);
+            out[1] += e * F162::from_b128(b1[j]);
+        }
+        out
+    }
+}
+
 
 #[inline(always)]
 unsafe fn to_u128(x: uint64x2_t) -> u128 {
@@ -560,10 +588,12 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
     let wk: Vec<_> = weights.iter().map(|w| kara(w.0.map(|x| vdupq_n_u64(x)))).collect();
     const PAIRS: usize = 32;
     let z = vdupq_n_u64(0);
+    let groups = wk.len().div_ceil(8);
     let mut scratch = vec![[[z; 6]; 2]; PAIRS];
     for first in (0..len).step_by(2 * PAIRS) {
         let pairs = ((len - first) / 2).min(PAIRS);
         for (group, ws) in wk.chunks(8).enumerate() {
+            let last = group + 1 == groups;
             for i in 0..pairs {
                 let mut acc = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
                 for (g, w) in ws.iter().enumerate() {
@@ -575,15 +605,16 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
                         acc[1][j] = x2(acc[1][j], pmul_hi(w[j], k[j]));
                     }
                 }
-                scratch[i] = acc;
-            }
-        }
-        for (i, acc) in scratch[..pairs].iter().enumerate() {
-            let a = reduce(assemble(acc[0].map(|v| to_u128(v))));
-            let b = reduce(assemble(acc[1].map(|v| to_u128(v))));
-            let j = first + 2 * i;
-            for (dst, k) in [(&mut *o0, 0), (&mut *o1, 1), (&mut *o2, 2)] {
-                dst[j] = a.0[k]; dst[j + 1] = b.0[k];
+                if last {
+                    let a = reduce(assemble(acc[0].map(|v| to_u128(v))));
+                    let b = reduce(assemble(acc[1].map(|v| to_u128(v))));
+                    let j = first + 2 * i;
+                    for (dst, k) in [(&mut *o0, 0), (&mut *o1, 1), (&mut *o2, 2)] {
+                        dst[j] = a.0[k]; dst[j + 1] = b.0[k];
+                    }
+                } else {
+                    scratch[i] = acc;
+                }
             }
         }
     }

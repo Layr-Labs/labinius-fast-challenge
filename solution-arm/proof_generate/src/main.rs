@@ -353,6 +353,22 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 /// registers, so the accumulator is read and written once per block instead of once per group.
 ///
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
+/// The SMS commitment written by its workers directly into the commitment encoding, when that
+/// path applies (the same bytes as [`commit`] then [`output::pack_commitment`]).
+fn commit_packed(values: &[B128], modulus: u128, output: &Output) -> Option<Vec<u8>> {
+    #[cfg(target_arch = "aarch64")]
+    if modulus == ntt::neon::sms::MODULUS {
+        use ntt::neon::sms;
+        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
+            .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+        let mut bytes = output.commitment_buffer();
+        sms::commit_packed(values, &matrix, threads(), &mut bytes, rq::coefficient_bytes(modulus));
+        return Some(bytes);
+    }
+    let _ = (values, output);
+    None
+}
+
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
@@ -867,9 +883,17 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 }
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
-    let coefficients = commit(values, modulus);
-    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
-    std::mem::forget(coefficients);
+    // every core free when the commitment's workers start (see `Output::wait_setup`)
+    output.wait_setup();
+    let commitment = match commit_packed(values, modulus, output) {
+        Some(bytes) => bytes,
+        None => {
+            let coefficients = commit(values, modulus);
+            let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
+            std::mem::forget(coefficients);
+            commitment
+        }
+    };
     labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
@@ -1013,6 +1037,14 @@ mod tests {
         for workers in [1, 3] {
             assert!(sms::commit(&values, &a, workers) == want, "workers {workers}");
         }
+        // the packed path writes exactly pack_commitment's bytes
+        let width = rq::coefficient_bytes(q);
+        let packed = output::pack_commitment(&want, q, vec![0u8; want.len() * width]);
+        for workers in [1, 3, 8] {
+            let mut bytes = vec![0xA5u8; want.len() * width];
+            sms::commit_packed(&values, &a, workers, &mut bytes, width);
+            assert!(bytes == packed, "packed, workers {workers}");
+        }
         // a short last chunk and a short last lockstep group, partial batches; the last sweep of
         // the column with one to four tiles (whole and short), a column of one short tile, and a
         // column whose chunks are all whole sweeps
@@ -1022,6 +1054,10 @@ mod tests {
             let want = commit_reference(&values, &matrix, q);
             let a = sms::matrix(elements, 3);
             assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
+            let width = rq::coefficient_bytes(q);
+            let mut bytes = vec![0x5Au8; want.len() * width];
+            sms::commit_packed(&values, &a, 3, &mut bytes, width);
+            assert!(bytes == output::pack_commitment(&want, q, vec![0u8; want.len() * width]), "{elements} elements packed");
         }
     }
     #[test]

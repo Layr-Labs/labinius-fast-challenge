@@ -97,7 +97,7 @@ fn view<T>(image: &'static [u8], len: usize) -> Option<&'static [T]> {
 static KEY: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new();
 static KEY_JOB: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
 
-/// Starts copying `image` (the SMS key data image) into [`KEY`] on four threads. With
+/// Starts copying `image` (the SMS key data image) into [`KEY`] on eight threads. With
 /// `LABINIUS_KEY_IN_PLACE` set the key is read in place instead.
 pub fn prefetch_key(image: &'static [u8]) {
     if image.is_empty() || std::env::var_os("LABINIUS_KEY_IN_PLACE").is_some() {
@@ -108,7 +108,7 @@ pub fn prefetch_key(image: &'static [u8]) {
         let mut v: Vec<u8> = Vec::with_capacity(len);
         let dst = v.as_mut_ptr() as usize;
         // pieces of whole 2 MiB pages, so that each thread faults in its own huge pages
-        let piece = len.div_ceil(4).next_multiple_of(2 << 20);
+        let piece = len.div_ceil(8).next_multiple_of(2 << 20);
         std::thread::scope(|s| {
             for start in (0..len).step_by(piece) {
                 let n = piece.min(len - start);
@@ -369,10 +369,10 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 }
 
 /// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 4;
-/// Elements transformed per sweep: up to four tiles, each accumulator read and written once.
+const SINK: usize = 8;
+/// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
-const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP == 2 * PASS);
+const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
 
 /// [`slot_sink`]'s body; `$rows13` and `$rows46` start rows 1-3 (v20-v31) and rows 4-6
 /// (v16-v27): loaded from `acc`, or zeroed for a chunk's first sweep ([`slot_sink_fresh`]).
@@ -625,6 +625,19 @@ unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_
     });
 }
 
+/// [`chunk_row`] for two digit rows `r`, `r + 1` at once ([`super::inverse_lazy_io2`]): `mr[h]` and
+/// `dev[h]` the means and deviation sums of row `r + h`; `y` the two scratch transforms.
+#[inline(always)]
+unsafe fn chunk_row2(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: &mut [[int16x8_t; N]; 2]) {
+    let p = P1 as i16;
+    super::inverse_lazy_io2(y, |h, s| narrow_digit(acc, s, r + h), |h, s, x| {
+        let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr[h].as_ptr().add(s))), p);
+        let dv = dev[h];
+        *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
+        *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
+    });
+}
+
 /// `x` in `[-(p-1)/2, (p-1)/2]` for `|x| <= p + p/2`.
 #[inline(always)]
 unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
@@ -647,6 +660,7 @@ unsafe fn sums(
     xs: &mut [[int16x8_t; N]; SWEEP],
     acc: &mut [int64x2_t],
     y: &mut [int16x8_t; N],
+    y2: &mut [[int16x8_t; N]; 2],
     dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
@@ -655,7 +669,7 @@ unsafe fn sums(
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
         while e < end {
-            // Up to four tiles per sweep, never across a chunk end (chunks are whole tiles). A short
+            // Up to eight tiles per sweep, never across a chunk end (chunks are whole tiles). A short
             // tile only occurs at the end of the column, where the missing elements read zero
             // words and their key lanes are zero, so those lanes contribute nothing.
             let l = SWEEP.min(end - e);
@@ -665,7 +679,7 @@ unsafe fn sums(
                 indices(&at, nib);
                 let x = &mut xs[i];
                 pass_lut::<PB>(nib, x, kern);
-                pass_c::<PB>(x, kern);
+                pass_c::<4>(x, kern);
                 pass_d::<PB, false>(x, kern, &[], &mut []);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
@@ -678,8 +692,11 @@ unsafe fn sums(
             e += l;
         }
         let c = (end - 1) / CHUNK;
-        for d in 0..DIGITS {
-            chunk_row(acc, 1 + d, a.mean_residues(c, d), &mut dev[d * 2 * N..][..2 * N], y);
+        // two digit rows per inverse pass (independent work for the latency-bound inverse)
+        const { assert!(DIGITS % 2 == 0) };
+        let dp = dev.as_mut_ptr();
+        for d in (0..DIGITS).step_by(2) {
+            chunk_row2(acc, 1 + d, [a.mean_residues(c, d), a.mean_residues(c, d + 1)], [dp.add(d * 2 * N), dp.add((d + 1) * 2 * N)], y2);
         }
     }
     narrow(acc, 0, y);
@@ -713,19 +730,43 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
     let mut out = vec![0u128; columns * N];
-    for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
+    commit_into(values, a, workers, &mut out, N, |dst, c, k, v| dst[c * N + k] = v);
+    out
+}
+
+/// [`commit`] straight into the proof's commitment encoding: coefficient `k` of column `j` as
+/// `width` little-endian bytes at `out[(j N + k) width..]`, each worker writing its own columns
+/// (no `u128` buffer, no separate packing pass after the workers).
+pub fn commit_packed(values: &[B128], a: &SmsMatrix, workers: usize, out: &mut [u8], width: usize) {
+    let len = 4 * a.elements;
+    assert_eq!(values.len() % len, 0);
+    assert!((1..=8).contains(&width) && MODULUS <= 1u128 << (8 * width));
+    assert_eq!(out.len(), values.len() / len * N * width);
+    commit_into(values, a, workers, out, N * width, |dst, c, k, v| {
+        let at = (c * N + k) * width;
+        dst[at..at + width].copy_from_slice(&(v as u64).to_le_bytes()[..width]);
+    });
+}
+
+/// The commitment of every column, handed coefficient by coefficient to `emit(target, column in
+/// target, coefficient, value)`, `target` holding `unit` entries per column.
+fn commit_into<T: Send>(values: &[B128], a: &SmsMatrix, workers: usize, out: &mut [T], unit: usize, emit: impl Fn(&mut [T], usize, usize, u128) + Sync) {
+    let len = 4 * a.elements;
+    let emit = &emit;
+    for_blocks(out, unit, LANES, workers, |first, block| unsafe {
         let mut m = Box::new([vdupq_n_s16(0); BITS]);
         let mut nib = Box::new([vdupq_n_u8(0); N / 4]);
         let mut xs = Box::new([[vdupq_n_s16(0); N]; SWEEP]);
         let mut y = Box::new([vdupq_n_s16(0); N]);
+        let mut y2 = Box::new([[vdupq_n_s16(0); N]; 2]);
         let mut acc = vec![vdupq_n_s64(0); ROWS * 4 * N];
         // per digit, the chunk deviations S - mean summed over the chunks
         let mut dev = vec![vdupq_n_s32(0); DIGITS * 2 * N];
         // the eight columns' tails, `i64` per lane (41 KiB, off the stack)
         let mut tail = Box::new([[0i64; LANES]; N]);
         let p = P1 as i16;
-        let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
+        let count = block.len() / unit;
+        for (b, target) in block.chunks_mut(LANES * unit).enumerate() {
             let col0 = first + LANES * b;
             let here = (count - LANES * b).min(LANES);
             let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
@@ -736,7 +777,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             });
             dev.fill(vdupq_n_s32(0));
-            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, &mut dev);
+            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, &mut y2, &mut dev);
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
             let pv = vdupq_n_s16(p);
@@ -773,14 +814,13 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             }
             // a partial batch has fewer than eight columns in `target`: only those lanes are written
-            for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(base[k][c] as u32, tail[k][c]);
+            for c in 0..target.len() / unit {
+                for k in 0..N {
+                    emit(target, c, k, crt(base[k][c] as u32, tail[k][c]));
                 }
             }
         }
     });
-    out
 }
 
 #[cfg(test)]
@@ -847,7 +887,16 @@ mod chunk_bench {
                 core::hint::black_box(&mut *y);
             }
             let l = t.elapsed().as_nanos() as f64 / reps as f64;
-            println!("chunk-end row: record {old:.0} ns, fused {new:.0} ns ({:+.1}%); inverse_folded {f:.0} ns, inverse_lazy {l:.0} ns", 100.0 * (new / old - 1.0));
+            let mut y2 = Box::new([[unsafe { vdupq_n_s16(0) }; N]; 2]);
+            let mut dev3 = dev2.clone();
+            let mut dev4 = dev2.clone();
+            let t = std::time::Instant::now();
+            for _ in 0..reps / 2 {
+                unsafe { chunk_row2(&acc, 1, [&mr, &mr], [dev3.as_mut_ptr(), dev4.as_mut_ptr()], &mut y2) };
+                core::hint::black_box(&mut dev3);
+            }
+            let pair = t.elapsed().as_nanos() as f64 / reps as f64;
+            println!("chunk-end row: record {old:.0} ns, fused {new:.0} ns ({:+.1}%), paired {pair:.0} ns/row; inverse_folded {f:.0} ns, inverse_lazy {l:.0} ns", 100.0 * (new / old - 1.0));
         }
     }
 }

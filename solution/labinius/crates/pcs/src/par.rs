@@ -74,13 +74,12 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long an idle worker spins for the next dispatch before it parks.
-const WORKER_SPIN: Duration = Duration::from_millis(2);
+const WORKER_SPIN: Duration = Duration::from_millis(10);
 /// How long the dispatching thread spins for the last tasks of its dispatch before it parks.
 const MAIN_SPIN: Duration = Duration::from_millis(10);
-/// Spins between two clock reads; every 16th read also yields the CPU, so that a spinning
-/// thread holds it from another runnable thread for tens of microseconds, not a time slice.
-const SPIN_CHECK: u32 = 64;
-const SPIN_YIELD: u32 = 16 * SPIN_CHECK;
+/// Spins between two clock reads; avoid excessive vDSO reads and spurious kernel context switches.
+const SPIN_CHECK: u32 = 1024;
+const SPIN_YIELD: u32 = 64 * SPIN_CHECK;
 
 /// The claim word: `[epoch: 24][tasks: 20][next: 20]`. A dispatch publishes `(epoch, tasks, 0)`;
 /// a runner takes task `next` with one `fetch_add`, which also tells it which dispatch the task

@@ -1741,10 +1741,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
             let (addr, _) = p.region();
             (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
         });
-        let at = image.as_ptr() as usize;
-        let (lo, hi) = ((at + 4095) & !4095, (at + image.len()) & !4095);
-        let release = (lo..hi.max(lo)).step_by(POPULATE_CHUNK).map(|o| (o, POPULATE_CHUNK.min(hi - o)));
-        output.populate(first.collect(), release.collect());
+        output.populate(first.collect(), vec![]);
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
@@ -1900,8 +1897,11 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is on disk; bypass glibc atexit and TLS destructor overhead.
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 #[cfg(test)]

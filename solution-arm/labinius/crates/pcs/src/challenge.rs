@@ -35,6 +35,7 @@
 //! ```
 use crate::fields::scalar::{B128, F162};
 use crate::ring::{PowerOfThreeRingElementWithLimbs, N162};
+use blake3::hazmat::{self, ChainingValue, HasherExt, Mode};
 use blake3::Hasher;
 use crate::arch::*;
 use std::f64::consts::PI;
@@ -56,6 +57,172 @@ pub const DEFAULT_BOUND: f64 = 12.0;
 // transcript
 // =============================================================================================
 
+/// The blake3 hash of the absorbed byte stream, kept as blake3's own tree: a plain [`Hasher`]
+/// while the stream is absorbed in order; after [`Stream::update_parallel`], the chaining values
+/// of the complete subtrees a prefix of the stream splits into, largest first, and a hasher for
+/// the rest of the stream from that prefix's end. Either form finalizes to the hash of the same
+/// bytes absorbed by one `Hasher` (`blake3::hazmat` is the tree's public interface).
+#[derive(Clone)]
+struct Stream {
+    /// `left[..depth]`: the chaining values of the complete subtrees covering `0 .. offset`; their
+    /// sizes are the set bits of `offset`, from the top.
+    left: [ChainingValue; MAX_DEPTH],
+    depth: usize,
+    /// Bytes covered by `left`: a multiple of `CHUNK_LEN`, zero exactly when `depth` is.
+    offset: u64,
+    /// The stream from `offset` on (with that input offset when it is not zero). When `depth > 0`
+    /// it holds at least one byte whenever the stream is finalized, and never more than the
+    /// smallest left subtree: the lowest set bit of `offset`, the largest subtree blake3's tree
+    /// has at that offset.
+    tail: Hasher,
+}
+
+/// Levels of blake3's tree over a stream of at most `2^64` bytes in `2^10`-byte chunks.
+const MAX_DEPTH: usize = 54;
+const CHUNK_LEN: u64 = blake3::CHUNK_LEN as u64;
+
+#[inline]
+fn low_bit(x: u64) -> u64 {
+    x & x.wrapping_neg()
+}
+
+impl Stream {
+    fn new() -> Self {
+        Stream {
+            left: [[0u8; 32]; MAX_DEPTH],
+            depth: 0,
+            offset: 0,
+            tail: Hasher::new(),
+        }
+    }
+
+    /// Bytes of the smallest left subtree, which bounds the tail (`depth > 0`).
+    #[inline]
+    fn lowest(&self) -> u64 {
+        low_bit(self.offset)
+    }
+
+    fn update(&mut self, mut bytes: &[u8]) {
+        if self.depth == 0 {
+            self.tail.update(bytes);
+            return;
+        }
+        loop {
+            let room = (self.lowest() - self.tail.count()) as usize;
+            if bytes.len() <= room {
+                self.tail.update(bytes);
+                return;
+            }
+            // The tail fills to a complete subtree as large as the smallest left one, and more
+            // input follows: it merges into the left subtrees like a carry into the set bits of
+            // `offset`, as non-root parents.
+            let (now, rest) = bytes.split_at(room);
+            self.tail.update(now);
+            let x = self.offset;
+            let mut size = self.lowest();
+            let mut cv = self.tail.finalize_non_root();
+            while x & size != 0 {
+                self.depth -= 1;
+                cv = hazmat::merge_subtrees_non_root(&self.left[self.depth], &cv, Mode::Hash);
+                size <<= 1;
+            }
+            self.left[self.depth] = cv;
+            self.depth += 1;
+            self.offset = x + low_bit(x);
+            self.tail = Hasher::new();
+            self.tail.set_input_offset(self.offset);
+            bytes = rest;
+        }
+    }
+
+    /// The root output of the stream: the tail as the rightmost subtree under the left ones.
+    fn finalize_xof(&self) -> blake3::OutputReader {
+        if self.depth == 0 {
+            return self.tail.finalize_xof();
+        }
+        let mut right = self.tail.finalize_non_root();
+        for i in (1..self.depth).rev() {
+            right = hazmat::merge_subtrees_non_root(&self.left[i], &right, Mode::Hash);
+        }
+        hazmat::merge_subtrees_root_xof(&self.left[0], &right, Mode::Hash)
+    }
+
+    /// [`update`](Self::update) of `bytes`, with the complete subtrees hashed in pieces on up
+    /// to `threads` runners of the pool and merged here: the same tree, so the same state.
+    fn update_parallel(&mut self, bytes: &[u8], threads: usize) {
+        /// Bytes per task: a power-of-two number of chunks.
+        const PIECE: u64 = 64 * CHUNK_LEN;
+        let head = self.tail.count();
+        if self.depth != 0 || threads <= 1 || head >= PIECE || (bytes.len() as u64) < 4 * PIECE {
+            return self.update(bytes);
+        }
+        let end = head + bytes.len() as u64;
+        // The prefix the subtrees cover; the tail keeps the last 1 ..= CHUNK_LEN bytes.
+        let x = (end - 1) / CHUNK_LEN * CHUNK_LEN;
+        // The complete subtrees of `0 .. x`, largest first, each cut into pieces of at most
+        // `PIECE` bytes (powers of two, aligned): `(start, len)` in stream offsets.
+        let mut subtrees = Vec::new();
+        let mut pieces = Vec::new();
+        let mut at = 0u64;
+        for bit in (0..64).rev() {
+            let size = 1u64 << bit;
+            if x & size == 0 {
+                continue;
+            }
+            let piece = size.min(PIECE);
+            subtrees.push((pieces.len(), size / piece));
+            for k in 0..size / piece {
+                pieces.push((at + k * piece, piece));
+            }
+            at += size;
+        }
+        debug_assert_eq!(at, x);
+        let plain = &self.tail;
+        let cvs: Vec<ChainingValue> = crate::par::map_blocks(pieces.len(), threads.min(pieces.len()), 1, |_t, lo, hi| {
+            (lo..hi)
+                .map(|i| {
+                    let (start, len) = pieces[i];
+                    if start == 0 {
+                        // The first piece continues the stream absorbed so far.
+                        let mut h = plain.clone();
+                        h.update(&bytes[..(len - head) as usize]);
+                        h.finalize_non_root()
+                    } else {
+                        let mut h = Hasher::new();
+                        h.set_input_offset(start);
+                        h.update(&bytes[(start - head) as usize..(start + len - head) as usize]);
+                        h.finalize_non_root()
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut left = [[0u8; 32]; MAX_DEPTH];
+        for (d, &(first, count)) in subtrees.iter().enumerate() {
+            // Aligned siblings merge pairwise up to the subtree's root; more input follows.
+            let mut level: Vec<ChainingValue> = cvs[first..first + count as usize].to_vec();
+            while level.len() > 1 {
+                level = level
+                    .chunks_exact(2)
+                    .map(|p| hazmat::merge_subtrees_non_root(&p[0], &p[1], Mode::Hash))
+                    .collect();
+            }
+            left[d] = level[0];
+        }
+        let mut tail = Hasher::new();
+        tail.set_input_offset(x);
+        tail.update(&bytes[(x - head) as usize..]);
+        *self = Stream {
+            left,
+            depth: subtrees.len(),
+            offset: x,
+            tail,
+        };
+    }
+}
+
 /// A blake3 Fiat-Shamir transcript: absorb, then derive.
 ///
 /// Every derivation clones the absorbing state, appends a per-transcript sample counter and a
@@ -64,17 +231,25 @@ pub const DEFAULT_BOUND: f64 = 12.0;
 /// deterministic function of the absorbed bytes.
 #[derive(Clone)]
 pub struct Transcript {
-    state: Hasher,
+    state: Stream,
     counter: u64,
 }
 
 impl Transcript {
     /// A fresh transcript whose state starts at the domain string `domain`.
     pub fn new(domain: &[u8]) -> Self {
-        let mut state = Hasher::new();
+        let mut state = Stream::new();
         state.update(&(domain.len() as u64).to_le_bytes());
         state.update(domain);
         Transcript { state, counter: 0 }
+    }
+
+    /// [`absorb_bytes`](Self::absorb_bytes), with a large input hashed on up to `threads` workers:
+    /// the same transcript, bit for bit (blake3 is a tree hash; the complete subtrees are hashed
+    /// separately and merged as a sequential hasher merges them).
+    pub fn absorb_bytes_parallel(&mut self, bytes: &[u8], threads: usize) {
+        self.state.update(&(bytes.len() as u64).to_le_bytes());
+        self.state.update_parallel(bytes, threads);
     }
 
     /// Absorb raw bytes, length-prefixed so that concatenations cannot collide.

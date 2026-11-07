@@ -312,7 +312,7 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
 }
 
 /// `324^-1 mod p` (`324 = 2^2 3^4`, [`super::FOLD`], the product of the radices), carried by every
-/// transformed key row: the slot sums then carry it too, and [`super::inverse_folded`] (no `1 / r`)
+/// transformed key row: the slot sums then carry it too, and [`super::inverse_lazy`] (no `1 / r`)
 /// inverts them to the same coefficients as [`super::inverse`] of the unscaled sums. The
 /// certificate's moments, the means and `mu` are of the coefficient rows and do not change; only
 /// the key image does.
@@ -589,14 +589,6 @@ const _: () = assert!(((CHUNK as u64 * PRODUCT >> 16) + 1) * C16.unsigned_abs() 
 /// `|r| <= 0.65 p` (the inverse takes `|x| <= p`). After the k6 chunk end (dadon line).
 #[inline(always)]
 unsafe fn narrow_digits(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
-    for (s, o) in out.iter_mut().enumerate() {
-        *o = narrow_digit(acc, s, r);
-    }
-}
-
-/// Slot `s` of [`narrow_digits`].
-#[inline(always)]
-unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
     let c = vdupq_n_s32(C16);
     let low = vdupq_n_s32(0xFFFF);
     let half = |a: int64x2_t, b: int64x2_t| -> int32x4_t {
@@ -605,24 +597,12 @@ unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
         let t = vmlaq_s32(l, h, c);
         vmlsq_n_s32(t, vqrdmulhq_n_s32(t, V31), P1 as i32)
     };
-    let at = idx(s, r);
-    let lo = half(*acc.get_unchecked(at), *acc.get_unchecked(at + 1));
-    let hi = half(*acc.get_unchecked(at + 2), *acc.get_unchecked(at + 3));
-    vmovn_high_s32(vmovn_s32(lo), hi)
-}
-
-/// One digit row's chunk end in one go: the sums narrowed in [`super::inverse_lazy_io`]'s first
-/// pass, and the deviations `S - mean` (centered) summed into `dev` (the row's `2 N` lanes) in its
-/// last pass, instead of three passes over the slots.
-#[inline(always)]
-unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_t], y: &mut [int16x8_t; N]) {
-    let p = P1 as i16;
-    let dv = dev.as_mut_ptr();
-    super::inverse_lazy_io(y, |s| narrow_digit(acc, s, r), |s, x| {
-        let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
-        *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
-        *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
-    });
+    for (s, o) in out.iter_mut().enumerate() {
+        let at = idx(s, r);
+        let lo = half(*acc.get_unchecked(at), *acc.get_unchecked(at + 1));
+        let hi = half(*acc.get_unchecked(at + 2), *acc.get_unchecked(at + 3));
+        *o = vmovn_high_s32(vmovn_s32(lo), hi);
+    }
 }
 
 /// `x` in `[-(p-1)/2, (p-1)/2]` for `|x| <= p + p/2`.
@@ -647,7 +627,7 @@ unsafe fn sums(
     xs: &mut [[int16x8_t; N]; SWEEP],
     acc: &mut [int64x2_t],
     y: &mut [int16x8_t; N],
-    dev: &mut [int32x4_t],
+    mut chunk: impl FnMut(usize, usize, &mut [int16x8_t; N]),
 ) {
     let kern = &kernels()[PB];
     acc.fill(vdupq_n_s64(0));
@@ -677,13 +657,18 @@ unsafe fn sums(
             }
             e += l;
         }
-        let c = (end - 1) / CHUNK;
         for d in 0..DIGITS {
-            chunk_row(acc, 1 + d, a.mean_residues(c, d), &mut dev[d * 2 * N..][..2 * N], y);
+            narrow_digits(acc, 1 + d, y);
+            super::inverse_lazy(y);
+            chunk((end - 1) / CHUNK, d, y);
         }
     }
     narrow(acc, 0, y);
-    super::inverse_folded::<PB>(y);
+    super::inverse_lazy(y);
+    // The lazy inverse returns residues within +/- p; the base row expects centered residues.
+    for value in y.iter_mut() {
+        *value = canonical(*value, P1 as i16);
+    }
 }
 
 /// `r mod 9721` and `t mod M` into `[0, Q)`.
@@ -736,7 +721,15 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             });
             dev.fill(vdupq_n_s32(0));
-            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, &mut dev);
+            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, |c, d, r| {
+                let mr = a.mean_residues(c, d);
+                let dv = &mut dev[d * 2 * N..][..2 * N];
+                for s in 0..N {
+                    let v = canonical(vsubq_s16(r[s], vdupq_n_s16(mr[s])), P1 as i16);
+                    dv[2 * s] = vaddw_s16(dv[2 * s], vget_low_s16(v));
+                    dv[2 * s + 1] = vaddw_high_s16(dv[2 * s + 1], v);
+                }
+            });
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
             let pv = vdupq_n_s16(p);
@@ -781,75 +774,6 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
         }
     });
     out
-}
-
-#[cfg(test)]
-mod chunk_bench {
-    use super::*;
-
-    /// One digit row's chunk end, the record's three passes against [`chunk_row`]: `cargo test
-    /// --release chunk_end_timing -- --ignored --nocapture` (on the board's core).
-    #[test]
-    #[ignore]
-    fn chunk_end_timing() {
-        let mut st = 7u64;
-        let bound = 1i64 << 34;
-        let acc: Vec<int64x2_t> = (0..ROWS * 4 * N).map(|_| unsafe { vcombine_s64(vdup_n_s64((crate::ntt::tests::xorshift(&mut st) % (2 * bound as u64)) as i64 - bound), vdup_n_s64((crate::ntt::tests::xorshift(&mut st) % (2 * bound as u64)) as i64 - bound)) }).collect();
-        let mr: Vec<i16> = (0..N).map(|i| (i as i16 * 37) % 4860).collect();
-        let mut dev = vec![unsafe { vdupq_n_s32(0) }; 2 * N];
-        let mut dev2 = dev.clone();
-        let mut y = Box::new([unsafe { vdupq_n_s16(0) }; N]);
-        // same deviations both ways
-        unsafe {
-            narrow_digits(&acc, 1, &mut y);
-            super::super::inverse_folded::<PB>(&mut y);
-            for s in 0..N {
-                let v = canonical(vsubq_s16(y[s], vdupq_n_s16(mr[s])), P1 as i16);
-                dev[2 * s] = vaddw_s16(dev[2 * s], vget_low_s16(v));
-                dev[2 * s + 1] = vaddw_high_s16(dev[2 * s + 1], v);
-            }
-            chunk_row(&acc, 1, &mr, &mut dev2, &mut y);
-        }
-        let a: &[[i32; 4]] = unsafe { core::slice::from_raw_parts(dev.as_ptr() as *const [i32; 4], dev.len()) };
-        let b: &[[i32; 4]] = unsafe { core::slice::from_raw_parts(dev2.as_ptr() as *const [i32; 4], dev2.len()) };
-        assert_eq!(a, b, "the fused chunk end gives the same deviations");
-        let reps = 20000;
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                unsafe {
-                    narrow_digits(&acc, 1, &mut y);
-                    super::super::inverse_folded::<PB>(&mut y);
-                    for s in 0..N {
-                        let v = canonical(vsubq_s16(y[s], vdupq_n_s16(mr[s])), P1 as i16);
-                        dev[2 * s] = vaddw_s16(dev[2 * s], vget_low_s16(v));
-                        dev[2 * s + 1] = vaddw_high_s16(dev[2 * s + 1], v);
-                    }
-                }
-                core::hint::black_box(&mut dev);
-            }
-            let old = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                unsafe { chunk_row(&acc, 1, &mr, &mut dev2, &mut y) };
-                core::hint::black_box(&mut dev2);
-            }
-            let new = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                unsafe { super::super::inverse_folded::<PB>(&mut y) };
-                core::hint::black_box(&mut *y);
-            }
-            let f = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                unsafe { super::super::inverse_lazy(&mut y); for v in y.iter_mut() { *v = vandq_s16(*v, vdupq_n_s16(0x0fff)); } };
-                core::hint::black_box(&mut *y);
-            }
-            let l = t.elapsed().as_nanos() as f64 / reps as f64;
-            println!("chunk-end row: record {old:.0} ns, fused {new:.0} ns ({:+.1}%); inverse_folded {f:.0} ns, inverse_lazy {l:.0} ns", 100.0 * (new / old - 1.0));
-        }
-    }
 }
 
 #[cfg(test)]

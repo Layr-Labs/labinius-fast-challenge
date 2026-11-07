@@ -118,6 +118,7 @@ pub struct Switch<'a> {
     l: Vec<F162>,
     lp: Vec<F162>,
     lt: ByteTables,
+    lpt: ByteTables,
     prefix_r: Vec<F162>,
     planes: [Vec<u64>; 3],
     half: usize,
@@ -129,6 +130,7 @@ impl<'a> Switch<'a> {
     pub fn new(words: &'a [B128], prepared: Prepared, batch: &[F162]) -> Self {
         let lt = ByteTables::new(batch);
         let lp = compose(&lt, prepared.inverses[0]);
+        let lpt = ByteTables::new(&lp);
         let prefix_r = vec![F162::ZERO; prepared.prefix];
         let mut out = Self {
             words,
@@ -136,6 +138,7 @@ impl<'a> Switch<'a> {
             l: batch.to_vec(),
             lp,
             lt,
+            lpt,
             prefix_r,
             planes: core::array::from_fn(|_| Vec::new()),
             half: words.len(),
@@ -153,7 +156,7 @@ impl<'a> Switch<'a> {
         let scale = scales(&self.prepared.ratios[k + 1..prefix]);
         let weights = eq_expand_f162(&self.prefix_r[..k]);
         let l = &self.lt;
-        let lp = ByteTables::new(&self.lp);
+        let lp = &self.lpt;
         let tasks = weights.len() * PACK;
         let sums = par::map_blocks(tasks, par::workers(tasks, 16), 16, |_, start, end| {
             let mut msg = [F162::ZERO; 2];
@@ -199,7 +202,7 @@ impl<'a> Switch<'a> {
 
     fn message(&self, half: usize) -> [F162; 2] {
         let l = &self.lt;
-        let lp = ByteTables::new(&self.lp);
+        let lp = &self.lpt;
         let p = &self.planes;
         let parts = par::workers(half, 1 << 10);
         let sums = par::map_blocks(half, parts, 64.min(half), |_, start, end| unsafe {
@@ -226,9 +229,10 @@ impl<'a> Switch<'a> {
         for (l, &lp) in self.l.iter_mut().zip(&self.lp) {
             *l += r * lp;
         }
-        self.lt = ByteTables::new(&self.l);
+        self.lt.rebuild(&self.l);
         if self.round + 1 < self.prepared.inverses.len() {
             self.lp = compose(&self.lt, self.prepared.inverses[self.round + 1]);
+            self.lpt.rebuild(&self.lp);
         }
         if self.round < self.prepared.prefix {
             self.prefix_r[self.round] = r;
@@ -250,7 +254,7 @@ impl<'a> Switch<'a> {
     fn fold_message(&mut self, r: F162) -> [F162; 2] {
         let hh = self.half / 2;
         let l = &self.lt;
-        let lp = ByteTables::new(&self.lp);
+        let lp = &self.lpt;
         let eq = &self.prepared.eq;
         let parts = par::workers(hh, 1 << 10);
         let edges: Vec<_> = (0..parts).map(|t| par::block(hh, parts, t, 64.min(hh))).collect();

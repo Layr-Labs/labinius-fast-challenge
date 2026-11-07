@@ -140,21 +140,39 @@ pub(super) struct ByteTables {
 
 impl ByteTables {
     pub(super) fn new(batch: &[F162]) -> Self {
-        assert_eq!(batch.len(), 128);
-        let mut lo = vec![0u128; 16 * 256];
-        let mut top = vec![0u64; 16 * 256];
-        for b in 0..16 {
-            let mut t = [F162::ZERO; 256];
-            for s in 1..256usize {
-                let i = s.trailing_zeros() as usize;
-                t[s] = t[s & (s - 1)] + batch[8 * b + i];
-            }
-            for (s, x) in t.iter().enumerate() {
-                lo[256 * b + s] = x.0[0] as u128 | (x.0[1] as u128) << 64;
-                top[256 * b + s] = x.0[2];
-            }
+        let mut lo: Vec<u128> = Vec::with_capacity(16 * 256);
+        let mut top: Vec<u64> = Vec::with_capacity(16 * 256);
+        unsafe {
+            Self::fill(batch, lo.as_mut_ptr(), top.as_mut_ptr());
+            lo.set_len(16 * 256);
+            top.set_len(16 * 256);
         }
         Self { lo, top }
+    }
+
+    pub(super) fn rebuild(&mut self, batch: &[F162]) {
+        assert!(self.lo.len() == 16 * 256 && self.top.len() == 16 * 256);
+        unsafe { Self::fill(batch, self.lo.as_mut_ptr(), self.top.as_mut_ptr()) }
+    }
+
+    ///
+    /// # Safety
+    unsafe fn fill(batch: &[F162], lo: *mut u128, top: *mut u64) {
+        assert_eq!(batch.len(), 128);
+        for b in 0..16 {
+            let (l, t) = (lo.add(256 * b), top.add(256 * b));
+            let img: [(u128, u64); 8] = core::array::from_fn(|i| {
+                let x = batch[8 * b + i];
+                (x.0[0] as u128 | (x.0[1] as u128) << 64, x.0[2])
+            });
+            *l = 0;
+            *t = 0;
+            for s in 1..256usize {
+                let (p, (il, it)) = (s & (s - 1), img[s.trailing_zeros() as usize]);
+                *l.add(s) = *l.add(p) ^ il;
+                *t.add(s) = *t.add(p) ^ it;
+            }
+        }
     }
 }
 

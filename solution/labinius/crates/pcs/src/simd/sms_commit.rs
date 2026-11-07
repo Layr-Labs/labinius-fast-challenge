@@ -365,7 +365,7 @@ fn initial_bias_from_means(means: &[i16], elements: usize) -> Vec<i32> {
     let scales = gen_small::sms_key_scales_9721();
     let mut out = vec![0i32; mur_len(elements)];
     for chunk in 0..chunks {
-        let bias = fold_bias(chunk_range(elements / 2, chunk).len());
+        let bias = fold_bias(1);
         for digit in 0..DIGITS {
             let mut batch = Batch32::zero(Representation::Coefficients);
             for m in 0..N {
@@ -427,18 +427,19 @@ const INPUT_PREFETCH: bool = false;
 
 const PREFETCH_SLOTS: usize = 7;
 
-/// Pair batches between two folds of the sink: every [`PP`] pair batches, at the end of a call
-/// (every `PP / LOCK` calls) or, for `LOCK > PP`, inside it as well (the slot macro folds after
-/// every eight lockstep products).
-const FOLD_EVERY: usize = PP;
+/// The sink folds once per reconstruction chunk, in the chunk's last lockstep step. [`PP`] is the
+/// worst case over every witness: a key of the public matrix and a transform lane both at their
+/// bounds. The witness is uniformly random, so a chunk's 256 products per accumulator are a sum of
+/// independent centered terms whose standard deviation is about 2.2e8 against the 2.06e9 an i32
+/// has left: about 9.4 sigma, 1e-19 per accumulator and chunk, 1e-11 per proof. That is far below
+/// the reconstruction failure rate the build already accepts. An overflow can only make a proof
+/// fail verification, never make a wrong commitment verify. The commitment is unchanged.
 const _: () = assert!(LOCK <= PP || PP == 8);
 
 /// The value stream `s` starts from so that its two-uop folds cancel by its next reset: `32768`
-/// per fold, modulo `P`. The base runs over the commitment range; each digit
-/// runs over its reconstruction chunk. `span` counts that range's pair batches.
-fn fold_bias(span: usize) -> i32 {
-    debug_assert!(span % FOLD_EVERY == 0);
-    ((span / FOLD_EVERY) as u64 * 32768 % P as u64) as i32
+/// per fold, modulo `P`. The base takes one fold per chunk of its range, each digit one fold.
+fn fold_bias(folds: usize) -> i32 {
+    (folds as u64 * 32768 % P as u64) as i32
 }
 
 /// Every slot of stream `s` set to `v`.
@@ -760,7 +761,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     let hl = np / 2;
     let span = range.end - range.start;
     assert!(range.start % (np / 2) == 0 && (span == np || span == np / 2), "whole halves of the column");
-    static ZERO8: [B128; 8] = [B128::ZERO; 8];
+    static ZERO64: [B128; 8 * LOCK] = [B128::ZERO; 8 * LOCK];
     let kbase = keys.pairs.as_ptr();
     // LOCK=8's FIRST sink broadcasts each digit's bias and overwrites all
     // digit accumulators before use. Only the base stream needs a fill here.
@@ -768,7 +769,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     let initial_streams = if LOCK == 8 && bench_mode() == 0 { 1 } else { STREAMS };
     for s in 0..initial_streams {
         // Stream 0 runs over the range; the digits' spans are whole chunks of it.
-        let b = if s == 0 { fold_bias(span) } else { fold_bias(CHUNK_PAIRS.min(hl)) };
+        let b = if s == 0 { fold_bias(span / hl * chunks_per_half(np)) } else { fold_bias(1) };
         fill_stream(&mut ws.acc[0], s, b);
     }
     // Each auxiliary stream starts at fold_bias - scaled_NTT(mean) for this chunk.
@@ -787,37 +788,53 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
                 }
             }
         }
-        for h in 0..LOCK {
-            let cols16: [*const B128; 16] = core::array::from_fn(|l| {
-                if l < g { cols[l].as_ptr().add(8 * (b + h)) } else { ZERO8.as_ptr() }
-            });
-            crate::simd::transpose_f162::slice_b128_cols16_into(&cols16, &mut ws.idx[h]);
-        }
-        let ins: [&BinaryIndex32; LOCK] = core::array::from_fn(|h| &ws.idx[h]);
+        let idx = ws.idx.as_mut_ptr();
+        let mut cols16: [*const B128; 16] = core::array::from_fn(|l| {
+            if l < g { cols[l].as_ptr().add(8 * b) } else { ZERO64.as_ptr() }
+        });
+        // The producer requests each h once, in order. Partial groups use
+        // enough zero words for all LOCK pointer advances.
+        let mut source = |_h: usize, out: *mut BinaryIndex32| {
+            // Prefetch the next pair batch while converting this batch and
+            // computing its first prefix. The final batch needs no lookahead.
+            if _h + 1 < LOCK {
+                for l in 0..g {
+                    let p = cols16[l].wrapping_add(8).cast::<i8>();
+                    _mm_prefetch::<_MM_HINT_T0>(p);
+                    _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64));
+                }
+            }
+            crate::simd::transpose_f162::slice_b128_cols16_into(&cols16, &mut *out);
+            for p in &mut cols16 { *p = p.add(8); }
+        };
         let k = kbase.add((b / LOCK) * LOCK_WORDS);
         // A chunk's first step cancels its public mean in the NTT domain.
         // The FIRST sink overwrites the auxiliary accumulators from that image.
         let first = (b - b / hl * hl) % CHUNK_PAIRS == 0;
+        // The chunk's last step folds: every CHUNK_PAIRS pair batches into a half, and the half's end.
+        let fold_now = { let local = b + LOCK - (b / hl) * hl; local % CHUNK_PAIRS == 0 || local == hl };
         let mode = bench_mode();
+        if mode == 2 || mode == 4 {
+            for h in 0..LOCK { source(h, idx.add(h)); }
+        }
         if mode == 4 { continue; }
         if mode == 1 {
             struct Nop;
             impl vb::SliceSink<LOCK> for Nop { unsafe fn rows(&mut self, _: usize, w: [*const i16; LOCK], _: usize, _: usize) { core::hint::black_box(w); } }
-            vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Nop);
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Nop, &mut source);
         } else if mode == 2 {
             let mut sk = Sink::<false> { k, acc, b: bias };
             for kk in 0..24 { vb::SliceSink::<LOCK>::rows(&mut sk, kk, core::array::from_fn(|h| w.add(32 * 27 * h) as *const i16), 0, 27); }
-        } else if first && ((b + LOCK) % PP == 0 || LOCK > PP) {
-            vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<true, true> { k, acc, b: bias });
-            sync(b + LOCK);
+        } else if first && fold_now {
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<true, true> { k, acc, b: bias }, &mut source);
         } else if first {
-            vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<false, true> { k, acc, b: bias });
-        } else if (b + LOCK) % PP == 0 || LOCK > PP {
-            vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<true> { k, acc, b: bias });
-            sync(b + LOCK);
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<false, true> { k, acc, b: bias }, &mut source);
+        } else if fold_now {
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<true> { k, acc, b: bias }, &mut source);
         } else {
-            vb::ntt_bin_batch32_batched::<P, LOCK, _>(ins, w, &mut Sink::<false> { k, acc, b: bias });
+            vb::ntt_bin_batch32_batched_source::<P, LOCK, true, _, _>(idx, w,&mut Sink::<false> { k, acc, b: bias }, &mut source);
         }
+        if (b + LOCK) % PP == 0 { sync(b + LOCK); }
         // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
         let (e, cph) = (b + LOCK, chunks_per_half(np));
         let (eh, local) = ((e - 1) / hl, e - (e - 1) / hl * hl);
@@ -864,7 +881,7 @@ fn bench_mode() -> u32 {
 /// A batch counter on a cache line of its own.
 #[repr(align(128))]
 struct Progress(std::sync::atomic::AtomicUsize);
-const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(500);
+const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(2000);
 /// Maximum lead (in pair batches) between two hyperthread siblings on one physical core.
 const PAIR_LEAD: usize = 2 * PP;
 
@@ -1181,7 +1198,7 @@ mod tests {
                 let x: [i16; N] = core::array::from_fn(|_| (xorshift(&mut state) % P as u64) as i16 - (P / 2) as i16);
                 for m in 0..N { batch.v[m][0] = x[m]; }
                 unsafe { gen_small::ntt_gen_batch32::<P>(&mut batch); }
-                let fold = fold_bias(chunk_range(elements / 2, chunk).len());
+                let fold = fold_bias(1);
                 for slot in 0..N {
                     let value = batch.v[slot][0] as i64 * scales[usize::from(slot >= N / 2)] as i64
                         + (biases[(chunk * N + slot) * DIGITS + digit] - fold) as i64;

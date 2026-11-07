@@ -614,11 +614,23 @@ unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
 /// pass, and the deviations `S - mean` (centered) summed into `dev` (the row's `2 N` lanes) in its
 /// last pass, instead of three passes over the slots.
 #[inline(always)]
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_t], y: &mut [int16x8_t; N]) {
     let p = P1 as i16;
     let dv = dev.as_mut_ptr();
     super::inverse_lazy_io(y, |s| narrow_digit(acc, s, r), |s, x| {
         let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
+        *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
+        *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
+    });
+}
+
+#[inline(always)]
+unsafe fn chunk_row2(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2]) {
+    let p = P1 as i16;
+    super::inverse_lazy_io2(y, |h, s| narrow_digit(acc, s, r + h), |h, s, x| {
+        let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr[h].as_ptr().add(s))), p);
+        let dv = dev[h];
         *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
         *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
     });
@@ -649,7 +661,9 @@ unsafe fn sums(
     dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
-    acc.fill(vdupq_n_s64(0));
+    for s in 0..N {
+        acc[idx(s, 0)..][..4].fill(vdupq_n_s64(0));
+    }
     let mut e = 0usize;
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
@@ -677,8 +691,12 @@ unsafe fn sums(
             e += l;
         }
         let c = (end - 1) / CHUNK;
-        for d in 0..DIGITS {
-            chunk_row(acc, 1 + d, a.mean_residues(c, d), &mut dev[d * 2 * N..][..2 * N], y);
+        const _: () = assert!(DIGITS % 2 == 0);
+        let dv = dev.as_mut_ptr();
+        for d in (0..DIGITS).step_by(2) {
+            let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
+            let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
+            chunk_row2(acc, 1 + d, mr, rows, [&mut *y, &mut xs[0]]);
         }
     }
     narrow(acc, 0, y);

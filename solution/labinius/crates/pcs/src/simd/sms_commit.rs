@@ -423,7 +423,7 @@ include!("sms_slot_gen.rs");
 const _: () = assert!(STREAMS == 7 && LOCK == 8);
 
 /// Whether a group step prefetches the next step's witness words into L2.
-const INPUT_PREFETCH: bool = false;
+const INPUT_PREFETCH: bool = true;
 
 const PREFETCH_SLOTS: usize = 7;
 

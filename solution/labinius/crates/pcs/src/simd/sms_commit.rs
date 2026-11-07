@@ -489,13 +489,11 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             let k = self.k.add(j * STREAMS * LOCK);
             let a = self.acc.add(j * STREAMS * 16);
             if PREFETCH_SLOTS > 0 {
-                let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
-                let hi = lo + STREAMS * LOCK * 4;
-                let mut p = (lo + 63) & !63;
-                while p < hi {
-                    _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
-                    p += 64;
-                }
+                let p = (k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize & !63) as *const i8;
+                _mm_prefetch::<_MM_HINT_T0>(p);
+                _mm_prefetch::<_MM_HINT_T0>(p.add(64));
+                _mm_prefetch::<_MM_HINT_T0>(p.add(128));
+                _mm_prefetch::<_MM_HINT_T0>(p.add(192));
             }
             macro_rules! call {
                 ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
@@ -796,8 +794,9 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         // enough zero words for all LOCK pointer advances.
         let mut source = |_h: usize, out: *mut BinaryIndex32| {
             // Prefetch the next pair batch while converting this batch and
-            // computing its first prefix. The final batch needs no lookahead.
-            if _h + 1 < LOCK {
+            // computing its first prefix. Continue prefetching into the next step
+            // across LOCK boundaries to prevent pipeline stalls at step starts.
+            if _h + 1 < LOCK || b + LOCK < range.end {
                 for l in 0..g {
                     let p = cols16[l].wrapping_add(8).cast::<i8>();
                     _mm_prefetch::<_MM_HINT_T0>(p);

@@ -304,6 +304,26 @@ impl IdleJob {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod affinity {
+    extern "C" {
+        fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+    }
+    pub fn allowed() -> Vec<usize> {
+        let mut mask = [0u64; 16];
+        if unsafe { sched_getaffinity(0, core::mem::size_of_val(&mask), mask.as_mut_ptr()) } != 0 {
+            return Vec::new();
+        }
+        (0..64 * mask.len()).filter(|&c| mask[c / 64] >> (c % 64) & 1 == 1).collect()
+    }
+    pub fn pin(cpu: usize) {
+        let mut mask = [0u64; 16];
+        mask[cpu / 64] |= 1 << (cpu % 64);
+        unsafe { sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr()) };
+    }
+}
+
 /// A fixed set of worker threads that run the tasks of one dispatch at a time.
 pub struct Pool {
     shared: &'static Shared,
@@ -341,8 +361,23 @@ impl Pool {
         // through it — measured as a commitment run by seven runners, 12-26 ms slower, in about
         // a third of the runs.
         let start = epoch_of(shared.claim.load(Ordering::Acquire));
+        #[cfg(target_os = "linux")]
+        let cpus = {
+            let cpus = affinity::allowed();
+            if width > 1 && cpus.len() >= width { cpus } else { Vec::new() }
+        };
         let handles = (1..width)
-            .map(|_| std::thread::spawn(move || worker(shared, start)))
+            .map(|w| {
+                #[cfg(target_os = "linux")]
+                let cpu = cpus.get(w).copied();
+                std::thread::spawn(move || {
+                    #[cfg(target_os = "linux")]
+                    if let Some(cpu) = cpu {
+                        affinity::pin(cpu);
+                    }
+                    worker(shared, start)
+                })
+            })
             .collect();
         Pool {
             shared,

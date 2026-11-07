@@ -746,16 +746,47 @@ impl Drop for Arena {
 /// The commitment of every column of `values` (columns of `4 a.elements` words) modulo
 /// [`MODULUS`].
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
+    let columns = values.len() / (4 * a.elements);
+    let mut out = vec![0u128; columns * N];
+    commit_columns(values, a, workers, &mut out, N, |column, base, tail, c| {
+        for (k, o) in column.iter_mut().enumerate() {
+            *o = crt(base[k][c] as u32, tail[k][c]);
+        }
+    });
+    out
+}
+
+pub const WIDTH: usize = 5;
+const _: () = assert!(MODULUS >= 1 << 32 && MODULUS < 1 << 40);
+
+pub fn commit_packed(values: &[B128], a: &SmsMatrix, workers: usize, bytes: &mut [u8]) {
+    let columns = values.len() / (4 * a.elements);
+    assert_eq!(bytes.len(), columns * N * WIDTH);
+    commit_columns(values, a, workers, bytes, N * WIDTH, |column, base, tail, c| {
+        let dst = column.as_mut_ptr();
+        for k in 0..N - 1 {
+            let x = crt(base[k][c] as u32, tail[k][c]) as u64;
+            unsafe { (dst.add(WIDTH * k) as *mut u64).write_unaligned(x.to_le()) };
+        }
+        let x = crt(base[N - 1][c] as u32, tail[N - 1][c]) as u64;
+        column[WIDTH * (N - 1)..].copy_from_slice(&x.to_le_bytes()[..WIDTH]);
+    });
+}
+
+fn commit_columns<T: Send>(
+    values: &[B128], a: &SmsMatrix, workers: usize, out: &mut [T], per_column: usize,
+    store: impl Fn(&mut [T], &[[u16; LANES]; N], &[[i64; LANES]; N], usize) + Sync,
+) {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
-    let mut out = vec![0u128; columns * N];
-    for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
+    assert_eq!(out.len(), columns * per_column);
+    for_blocks(out, per_column, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
         let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
-        let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
+        let count = block.len() / per_column;
+        for (b, target) in block.chunks_mut(LANES * per_column).enumerate() {
             let col0 = first + LANES * b;
             let here = (count - LANES * b).min(LANES);
             let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
@@ -806,14 +837,11 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             }
             // a partial batch has fewer than eight columns in `target`: only those lanes are written
-            for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(base[k][c] as u32, tail[k][c]);
-                }
+            for (c, column) in target.chunks_exact_mut(per_column).enumerate() {
+                store(column, &base, tail, c);
             }
         }
     });
-    out
 }
 
 #[cfg(test)]

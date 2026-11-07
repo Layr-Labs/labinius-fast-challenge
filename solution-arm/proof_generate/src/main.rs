@@ -356,10 +356,7 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
-        use ntt::neon::sms;
-        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
-            .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
-        return sms::commit(values, &matrix, threads());
+        return ntt::neon::sms::commit(values, &sms_matrix(), threads());
     }
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::hybrid::MODULUS {
@@ -407,6 +404,25 @@ fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
         }
     });
     out
+}
+
+#[cfg(target_arch = "aarch64")]
+fn sms_matrix() -> ntt::neon::sms::SmsMatrix {
+    use ntt::neon::sms;
+    sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
+        .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()))
+}
+
+fn commit_bytes(values: &[B128], modulus: u128, mut bytes: Vec<u8>) -> Vec<u8> {
+    #[cfg(target_arch = "aarch64")]
+    if modulus == ntt::neon::sms::MODULUS && rq::coefficient_bytes(modulus) == ntt::neon::sms::WIDTH {
+        ntt::neon::sms::commit_packed(values, &sms_matrix(), threads(), &mut bytes);
+        return bytes;
+    }
+    let coefficients = commit(values, modulus);
+    let bytes = output::pack_commitment(&coefficients, modulus, bytes);
+    std::mem::forget(coefficients);
+    bytes
 }
 
 /// The checker's schoolbook commitment, for a modulus too wide for [`commit`]'s `u64` lanes.
@@ -874,9 +890,7 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
-    let coefficients = commit(values, modulus);
-    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
-    std::mem::forget(coefficients);
+    let commitment = commit_bytes(values, modulus, output.commitment_buffer());
     labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
@@ -1017,8 +1031,12 @@ mod tests {
         let want = commit_reference(&values, &matrix, q);
         let a = sms::matrix(RING_ELEMENTS, 8);
         eprintln!("sms margin {}", a.margin);
+        let packed = rq::pack_ring_elements(&want, q);
         for workers in [1, 3] {
             assert!(sms::commit(&values, &a, workers) == want, "workers {workers}");
+            let mut bytes = vec![0xa5u8; packed.len()];
+            sms::commit_packed(&values, &a, workers, &mut bytes);
+            assert!(bytes == packed, "packed, workers {workers}");
         }
         // a short last chunk and a short last lockstep group, partial batches; the last sweep of
         // the column with one to four tiles (whole and short), a column of one short tile, and a

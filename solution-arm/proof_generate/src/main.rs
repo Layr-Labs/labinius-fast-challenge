@@ -867,6 +867,7 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 }
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
+    output.wait_setup();
     let coefficients = commit(values, modulus);
     let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
     std::mem::forget(coefficients);

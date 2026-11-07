@@ -492,9 +492,30 @@ impl Matrix {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod affinity {
+    extern "C" {
+        fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+    }
+    pub fn allowed() -> Vec<usize> {
+        let mut mask = [0u64; 16];
+        if unsafe { sched_getaffinity(0, core::mem::size_of_val(&mask), mask.as_mut_ptr()) } != 0 {
+            return Vec::new();
+        }
+        (0..64 * mask.len()).filter(|&c| mask[c / 64] >> (c % 64) & 1 == 1).collect()
+    }
+    pub fn pin(cpu: usize) {
+        let mut mask = [0u64; 16];
+        mask[cpu / 64] |= 1 << (cpu % 64);
+        unsafe { sched_setaffinity(0, core::mem::size_of_val(&mask), mask.as_ptr()) };
+    }
+}
+
 /// Runs `f(first, block)` on `workers` scoped threads over contiguous blocks of `out`, whose
 /// items come in groups of `unit` (`first` counts groups), block edges on multiples of `align`
 /// groups.
+///
 pub fn for_blocks<T: Send>(
     out: &mut [T],
     unit: usize,
@@ -510,11 +531,24 @@ pub fn for_blocks<T: Send>(
             (s * unit, e * unit)
         })
         .collect();
+    #[cfg(target_os = "linux")]
+    let cpus = {
+        let cpus = affinity::allowed();
+        if workers > 1 && cpus.len() >= workers { cpus } else { Vec::new() }
+    };
     let blocks = labinius::par::split_mut(out, &edges);
     let f = &f;
     std::thread::scope(|scope| {
-        for (block, &(s, _)) in blocks.into_iter().zip(&edges) {
-            scope.spawn(move || f(s / unit, block));
+        for (t, (block, &(s, _))) in blocks.into_iter().zip(&edges).enumerate() {
+            #[cfg(target_os = "linux")]
+            let cpu = cpus.get(t).copied();
+            scope.spawn(move || {
+                #[cfg(target_os = "linux")]
+                if let Some(cpu) = cpu {
+                    affinity::pin(cpu);
+                }
+                f(s / unit, block)
+            });
         }
     });
 }

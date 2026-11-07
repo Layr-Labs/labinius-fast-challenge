@@ -97,7 +97,6 @@ fn view<T>(image: &'static [u8], len: usize) -> Option<&'static [T]> {
 static KEY: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new();
 static KEY_JOB: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
 
-/// Starts copying `image` (the SMS key data image) into [`KEY`] on four threads. With
 /// `LABINIUS_KEY_IN_PLACE` set the key is read in place instead.
 pub fn prefetch_key(image: &'static [u8]) {
     if image.is_empty() || std::env::var_os("LABINIUS_KEY_IN_PLACE").is_some() {
@@ -108,7 +107,7 @@ pub fn prefetch_key(image: &'static [u8]) {
         let mut v: Vec<u8> = Vec::with_capacity(len);
         let dst = v.as_mut_ptr() as usize;
         // pieces of whole 2 MiB pages, so that each thread faults in its own huge pages
-        let piece = len.div_ceil(4).next_multiple_of(2 << 20);
+        let piece = len.div_ceil(8).next_multiple_of(2 << 20);
         std::thread::scope(|s| {
             for start in (0..len).step_by(piece) {
                 let n = piece.min(len - start);

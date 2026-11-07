@@ -649,39 +649,31 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
     for first in (0..len).step_by(2 * PAIRS) {
         let pairs = ((len - first) / 2).min(PAIRS);
         let next = first + 2 * PAIRS < len;
-        for (group, ws) in wk.chunks(8).enumerate() {
-            // This group's rows of the next chunk into L2.
-            for g in 0..ws.len() {
-                let row = words.as_ptr().add((8 * group + g) * stride + start + first) as *const u8;
-                if next {
-                    prefetch_l2(row.wrapping_add(64 * PAIRS), 64 * PAIRS);
-                }
+        if next {
+            for q in 0..wk.len() {
+                let row = words.as_ptr().add(q * stride + start + first) as *const u8;
+                prefetch_l2(row.wrapping_add(64 * PAIRS), 64 * PAIRS);
             }
-            // Two pairs (one 64-byte line of each row) per step: the eight rows of a group sit 4 MiB
-            // apart, so their lines share one L1 set; reading a line once instead of once per pair
-            // halves the L1 refills (a 4-way set cannot hold eight rows' lines between two pairs).
-            let mut i = 0;
-            while i + 2 <= pairs {
-                let mut a = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
-                let mut b = if group == 0 { [[z; 6]; 2] } else { scratch[i + 1] };
-                for (g, w) in ws.iter().enumerate() {
-                    let q = 8 * group + g;
-                    let row = words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64;
-                    mat_step(&mut a, w, vld2q_u64(row));
-                    mat_step(&mut b, w, vld2q_u64(row.add(4)));
-                }
-                scratch[i] = a;
-                scratch[i + 1] = b;
-                i += 2;
+        }
+        let mut i = 0;
+        while i + 2 <= pairs {
+            let mut a = [[z; 6]; 2];
+            let mut b = [[z; 6]; 2];
+            for (q, w) in wk.iter().enumerate() {
+                let row = words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64;
+                mat_step(&mut a, w, vld2q_u64(row));
+                mat_step(&mut b, w, vld2q_u64(row.add(4)));
             }
-            if i < pairs {
-                let mut acc = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
-                for (g, w) in ws.iter().enumerate() {
-                    let q = 8 * group + g;
-                    mat_step(&mut acc, w, vld2q_u64(words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64));
-                }
-                scratch[i] = acc;
+            scratch[i] = a;
+            scratch[i + 1] = b;
+            i += 2;
+        }
+        if i < pairs {
+            let mut acc = [[z; 6]; 2];
+            for (q, w) in wk.iter().enumerate() {
+                mat_step(&mut acc, w, vld2q_u64(words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64));
             }
+            scratch[i] = acc;
         }
         for (i, acc) in scratch[..pairs].iter().enumerate() {
             let a = reduce(assemble(acc[0].map(|v| to_u128(v))));

@@ -871,7 +871,6 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
     let coefficients = commit(values, modulus);
     let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
     std::mem::forget(coefficients);
-    labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
     // round, and idle population workers measurably slowed it. The final encode faults the

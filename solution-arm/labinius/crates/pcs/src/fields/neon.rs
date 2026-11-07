@@ -313,6 +313,32 @@ pub(super) fn dot_lifted(a: &[F162], b: &[B128]) -> F162 {
     }
 }
 
+pub(super) fn dot_lifted_planar(a: [&[u64]; 3], b: &[B128]) -> F162 {
+    assert!(a.iter().all(|p| p.len() == b.len()));
+    unsafe {
+        let mut acc = [vdupq_n_u64(0); 6];
+        let pairs = b.len() / 2;
+        for i in 0..pairs {
+            let a0 = vld1q_u64(a[0].as_ptr().add(2 * i));
+            let a1 = vld1q_u64(a[1].as_ptr().add(2 * i));
+            let a2 = vld1q_u64(a[2].as_ptr().add(2 * i));
+            let bb = vld2q_u64(b.as_ptr().add(2 * i) as *const u64);
+            let ka = [a0, a1, vdupq_n_u64(0), x2(a0, a1), x2(a0, a2), x2(a1, a2)];
+            let kb = [bb.0, bb.1, vdupq_n_u64(0), x2(bb.0, bb.1), bb.0, bb.1];
+            for k in [0usize, 1, 3, 4, 5] {
+                acc[k] = x2(acc[k], pmul_lo(ka[k], kb[k]));
+                acc[k] = x2(acc[k], pmul_hi(ka[k], kb[k]));
+            }
+        }
+        let mut out = reduce(assemble(acc.map(|x| to_u128(x))));
+        if pairs * 2 < b.len() {
+            let j = 2 * pairs;
+            out += F162([a[0][j], a[1][j], a[2][j]]) * F162::from_b128(b[j]);
+        }
+        out
+    }
+}
+
 
 #[inline(always)]
 unsafe fn to_u128(x: uint64x2_t) -> u128 {

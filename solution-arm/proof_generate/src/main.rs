@@ -434,19 +434,16 @@ fn commit_reference(values: &[B128], matrix: &[u128], modulus: u128) -> Vec<u128
     out
 }
 
-fn dot_lifted(eq: &[F162], column: &[B128]) -> F162 {
-    cf::dot_lifted(eq, column)
-}
-
 fn row_evaluate(values: &[B128], p0: &[F162]) -> Vec<F162> {
     let eq = eq_table(p0);
+    let planes: [Vec<u64>; 3] = core::array::from_fn(|k| eq.iter().map(|e| e.0[k]).collect());
+    let planes = [&planes[0][..], &planes[1][..], &planes[2][..]];
     let mut out = vec![F162::ZERO; COLUMNS];
-    let eq = &eq;
     labinius::par::for_each(
         out.chunks_mut(ROW_BATCH).zip(values.chunks(ROW_BATCH * COLUMN_LEN)),
         |(block, columns)| {
             for (slot, column) in block.iter_mut().zip(columns.chunks_exact(COLUMN_LEN)) {
-                *slot = dot_lifted(eq, column);
+                *slot = cf::dot_lifted_planar(planes, column);
             }
         },
     );

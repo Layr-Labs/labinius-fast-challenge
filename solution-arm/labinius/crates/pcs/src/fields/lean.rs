@@ -189,35 +189,8 @@ impl<'a> Switch<'a> {
     pub fn msg(&mut self) -> [F162; 2] {
         self.half /= 2;
         if let Some(m) = self.pending.take() { return m; }
-        if self.round < self.prepared.prefix {
-            return self.prefix_message();
-        }
-        self.message(self.half)
-    }
-
-    fn message(&self, half: usize) -> [F162; 2] {
-        let l = ByteTables::new(&self.l);
-        let lp = ByteTables::new(&self.lp);
-        let p = &self.planes;
-        let parts = par::workers(half, 1 << 10);
-        let sums = par::map_blocks(half, parts, 64.min(half), |_, start, end| unsafe {
-            let mut out = [F162::ZERO; 2];
-            let mut eq = [B128::ZERO; 64];
-            for base in (start..end).step_by(64) {
-                let count = (end - base).min(64);
-                self.prepared.eq.fill(base, &mut eq[..count]);
-                let m = neon::linear_message(
-                    &eq[..count],
-                    core::array::from_fn(|k| &p[k][base..base + count]),
-                    core::array::from_fn(|k| &p[k][half + base..half + base + count]),
-                    &l, &lp,
-                );
-                out[0] += m[0];
-                out[1] += m[1];
-            }
-            out
-        });
-        sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])
+        assert!(self.round < self.prepared.prefix, "a message past the prefix was not computed ahead");
+        self.prefix_message()
     }
 
     pub fn fold(&mut self, r: F162) {
@@ -296,6 +269,7 @@ impl<'a> Switch<'a> {
 
     fn materialize(&mut self) {
         let n = self.words.len() >> self.prepared.prefix;
+        let half = n / 2;
         let reserve = n.max(PLANE_RESERVE / core::mem::size_of::<u64>());
         self.planes = core::array::from_fn(|_| {
             let mut v = Vec::<u64>::with_capacity(reserve);
@@ -304,15 +278,40 @@ impl<'a> Switch<'a> {
         });
         let weights = eq_expand_f162(&self.prefix_r);
         let words = self.words;
+        let l = ByteTables::new(&self.l);
+        let lp = ByteTables::new(&self.lp);
+        let eq = &self.prepared.eq;
         let parts = par::workers(n, 1 << 12);
-        let edges: Vec<_> = (0..parts).map(|t| par::block(n, parts, t, 2)).collect();
+        let edges: Vec<_> = (0..parts).map(|t| par::block(half, parts, t, 64.min(half))).collect();
         let [p0, p1, p2] = &mut self.planes;
-        let chunks = par::split_mut(p0, &edges).into_iter()
-            .zip(par::split_mut(p1, &edges)).zip(par::split_mut(p2, &edges));
-        let weights = &weights;
-        par::for_each(chunks.zip(&edges), |(((a, b), c), &(start, _))| unsafe {
-            neon::materialize_prefix(words, weights, start, [a, b, c])
+        let (a0, a1) = p0.split_at_mut(half);
+        let (b0, b1) = p1.split_at_mut(half);
+        let (c0, c1) = p2.split_at_mut(half);
+        let chunks = par::split_mut(a0, &edges).into_iter().zip(par::split_mut(a1, &edges))
+            .zip(par::split_mut(b0, &edges)).zip(par::split_mut(b1, &edges))
+            .zip(par::split_mut(c0, &edges)).zip(par::split_mut(c1, &edges));
+        let (weights, l, lp) = (&weights, &l, &lp);
+        let sums = par::map_each(chunks.zip(&edges), |((((((a0, a1), b0), b1), c0), c1), &(start, end))| unsafe {
+            neon::materialize_prefix(words, weights, start, [&mut *a0, &mut *b0, &mut *c0]);
+            neon::materialize_prefix(words, weights, half + start, [&mut *a1, &mut *b1, &mut *c1]);
+            let mut out = [F162::ZERO; 2];
+            let mut tile = [B128::ZERO; 64];
+            for base in (start..end).step_by(64) {
+                let count = (end - base).min(64);
+                let o = base - start;
+                eq.fill(base, &mut tile[..count]);
+                let m = neon::linear_message(
+                    &tile[..count],
+                    [&a0[o..o + count], &b0[o..o + count], &c0[o..o + count]],
+                    [&a1[o..o + count], &b1[o..o + count], &c1[o..o + count]],
+                    l, lp,
+                );
+                out[0] += m[0];
+                out[1] += m[1];
+            }
+            out
         });
+        self.pending = Some(sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]]));
     }
 
     pub fn final_eval(&self) -> F162 {

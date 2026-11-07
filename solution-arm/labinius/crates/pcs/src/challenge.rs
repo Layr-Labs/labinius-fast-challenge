@@ -526,14 +526,21 @@ pub static UNITS: LazyLock<[u16; N162]> = LazyLock::new(|| {
 /// and the first [`HALF`] units: 162 x 88 f64 each, ~228 KB together.
 static PHASE: LazyLock<(Vec<f64>, Vec<f64>)> = LazyLock::new(|| {
     let units = &*UNITS;
+    // The angle only depends on `m = p * u_k mod 243`, so there are 243 distinct arguments,
+    // not 162 x 88. Evaluating each once is bit-identical to the old per-entry calls (same
+    // expression, same integer `m`) and cuts ~28k libm calls to 243.
+    let mut trig = [(0.0f64, 0.0f64); CONDUCTOR243];
+    for (m, t) in trig.iter_mut().enumerate() {
+        let angle = 2.0 * PI * (m as f64) / (CONDUCTOR243 as f64);
+        *t = (angle.cos(), angle.sin());
+    }
     let mut re = vec![0.0f64; N162 * LANES];
     let mut im = vec![0.0f64; N162 * LANES];
     for p in 0..N162 {
         for k in 0..HALF {
             let m = (p * units[k] as usize) % CONDUCTOR243;
-            let angle = 2.0 * PI * (m as f64) / (CONDUCTOR243 as f64);
-            re[p * LANES + k] = angle.cos();
-            im[p * LANES + k] = angle.sin();
+            re[p * LANES + k] = trig[m].0;
+            im[p * LANES + k] = trig[m].1;
         }
     }
     (re, im)

@@ -686,6 +686,61 @@ unsafe fn sums(
     super::inverse_folded::<PB>(y);
 }
 
+#[inline(never)]
+unsafe fn sums2(
+    words: [&[(*const u8, usize); LANES]; 2],
+    a: &SmsMatrix,
+    nib: &mut [uint8x16_t; N / 4],
+    xs: [&mut [[int16x8_t; N]; SWEEP]; 2],
+    acc: [&mut [int64x2_t]; 2],
+    y: [&mut [int16x8_t; N]; 2],
+    dev: [&mut [int32x4_t]; 2],
+) {
+    let kern = &kernels()[PB];
+    let [xs0, xs1] = xs;
+    let [acc0, acc1] = acc;
+    let [y0, y1] = y;
+    let [dev0, dev1] = dev;
+    acc0.fill(vdupq_n_s64(0));
+    acc1.fill(vdupq_n_s64(0));
+    let mut e = 0usize;
+    while e < a.elements {
+        let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
+        while e < end {
+            let l = SWEEP.min(end - e);
+            let groups = l.div_ceil(LOCK);
+            for (w, xs) in [(words[0], &mut *xs0), (words[1], &mut *xs1)] {
+                for i in 0..groups * LOCK {
+                    let at = pass_words(w, a.elements, e, i);
+                    indices(&at, nib);
+                    let x = &mut xs[i];
+                    pass_lut::<PB>(nib, x, kern);
+                    pass_c::<PB>(x, kern);
+                    pass_d::<PB, false>(x, kern, &[], &mut []);
+                }
+            }
+            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            if e % CHUNK == 0 {
+                sink::<true>(xs0, keys, acc0, groups);
+                sink::<true>(xs1, keys, acc1, groups);
+            } else {
+                sink::<false>(xs0, keys, acc0, groups);
+                sink::<false>(xs1, keys, acc1, groups);
+            }
+            e += l;
+        }
+        let c = (end - 1) / CHUNK;
+        for d in 0..DIGITS {
+            chunk_row(acc0, 1 + d, a.mean_residues(c, d), &mut dev0[d * 2 * N..][..2 * N], y0);
+            chunk_row(acc1, 1 + d, a.mean_residues(c, d), &mut dev1[d * 2 * N..][..2 * N], y1);
+        }
+    }
+    narrow(acc0, 0, y0);
+    super::inverse_folded::<PB>(y0);
+    narrow(acc1, 0, y1);
+    super::inverse_folded::<PB>(y1);
+}
+
 /// `r mod 9721` and `t mod M` into `[0, Q)`.
 #[inline]
 fn crt(r: u32, t: u32) -> u128 {
@@ -721,22 +776,45 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
         let mut acc = vec![vdupq_n_s64(0); ROWS * 4 * N];
         // per digit, the chunk deviations S - mean summed over the chunks
         let mut dev = vec![vdupq_n_s32(0); DIGITS * 2 * N];
+        let mut xs2 = Box::new([[vdupq_n_s16(0); N]; SWEEP]);
+        let mut y2 = Box::new([vdupq_n_s16(0); N]);
+        let mut acc2 = vec![vdupq_n_s64(0); ROWS * 4 * N];
+        let mut dev2 = vec![vdupq_n_s32(0); DIGITS * 2 * N];
         // the eight columns' tails, `i64` per lane (41 KiB, off the stack)
         let mut tail = Box::new([[0i64; LANES]; N]);
         let p = P1 as i16;
         let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
+        let batches = count.div_ceil(LANES);
+        let words_of = |b: usize| -> [(*const u8, usize); LANES] {
             let col0 = first + LANES * b;
             let here = (count - LANES * b).min(LANES);
-            let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
+            core::array::from_fn(|c| {
                 if c < here {
                     (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
                 } else {
                     (ZERO_WORDS.as_ptr() as *const u8, 0)
                 }
-            });
-            dev.fill(vdupq_n_s32(0));
-            sums(&words, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, &mut dev);
+            })
+        };
+        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
+            if b % 2 == 0 {
+                let w0 = words_of(b);
+                dev.fill(vdupq_n_s32(0));
+                if b + 1 < batches {
+                    let w1 = words_of(b + 1);
+                    dev2.fill(vdupq_n_s32(0));
+                    sums2(
+                        [&w0, &w1], a, &mut nib,
+                        [&mut *xs, &mut *xs2], [&mut acc[..], &mut acc2[..]],
+                        [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]],
+                    );
+                } else {
+                    sums(&w0, a, &mut m, &mut nib, &mut xs, &mut acc, &mut y, &mut dev);
+                }
+            } else {
+                core::mem::swap(&mut y, &mut y2);
+                core::mem::swap(&mut dev, &mut dev2);
+            }
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
             let pv = vdupq_n_s16(p);

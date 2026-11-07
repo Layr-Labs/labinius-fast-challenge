@@ -141,19 +141,26 @@ pub(super) struct ByteTables {
 impl ByteTables {
     pub(super) fn new(batch: &[F162]) -> Self {
         assert_eq!(batch.len(), 128);
+        const PER_TASK: usize = 2;
         let mut lo = vec![0u128; 16 * 256];
         let mut top = vec![0u64; 16 * 256];
-        for b in 0..16 {
-            let mut t = [F162::ZERO; 256];
-            for s in 1..256usize {
-                let i = s.trailing_zeros() as usize;
-                t[s] = t[s & (s - 1)] + batch[8 * b + i];
+        let (lo_ptr, top_ptr) = (lo.as_mut_ptr() as usize, top.as_mut_ptr() as usize);
+        crate::par::pool().run(16 / PER_TASK, |task| {
+            for b in PER_TASK * task..PER_TASK * (task + 1) {
+                let mut t = [F162::ZERO; 256];
+                for s in 1..256usize {
+                    let i = s.trailing_zeros() as usize;
+                    t[s] = t[s & (s - 1)] + batch[8 * b + i];
+                }
+                unsafe {
+                    let (lo, top) = ((lo_ptr as *mut u128).add(256 * b), (top_ptr as *mut u64).add(256 * b));
+                    for (s, x) in t.iter().enumerate() {
+                        *lo.add(s) = x.0[0] as u128 | (x.0[1] as u128) << 64;
+                        *top.add(s) = x.0[2];
+                    }
+                }
             }
-            for (s, x) in t.iter().enumerate() {
-                lo[256 * b + s] = x.0[0] as u128 | (x.0[1] as u128) << 64;
-                top[256 * b + s] = x.0[2];
-            }
-        }
+        });
         Self { lo, top }
     }
 }

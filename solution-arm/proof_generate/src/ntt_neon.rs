@@ -610,21 +610,49 @@ unsafe fn pass_b<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     }
 }
 
+/// Level-4 nodes that need no first-input reduction before level 5 after the 9721 LUT front.
+/// Proven for all admissible nibble patterns by `lazy_lut_intervals` below.
+#[inline(always)]
+const fn skip_lut5(n: usize) -> bool {
+    const NODES: [usize; 27] = [
+        1, 11, 15, 16, 17, 19, 20, 22, 23, 25, 28, 30, 31, 32,
+        34, 35, 36, 37, 44, 50, 56, 59, 61, 65, 67, 70, 71,
+    ];
+    const MASK: u128 = {
+        let mut mask = 0;
+        let mut i = 0;
+        while i < NODES.len() { mask |= 1 << NODES[i]; i += 1; }
+        mask
+    };
+    MASK >> n & 1 != 0
+}
+
 /// Levels 4 and 5: per level-3 node (27 slots) and `j < 3`, the nine slots `j + 3 i`. All three
 /// `j` of a node in one block (arm-big): nine independent butterflies per level.
+/// `S == 4` uses prime 9721's table-front intervals to omit 99 first-input reductions.
 #[inline(always)]
 unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
-    let s: Schedule = schedule(S);
+    let s: Schedule = schedule(if S == 4 { 1 } else { S });
     let k = vld1q_s16(kern.k.as_ptr());
     #[inline(always)]
-    unsafe fn lvl4(x: &[int16x8_t; N], s: Schedule, t0: int16x8_t, k: int16x8_t, at: usize) -> [int16x8_t; 9] {
+    unsafe fn lvl4<const SS: usize>(x: &[int16x8_t; N], s: Schedule, t0: int16x8_t, k: int16x8_t, at: usize, n: usize) -> [int16x8_t; 9] {
         let mut v: [int16x8_t; 9] = core::array::from_fn(|i| load(x, at + 3 * i));
-        reduce_inputs(&mut v, s.before[4], s.cheap, &[0, 1, 2], k);
+        if SS != 4 || (n != 1 && n != 15) {
+            reduce_inputs(&mut v, s.before[4], s.cheap, &[0, 1, 2], k);
+        }
         for i in 0..3 {
             let (a, b, c) = r3!(s, 0, 1, 2, 3, v[i], v[i + 3], v[i + 6], t0, k);
             (v[i], v[i + 3], v[i + 6]) = (a, b, c);
         }
-        reduce_inputs(&mut v, s.before[5], s.cheap, &[0, 3, 6], k);
+        if SS == 4 {
+            for g in 0..3 {
+                if !skip_lut5(3 * n + g) {
+                    v[3 * g] = vmlsq_laneq_s16::<0>(v[3 * g], vrshrq_n_s16::<13>(v[3 * g]), k);
+                }
+            }
+        } else {
+            reduce_inputs(&mut v, s.before[5], s.cheap, &[0, 3, 6], k);
+        }
         v
     }
     #[inline(always)]
@@ -644,10 +672,10 @@ unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
         let t0 = vld1q_s16(kern.c[n].as_ptr());
         let t1 = vld1q_s16(kern.c[n].as_ptr().add(8));
         let base = 27 * n;
-        let v0 = lvl4(x, s, t0, k, base);
-        let v1 = lvl4(x, s, t0, k, base + 1);
+        let v0 = lvl4::<S>(x, s, t0, k, base, n);
+        let v1 = lvl4::<S>(x, s, t0, k, base + 1, n);
         lvl5(x, s, v0, t0, t1, k, base);
-        let v2 = lvl4(x, s, t0, k, base + 2);
+        let v2 = lvl4::<S>(x, s, t0, k, base + 2, n);
         lvl5(x, s, v1, t0, t1, k, base + 1);
         lvl5(x, s, v2, t0, t1, k, base + 2);
     }
@@ -731,7 +759,7 @@ pub unsafe fn transform_lut<const P: usize>(m: &[int16x8_t; BITS], idx: &mut [ui
     let kern = &kernels()[P];
     nibbles(m, idx);
     pass_lut::<P>(idx, x, kern);
-    pass_c::<P>(x, kern);
+    if P == 1 { pass_c::<4>(x, kern); } else { pass_c::<P>(x, kern); }
     pass_d::<P, false>(x, kern, &[], &mut []);
 }
 
@@ -1342,6 +1370,89 @@ mod tests {
     #[inline(never)]
     unsafe fn mca_indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
         indices(words, idx);
+    }
+
+    /// Every legal table pattern is covered, then conservative signed intervals are
+    /// propagated through every integer Barrett rounding and every lazy intermediate.
+    #[test]
+    fn lazy_lut_intervals() {
+        type Range = (i32, i32);
+        fn check(a: Range) -> Range {
+            assert!(a.0 >= -32768 && a.1 <= 32767, "interval {a:?}");
+            a
+        }
+        fn add(a: Range, b: Range) -> Range { check((a.0 + b.0, a.1 + b.1)) }
+        fn sub(a: Range, b: Range) -> Range { check((a.0 - b.1, a.1 - b.0)) }
+        fn map(a: Range, f: impl Fn(i32) -> i32) -> Range {
+            check(a);
+            check((a.0..=a.1).map(f).fold((i32::MAX, i32::MIN), |r, v| (r.0.min(v), r.1.max(v))))
+        }
+        fn mul(a: Range, t: &[i16]) -> Range {
+            map(a, |v| v * t[0] as i32 - ((v * t[1] as i32 + 16384) >> 15) * 9721)
+        }
+        fn red(a: Range) -> Range { map(a, |v| v - ((v + 4096) >> 13) * 9721) }
+        fn bare(v: [Range; 3], k: &Kernel) -> [Range; 3] {
+            let [a, b, c] = v;
+            let e = mul(sub(b, c), &k.k[2..]);
+            [add(a, add(b, c)), add(sub(a, c), e), sub(sub(a, b), e)]
+        }
+        fn sixth(v: [Range; 3], k: &Kernel) -> [Range; 3] {
+            let [a, b, c] = v;
+            let e = mul(add(b, c), &k.k[2..]);
+            [add(add(a, b), e), add(sub(a, b), c), sub(sub(a, c), e)]
+        }
+        fn r3(v: [Range; 3], t: &[i16], k: &Kernel) -> [Range; 3] {
+            bare([v[0], mul(v[1], t), mul(v[2], &t[2..])], k)
+        }
+        let k = &kernels()[1];
+        let mut x = [(0, 0); N];
+        for n in 0..4 {
+            for j in 0..27 {
+                let look = |t: usize, pos: usize| {
+                    (0..16).filter(|&pat| (0..4).all(|b| pat >> b & 1 == 0 || pos + 162 * b < BITS))
+                        .map(|pat| k.lut[n][t][pat] as i32)
+                        .fold((i32::MAX, i32::MIN), |r, v| (r.0.min(v), r.1.max(v)))
+                };
+                for h in 0..2 {
+                    let v = core::array::from_fn(|r| {
+                        let t = 2 * r;
+                        let a = look(t, j + 27 * r);
+                        let b = look(t + 1, j + 27 * r + 81);
+                        if h == 0 { add(a, b) } else { sub(a, b) }
+                    });
+                    let ys = if h == 0 { bare(v, k) } else { sixth(v, k) };
+                    for (i, a) in ys.into_iter().enumerate() {
+                        x[162 * n + 81 * h + j + 27 * i] = a;
+                    }
+                }
+            }
+        }
+        for n in 0..24 {
+            for j in 0..9 {
+                let pos: [usize; 3] = core::array::from_fn(|i| 27 * n + j + 9 * i);
+                let mut v = pos.map(|i| x[i]);
+                if n != 1 && n != 15 { v[0] = red(v[0]); }
+                for (i, a) in pos.into_iter().zip(r3(v, &k.c[n], k)) { x[i] = a; }
+            }
+        }
+        for n in 0..72 {
+            for j in 0..3 {
+                let pos: [usize; 3] = core::array::from_fn(|i| 9 * n + j + 3 * i);
+                let mut v = pos.map(|i| x[i]);
+                if !skip_lut5(n) { v[0] = red(v[0]); }
+                let t = if n % 3 == 0 { &k.c[n / 3][4..] } else { &k.c[n / 3][8 + 4 * (n % 3 - 1)..] };
+                for (i, a) in pos.into_iter().zip(r3(v, t, k)) { x[i] = a; }
+            }
+        }
+        let bound = super::super::lut_transform_bound(9721, SCHEDULES[1]) as i32;
+        for n in 0..216 {
+            let mut v = core::array::from_fn(|i| x[3 * n + i]);
+            v[0] = red(v[0]);
+            let t = &k.d[n / 2][4 * (n % 2)..];
+            for a in r3(v, t, k) {
+                assert!(a.0 >= -bound && a.1 <= bound, "final {a:?} bound {bound}");
+            }
+        }
     }
 
     fn lanes(v: int16x8_t) -> [i16; 8] {

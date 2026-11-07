@@ -1717,18 +1717,29 @@ pub mod neon {
         let built: Vec<OnceLock<Group>> = (0..ngroups).map(|_| OnceLock::new()).collect();
         let workers = threads.clamp(1, blocks.max(1));
         let pool = crate::par::pool();
-        pool.run(ngroups, |g| {
-            let _ = built[g].set(Group::of(challenges, g));
-        });
-        let groups: Vec<&Group> = built.iter().map(|g| g.get().expect("every group is built")).collect();
-        let bias = bias(groups.iter().copied());
         let mut out: Vec<RingElement> = Vec::with_capacity(elements);
         let out_addr = out.as_mut_ptr() as usize;
         let words_addr = words.as_ptr() as usize;
         let next = AtomicUsize::new(0);
-        let (groups, bias) = (&groups, &bias);
+        let next_group = AtomicUsize::new(0);
+        let groups_done = AtomicUsize::new(0);
+        let built = &built;
         pool.run(workers, |_| {
             let mut ws = Workspace::new();
+            loop {
+                let g = next_group.fetch_add(1, Ordering::Relaxed);
+                if g >= ngroups {
+                    break;
+                }
+                let _ = built[g].set(Group::of(challenges, g));
+                groups_done.fetch_add(1, Ordering::Release);
+            }
+            while groups_done.load(Ordering::Acquire) < ngroups {
+                core::hint::spin_loop();
+            }
+            let groups: Vec<&Group> = built.iter().map(|g| g.get().expect("every group is built")).collect();
+            let bias = bias(groups.iter().copied());
+            let groups = &groups;
             let mut claim = || {
                 let b = next.fetch_add(1, Ordering::Relaxed);
                 (b < blocks).then_some(b)
@@ -1741,7 +1752,7 @@ pub mod neon {
                         words_addr as *const u128,
                         column_words,
                         groups,
-                        bias,
+                        &bias,
                         b,
                         &mut claim,
                         &mut ws,

@@ -21,6 +21,15 @@ use core::arch::aarch64::*;
 use labinius::fields::scalar::B128;
 use std::sync::OnceLock;
 
+#[cfg(test)]
+#[path = "ntt_stat.rs"]
+mod stat;
+#[path = "ntt_stat_schedule.rs"]
+mod stat_schedule;
+#[cfg(feature = "stat-moments")]
+#[path = "ntt_stat_moments.rs"]
+mod stat_moments;
+
 /// Columns per vector.
 const LANES: usize = 8;
 /// Coefficients a binary witness element can have set.
@@ -29,7 +38,7 @@ const BITS: usize = 512;
 /// One prime's constants in the order the passes read them. A twiddle `w` is stored as the pair
 /// `(w, round(w 2^15 / p))`, both centered.
 pub struct Kernel {
-    /// `[p, round(2^26 / p), eps, eps', 0, 0, 0, 0]`, `eps = zeta^648`.
+    /// `[p, round(2^26 / p), eps, eps', -p, 0, 0, 0]`, `eps = zeta^648`.
     k: [i16; 8],
     /// Levels 0 and 1: `[zeta^324, zeta^1620, zeta^162, zeta^486, zeta^810, zeta^486, 0, 0]`.
     a: [i16; 8],
@@ -76,7 +85,7 @@ impl Kernel {
         };
         let eps = tw(648);
         let v = (((1u64 << 27) / p as u64 + 1) / 2) as i16;
-        let k = [p as i16, v, eps[0], eps[1], 0, 0, 0, 0];
+        let k = [p as i16, v, eps[0], eps[1], -(p as i16), 0, 0, 0];
         let c = |e: usize| super::centered(plan.root(e) as i64, p);
         let a = [c(324), c(1620), c(162), c(486), c(810), c(486), 0, 0];
         let mut g = [0i16; 8];
@@ -160,21 +169,14 @@ pub fn kernels() -> &'static [Kernel; 3] {
 }
 
 /// Barrett product by the twiddle in lanes `W` (value) and `T` (twisted) of `t`; `k` holds `p` in
-/// lane 0. `|result| <= product_bound(p, |a|)`.
+/// lane 0 and `-p` in lane 4. `|result| <= product_bound(p, |a|)`.
 #[inline(always)]
 unsafe fn mulc<const W: i32, const T: i32>(a: int16x8_t, t: int16x8_t, k: int16x8_t) -> int16x8_t {
-    let mut lo = vmulq_laneq_s16::<W>(a, t);
+    let lo = vmulq_laneq_s16::<W>(a, t);
     let hi = vqrdmulhq_laneq_s16::<T>(a, t);
-    // `lo - hi p` as one `mls`: written as the intrinsic, LLVM turns the two products into
-    // `mul`, `neg`, `mla`, one instruction more.
-    core::arch::asm!(
-        "mls {lo:v}.8h, {hi:v}.8h, {k:v}.h[0]",
-        lo = inout(vreg) lo,
-        hi = in(vreg) hi,
-        k = in(vreg_low16) k,
-        options(pure, nomem, nostack, preserves_flags)
-    );
-    lo
+    // Precomputing `-p` keeps this a single multiply-add without a vector negation,
+    // and leaves all three instructions visible to LLVM's scheduler.
+    vmlaq_laneq_s16::<4>(lo, hi, k)
 }
 
 /// Barrett reduction of any `i16` lanes to `|result| <= reduced_bound(p)`, congruent mod `p`.
@@ -641,7 +643,7 @@ const fn skip_lut5(n: usize) -> bool {
 
 /// Levels 4 and 5: per level-3 node (27 slots) and `j < 3`, the nine slots `j + 3 i`. All three
 /// `j` of a node in one block (arm-big): nine independent butterflies per level.
-/// `S == 4` uses prime 9721's table-front intervals to omit 99 first-input reductions.
+/// `S == 4` uses the discretely certified 9721 schedule in stat_schedule.
 #[inline(always)]
 unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     let s: Schedule = schedule(if S == 4 { 1 } else { S });
@@ -656,6 +658,8 @@ unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
             let (a, b, c) = r3!(s, 0, 1, 2, 3, v[i], v[i + 3], v[i + 6], t0, k);
             (v[i], v[i + 3], v[i + 6]) = (a, b, c);
         }
+        #[cfg(feature = "stat-moments")]
+        if SS == 4 { stat_moments::record(4, at, 3, &v); }
         if SS == 4 {
             for g in 0..3 {
                 if SKIP >> g & 1 == 0 {
@@ -708,18 +712,9 @@ unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     }
 }
 
-/// Node `n`'s reductions in `pass_c::<4>`: whether its level-4 inputs are reduced, and the `g`
-/// whose level-5 first input is not ([`skip_lut5`]) as bits.
+/// Node `n`'s certified level-4 reduction and skipped level-5 inputs as bits.
 const fn lut_node_kind(n: usize) -> (bool, u8) {
-    let mut skip = 0u8;
-    let mut g = 0;
-    while g < 3 {
-        if skip_lut5(3 * n + g) {
-            skip |= 1 << g;
-        }
-        g += 1;
-    }
-    (n != 1 && n != 15, skip)
+    (stat_schedule::NODES[n].0, !stat_schedule::NODES[n].1 & 7)
 }
 
 /// `acc[2 s..2 s + 2] -= a_s * y` for the six slots `s = base..base + 6`, `a_s` in lanes 0..6
@@ -751,24 +746,29 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
     row: &[i16],
     acc: &mut [int32x4_t],
 ) {
-    let s: Schedule = schedule(S);
+    let s: Schedule = schedule(if S == 4 { 1 } else { S });
     let k = vld1q_s16(kern.k.as_ptr());
     debug_assert!(!MAC || (row.len() == ROW && acc.len() == 2 * N));
     #[inline(always)]
-    unsafe fn compute(x: &[int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, q: usize) -> [int16x8_t; 6] {
+    unsafe fn compute<const SS: usize, const RED: u8>(x: &[int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, q: usize) -> [int16x8_t; 6] {
         let t = vld1q_s16(kern.d[q].as_ptr());
         let mut v: [int16x8_t; 6] = core::array::from_fn(|i| load(x, 6 * q + i));
-        reduce_inputs(&mut v, s.before[6], s.cheap, &[0, 3], k);
+        if SS == 4 {
+            if RED & 1 != 0 { v[0] = reduce_round13(v[0], k); }
+            if RED & 2 != 0 { v[3] = reduce_round13(v[3], k); }
+        } else {
+            reduce_inputs(&mut v, s.before[6], s.cheap, &[0, 3], k);
+        }
         let (y0, y1, y2) = r3!(s, 0, 1, 2, 3, v[0], v[1], v[2], t, k);
         let (y3, y4, y5) = r3!(s, 4, 5, 6, 7, v[3], v[4], v[5], t, k);
         [y0, y1, y2, y3, y4, y5]
     }
-    // three groups per step, all computed before any is stored (arm-big); 108 = 36 * 3
-    for q in (0..N / 6).step_by(3) {
-        let ys = [compute(x, s, kern, k, q), compute(x, s, kern, k, q + 1), compute(x, s, kern, k, q + 2)];
+    #[inline(always)]
+    unsafe fn block<const SS: usize, const MACC: bool, const A: u8, const B: u8, const C: u8>(x: &mut [int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, row: &[i16], acc: &mut [int32x4_t], q: usize) {
+        let ys = [compute::<SS,A>(x, s, kern, k, q), compute::<SS,B>(x, s, kern, k, q + 1), compute::<SS,C>(x, s, kern, k, q + 2)];
         for (d, y) in ys.iter().enumerate() {
             let base = 6 * (q + d);
-            if MAC {
+            if MACC {
                 let av = vld1q_s16(row.as_ptr().add(base));
                 mac6(acc, base, y, av);
             } else {
@@ -777,6 +777,15 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
                 }
             }
         }
+    }
+    // Same three-group scheduling blocks; every reduction choice is a constant.
+    if S == 4 {
+        macro_rules! blocks {
+            ($($q:literal),*) => {$(block::<S, MAC, {stat_schedule::pair($q)}, {stat_schedule::pair($q+1)}, {stat_schedule::pair($q+2)}>(x,s,kern,k,row,acc,$q);)*};
+        }
+        blocks!(0,3,6,9,12,15,18,21,24,27,30,33,36,39,42,45,48,51,54,57,60,63,66,69,72,75,78,81,84,87,90,93,96,99,102,105);
+    } else {
+        for q in (0..N/6).step_by(3) {block::<S, MAC, 3,3,3>(x,s,kern,k,row,acc,q);}
     }
 }
 
@@ -793,7 +802,8 @@ pub unsafe fn transform<const P: usize>(m: &[int16x8_t; BITS], x: &mut [int16x8_
 }
 
 /// [`transform`] through the nibble tables: [`nibbles`] and [`pass_lut`] in place of [`pass_a`]
-/// and [`pass_b`], values within [`super::lut_transform_bound`].
+/// and [`pass_b`]. Prime 9721 uses stat_schedule::OUTPUT_BOUND, conditional on
+/// the statistical overflow certificate; other primes use lut_transform_bound.
 #[inline(never)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub unsafe fn transform_lut<const P: usize>(m: &[int16x8_t; BITS], idx: &mut [uint8x16_t; GROUPS], x: &mut [int16x8_t; N]) {
@@ -801,7 +811,18 @@ pub unsafe fn transform_lut<const P: usize>(m: &[int16x8_t; BITS], idx: &mut [ui
     nibbles(m, idx);
     pass_lut::<P>(idx, x, kern);
     if P == 1 { pass_c::<4>(x, kern); } else { pass_c::<P>(x, kern); }
-    pass_d::<P, false>(x, kern, &[], &mut []);
+    if P == 1 { pass_d::<4, false>(x, kern, &[], &mut []); }
+    else { pass_d::<P, false>(x, kern, &[], &mut []); }
+}
+
+/// Stand-only assembly export: the complete selected forward transform.
+#[cfg(test)]
+#[no_mangle]
+#[inline(never)]
+unsafe fn mca_stat_forward_lut(idx:&[uint8x16_t;GROUPS],x:&mut [int16x8_t;N],kern:&Kernel) {
+    pass_lut::<1>(idx,x,kern);
+    pass_c::<4>(x,kern);
+    pass_d::<4,false>(x,kern,&[],&mut []);
 }
 
 /// Levels 0 and 1 of a general transform: Barrett products, every value reduced in between
@@ -1413,8 +1434,8 @@ mod tests {
         indices(words, idx);
     }
 
-    /// Every legal table pattern is covered, then conservative signed intervals are
-    /// propagated through every integer Barrett rounding and every lazy intermediate.
+    /// The old record's deterministic schedule: every legal table pattern is
+    /// covered. The selected statistical schedule has its own discrete test.
     #[test]
     fn lazy_lut_intervals() {
         type Range = (i32, i32);
@@ -1953,7 +1974,7 @@ mod tests {
                         _ => transform_lut::<1>(&m, &mut idx, &mut x),
                     }
                 }
-                let bound = super::super::lut_transform_bound(plan.p, SCHEDULES[i]);
+                let bound = if i == 1 { stat_schedule::OUTPUT_BOUND } else { super::super::lut_transform_bound(plan.p, SCHEDULES[i]) as u64 };
                 for c in 0..8 {
                     let b: Vec<B128> = words[c].iter().map(|&w| B128(w)).collect();
                     let mut s = [0u32; N];

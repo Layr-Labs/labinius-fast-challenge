@@ -7,6 +7,10 @@ edition = "2021"
 [workspace]
 resolver = "2"
 
+[features]
+# Development-only complete per-slot moments, excluded from timed builds.
+stat-moments = []
+
 [[bin]]
 name = "labinius-fast"
 path = "src/main.rs"

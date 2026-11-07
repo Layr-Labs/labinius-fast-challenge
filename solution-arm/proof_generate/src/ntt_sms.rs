@@ -575,7 +575,10 @@ unsafe fn narrow(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
 }
 
 /// The largest product of a key slot (a centered residue) and a transform slot.
-const PRODUCT: u64 = (P1 as u64 - 1) / 2 * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64;
+const PRODUCT: u64 = (P1 as u64 - 1) / 2 * super::stat_schedule::OUTPUT_BOUND;
+// slot_sink uses exact i64 dot products for every i16. The base row spans
+// 4096 elements; digit rows span CHUNK. narrow_sum's 2^41 premise still holds.
+const _: () = assert!(4096 * PRODUCT < 1 << 41);
 /// `2^16 mod p`, centered.
 const C16: i32 = centered(1 << 16, P1) as i32;
 /// `round(2^31 / p)`.
@@ -664,8 +667,14 @@ unsafe fn sums(
                 indices(&at, nib);
                 let x = &mut xs[i];
                 pass_lut::<PB>(nib, x, kern);
+                #[cfg(feature = "stat-moments")]
+                super::stat_moments::record(3,0,1,x);
                 pass_c::<4>(x, kern);
-                pass_d::<PB, false>(x, kern, &[], &mut []);
+                #[cfg(feature = "stat-moments")]
+                super::stat_moments::record(5,0,1,x);
+                pass_d::<4, false>(x, kern, &[], &mut []);
+                #[cfg(feature = "stat-moments")]
+                super::stat_moments::record(6,0,1,x);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             // the chunk's first sweep starts the digit rows' sums afresh

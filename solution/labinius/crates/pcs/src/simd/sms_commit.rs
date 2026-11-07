@@ -795,8 +795,8 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         // The producer requests each h once, in order. Partial groups use
         // enough zero words for all LOCK pointer advances.
         let mut source = |_h: usize, out: *mut BinaryIndex32| {
-            // Prefetch the next pair batch while converting this batch and
-            // computing its first prefix. The final batch needs no lookahead.
+            crate::simd::transpose_f162::slice_b128_cols16_into(&cols16, &mut *out);
+            // Prefetch after conversion; the next first prefix supplies lead time. The final batch needs no lookahead.
             if _h + 1 < LOCK {
                 for l in 0..g {
                     let p = cols16[l].wrapping_add(8).cast::<i8>();
@@ -804,7 +804,6 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
                     _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64));
                 }
             }
-            crate::simd::transpose_f162::slice_b128_cols16_into(&cols16, &mut *out);
             for p in &mut cols16 { *p = p.add(8); }
         };
         let k = kbase.add((b / LOCK) * LOCK_WORDS);

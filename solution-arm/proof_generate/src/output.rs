@@ -208,6 +208,16 @@ impl Output {
         });
         assert!(self.populate.set(job).is_ok(), "output populated once");
     }
+    pub fn prefault(&self) {
+        let Some(map) = self.state.mapped() else { return; };
+        let addr = map.addr;
+        par::map_blocks_scoped(self.state.layout.len(), par::threads(), CHUNK, |_, s, e| {
+            #[cfg(target_os = "linux")]
+            if s < e {
+                unsafe { sys::madvise((addr + s) as *mut u8, e - s, 23); }
+            }
+        });
+    }
     pub fn write(&self, p: &ProofParts) {
         self.quiesce();
         let layout = Layout::parts(p);

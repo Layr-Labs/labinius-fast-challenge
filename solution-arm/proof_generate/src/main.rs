@@ -921,6 +921,7 @@ fn main() {
     let output = Output::start(&args[2], modulus);
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
+    output.prefault();
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
     output.write(&proof);

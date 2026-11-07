@@ -747,29 +747,32 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
             }
             // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
-            // once (from 4381e86b / de004ec5): one pass per digit over the slots, not per column.
-            let devs: &[[i32; 4]] = core::slice::from_raw_parts(dev.as_ptr() as *const [i32; 4], dev.len());
             let tail = &mut *tail;
-            for (t, &mu) in tail.iter_mut().zip(a.mu.iter()) {
-                *t = [mu as i64; LANES];
-            }
-            for d in 0..DIGITS {
-                let (u, v) = lattice::WEIGHTS[d];
-                let (u, v) = (u as i64, v as i64);
-                let e = |k: usize, c: usize| devs[d * 2 * N + 2 * k + c / 4][c % 4] as i64;
-                for k in 0..N / 2 {
-                    for c in 0..LANES {
-                        let x = e(k, c);
-                        tail[k][c] += u * x;
-                        tail[k + N / 2][c] += v * x;
+            for k in 0..N / 2 {
+                let h = k + N / 2;
+                let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
+                let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
+                for d in 0..DIGITS {
+                    let (u, v) = lattice::WEIGHTS[d];
+                    let w = u + v;
+                    for half in 0..2 {
+                        let x = dev[d * 2 * N + 2 * k + half];
+                        let y = dev[d * 2 * N + 2 * h + half];
+                        let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
+                        let (i, j) = (2 * half, 2 * half + 1);
+                        lo[i] = vmlal_n_s32(lo[i], xl, u);
+                        lo[j] = vmlal_high_n_s32(lo[j], x, u);
+                        lo[i] = vmlsl_n_s32(lo[i], yl, v);
+                        lo[j] = vmlsl_high_n_s32(lo[j], y, v);
+                        hi[i] = vmlal_n_s32(hi[i], xl, v);
+                        hi[j] = vmlal_high_n_s32(hi[j], x, v);
+                        hi[i] = vmlal_n_s32(hi[i], yl, w);
+                        hi[j] = vmlal_high_n_s32(hi[j], y, w);
                     }
                 }
-                for k in N / 2..N {
-                    for c in 0..LANES {
-                        let x = e(k, c);
-                        tail[k - N / 2][c] -= v * x;
-                        tail[k][c] += (u + v) * x;
-                    }
+                for q in 0..4 {
+                    vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
+                    vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
                 }
             }
             // a partial batch has fewer than eight columns in `target`: only those lanes are written

@@ -50,35 +50,24 @@ use crate::arch::*;
 /// doubling: variable `k` is bit `k` of the index.
 ///
 pub fn eq_table(ps: &[F162]) -> Vec<F162> {
-    const TENSOR: usize = 12;
+    const PARALLEL: usize = 4096;
     const PIECE: usize = 1024;
-    if ps.len() < TENSOR {
-        return eq_doubling(ps);
-    }
-    let h = ps.len() / 2;
-    let (low, high) = (eq_doubling(&ps[..h]), eq_doubling(&ps[h..]));
-    let mut t = vec![F162::ZERO; 1 << ps.len()];
-    let (low, high) = (&low, &high);
-    crate::par::for_each(t.chunks_mut(PIECE).enumerate(), |(c, out)| {
-        let first = c * PIECE;
-        for (i, slot) in out.iter_mut().enumerate() {
-            let b = first + i;
-            *slot = low[b & ((1 << h) - 1)] * high[b >> h];
-        }
-    });
-    t
-}
-
-fn eq_doubling(ps: &[F162]) -> Vec<F162> {
     let mut t = vec![F162::ZERO; 1 << ps.len()];
     t[0] = F162::ONE;
     let mut n = 1;
     for &p in ps {
         let (lo, hi) = t[..2 * n].split_at_mut(n);
-        for (x, y) in lo.iter_mut().zip(hi.iter_mut()) {
-            let xp = *x * p;
-            *y = xp;
-            *x += xp;
+        let level = |lo: &mut [F162], hi: &mut [F162]| {
+            for (x, y) in lo.iter_mut().zip(hi.iter_mut()) {
+                let xp = *x * p;
+                *y = xp;
+                *x += xp;
+            }
+        };
+        if n >= PARALLEL {
+            crate::par::for_each(lo.chunks_mut(PIECE).zip(hi.chunks_mut(PIECE)), |(a, b)| level(a, b));
+        } else {
+            level(lo, hi);
         }
         n *= 2;
     }

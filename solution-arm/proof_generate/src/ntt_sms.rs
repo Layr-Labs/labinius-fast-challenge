@@ -641,6 +641,8 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
 unsafe fn sums(
     words: &[(*const u8, usize); LANES],
     a: &SmsMatrix,
+    start: usize,
+    end: usize,
     m: &mut [int16x8_t; BITS],
     nib: &mut [uint8x16_t; N / 4],
     xs: &mut [[int16x8_t; N]; SWEEP],
@@ -649,15 +651,14 @@ unsafe fn sums(
     dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
-    acc.fill(vdupq_n_s64(0));
-    let mut e = 0usize;
-    while e < a.elements {
-        let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
-        while e < end {
+    let mut e = start;
+    while e < end {
+        let chunk_end = ((e / CHUNK + 1) * CHUNK).min(end);
+        while e < chunk_end {
             // Up to eight tiles per sweep, never across a chunk end (chunks are whole tiles). A short
             // tile only occurs at the end of the column, where the missing elements read zero
             // words and their key lanes are zero, so those lanes contribute nothing.
-            let l = SWEEP.min(end - e);
+            let l = SWEEP.min(chunk_end - e);
             let groups = l.div_ceil(LOCK);
             for i in 0..groups * LOCK {
                 let at = pass_words(words, a.elements, e, i);
@@ -676,13 +677,11 @@ unsafe fn sums(
             }
             e += l;
         }
-        let c = (end - 1) / CHUNK;
+        let c = (chunk_end - 1) / CHUNK;
         for d in 0..DIGITS {
             chunk_row(acc, 1 + d, a.mean_residues(c, d), &mut dev[d * 2 * N..][..2 * N], y);
         }
     }
-    narrow(acc, 0, y);
-    super::inverse_folded::<PB>(y);
 }
 
 #[inline]
@@ -708,8 +707,6 @@ fn crt(r: u32, t: i64) -> u128 {
 #[repr(C)]
 struct Scratch {
     xs: [[int16x8_t; N]; SWEEP],
-    acc: [int64x2_t; ROWS * 4 * N],
-    dev: [int32x4_t; DIGITS * 2 * N],
     m: [int16x8_t; BITS],
     nib: [uint8x16_t; N / 4],
     y: [int16x8_t; N],
@@ -752,21 +749,36 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
-        let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;
+        let Scratch { xs, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / N;
-        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
-            let col0 = first + LANES * b;
-            let here = (count - LANES * b).min(LANES);
-            let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
-                if c < here {
-                    (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
-                } else {
-                    (ZERO_WORDS.as_ptr() as *const u8, 0)
-                }
-            });
-            dev.fill(vdupq_n_s32(0));
-            sums(&words, a, m, nib, xs, acc, y, dev);
+        let sets = count.div_ceil(LANES);
+        // A column's accumulators persist across both element halves: the key of one half is
+        // 18.5 MiB, below the 36 MiB L3, so every column set of that half re-reads it from L3
+        // instead of DRAM. The full key is 37 MiB and does not fit.
+        let mut accs = vec![[vdupq_n_s64(0); ROWS * 4 * N]; sets];
+        let mut devs = vec![[vdupq_n_s32(0); DIGITS * 2 * N]; sets];
+        let half = a.elements / 2;
+        assert!(half > 0 && a.elements % CHUNK == 0 && half % CHUNK == 0, "whole chunks in each half");
+        for part in 0..2 {
+            let (e0, e1) = if part == 0 { (0, half) } else { (half, a.elements) };
+            for s in 0..sets {
+                let col0 = first + LANES * s;
+                let here = (count - LANES * s).min(LANES);
+                let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
+                    if c < here {
+                        (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
+                    } else {
+                        (ZERO_WORDS.as_ptr() as *const u8, 0)
+                    }
+                });
+                sums(&words, a, e0, e1, m, nib, xs, &mut accs[s], y, &mut devs[s]);
+            }
+        }
+        for (s, target) in block.chunks_mut(LANES * N).enumerate() {
+            let here = target.len() / N;
+            narrow(&accs[s], 0, y);
+            super::inverse_folded::<PB>(y);
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
             let pv = vdupq_n_s16(p);
@@ -778,6 +790,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
             }
             // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
             let tail = &mut *tail;
+            let dev = &devs[s];
             for k in 0..N / 2 {
                 let h = k + N / 2;
                 let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
@@ -806,7 +819,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
                 }
             }
             // a partial batch has fewer than eight columns in `target`: only those lanes are written
-            for (c, column) in target.chunks_exact_mut(N).enumerate() {
+            for (c, column) in target.chunks_exact_mut(N).take(here).enumerate() {
                 for (k, o) in column.iter_mut().enumerate() {
                     *o = crt(base[k][c] as u32, tail[k][c]);
                 }

@@ -425,7 +425,7 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-const PREFETCH_SLOTS: usize = 10;
+const PREFETCH_SLOTS: usize = 11;
 
 /// The sink folds once per reconstruction chunk, in the chunk's last lockstep step. [`PP`] is the
 /// worst case over every witness: a key of the public matrix and a transform lane both at their
@@ -489,13 +489,11 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             let k = self.k.add(j * STREAMS * LOCK);
             let a = self.acc.add(j * STREAMS * 16);
             if PREFETCH_SLOTS > 0 {
-                let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
-                let hi = lo + STREAMS * LOCK * 4;
-                let mut p = (lo + 63) & !63;
-                while p < hi {
-                    _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
-                    p += 64;
-                }
+                let p = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as *const i8;
+                _mm_prefetch::<_MM_HINT_T0>(p);
+                _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64));
+                _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(128));
+                _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(192));
             }
             macro_rules! call {
                 ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
@@ -883,7 +881,7 @@ fn bench_mode() -> u32 {
 struct Progress(std::sync::atomic::AtomicUsize);
 const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(3000);
 /// Maximum lead (in pair batches) between two hyperthread siblings on one physical core.
-const PAIR_LEAD: usize = 2 * PP;
+const PAIR_LEAD: usize = 4 * PP;
 
 /// Diagnostics of the last [`commit_paired`], for the profile line only: per worker, the
 /// microseconds from the commitment's start to the end of its last group, and the 16-column
@@ -973,18 +971,21 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
                     if other.load(Ordering::Acquire) + PAIR_LEAD >= d {
                         return;
                     }
-                    let start = std::time::Instant::now();
                     let mut spins = 0u32;
+                    let mut start: Option<std::time::Instant> = None;
                     while other.load(Ordering::Acquire) + PAIR_LEAD < d {
                         core::hint::spin_loop();
                         spins += 1;
-                        if spins % 64 == 0 && start.elapsed() > SIBLING_WAIT {
-                            coupled.store(false, Ordering::Relaxed);
-                            let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
-                            if k < 16 {
-                                DECOUPLED_AT[k].store(((t0.elapsed().as_micros() as u32) << 4) | worker as u32, Ordering::Relaxed);
+                        if spins % 1024 == 0 {
+                            let s = *start.get_or_insert_with(std::time::Instant::now);
+                            if s.elapsed() > SIBLING_WAIT {
+                                coupled.store(false, Ordering::Relaxed);
+                                let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
+                                if k < 16 {
+                                    DECOUPLED_AT[k].store(((t0.elapsed().as_micros() as u32) << 4) | worker as u32, Ordering::Relaxed);
+                                }
+                                return;
                             }
-                            return;
                         }
                     }
                 })

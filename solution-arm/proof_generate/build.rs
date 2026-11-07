@@ -23,7 +23,12 @@ const RING_ELEMENTS: usize = 4096;
 
 fn main() {
     let dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    for f in ["build.rs", "src/ntt.rs", "src/ntt_neon.rs", "src/ntt_hybrid.rs", "src/ntt_sms.rs", "src/sms_lattice.rs", "src/rq.rs"] {
+    let features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let bdep = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
+        && env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() == Ok("little")
+        && features.split(',').any(|feature| feature == "sve2-bitperm");
+    println!("cargo:warning=SMS key runtime backend: {}", if bdep { "packed14-bdep" } else { "expanded-blocked-i16" });
+    for f in ["build.rs", "src/ntt.rs", "src/ntt_neon.rs", "src/ntt_hybrid.rs", "src/ntt_sms.rs", "src/sms_key.rs", "src/sms_slot_bdep_rows03.inc", "src/sms_slot_bdep_rows46.inc", "src/sms_slot_neon.S", "src/sms_lattice.rs", "src/rq.rs"] {
         println!("cargo:rerun-if-changed={f}");
     }
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");

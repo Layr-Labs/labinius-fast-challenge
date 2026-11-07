@@ -535,15 +535,23 @@ unsafe fn lookup_one<const KK: u32>(t: &[*const uint8x16_t; PASS], idx: &[u64; P
     *s = eor_plain(*s, eor_plain(eor_plain(a, b), c));
 }
 
-/// `a ^ b ^ c` as one `EOR3`.
+/// `a ^ b ^ c` as one `EOR3` when SHA3 instructions are available.
 #[inline(always)]
-unsafe fn eor3(mut a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> uint8x16_t {
-    core::arch::asm!(
-        "eor3 {a:v}.16b, {a:v}.16b, {b:v}.16b, {c:v}.16b",
-        a = inout(vreg) a, b = in(vreg) b, c = in(vreg) c,
-        options(pure, nomem, nostack, preserves_flags)
-    );
-    a
+unsafe fn eor3(a: uint8x16_t, b: uint8x16_t, c: uint8x16_t) -> uint8x16_t {
+    #[cfg(target_feature = "sha3")]
+    {
+        let mut a = a;
+        core::arch::asm!(
+            "eor3 {a:v}.16b, {a:v}.16b, {b:v}.16b, {c:v}.16b",
+            a = inout(vreg) a, b = in(vreg) b, c = in(vreg) c,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        a
+    }
+    #[cfg(not(target_feature = "sha3"))]
+    {
+        eor_plain(eor_plain(a, b), c)
+    }
 }
 
 /// `a ^ b` as one plain `EOR` that LLVM cannot fuse into `EOR3` (V0-only on Neoverse V2).

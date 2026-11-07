@@ -62,6 +62,32 @@ mod imp {
     pub unsafe fn unmap(ptr: *mut u8, size: usize) {
         munmap(ptr, span(size));
     }
+
+    static SPARE: std::sync::Mutex<[(usize, usize); SPARES]> = std::sync::Mutex::new([(0, 0); SPARES]);
+    const SPARES: usize = 8;
+
+    pub unsafe fn take(size: usize) -> *mut u8 {
+        let len = span(size);
+        if let Ok(mut spare) = SPARE.lock() {
+            if let Some(slot) = spare.iter_mut().find(|s| s.0 != 0 && s.1 == len) {
+                let ptr = slot.0 as *mut u8;
+                *slot = (0, 0);
+                return ptr;
+            }
+        }
+        map(size)
+    }
+
+    pub unsafe fn release(ptr: *mut u8, size: usize) {
+        let len = span(size);
+        if let Ok(mut spare) = SPARE.lock() {
+            if let Some(slot) = spare.iter_mut().find(|s| s.0 == 0) {
+                *slot = (ptr as usize, len);
+                return;
+            }
+        }
+        unmap(ptr, size);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -69,7 +95,7 @@ unsafe impl GlobalAlloc for Allocator {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if imp::is_big(&layout) {
-            imp::map(layout.size())
+            imp::take(layout.size())
         } else {
             System.alloc(layout)
         }
@@ -87,7 +113,7 @@ unsafe impl GlobalAlloc for Allocator {
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if imp::is_big(&layout) {
-            imp::unmap(ptr, layout.size())
+            imp::release(ptr, layout.size())
         } else {
             System.dealloc(ptr, layout)
         }

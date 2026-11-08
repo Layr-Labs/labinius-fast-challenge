@@ -1775,7 +1775,7 @@ unsafe fn message_range(
 /// [`BIND_STRETCH`] outputs, the later sweeps adding their reduced sums to the stored ones
 /// (reduction is linear, so the values are the same).
 /// Words ahead of the current eight that [`materialize_prefix_range`] prefetches in each stream.
-const MATERIALIZE_AHEAD: usize = 32;
+const MATERIALIZE_AHEAD: usize = 48;
 
 #[inline(always)]
 unsafe fn bcast4(x: F162) -> [__m512i; 4] {

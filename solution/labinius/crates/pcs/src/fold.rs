@@ -2117,10 +2117,10 @@ mod bitsliced {
         for s0 in (0..OUT_SLOTS).step_by(8) {
             let n = (OUT_SLOTS - s0).min(8);
             let mask = ((1u32 << n) - 1) as __mmask8;
-            let mut s_lo = [[zero; 8]; 8];
-            let mut s_hi = [[zero; 8]; 8];
-            let mut t_lo = [[zero; 8]; 8];
-            let mut t_hi = [[zero; 8]; 8];
+            let mut s_lo: [[__m512i; 8]; 8] = core::mem::MaybeUninit::uninit().assume_init();
+            let mut s_hi: [[__m512i; 8]; 8] = core::mem::MaybeUninit::uninit().assume_init();
+            let mut t_lo: [[__m512i; 8]; 8] = core::mem::MaybeUninit::uninit().assume_init();
+            let mut t_hi: [[__m512i; 8]; 8] = core::mem::MaybeUninit::uninit().assume_init();
             for ds in 0..8 {
                 let s = (s0 + ds).min(OUT_SLOTS - 1);
                 let t = if s < 81 { 162 + s } else { s + 81 };
@@ -2135,14 +2135,18 @@ mod bitsliced {
                     if b == 7 { zero } else { _mm512_load_si512(at_ptr.add(8 + b)) }
                 }));
             }
+            let biases: [(__m512i, __m512i, bool); 8] = core::array::from_fn(|ds| {
+                let s = (s0 + ds).min(OUT_SLOTS - 1);
+                let below = s < 81;
+                let t = if below { 162 + s } else { s + 81 };
+                let bs = _mm512_set1_epi16(*bias.get_unchecked(s) as i16);
+                let bt = _mm512_set1_epi16(*bias.get_unchecked(t) as i16);
+                (bs, bt, below)
+            });
             for g in 0..LANES / 64 {
                 macro_rules! row {
                     ($ds:literal) => {{
-                        let s = (s0 + $ds).min(OUT_SLOTS - 1);
-                        let below = s < 81;
-                        let t = if below { 162 + s } else { s + 81 };
-                        let bs = _mm512_set1_epi16(*bias.get_unchecked(s) as i16);
-                        let bt = _mm512_set1_epi16(*bias.get_unchecked(t) as i16);
+                        let (bs, bt, below) = biases[$ds];
                         let sl = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, s_lo[$ds][g]));
                         let sh = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, s_hi[$ds][g]));
                         let tl = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, t_lo[$ds][g]));

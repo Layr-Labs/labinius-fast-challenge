@@ -1894,24 +1894,16 @@ mod bitsliced {
                     add_carry64!(c0, c1);
                     step_pending!();
                 }
-                // The schedule pads each sign of a slot pair to a multiple of 2: the remainder
-                // (at most 62 inputs) decomposes into binary partial trees of sizes 32, 16, 8, 4, 2.
+                // Keep the full-chunk trees hot without duplicating their large subtrees for
+                // the remainder. At most seven eight-input tiles and the four/two tails read
+                // exactly the original entries. Their total is still at most 62, so together
+                // they produce at most one weight-64 carry per lane.
                 let rest = terms.chunks_exact(64).remainder();
                 debug_assert!(rest.len() % 2 == 0);
                 if !rest.is_empty() {
                     t = rest.as_ptr();
                     let n = rest.len();
-                    if n & 32 != 0 {
-                        let (c0, c1) = thirty_two!(0, $leaf);
-                        half_adders!(c0, c1, 5);
-                        t = t.add(32);
-                    }
-                    if n & 16 != 0 {
-                        let (c0, c1) = sixteen!(0, $leaf);
-                        half_adders!(c0, c1, 4, 5);
-                        t = t.add(16);
-                    }
-                    if n & 8 != 0 {
+                    for _ in 0..n / 8 {
                         let (c0, c1) = eight!(0, $leaf);
                         half_adders!(c0, c1, 3, 4, 5);
                         t = t.add(8);
@@ -2516,6 +2508,71 @@ mod bitsliced {
                         unslice(acc.as_ptr().add(slot * BITS), got.as_mut_ptr());
                         for l in 0..LANES {
                             assert_eq!(got[l] as usize, want[slot][l] & 0x7fff, "lens {lens:?} slot {slot} lane {l}");
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Every even remainder, both polarities, incoming low-bit states and seven-chunk
+        /// flush boundaries. Guards check the slot-pair's precise accumulator footprint.
+        #[test]
+        fn bitfold_pair_eight_tile_remainders() {
+            unsafe {
+                let zero = _mm512_setzero_si512();
+                let guard = _mm512_set1_epi32(0x5a3c_7e19);
+                let mut planes = vec![zero; 66];
+                for p in 2..66 {
+                    let bits: [u64; 8] = core::array::from_fn(|w| {
+                        0x9e37_79b9_7f4a_7c15u64.wrapping_mul((p * 8 + w + 1) as u64)
+                            .rotate_left((p % 64) as u32)
+                    });
+                    planes[p] = core::mem::transmute(bits);
+                }
+                let bits: Vec<[u64; 8]> = planes.iter().map(|p| core::mem::transmute(*p)).collect();
+                for chunks in [0, 6, 7, 8, 15] {
+                    for tail in (0..64).step_by(2) {
+                        let terms = |n: usize| -> Vec<u16> {
+                            (0..n).map(|i| if i % 13 == 0 { 0 } else { 8 * (2 + i % 63) as u16 }).collect()
+                        };
+                        let pos = terms(64 * chunks + tail);
+                        let neg = terms(64 * chunks + (tail ^ 62));
+                        let mut want = [[0usize; LANES]; 2];
+                        let mut acc = vec![zero; 2 * BITS + 2];
+                        acc[0] = guard;
+                        acc[2 * BITS + 1] = guard;
+                        for slot in 0..2 {
+                            for lane in 0..LANES {
+                                let initial = (lane * 61 + slot * 13) % 30000;
+                                want[slot][lane] = initial;
+                            }
+                            for b in 0..BITS {
+                                let words: [u64; 8] = core::array::from_fn(|w| {
+                                    (0..64).fold(0, |x, l| x | (((want[slot][64 * w + l] >> b) & 1) as u64) << l)
+                                });
+                                acc[1 + slot * BITS + b] = core::mem::transmute(words);
+                            }
+                        }
+                        for (list, complement) in [(&pos, 0), (&neg, 1)] {
+                            for &o in list {
+                                for slot in 0..2 {
+                                    for lane in 0..LANES {
+                                        let bit = (bits[o as usize / 8 + slot][lane / 64] >> (lane % 64) & 1) as usize;
+                                        want[slot][lane] += bit ^ complement;
+                                    }
+                                }
+                            }
+                        }
+                        accumulate_pair(planes.as_ptr(), &pos, &neg, acc.as_mut_ptr().add(1));
+                        for slot in 0..2 {
+                            let mut got = [0i16; LANES];
+                            unslice(acc.as_ptr().add(1 + slot * BITS), got.as_mut_ptr());
+                            for lane in 0..LANES {
+                                assert_eq!(got[lane] as usize, want[slot][lane], "chunks {chunks} tail {tail} slot {slot} lane {lane}");
+                            }
+                        }
+                        for at in [0, 2 * BITS + 1] {
+                            assert_eq!(core::mem::transmute::<_, [u64; 8]>(acc[at]), core::mem::transmute::<_, [u64; 8]>(guard));
                         }
                     }
                 }

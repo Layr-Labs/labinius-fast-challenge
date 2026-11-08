@@ -501,7 +501,10 @@ fn core_cpus()->Option<&'static [Vec<usize>]> {
 /// Read the CPU topology [`CorePlacement::for_workers`] needs now.
 pub fn warm_topology() {
     #[cfg(target_os="linux")]
-    let _=physical_cores();
+    {
+        let _ = physical_cores();
+        let _ = core_cpus();
+    }
 }
 #[cfg(target_os="linux")]
 fn read_core_cpus()->Option<Vec<Vec<usize>>> {

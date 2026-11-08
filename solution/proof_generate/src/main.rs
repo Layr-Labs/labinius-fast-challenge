@@ -1732,7 +1732,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let recombine_time = clock.elapsed();
     // Huge pages: a few page-table entries to drop. (A thread of its own to free it, as the
     // baseline did, is a ninth runnable thread beside eight busy ones.)
-    drop(rows);
+    std::mem::forget(rows);
     if let Some(output) = output {
         // The pages of the switch's binding pass first: they are written ~10 ms from here,
         // and faulting them in there stalls the pass's runners.

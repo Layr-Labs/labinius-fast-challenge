@@ -1,154 +1,45 @@
-//! Worker count, aligned blocks, scoped loops, and a persistent pool for the prover.
-//!
-//! Every pass splits its index range into contiguous blocks, one per worker, on boundaries the
-//! kernel asks for; workers never share an output element, and passes that reduce (XOR sums over
-//! GF(2)) combine their per-worker partial sums afterwards, so the result does not depend on the
-//! worker count.
+//! The little the parallel paths share: how many threads to use and how to cut a range.
 
-use std::sync::OnceLock;
-
-/// Worker threads: `LABINIUS_THREADS` when it holds a positive integer, otherwise the available
-/// parallelism. The variable is a development knob for matching the scored machine's CPU count
-/// on a larger host; the scoring sandbox starts the prover with a cleared environment.
+/// `available_parallelism`, or 1: asked once. (Each query reads `/proc/self/cgroup` and the
+/// cgroup's `cpu.max` files up the hierarchy, a dozen syscalls, and several phases ask.)
 pub fn threads() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("LABINIUS_THREADS")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
-    })
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
-/// `[start, end)` of block `t` of `parts` over `n` items, block edges on multiples of `align`.
-#[inline]
-pub fn block(n: usize, parts: usize, t: usize, align: usize) -> (usize, usize) {
-    let units = n / align;
-    let lo = units * t / parts;
-    let hi = units * (t + 1) / parts;
-    let end = if t + 1 == parts { n } else { hi * align };
-    (lo * align, end)
-}
-
-/// `s` cut into the disjoint, ascending `[start, end)` ranges of `edges`.
-pub fn split_mut<'a, T>(s: &'a mut [T], edges: &[(usize, usize)]) -> Vec<&'a mut [T]> {
-    let mut out = Vec::with_capacity(edges.len());
-    let mut rest = s;
-    let mut base = 0;
-    for &(lo, hi) in edges {
-        let (_, tail) = core::mem::take(&mut rest).split_at_mut(lo - base);
-        let (mid, tail) = tail.split_at_mut(hi - lo);
-        out.push(mid);
-        rest = tail;
-        base = hi;
+/// `n` items cut into at most `parts` contiguous ranges whose starts are multiples of `align`;
+/// the last range takes the remainder. Empty ranges are not returned.
+pub fn ranges(n: usize, parts: usize, align: usize) -> Vec<core::ops::Range<usize>> {
+    let align = align.max(1);
+    let parts = parts.max(1);
+    let per = n.div_ceil(parts).div_ceil(align) * align;
+    let mut out = Vec::with_capacity(parts);
+    let mut start = 0;
+    while start < n {
+        let end = (start + per).min(n);
+        out.push(start..end);
+        start = end;
     }
     out
 }
 
-/// Workers for `n` items when a block below `min` items is not worth a thread.
-#[inline]
-pub fn workers(n: usize, min: usize) -> usize {
-    (n / min.max(1)).clamp(1, threads())
-}
-
-pub fn map_blocks<R: Send>(
-    n: usize,
-    parts: usize,
-    align: usize,
-    f: impl Fn(usize, usize, usize) -> R + Sync,
-) -> Vec<R> {
-    if parts <= 1 {
-        return vec![f(0, 0, n)];
-    }
-    pool().map(parts, |t| {
-        let (s, e) = block(n, parts, t, align);
-        f(t, s, e)
-    })
-}
-
-pub fn map_blocks_scoped<R: Send>(
-    n: usize,
-    parts: usize,
-    align: usize,
-    f: impl Fn(usize, usize, usize) -> R + Sync,
-) -> Vec<R> {
-    if parts <= 1 {
-        return vec![f(0, 0, n)];
-    }
-    let f = &f;
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..parts - 1)
-            .map(|t| {
-                let (s, e) = block(n, parts, t, align);
-                scope.spawn(move || f(t, s, e))
-            })
-            .collect();
-        let (s, e) = block(n, parts, parts - 1, align);
-        let last = f(parts - 1, s, e);
-        let mut out: Vec<R> = handles
-            .into_iter()
-            .map(|h| h.join().expect("worker panicked"))
-            .collect();
-        out.push(last);
-        out
-    })
-}
-
-/// The result-free counterpart of [`map_blocks`].
-pub fn for_blocks(n: usize, parts: usize, align: usize, f: impl Fn(usize, usize, usize) + Sync) {
-    pool().run(parts.max(1), |t| {
-        let (s, e) = block(n, parts.max(1), t, align);
-        f(t, s, e);
-    });
-}
-
-pub fn map_each<T: Send, R: Send>(items: impl IntoIterator<Item = T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
-    struct Slot<T>(std::cell::UnsafeCell<Option<T>>);
-    unsafe impl<T: Send> Sync for Slot<T> {}
-    let items: Vec<_> = items.into_iter().map(|x| Slot(std::cell::UnsafeCell::new(Some(x)))).collect();
-    pool().map(items.len(), |i| {
-        let item = unsafe { (*items[i].0.get()).take().unwrap_unchecked() };
-        f(item)
-    })
-}
-
-/// Consume independent work items on the pool. In particular, items may contain disjoint
-/// mutable slices from [`split_mut`], so callers need no raw pointers to move off a scope.
-pub fn for_each<T: Send>(items: impl IntoIterator<Item = T>, f: impl Fn(T) + Sync) {
-    struct Slot<T>(std::cell::UnsafeCell<Option<T>>);
-    // Each slot is taken exactly once, by the task with its index. T crosses threads as an
-    // owned value; no shared reference to T is exposed.
-    unsafe impl<T: Send> Sync for Slot<T> {}
-    let items: Vec<_> = items.into_iter().map(|x| Slot(std::cell::UnsafeCell::new(Some(x)))).collect();
-    pool().run(items.len(), |i| {
-        let item = unsafe { (*items[i].0.get()).take().unwrap_unchecked() };
-        f(item);
-    });
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::ranges;
 
     #[test]
-    fn blocks_tile_the_range() {
-        for n in [0usize, 1, 7, 8, 63, 64, 65, 1000, 4096] {
-            for parts in 1..=9 {
-                for align in [1usize, 8, 64] {
-                    let mut next = 0;
-                    for t in 0..parts {
-                        let (s, e) = block(n, parts, t, align);
-                        assert_eq!(s, next);
-                        assert!(e >= s);
-                        if t + 1 < parts {
-                            assert_eq!(e % align, 0);
-                        }
-                        next = e;
-                    }
-                    assert_eq!(next, n);
-                }
+    fn ranges_cover_once() {
+        for (n, parts, align) in [(0, 4, 64), (1, 8, 64), (1000, 8, 64), (4096, 3, 32), (5, 8, 1)] {
+            let r = ranges(n, parts, align);
+            assert!(r.len() <= parts);
+            let mut at = 0;
+            for x in &r {
+                assert_eq!(x.start, at);
+                assert!(x.start % align == 0);
+                assert!(x.end > x.start);
+                at = x.end;
             }
+            assert_eq!(at, n);
         }
     }
 }
@@ -169,7 +60,7 @@ pub fn pool() -> &'static Pool {
 // pool below keeps `threads - 1` workers and runs the caller's closure on them and on the
 // calling thread, which is the same shape as a scope with one spawn per task.
 //
-// Between dispatches a worker spins (`spin_loop`) for [`WORKER_SPIN`] before it parks on a condvar.
+// Between dispatches a worker spins (`pause`) for [`WORKER_SPIN`] before it parks on a condvar.
 // A parked worker's CPU goes idle, and on the c7i hosts the idle governor puts it in C6 (exit
 // latency ~190 us): a dispatch that has to wake parked workers waits 0.1-0.3 ms for them, which
 // is longer than many of the switch's per-round dispatches take. A spinning worker picks a task
@@ -182,7 +73,6 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Spin durations inherited from the x86 pool. Tune on Graviton4, not the GB10 host.
 /// How long an idle worker spins for the next dispatch before it parks.
 const WORKER_SPIN: Duration = Duration::from_millis(2);
 /// How long the dispatching thread spins for the last tasks of its dispatch before it parks.
@@ -214,13 +104,6 @@ fn tasks_of(w: u64) -> usize {
 #[inline]
 fn next_of(w: u64) -> usize {
     (w & TASK_MASK) as usize
-}
-
-// A panic cannot unwind out of a dispatch while another worker still borrows its closure.
-// This matches the prover's panic=abort release profile, including in library test builds.
-struct AbortOnPanic;
-impl Drop for AbortOnPanic {
-    fn drop(&mut self) { std::process::abort(); }
 }
 
 type Task = dyn Fn(usize) + Sync;
@@ -265,9 +148,7 @@ impl Shared {
             }
             // Task `n` of this dispatch is ours and not done, so its closure is in place.
             let f = unsafe { (*self.job.get()).unwrap_unchecked() };
-            let guard = AbortOnPanic;
             f(n);
-            core::mem::forget(guard);
             if self.done.fetch_add(1, Ordering::SeqCst) + 1 == tasks && self.waiting.load(Ordering::SeqCst) {
                 let _g = self.lock.lock().unwrap();
                 self.finished.notify_one();
@@ -384,7 +265,6 @@ impl Pool {
     }
 
     fn dispatch<'a>(&self, tasks: usize, f: &'a (dyn Fn(usize) + Sync + 'a)) {
-        let guard = AbortOnPanic;
         let s = self.shared;
         // `run` does not return before the dispatch's tasks are done, and no runner touches the
         // closure after its last task: the lifetime is only extended over this call.
@@ -424,7 +304,6 @@ impl Pool {
             }
         }
         unsafe { *s.job.get() = None };
-        core::mem::forget(guard);
     }
 
     /// Hand `chunks` calls of `f` to the workers' idle time ([`IdleJob`]): they run between
@@ -536,9 +415,7 @@ fn idle_chunk(s: &Shared) -> bool {
     let i = job.next.fetch_add(1, Ordering::SeqCst);
     let ran = i < job.chunks;
     if ran {
-        let guard = AbortOnPanic;
         (job.f)(i);
-        core::mem::forget(guard);
         job.done.fetch_add(1, Ordering::Release);
     }
     if !ran || i + 1 == job.chunks {
@@ -596,66 +473,131 @@ mod pool_tests {
         assert_eq!(total.load(Ordering::Relaxed), 200 * 16 + 200 * 15);
     }
 }
-
-#[cfg(test)]
-mod scheduling_tests {
-    use super::*;
-
-    #[test]
-    fn nested_and_concurrent_dispatches_execute_once() {
-        let pool = Pool::new(4);
-        let hits = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..3 {
-                let (pool, hits) = (&pool, &hits);
-                scope.spawn(move || {
-                    for _ in 0..30 {
-                        pool.run(13, |_| pool.run(7, |_| { hits.fetch_add(1, Ordering::Relaxed); }));
-                    }
-                });
+/// Temporary per-task affinity, restored before a pool task returns.
+#[cfg(target_os="linux")]
+pub struct CorePlacement { cpus:Vec<usize> }
+#[cfg(target_os="linux")]
+pub struct AffinityGuard { old:[usize;16] }
+#[cfg(target_os="linux")]
+unsafe extern "C" {
+    fn sched_getaffinity(pid:i32,size:usize,mask:*mut usize)->i32;
+    fn sched_setaffinity(pid:i32,size:usize,mask:*const usize)->i32;
+}
+/// The first allowed logical CPU of each physical core, from `/proc/cpuinfo`: read once (the
+/// kernel samples every CPU's frequency to print it), by [`warm_topology`] off the critical
+/// path when the caller arranges it.
+#[cfg(target_os="linux")]
+fn physical_cores()->Option<&'static [usize]> {
+    static FIRST:std::sync::OnceLock<Option<Vec<usize>>>=std::sync::OnceLock::new();
+    FIRST.get_or_init(||core_cpus().map(|c|c.iter().map(|l|l[0]).collect())).as_deref()
+}
+/// The allowed logical CPUs of each physical core (cores in the order of their first CPU in
+/// `/proc/cpuinfo`, each core's CPUs in that order): read once, like [`physical_cores`].
+#[cfg(target_os="linux")]
+fn core_cpus()->Option<&'static [Vec<usize>]> {
+    static CORES:std::sync::OnceLock<Option<Vec<Vec<usize>>>>=std::sync::OnceLock::new();
+    CORES.get_or_init(read_core_cpus).as_deref()
+}
+/// Read the CPU topology [`CorePlacement::for_workers`] needs now.
+pub fn warm_topology() {
+    #[cfg(target_os="linux")]
+    let _=physical_cores();
+}
+#[cfg(target_os="linux")]
+fn read_core_cpus()->Option<Vec<Vec<usize>>> {
+        let mut allowed=[0usize;16];
+        if unsafe {sched_getaffinity(0,std::mem::size_of_val(&allowed),allowed.as_mut_ptr())} !=0 {return None;}
+        let info=std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        let mut seen=std::collections::BTreeMap::new();
+        let mut cores:Vec<Vec<usize>>=Vec::new();
+        for record in info.split("\n\n") {
+            let mut cpu=None;let mut package=None;let mut core=None;
+            for line in record.lines() {
+                let Some((k,v))=line.split_once(':') else {continue};
+                match k.trim() {
+                    "processor"=>cpu=v.trim().parse::<usize>().ok(),
+                    "physical id"=>package=Some(v.trim().to_owned()),
+                    "core id"=>core=Some(v.trim().to_owned()),
+                    _=>{}
+                }
             }
-        });
-        assert_eq!(hits.load(Ordering::Relaxed), 3 * 30 * 13 * 7);
-    }
-
-    #[test]
-    fn dispatch_splits_large_task_counts_and_map_keeps_order() {
-        for width in [1, 3, 8] {
-            let pool = Pool::new(width);
-            let n = MAX_TASKS + 19;
-            let got = pool.map(n, |i| i.wrapping_mul(23));
-            assert_eq!(got, (0..n).map(|i| i * 23).collect::<Vec<_>>());
+            let (Some(cpu),Some(package),Some(core))=(cpu,package,core) else {continue};
+            let bits=usize::BITS as usize;
+            if cpu>=allowed.len()*bits || allowed[cpu/bits]&(1usize<<(cpu%bits))==0 {continue;}
+            let next=cores.len();
+            let i=*seen.entry((package,core)).or_insert(next);
+            if i==next {cores.push(Vec::new());}
+            cores[i].push(cpu);
         }
+        Some(cores)
+}
+#[cfg(target_os="linux")]
+impl CorePlacement {
+    pub fn for_workers(workers:usize)->Option<Self> {
+        let cpus=physical_cores()?;
+        if workers==0 || cpus.len()<workers {return None;}
+        Some(Self{cpus:cpus.to_vec()})
     }
-
-    #[test]
-    fn for_each_owns_items_and_accepts_disjoint_mutable_slices() {
-        let mut values = vec![0usize; 1003];
-        for_each(values.chunks_mut(17).enumerate(), |(i, chunk)| chunk.fill(i));
-        assert!(values.iter().enumerate().all(|(i, &x)| x == i / 17));
-        let hits = AtomicUsize::new(0);
-        for_each((0..100).map(Box::new), |x| { hits.fetch_add(*x, Ordering::Relaxed); });
-        assert_eq!(hits.load(Ordering::Relaxed), 4950);
+    /// Tasks `2k` and `2k + 1` on the two hyperthreads of physical core `k`: for a dispatch of
+    /// exactly twice as many tasks as there are cores, each core having exactly two allowed CPUs.
+    pub fn for_sibling_pairs(tasks:usize)->Option<Self> {
+        let cores=core_cpus()?;
+        if cores.is_empty() || tasks!=2*cores.len() || cores.iter().any(|c|c.len()!=2) {return None;}
+        Some(Self{cpus:cores.iter().flatten().copied().collect()})
     }
+    /// One task per allowed logical CPU, in CPU order: for a dispatch of exactly `tasks` equal
+    /// tasks on a pool as wide as the CPU set, so that no two of them share a CPU while another
+    /// sits idle, whatever the scheduler's placement of the workers was when they were woken
+    /// (after the commitment's per-core placement the eight runners are not spread evenly).
+    pub fn for_logical(tasks:usize)->Option<Self> {
+        let mut allowed=[0usize;16];
+        if unsafe {sched_getaffinity(0,std::mem::size_of_val(&allowed),allowed.as_mut_ptr())} !=0 {return None;}
+        let bits=usize::BITS as usize;
+        let cpus:Vec<usize>=(0..allowed.len()*bits).filter(|&c| allowed[c/bits]&(1usize<<(c%bits))!=0).collect();
+        if tasks==0 || cpus.len()<tasks {return None;}
+        Some(Self{cpus})
+    }
+    pub fn pin(&self,worker:usize)->Option<AffinityGuard> {
+        let cpu=*self.cpus.get(worker)?;
+        let mut old=[0usize;16];
+        if unsafe {sched_getaffinity(0,std::mem::size_of_val(&old),old.as_mut_ptr())} !=0 {return None;}
+        let mut chosen=[0usize;16];
+        chosen[cpu/usize::BITS as usize]=1usize<<(cpu%usize::BITS as usize);
+        if unsafe {sched_setaffinity(0,std::mem::size_of_val(&chosen),chosen.as_ptr())} !=0 {return None;}
+        Some(AffinityGuard{old})
+    }
+}
+#[cfg(target_os="linux")]
+impl Drop for AffinityGuard {
+    fn drop(&mut self) {unsafe {sched_setaffinity(0,std::mem::size_of_val(&self.old),self.old.as_ptr());}}
+}
+#[cfg(not(target_os="linux"))]
+pub struct CorePlacement;
+#[cfg(not(target_os="linux"))]
+impl CorePlacement {
+    pub fn for_workers(_:usize)->Option<Self>{None}
+    pub fn for_logical(_:usize)->Option<Self>{None}
+    pub fn for_sibling_pairs(_:usize)->Option<Self>{None}
+    pub fn pin(&self,_:usize)->Option<()>{None}
+}
 
+#[cfg(all(test,target_os="linux"))]
+mod affinity_tests {
+    use super::*;
     #[test]
-    fn idle_completion_stop_replacement_and_quiescence() {
-        let pool = Pool::new(3);
-        let hits = std::sync::Arc::new(AtomicUsize::new(0));
-        let h = hits.clone();
-        let job = pool.idle(50, move |_| { h.fetch_add(1, Ordering::Relaxed); });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !job.finished() && Instant::now() < deadline { std::thread::yield_now(); }
-        assert!(job.finished());
-        pool.quiesce(job);
-        assert_eq!(hits.load(Ordering::Relaxed), 50);
-        let h = hits.clone();
-        let old = pool.idle(10000, move |_| { h.fetch_add(1, Ordering::Relaxed); });
-        let newer = pool.idle(0, |_| {});
-        pool.quiesce(old);
-        pool.quiesce(newer);
-        let count = hits.load(Ordering::Relaxed);
-        pool.run(32, |_| {});
-        assert_eq!(hits.load(Ordering::Relaxed), count);
+    fn temporary_affinity_restores_the_original_mask() {
+        let mut original=[0usize;16];
+        assert_eq!(unsafe {sched_getaffinity(0,std::mem::size_of_val(&original),original.as_mut_ptr())},0);
+        let Some(p)=CorePlacement::for_workers(1) else {return};
+        {
+            let Some(_guard)=p.pin(0) else {return};
+            let mut pinned=[0usize;16];
+            assert_eq!(unsafe {sched_getaffinity(0,std::mem::size_of_val(&pinned),pinned.as_mut_ptr())},0);
+            assert_eq!(pinned.iter().map(|x|x.count_ones()).sum::<u32>(),1);
+            assert!(pinned.iter().zip(original).all(|(a,b)|*a & b==*a));
+        }
+        let mut restored=[0usize;16];
+        assert_eq!(unsafe {sched_getaffinity(0,std::mem::size_of_val(&restored),restored.as_mut_ptr())},0);
+        assert_eq!(restored,original);
     }
 }

@@ -337,11 +337,6 @@ fn encode(a: i64, b: i64, t: &Basis, limit: usize) -> ([i64; 12], usize) {
 }
 
 pub(super) fn digits_pair(x: u128, y: u128) -> ([i8; 6], [i8; 6]) {
-    digits_pair_limit(x, y, 512)
-}
-
-/// [`digits_pair`] with a bound on the search's nodes.
-pub(super) fn digits_pair_limit(x: u128, y: u128, limit: usize) -> ([i8; 6], [i8; 6]) {
     let center = |v: u128| {
         let r = (v % M as u128) as i64;
         if r >= M / 2 {
@@ -350,7 +345,7 @@ pub(super) fn digits_pair_limit(x: u128, y: u128, limit: usize) -> ([i8; 6], [i8
             r
         }
     };
-    let (r, _) = encode(center(x), center(y), &BASIS, limit);
+    let (r, _) = encode(center(x), center(y), &BASIS, 512);
     assert!(r.iter().all(|v| v.abs() <= MAX_DIGIT_ABS as i64));
     (
         std::array::from_fn(|d| r[2 * d] as i8),

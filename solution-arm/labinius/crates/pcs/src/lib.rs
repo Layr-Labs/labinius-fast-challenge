@@ -37,7 +37,6 @@ pub mod f162;
 pub mod fields;
 pub mod fold;
 pub mod fold_bits;
-pub mod fold_bits2;
 pub mod key;
 pub mod labrador;
 pub mod limb;

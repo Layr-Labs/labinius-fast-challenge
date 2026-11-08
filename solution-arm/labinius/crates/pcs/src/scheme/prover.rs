@@ -52,11 +52,28 @@ impl Prover {
         prover
     }
 
+    /// A prover with no warm-up commitment.
+    ///
+    /// [`Prover::new`] commits and folds a zero witness so a later commitment finds the auxiliary
+    /// buffer already resident. This benchmark commits once, inside the timed process, so that
+    /// warm-up is a second full commitment. The real commitment pays the first touch instead.
+    pub fn cold(pp: &PublicParameters) -> Prover {
+        Prover {
+            params: pp.params.clone(),
+            key: pp.key.clone(),
+            setup: pp.recursion.clone(),
+            workspace: None,
+        }
+    }
+
     pub fn commit(&mut self, witness: &Witness) -> (Commitment, CommitmentOpening) {
         assert_eq!(
             witness.params, self.params,
             "the witness was built for other parameters"
         );
+        // No separate prefault. The column groups already run on several threads and write
+        // disjoint batches, so the kernel zero-fill happens inside that parallel write instead
+        // of as an extra 42 MB pass before it.
         let mut aux = self.workspace.take().unwrap_or_else(|| {
             AuxData::new(self.key.len_ring(), self.params.columns(), self.key.limbs())
         });
@@ -232,3 +249,4 @@ impl Prover {
         })
     }
 }
+

@@ -32,8 +32,8 @@ mod bin_small {
 
     // ------------------------------------------------------------------ the two kernels
 
-    /// `EXACT`: the two kernels must agree lane by lane in i16 (q = 3889, where neither reduces);
-    /// otherwise only modulo q.
+    /// `EXACT`: the two kernels must agree lane by lane in i16; otherwise only modulo q (the asm
+    /// kernel's s2 = 1 half reuses the s2 = 0 lookups, so its lanes are other representatives).
     fn check_against_asm<const Q: u16, const EXACT: bool>() {
         for polys in batches(64, 0x5EED ^ Q as u64) {
             let idx = idx_of(&elems_of(&polys));
@@ -59,7 +59,7 @@ mod bin_small {
 
     #[test]
     fn matches_asm_3889() {
-        check_against_asm::<3889, true>();
+        check_against_asm::<3889, false>();
     }
 
     #[test]
@@ -151,6 +151,48 @@ mod bin_asm {
             // and the lift really is the coefficient vector the test built
             for p in 0..32 {
                 assert_eq!(f162::lift_elem(&e, p), polys[p], "lift_elem {p}");
+            }
+        }
+    }
+
+    /// The in-place `B128` slicer against the staged one (`F162` front end on the lifted words)
+    /// and against the scalar definition, on random words and on words with single bits / all
+    /// ones (every plane, including the edges 127/128 of the zero top limb).
+    #[test]
+    fn transpose_b128_matches() {
+        use labinius::rng::Rng;
+        use labinius::{B128, F162};
+        let mut rng = Rng::new(0xB128);
+        let mut cases: Vec<[B128; 128]> = Vec::new();
+        for _ in 0..64 {
+            cases.push(core::array::from_fn(|_| {
+                B128(rng.next_u64() as u128 | ((rng.next_u64() as u128) << 64))
+            }));
+        }
+        cases.push([B128(u128::MAX); 128]);
+        cases.push([B128(0); 128]);
+        for bit in [0usize, 1, 63, 64, 65, 80, 81, 120, 121, 126, 127] {
+            for p in [0usize, 7, 8, 31, 77, 127] {
+                let mut c = [B128(0); 128];
+                c[p] = B128(1u128 << bit);
+                cases.push(c);
+            }
+        }
+        for words in &cases {
+            let lifted: [F162; 128] = core::array::from_fn(|i| F162::from_b128(words[i]));
+            let want = f162::index_rows_scalar(&lifted);
+            let mut got = BinaryIndex32::zero();
+            let mut staged = BinaryIndex32::zero();
+            let mut cols = BinaryIndex32::zero();
+            unsafe {
+                tf::slice_b128_into(words, &mut got);
+                tf::slice_b128_staged_into(words, &mut staged);
+                tf::slice_b128_cols16_into(&core::array::from_fn(|c| words.as_ptr().add(8*c)), &mut cols);
+            }
+            for i in 0..162 {
+                assert!(want.rows[i] == got.rows[i], "slice_b128_into row {i}");
+                assert!(want.rows[i] == cols.rows[i], "slice_b128_cols16_into row {i}");
+                assert!(staged.rows[i] == got.rows[i], "slice_b128_into vs staged row {i}");
             }
         }
     }
@@ -248,10 +290,10 @@ mod bin_asm {
                     for r in 0..3 {
                         let (lo, hi) = (nib[ii + 27 * r], nib[ii + 27 * r + 81]);
                         for h in 0..2 {
-                            let s2 = if r == 0 { 0 } else { h };
-                            let x = Self::table(k, s2, r, 0, lo) as i32;
-                            let y = Self::table(k, s2, r, 1, hi) as i32;
-                            let val = if h == 0 { x + y } else { x - y };
+                            // the s2 = 1 half: zeta6^r (x - y) on the s2 = 0 tables, r = 1 negated
+                            let x = Self::table(k, 0, r, 0, lo) as i32;
+                            let y = Self::table(k, 0, r, 1, hi) as i32;
+                            let val = match (h, r) { (0, _) => x + y, (_, 1) => y - x, _ => x - y };
                             six[h][r] = self.see(val);
                             if six[h][r].unsigned_abs() as i32 > self.max[0] {
                                 self.max[0] = six[h][r].unsigned_abs() as i32;
@@ -261,9 +303,11 @@ mod bin_asm {
                     // level 3 (only the omega multiply is left)
                     for h in 0..2 {
                         let (o0, o1, o2) = self.r3(six[h][0], six[h][1], six[h][2]);
-                        v[base + 81 * h + ii] = o0;
-                        v[base + 81 * h + ii + 27] = o1;
-                        v[base + 81 * h + ii + 54] = o2;
+                        // and its outputs rotated by two
+                        let o = if h == 0 { [o0, o1, o2] } else { [o2, o0, o1] };
+                        v[base + 81 * h + ii] = o[0];
+                        v[base + 81 * h + ii + 27] = o[1];
+                        v[base + 81 * h + ii + 54] = o[2];
                     }
                 }
             }
@@ -396,6 +440,37 @@ mod bin_asm {
                 assert!(worst as f64 / q as f64 <= 0.532);
             }
         }
+    }
+
+    // The batched producer has its own register allocation; compare its
+    // stored rows exactly with the ordinary kernel on adversarial and random input.
+    #[test]
+    fn batched_matches_plain() {
+        struct Sink<'a>(&'a mut [Batch32]);
+        impl vb::SliceSink<8> for Sink<'_> {
+            unsafe fn rows(&mut self,blk:usize,w:[*const i16;8],r0:usize,r1:usize) {
+                for h in 0..8 { for i in r0..r1 {
+                    self.0[h].v[27*blk+i].copy_from_slice(core::slice::from_raw_parts(w[h].add(32*i),32));
+                }}
+            }
+        }
+        #[repr(align(64))]
+        struct Scratch([i16;6*8*27*32]);
+        fn check<const Q:u16>() {
+            let inputs=batches(32,0x51227 ^ Q as u64);
+            for polys in inputs.chunks_exact(8) {
+                let idx:Vec<_>=polys.iter().map(idx_of_polys).collect();
+                let mut got:Vec<_>=(0..8).map(|_|Batch32::zero(Representation::Coefficients)).collect();
+                let mut scratch=Box::new(Scratch([0;6*8*27*32]));
+                unsafe {vb::ntt_bin_batch32_batched::<Q,8,_>(core::array::from_fn(|h|&idx[h]),scratch.0.as_mut_ptr(),&mut Sink(&mut got));}
+                for h in 0..8 {
+                    let mut expected=Batch32::zero(Representation::Coefficients);
+                    unsafe {vb::ntt_bin_batch32::<Q>(&idx[h],&mut expected);}
+                    assert_eq!(got[h].v,expected.v,"Q={Q}, batch={h}");
+                }
+            }
+        }
+        check::<3889>();check::<9721>();
     }
 
     /// The *proved* bound of the schedule (the shadow model only sees the inputs the test feeds it):

@@ -502,33 +502,46 @@ const G: usize = 4;
 fn accumulate<const Q: u16>(w: &AuxData, ch: &ChallengeNtt, bpc: usize) -> Vec<Batch32> {
     let pairs = ch.pair.len();
     let g = G.min(bpc);
-    let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
-    let base = acc.as_mut_ptr() as *mut i32;
-    let row = |j: usize, b: usize| w.batch(j * bpc + b).v.as_ptr() as *const i16;
+    let starts: Vec<usize> = (0..bpc).step_by(g).collect();
     let mut out: Vec<Batch32> = (0..bpc)
         .map(|_| Batch32::zero(Representation::Ntt))
         .collect();
-    unsafe {
-        for b0 in (0..bpc).step_by(g) {
-            acc.fill(AccVec([0i32; 16]));
-            for i in 0..pairs {
-                for b in 0..g {
-                    accumulate_pair(
-                        row(2 * i, b0 + b),
-                        row(2 * i + 1, b0 + b),
-                        ch.pair[i].as_ptr(),
-                        base.add(32 * N * b),
-                    );
+    // Each `b0` group streams a disjoint set of batch positions and writes a disjoint slice of
+    // `out`. The address is a usize so the worker is `Send`.
+    let out_addr = out.as_mut_ptr() as usize;
+    let stride = std::mem::size_of::<Batch32>();
+    std::thread::scope(|scope| {
+        for b0 in starts {
+            let w = w;
+            let ch = ch;
+            scope.spawn(move || {
+                let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
+                let base = acc.as_mut_ptr() as *mut i32;
+                unsafe {
+                    for i in 0..pairs {
+                        for b in 0..g {
+                            let row = |j: usize| {
+                                w.batch(j * bpc + b0 + b).v.as_ptr() as *const i16
+                            };
+                            accumulate_pair(
+                                row(2 * i),
+                                row(2 * i + 1),
+                                ch.pair[i].as_ptr(),
+                                base.add(32 * N * b),
+                            );
+                        }
+                        if (2 * (i + 1)) % fold_period(Q) == 0 {
+                            fold_back::<Q>(base, g * N * 2);
+                        }
+                    }
+                    for b in 0..g {
+                        let dst = &mut *((out_addr + (b0 + b) * stride) as *mut Batch32);
+                        drain::<Q>(base.add(32 * N * b), dst);
+                    }
                 }
-                if (2 * (i + 1)) % fold_period(Q) == 0 {
-                    fold_back::<Q>(base, g * N * 2);
-                }
-            }
-            for b in 0..g {
-                drain::<Q>(base.add(32 * N * b), &mut out[b0 + b]);
-            }
+            });
         }
-    }
+    });
     out
 }
 
@@ -616,6 +629,31 @@ unsafe fn inverse_split<const Q: u16>(b: &mut Batch32) {
     }
 }
 
+/// Run `f` on each batch from several threads. Batches are disjoint; the pointer is a `usize`
+/// because `*mut Batch32` is not `Send`.
+fn parallel_batches(vb: &mut [Batch32], f: impl Fn(&mut Batch32) + Sync) {
+    let n = vb.len();
+    if n == 0 {
+        return;
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(n);
+    let addr = vb.as_mut_ptr() as usize;
+    let stride = std::mem::size_of::<Batch32>();
+    crate::par::pool().run(threads, |t| {
+        let mut i = t;
+        while i < n {
+            unsafe {
+                f(&mut *((addr + i * stride) as *mut Batch32));
+            }
+            i += threads;
+        }
+    });
+}
+
 /// The fold over a splitting base limb: transform the challenges, accumulate, invert.
 fn fold_split<const Q: u16>(
     aux: &AuxData,
@@ -624,11 +662,7 @@ fn fold_split<const Q: u16>(
 ) -> Vec<Batch32> {
     let ch = challenge_ntt::<Q>(challenges);
     let mut vb = accumulate::<Q>(aux, &ch, bpc);
-    unsafe {
-        for b in vb.iter_mut() {
-            inverse_split::<Q>(b);
-        }
-    }
+    parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
     vb
 }
 
@@ -640,11 +674,7 @@ fn fold_quad<const Q: u16>(
 ) -> Vec<Batch32> {
     let ch = challenge_ntt_quad_base::<Q>(challenges);
     let mut vb = accumulate::<Q>(aux, &ch, bpc);
-    unsafe {
-        for b in vb.iter_mut() {
-            intt_quad_gen_batch32::<Q>(b);
-        }
-    }
+    parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
     vb
 }
 
@@ -870,4 +900,1798 @@ pub(crate) fn fold_columns_slots(
     out: &mut [[i16; N162]; 4],
 ) {
     dispatch_limb!(q, |Q| fold_columns_limb::<Q>(challenges, columns, out))
+}
+
+// =============================================================================================
+// the streaming fold: the transform regenerated from the words instead of kept
+// =============================================================================================
+//
+// At the challenge's shape the kept base-limb transform is `columns * bpc` batches of 41472
+// bytes — 5.4 GB for 2^24 words — written once with non-temporal stores, faulted in, read once
+// here and freed at exit. One binary transform of a batch is a few hundred cycles per ring
+// element, so regenerating it from the words costs less than streaming it, and the prover's
+// footprint drops to the words themselves.
+//
+// The accumulation is [`accumulate`]'s exactly: the same `accumulate_pair` over the same
+// lazily reduced kernel output (`ntt_bin_batch32` writes the values `MacKeep` streamed out), the
+// same fold-back cadence, the same `drain` and inverse transform, so the fold is bit for bit the
+// one the kept transform gives. Each worker owns a run of batch positions and regenerates the
+// `(column, position)` transforms it needs, so every transform is computed exactly once.
+
+use crate::fields::scalar::B128;
+use crate::simd::ntt::bin_asm as vb;
+use crate::simd::ntt::bin_quad as vq;
+use crate::simd::transpose_f162::{slice_b128_into, BinaryIndex32};
+
+/// The binary transform of a base limb's tree, as a type so that a splitting prime only ever
+/// instantiates the splitting kernels and a quadratic-slot prime only the quadratic one (the
+/// kernels' tables are built at compile time for their own class of prime).
+trait WordTransform {
+    /// `NTT_q(w)` of the 32 binary ring elements `idx` indexes, lazily reduced, in `out`.
+    ///
+    /// # Safety
+    /// AVX-512 F/BW/VL/VBMI/VBMI2/VNNI and GFNI.
+    unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32);
+}
+
+struct SplitTransform<const Q: u16>;
+struct QuadTransform<const Q: u16>;
+
+impl<const Q: u16> WordTransform for SplitTransform<Q> {
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni"))]
+    unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32) {
+        if Gen::<Q>::LARGE {
+            vl::ntt_bin_batch32::<Q>(idx, out);
+        } else {
+            vb::ntt_bin_batch32::<Q>(idx, out);
+        }
+    }
+}
+
+impl<const Q: u16> WordTransform for QuadTransform<Q> {
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni"))]
+    unsafe fn transform(idx: &BinaryIndex32, out: &mut Batch32) {
+        vq::ntt_quad_bin_batch32::<Q>(idx, out);
+    }
+}
+
+/// `NTT_q(w)` of the 32 binary ring elements formed by `words`, lazily reduced, in `out`.
+///
+/// # Safety
+/// AVX-512 F/BW/VL/VBMI/VBMI2/VNNI and GFNI.
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni"))]
+unsafe fn transform_words<T: WordTransform>(
+    words: &[B128; 128],
+    idx: &mut BinaryIndex32,
+    out: &mut Batch32,
+) {
+    slice_b128_into(words, idx);
+    T::transform(idx, out);
+}
+
+/// [`accumulate`] with the witness transform regenerated from `words`: `v_ntt` modulo `Q`,
+/// centered, one `Batch32` per batch position. `words` is `columns` columns of `128 * bpc`
+/// words each.
+fn accumulate_streaming<const Q: u16, T: WordTransform>(
+    words: &[B128],
+    columns: usize,
+    ch: &ChallengeNtt,
+    bpc: usize,
+    workers: usize,
+) -> Vec<Batch32> {
+    let pairs = ch.pair.len();
+    assert_eq!(2 * pairs, columns, "one challenge per column, paired");
+    let column_words = 128 * bpc;
+    assert_eq!(words.len(), columns * column_words, "the words are not whole columns");
+    let g = G.min(bpc);
+    let groups: Vec<usize> = (0..bpc).step_by(g).collect();
+    let workers = workers.clamp(1, groups.len());
+    let mut out: Vec<Batch32> = (0..bpc)
+        .map(|_| Batch32::zero(Representation::Ntt))
+        .collect();
+    let out_addr = out.as_mut_ptr() as usize;
+    let stride = std::mem::size_of::<Batch32>();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    crate::par::pool().run(workers, |_| {
+        let mut acc = vec![AccVec([0i32; 16]); g * N * 2];
+        let base = acc.as_mut_ptr() as *mut i32;
+        let mut idx = BinaryIndex32::zero();
+        let mut w0 = Box::new(Batch32::zero(Representation::Ntt));
+        let mut w1 = Box::new(Batch32::zero(Representation::Ntt));
+        loop {
+            let gi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if gi >= groups.len() {
+                break;
+            }
+            let b0 = groups[gi];
+            let gb = g.min(bpc - b0);
+            for v in acc.iter_mut() {
+                *v = AccVec([0i32; 16]);
+            }
+            unsafe {
+                for i in 0..pairs {
+                    for b in 0..gb {
+                        let at = |j: usize| {
+                            let start = j * column_words + 128 * (b0 + b);
+                            &*(words.as_ptr().add(start) as *const [B128; 128])
+                        };
+                        transform_words::<T>(at(2 * i), &mut idx, &mut w0);
+                        transform_words::<T>(at(2 * i + 1), &mut idx, &mut w1);
+                        accumulate_pair(
+                            w0.v.as_ptr() as *const i16,
+                            w1.v.as_ptr() as *const i16,
+                            ch.pair[i].as_ptr(),
+                            base.add(32 * N * b),
+                        );
+                    }
+                    if (2 * (i + 1)) % fold_period(Q) == 0 {
+                        fold_back::<Q>(base, gb * N * 2);
+                    }
+                }
+                for b in 0..gb {
+                    let dst = &mut *((out_addr + (b0 + b) * stride) as *mut Batch32);
+                    drain::<Q>(base.add(32 * N * b), dst);
+                }
+            }
+        }
+    });
+    out
+}
+
+fn fold_split_streaming<const Q: u16>(
+    words: &[B128],
+    columns: usize,
+    challenges: &[ShortChallenge],
+    bpc: usize,
+    workers: usize,
+) -> Vec<Batch32> {
+    let ch = challenge_ntt::<Q>(challenges);
+    let mut vb = accumulate_streaming::<Q, SplitTransform<Q>>(words, columns, &ch, bpc, workers);
+    parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
+    vb
+}
+
+fn fold_quad_streaming<const Q: u16>(
+    words: &[B128],
+    columns: usize,
+    challenges: &[ShortChallenge],
+    bpc: usize,
+    workers: usize,
+) -> Vec<Batch32> {
+    let ch = challenge_ntt_quad_base::<Q>(challenges);
+    let mut vb = accumulate_streaming::<Q, QuadTransform<Q>>(words, columns, &ch, bpc, workers);
+    parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
+    vb
+}
+
+/// [`fold_witness`] from the `B128` words the witness was lifted from, with the base-limb
+/// transform regenerated on the fly rather than read from an [`AuxData`]: the same `v`, in
+/// coefficient form modulo the base prime `q`, centered. `words` is `columns` columns of
+/// `128 * bpc` words; `workers` bounds the threads.
+pub fn fold_witness_streaming(
+    words: &[B128],
+    columns: usize,
+    challenges: &[ShortChallenge],
+    bpc: usize,
+    q: u16,
+    workers: usize,
+) -> Vec<RingElement> {
+    assert_eq!(challenges.len(), columns, "one challenge per column");
+    assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
+    let vb = dispatch_limb!(
+        q,
+        split |Q| fold_split_streaming::<Q>(words, columns, challenges, bpc, workers),
+        quad |Q| fold_quad_streaming::<Q>(words, columns, challenges, bpc, workers),
+    );
+    (0..32 * bpc).map(|i| vb[i / 32].get(i % 32)).collect()
+}
+
+// =============================================================================================
+// the fold from the words with bit-sliced counters
+// =============================================================================================
+//
+// [`crate::fold_bits`] computes `v` without any transform: a few vector operations per
+// challenge term on 512-lane bit planes of the words. This is the driver: the GFNI transpose of
+// the library feeds the planes, the blocks go out over the pool, and two runtime checks guard
+// the result — the GFNI transposer is compared with the portable one on one block (and
+// replaced by it if they differ), and one batch position of the fold is recomputed through the
+// transform path by the caller (`fold_witness_positions`) and compared.
+
+use crate::fold_bits::{self as fb, Challenge, Lanes, Transposer};
+use crate::simd::transpose_f162::transpose8x8_q;
+use crate::fields::bitmat::{transpose_tile, GF_IDENT};
+
+/// The library's GFNI tile transpose, continued to bit planes: per 64-word tile the byte
+/// transpose, the 8x8 bit transpose of every qword (`gf2p8affine` by the identity), and an 8x8
+/// byte transpose, which leaves qword `t` of vector `k` holding bit `8 k + t` of the tile's
+/// 64 words in `word_at` order; a qword transpose across the eight tiles then assembles each
+/// plane's 512 lanes.
+///
+/// Which plane index a given (`k`, `t`) lands on depends on the affine's bit convention, so the
+/// driver derives the plane permutation at run time against the portable transposer.
+pub struct Gfni {
+    /// `plane[q]` is produced at raw index `perm[q]`.
+    perm: [u8; fb::WORD_BITS],
+    /// The word lane `l` carries.
+    map: fn(usize) -> usize,
+}
+
+impl Gfni {
+    /// A transposer validated against the portable one on `sample` (512 words), under each
+    /// candidate lane order: `None` when no lane order and permutation of its raw planes
+    /// reproduces the portable planes.
+    pub fn validated(sample: &[u128]) -> Option<Gfni> {
+        assert!(sample.len() >= fb::LANES);
+        let mut raw = [fb::V::zero(); fb::WORD_BITS];
+        unsafe { gfni_raw_planes(sample.as_ptr(), &mut raw) };
+        let raw_words: Vec<[u64; 8]> = raw.iter().map(|v| v.words()).collect();
+        let candidates: [fn(usize) -> usize; 2] = [fb::lane_word_reversed8, fb::lane_word];
+        'maps: for map in candidates {
+            let mut want = [fb::V::zero(); fb::WORD_BITS];
+            unsafe { fb::portable_planes(sample.as_ptr(), &mut want, map) };
+            let mut perm = [0u8; fb::WORD_BITS];
+            let mut used = [false; fb::WORD_BITS];
+            for (q, w) in want.iter().enumerate() {
+                let w = w.words();
+                let Some(at) = (0..fb::WORD_BITS).find(|&i| !used[i] && raw_words[i] == w) else {
+                    continue 'maps;
+                };
+                used[at] = true;
+                perm[q] = at as u8;
+            }
+            return Some(Gfni { perm, map });
+        }
+        None
+    }
+}
+
+/// The raw planes of the GFNI path, before the permutation.
+///
+/// # Safety
+/// AVX-512 F/BW/VBMI and GFNI; `words` addresses 512 readable `u128`.
+#[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f,avx512bw,avx512vbmi,gfni"))]
+unsafe fn gfni_raw_planes(words: *const u128, out: &mut [fb::V; fb::WORD_BITS]) {
+    // Byte (8 t + i) of the output takes byte (8 i + t) of the input: an 8x8 byte transpose.
+    let idx: [u8; 64] = core::array::from_fn(|o| (8 * (o % 8) + o / 8) as u8);
+    let t8 = _mm512_loadu_si512(idx.as_ptr() as *const __m512i);
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    let mut u = [[_mm512_setzero_si512(); 16]; 8];
+    let mut xp = [_mm512_setzero_si512(); 16];
+    for tile in 0..8 {
+        transpose_tile(words.add(64 * tile) as *const u8, &mut xp);
+        for k in 0..16 {
+            let bits = _mm512_gf2p8affine_epi64_epi8::<0>(ident, xp[k]);
+            u[tile][k] = _mm512_permutexvar_epi8(t8, bits);
+        }
+    }
+    for k in 0..16 {
+        let o = transpose8x8_q(core::array::from_fn(|tile| u[tile][k]));
+        for t in 0..8 {
+            out[8 * k + t] = <fb::V as fb::Lanes>::from_words(core::mem::transmute::<__m512i, [u64; 8]>(o[t]));
+        }
+    }
+}
+
+impl Transposer for Gfni {
+    unsafe fn planes<L: Lanes>(&self, words: *const u128, out: &mut [L; fb::WORD_BITS]) {
+        let mut raw = [fb::V::zero(); fb::WORD_BITS];
+        gfni_raw_planes(words, &mut raw);
+        for q in 0..fb::WORD_BITS {
+            out[q] = L::from_words(raw[self.perm[q] as usize].words());
+        }
+    }
+    fn lane_word(&self, l: usize) -> usize {
+        (self.map)(l)
+    }
+}
+
+/// `v = sum_j c_j W_j` from the words with the bit-sliced counters, in coefficient form,
+/// centered: the same elements [`fold_witness_streaming`] returns. `words` is `columns`
+/// columns of `column_words` words (a multiple of 512). Blocks of 128 elements go out over the
+/// pool.
+pub fn fold_witness_bits(
+    words: &[B128],
+    columns: usize,
+    column_words: usize,
+    challenges: &[ShortChallenge],
+) -> Vec<RingElement> {
+    assert_eq!(challenges.len(), columns, "one challenge per column");
+    assert!(column_words % fb::LANES == 0 && words.len() == columns * column_words);
+    let cs: Vec<Challenge> = challenges
+        .iter()
+        .map(|c| Challenge {
+            positions: c.positions,
+            signs: c.signs,
+            weight: c.weight,
+        })
+        .collect();
+    let raw = words.as_ptr() as usize;
+    let elements = column_words / 4;
+    let blocks = elements / fb::BLOCK_ELEMENTS;
+    let reach = fb::Reach::of(&cs);
+    let mut out: Vec<[i16; N]> = vec![[0i16; N]; elements];
+    let out_addr = out.as_mut_ptr() as usize;
+    let sample = &words[..fb::LANES];
+    let gfni = Gfni::validated(unsafe { core::slice::from_raw_parts(sample.as_ptr() as *const u128, fb::LANES) });
+    FOLD_USED_GFNI.store(gfni.is_some(), std::sync::atomic::Ordering::Relaxed);
+    let run_block = |block: usize| {
+        let chunk = unsafe {
+            core::slice::from_raw_parts_mut(
+                (out_addr as *mut [i16; N]).add(block * fb::BLOCK_ELEMENTS),
+                fb::BLOCK_ELEMENTS,
+            )
+        };
+        let raw = raw as *const u128;
+        unsafe {
+            match &gfni {
+                Some(t) => fb::fold_block::<fb::V, Gfni>(raw, columns, column_words, &cs, &reach, block, t, chunk),
+                None => fb::fold_block::<fb::V, fb::Portable>(raw, columns, column_words, &cs, &reach, block, &fb::Portable, chunk),
+            }
+        }
+    };
+    crate::par::pool().run(blocks, run_block);
+    out.into_iter()
+        .map(|v| RingElement {
+            v,
+            representation: Representation::Coefficients,
+        })
+        .collect()
+}
+
+/// Whether the last [`fold_witness_bits`] ran on the GFNI transposer (else the portable one),
+/// for the profile line.
+pub static FOLD_USED_GFNI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`fold_witness_streaming`] restricted to the batch positions `positions` (32 ring elements
+/// each): element `32 b + i` of the fold for `b` in `positions`, in order — the transform path's
+/// answer, for checking another path against.
+pub fn fold_witness_positions(
+    words: &[B128],
+    columns: usize,
+    challenges: &[ShortChallenge],
+    bpc: usize,
+    q: u16,
+    positions: core::ops::Range<usize>,
+) -> Vec<RingElement> {
+    assert_eq!(challenges.len(), columns, "one challenge per column");
+    assert!(bpc > 0 && words.len() == columns * 128 * bpc && positions.end <= bpc);
+    let vb = dispatch_limb!(
+        q,
+        split |Q| {
+            let ch = challenge_ntt::<Q>(challenges);
+            let mut vb = accumulate_streaming_positions::<Q, SplitTransform<Q>>(words, columns, &ch, bpc, positions.clone());
+            parallel_batches(&mut vb, |b| unsafe { inverse_split::<Q>(b) });
+            vb
+        },
+        quad |Q| {
+            let ch = challenge_ntt_quad_base::<Q>(challenges);
+            let mut vb = accumulate_streaming_positions::<Q, QuadTransform<Q>>(words, columns, &ch, bpc, positions.clone());
+            parallel_batches(&mut vb, |b| unsafe { intt_quad_gen_batch32::<Q>(b) });
+            vb
+        },
+    );
+    (0..32 * vb.len()).map(|i| vb[i / 32].get(i % 32)).collect()
+}
+
+/// [`accumulate_streaming`] over the batch positions `positions` only, one position per task.
+fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
+    words: &[B128],
+    columns: usize,
+    ch: &ChallengeNtt,
+    bpc: usize,
+    positions: core::ops::Range<usize>,
+) -> Vec<Batch32> {
+    let pairs = ch.pair.len();
+    assert_eq!(2 * pairs, columns, "one challenge per column, paired");
+    let column_words = 128 * bpc;
+    let n = positions.len();
+    let mut out: Vec<Batch32> = (0..n).map(|_| Batch32::zero(Representation::Ntt)).collect();
+    let out_addr = out.as_mut_ptr() as usize;
+    let stride = std::mem::size_of::<Batch32>();
+    let first = positions.start;
+    crate::par::pool().run(n, |i| {
+        let b = first + i;
+        let mut acc = vec![AccVec([0i32; 16]); N * 2];
+        let base = acc.as_mut_ptr() as *mut i32;
+        let mut idx = BinaryIndex32::zero();
+        let mut w0 = Box::new(Batch32::zero(Representation::Ntt));
+        let mut w1 = Box::new(Batch32::zero(Representation::Ntt));
+        unsafe {
+            for p in 0..pairs {
+                let at = |j: usize| {
+                    let start = j * column_words + 128 * b;
+                    &*(words.as_ptr().add(start) as *const [B128; 128])
+                };
+                transform_words::<T>(at(2 * p), &mut idx, &mut w0);
+                transform_words::<T>(at(2 * p + 1), &mut idx, &mut w1);
+                accumulate_pair(
+                    w0.v.as_ptr() as *const i16,
+                    w1.v.as_ptr() as *const i16,
+                    ch.pair[p].as_ptr(),
+                    base,
+                );
+                if (2 * (p + 1)) % fold_period(Q) == 0 {
+                    fold_back::<Q>(base, N * 2);
+                }
+            }
+            let dst = &mut *((out_addr + i * stride) as *mut Batch32);
+            drain::<Q>(base, dst);
+        }
+    });
+    out
+}
+
+/// Exact integer fold directly from the binary words, using 512-lane bit-sliced counters.
+/// Shapes without whole 512-word blocks or with more than 32767 challenge terms retain the
+/// NTT implementation. For honest challenge instances the exact coefficients equal its
+/// centered residues; this path performs no modular reconstruction.
+/// Diagnostics of the last bitsliced fold, for the profile line only: per worker, the
+/// microseconds from the fold's dispatch to the end of its last task, and the tasks it ran.
+pub static FOLD_END_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+pub static FOLD_TASKS: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+
+/// The diagnostics above as ` fold_end_us=a/b/.. fold_tasks=a/b/..`.
+pub fn fold_report(workers: usize) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let w = workers.min(16);
+    let ends: Vec<String> = (0..w).map(|i| FOLD_END_US[i].load(Relaxed).to_string()).collect();
+    let tasks: Vec<String> = (0..w).map(|i| FOLD_TASKS[i].load(Relaxed).to_string()).collect();
+    format!(" fold_end_us={} fold_tasks={}", ends.join("/"), tasks.join("/"))
+}
+
+pub fn fold_witness_bitsliced(
+    words: &[B128],
+    columns: usize,
+    challenges: &[ShortChallenge],
+    bpc: usize,
+    q: u16,
+    workers: usize,
+) -> Vec<RingElement> {
+    assert_eq!(challenges.len(), columns, "one challenge per column");
+    assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
+    if bpc % 4 != 0 || !bitsliced::fits(challenges) {
+        return fold_witness_streaming(words, columns, challenges, bpc, q, workers);
+    }
+    bitsliced::fold_words(words, challenges, 128 * bpc, workers)
+}
+
+// Exact fold of the binary witness, independent of commitment-modulus arithmetic.
+mod bitsliced {
+    //! Integer convolution in Z[Y]/(Y^243 + 1), followed by reduction modulo
+    //! Y^162 - Y^81 + 1. Since (Y^81 + 1)(Y^162 - Y^81 + 1) = Y^243 + 1,
+    //! this gives exactly the original ring product, with no probabilistic reconstruction.
+    //!
+    //! A negative bit contribution is accumulated as its complement, with a scalar bias removed
+    //! at the end: -b = (1-b)-1. The complement is never stored: a slot pair's negative terms
+    //! are scheduled apart from its positive ones, and their leaf full adders take the carry of
+    //! the complemented inputs (the sum of two complemented inputs is the sum of the direct
+    //! ones). Every negative entry, guard and padding reads included, adds one to the bias of
+    //! both its slots. The counter's low six bits use a 64-input carry-save tree (two ternlogs
+    //! per full adder); the carry into bit six ripples through the remaining nine bits once per
+    //! 64 inputs. The 15-bit counter cannot overflow when the total challenge weight plus the
+    //! padding ([`fits`]) is at most 32767.
+    use super::{B128, Representation, RingElement, ShortChallenge};
+    use crate::fields::bitmat;
+    use crate::simd::transpose_f162::transpose8x8_q;
+    use crate::arch::*;
+
+    const LANES: usize = 512;
+    const SLOTS: usize = 243;
+    /// Schedule entries ahead of use that the accumulation prefetches the planes of: the planes
+    /// (264 KB per worker) live in L2, and each entry's two vectors are otherwise demand misses.
+    const PF_AHEAD: usize = 0;
+    const BITS: usize = 15;
+    /// Columns per group: 32 * 129 planes, about 258 KiB per worker. Larger groups
+    /// amortize the schedule and partial carry-save trees. The qword offsets remain in u16:
+    /// `(GUARD + COL_GROUP * STRIDE) * 8 <= 65535`.
+    const COL_GROUP: usize = 32;
+    /// Parts of the column groups per block in the fold's dynamic task hand-out.
+    const PARTS: usize = 2;
+    /// Planes per column: the 128 direct planes and a zero guard, which is also the next
+    /// column's leading guard. Every term's 128-plane run is flanked by zero planes, so a window
+    /// of two consecutive slots reads a zero wherever the term does not reach, with no edge
+    /// cases in the schedule.
+    const STRIDE: usize = 129;
+    /// Plane index of column `j`'s first direct plane; `GUARD + j * STRIDE - 1` is its leading
+    /// zero guard, and planes 0 and 1 (the padding pair of a short chunk) are both zero.
+    const GUARD: usize = 2;
+    /// Slot pairs `(2q, 2q + 1)`; the odd slot of the last pair (243) is a dummy.
+    const PAIRS: usize = SLOTS.div_ceil(2);
+    /// Entries a group's schedule may add to a slot pair beyond one per term: padding of its
+    /// positive and of its negative entries to multiples of 2.
+    const PAD_PER_GROUP: usize = 2;
+    // The offsets use x86's scale-8 addressing directly, avoiding a shift per input.
+    const _: () = assert!((GUARD + COL_GROUP * STRIDE) * 8 <= u16::MAX as usize);
+
+    /// Whether the counters cannot overflow: a slot's counter adds at most one entry per
+    /// challenge term and the padding of every group.
+    pub(super) fn fits(challenges: &[ShortChallenge]) -> bool {
+        let weight: usize = challenges.iter().map(|c| c.weight).sum();
+        weight + PAD_PER_GROUP * challenges.len().div_ceil(COL_GROUP) <= i16::MAX as usize
+    }
+
+    struct Group {
+        first: usize,
+        columns: usize,
+        /// `terms[offsets[q] .. mid[q]]` and `terms[mid[q] .. offsets[q + 1]]` are the
+        /// positive and the negative entries of slot pair `q`, each padded to a multiple of 2
+        /// with offset 0 (planes 0 and 1 are zero): whole 64-input chunks, then binary tail
+        /// trees of sizes 32, 16, 8, 4, 2.
+        offsets: [usize; PAIRS + 1],
+        mid: [usize; PAIRS],
+        terms: Vec<u16>,
+    }
+
+    /// The schedule of column group `g` (columns `cs`), and per slot pair the number of its
+    /// negative entries (padding included): each adds one to the bias of both slots.
+    fn plan_group<const GROUP: usize>(g: usize, cs: &[ShortChallenge]) -> (Group, [i32; PAIRS]) { unsafe {
+        // A term's run `[m, end)` of slots meets slot pair `q` when `2q <= end - 1` and
+        // `2q + 1 >= m`, i.e. `q` in `[m / 2, (end - 1) / 2]`; the wrapped run `[0, wrap)`
+        // meets pairs `[0, (wrap - 1) / 2]`, with the opposite sign (`Y^243 = -1`).
+        // `count_diff[negative]`: the entries of each sign per pair, as range differences.
+        let mut count_diff = [[0i32; PAIRS + 1]; 2];
+        for c in cs.iter() {
+            assert!(c.weight <= c.positions.len());
+            for t in 0..c.weight {
+                let m = c.positions[t] as usize;
+                assert!(m < 162);
+                let negative = ((c.signs >> t) & 1 != 0) ^ (m % 2 != 0);
+                let end = (m + 128).min(SLOTS);
+                count_diff[negative as usize][m / 2] += 1;
+                count_diff[negative as usize][(end + 1) / 2] -= 1;
+                let wrap = (m + 128).saturating_sub(SLOTS);
+                if wrap != 0 {
+                    count_diff[!negative as usize][0] += 1;
+                    count_diff[!negative as usize][(wrap + 1) / 2] -= 1;
+                }
+            }
+        }
+        let mut group = Group {
+            first: g * GROUP,
+            columns: cs.len(),
+            offsets: [0; PAIRS + 1],
+            mid: [0; PAIRS],
+            terms: Vec::new(),
+        };
+        let mut negatives = [0i32; PAIRS];
+        let mut count = [0i32; 2];
+        for q in 0..PAIRS {
+            for (c, diff) in count.iter_mut().zip(&count_diff) {
+                *c += diff[q];
+                debug_assert!(*c >= 0);
+            }
+            let (pos, neg) = ((count[0] as usize + 1) & !1, (count[1] as usize + 1) & !1);
+            group.mid[q] = group.offsets[q] + pos;
+            group.offsets[q + 1] = group.mid[q] + neg;
+            negatives[q] = neg as i32;
+        }
+        // Offset 0 is the padding pair (planes 0 and 1 are zero), not a column's plane.
+        // Only the last entry of a non-empty sign range can be padding (at most 1 entry for
+        // even alignment); presetting that slot to 0 avoids zeroing the whole schedule vector.
+        let total_terms = group.offsets[PAIRS];
+        // [`PF_AHEAD`] trailing zero offsets: the accumulation's look-ahead reads them.
+        group.terms = Vec::with_capacity(total_terms + PF_AHEAD);
+        core::ptr::write_bytes(group.terms.as_mut_ptr().add(total_terms), 0, PF_AHEAD);
+        unsafe {
+            let terms_ptr = group.terms.as_mut_ptr();
+            for q in 0..PAIRS {
+                if group.mid[q] > group.offsets[q] {
+                    *terms_ptr.add(group.mid[q] - 1) = 0;
+                }
+                if group.offsets[q + 1] > group.mid[q] {
+                    *terms_ptr.add(group.offsets[q + 1] - 1) = 0;
+                }
+            }
+            let mut at: [[u32; PAIRS]; 2] = [
+                core::array::from_fn(|q| group.offsets[q] as u32),
+                core::array::from_fn(|q| group.mid[q] as u32),
+            ];
+            for (j, c) in cs.iter().enumerate() {
+                let column = GUARD + j * STRIDE;
+                for t in 0..c.weight {
+                    let m = c.positions[t] as usize;
+                    let negative = ((c.signs >> t) & 1 != 0) ^ (m % 2 != 0);
+                    let end = (m + 128).min(SLOTS);
+                    // The plane of slot `2q` for the run starting at slot `m`: `column + 2q - m`, which
+                    // is the guard before the run when `2q = m - 1`; the odd slot reads one plane
+                    // further, the guard after the run when `2q + 1 = end`.
+                    let q0 = m / 2;
+                    let q1 = (end + 1) / 2;
+                    let at_ptr = at[negative as usize].as_mut_ptr();
+                    let mut val = (8 * (column + 2 * q0).wrapping_sub(m)) as u16;
+                    for q in q0..q1 {
+                        let p = at_ptr.add(q);
+                        let idx = *p as usize;
+                        debug_assert!(idx < if negative { group.offsets[q + 1] } else { group.mid[q] });
+                        *p = idx as u32 + 1;
+                        *terms_ptr.add(idx) = val;
+                        val = val.wrapping_add(16);
+                    }
+                    let wrap = (m + 128).saturating_sub(SLOTS);
+                    if wrap != 0 {
+                        let q1 = (wrap + 1) / 2;
+                        let at_ptr = at[!negative as usize].as_mut_ptr();
+                        let mut val = (8 * (column + (end - m))) as u16;
+                        for q in 0..q1 {
+                            let p = at_ptr.add(q);
+                            let idx = *p as usize;
+                            debug_assert!(idx < if !negative { group.offsets[q + 1] } else { group.mid[q] });
+                            *p = idx as u32 + 1;
+                            *terms_ptr.add(idx) = val;
+                            val = val.wrapping_add(16);
+                        }
+                    }
+                }
+            }
+            group.terms.set_len(total_terms + PF_AHEAD);
+        }
+        (group, negatives)
+    } }
+
+    fn plan<const GROUP: usize>(challenges: &[ShortChallenge], workers: usize) -> (Vec<Group>, [i32; SLOTS]) {
+        let jobs = challenges.len().div_ceil(GROUP);
+        let group = |g: usize| {
+            let first = g * GROUP;
+            let last = (first + GROUP).min(challenges.len());
+            plan_group::<GROUP>(g, &challenges[first..last])
+        };
+        // The schedule is independent for each public column group; the pool's parked
+        // workers take the groups, and the merge keeps column order.
+        let built: Vec<(Group, [i32; PAIRS])> = if jobs < 4 || workers <= 1 {
+            (0..jobs).map(group).collect()
+        } else {
+            crate::par::pool().map(jobs, group)
+        };
+        let mut groups = Vec::with_capacity(jobs);
+        let mut negatives = [0i32; PAIRS];
+        for (group, n) in built {
+            groups.push(group);
+            for (dst, x) in negatives.iter_mut().zip(n) { *dst += x; }
+        }
+        let bias = core::array::from_fn(|s| negatives[s / 2]);
+        (groups, bias)
+    }
+
+    #[repr(C, align(64))]
+    struct Aligned<T>(T);
+
+    const fn swap_index(mask: usize, value: usize) -> [u8; 64] {
+        let mut out = [0; 64];
+        let mut p = 0;
+        while p < 64 {
+            out[p] = (64 * ((p & mask != 0) as usize) + (p & !mask) + value) as u8;
+            p += 1;
+        }
+        out
+    }
+
+    static SWAPS: Aligned<[[[u8; 64]; 2]; 4]> = Aligned([
+        [swap_index(8, 0), swap_index(8, 8)],
+        [swap_index(4, 0), swap_index(4, 4)],
+        [swap_index(2, 0), swap_index(2, 2)],
+        [swap_index(1, 0), swap_index(1, 1)],
+    ]);
+
+    /// Exactly bitmat's byte transpose, specialized to four fixed rounds. Both the vector-slot
+    /// bit and the byte-position bit exchanged in round r are 3-r. Constant pair indices let
+    /// the compiler keep all sixteen vectors in registers instead of indexing a stack array.
+    #[inline(always)]
+    unsafe fn transpose_tile(src: *const B128, dst: *mut __m512i) {
+        let mut z: [__m512i; 16] = core::array::from_fn(|i| {
+            _mm512_loadu_si512((src as *const u8).add(64 * i) as *const __m512i)
+        });
+        macro_rules! pair {
+            ($a:literal, $b:literal, $i0:ident, $i1:ident) => {{
+                let (a, b) = (z[$a], z[$b]);
+                z[$a] = _mm512_permutex2var_epi8(a, $i0, b);
+                z[$b] = _mm512_permutex2var_epi8(a, $i1, b);
+            }};
+        }
+        let i0 = _mm512_load_si512(SWAPS.0[0][0].as_ptr() as *const __m512i);
+        let i1 = _mm512_load_si512(SWAPS.0[0][1].as_ptr() as *const __m512i);
+        pair!(0, 8, i0, i1); pair!(1, 9, i0, i1); pair!(2, 10, i0, i1); pair!(3, 11, i0, i1);
+        pair!(4, 12, i0, i1); pair!(5, 13, i0, i1); pair!(6, 14, i0, i1); pair!(7, 15, i0, i1);
+        let i0 = _mm512_load_si512(SWAPS.0[1][0].as_ptr() as *const __m512i);
+        let i1 = _mm512_load_si512(SWAPS.0[1][1].as_ptr() as *const __m512i);
+        pair!(0, 4, i0, i1); pair!(1, 5, i0, i1); pair!(2, 6, i0, i1); pair!(3, 7, i0, i1);
+        pair!(8, 12, i0, i1); pair!(9, 13, i0, i1); pair!(10, 14, i0, i1); pair!(11, 15, i0, i1);
+        let i0 = _mm512_load_si512(SWAPS.0[2][0].as_ptr() as *const __m512i);
+        let i1 = _mm512_load_si512(SWAPS.0[2][1].as_ptr() as *const __m512i);
+        pair!(0, 2, i0, i1); pair!(1, 3, i0, i1); pair!(4, 6, i0, i1); pair!(5, 7, i0, i1);
+        pair!(8, 10, i0, i1); pair!(9, 11, i0, i1); pair!(12, 14, i0, i1); pair!(13, 15, i0, i1);
+        let i0 = _mm512_load_si512(SWAPS.0[3][0].as_ptr() as *const __m512i);
+        let i1 = _mm512_load_si512(SWAPS.0[3][1].as_ptr() as *const __m512i);
+        pair!(0, 1, i0, i1); pair!(2, 3, i0, i1); pair!(4, 5, i0, i1); pair!(6, 7, i0, i1);
+        pair!(8, 9, i0, i1); pair!(10, 11, i0, i1); pair!(12, 13, i0, i1); pair!(14, 15, i0, i1);
+        for i in 0..16 {
+            _mm512_store_si512(dst.add(i), z[i]);
+        }
+    }
+
+    // Byte transpose inside each vector, and its inverse with reversed GFNI matrix rows and
+    // qwords pre-ordered `[0, 4, 1, 5, 2, 6, 3, 7]` so `vpunpcklbw`/`vpunpckhbw` emit the
+    // natural 64-lane order directly without a follow-up `vpermt2q`.
+    const PERM: Aligned<[u8; 64]> = Aligned({
+        let mut a = [0; 64];
+        let mut i = 0;
+        while i < 64 {
+            a[i] = (8 * (i % 8) + i / 8) as u8;
+            i += 1;
+        }
+        a
+    });
+    const BACK: Aligned<[u8; 64]> = Aligned({
+        let mut a = [0; 64];
+        let mut i = 0;
+        while i < 64 {
+            let q = i / 8;
+            let src_q = (q / 2) + 4 * (q % 2);
+            a[i] = (8 * (7 - i % 8) + src_q) as u8;
+            i += 1;
+        }
+        a
+    });
+
+    /// Lane l corresponds to this source word. GFNI reverses the eight matrix rows; the byte
+    /// transpose uses bitmat's public word permutation. No permutation is needed in the hot loop;
+    /// [`write_block`] relies on its shape (lane `64 g + 16 k + r` is word `64 g + 4 (r ^ 7) + k`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn word_of(l: usize) -> usize {
+        64 * (l / 64) + bitmat::word_at((l % 64 & !7) + 7 - l % 8)
+    }
+
+    /// The 128 planes of a block of 512 words to `out`; the guard planes around them are the
+    /// caller's.
+    ///
+    /// The 8 KB the next call slices (`next`, any readable address) are prefetched a tile at a
+    /// time: the blocks of a group are 256 KB apart, two fresh pages each, which the hardware
+    /// prefetchers only start on after the first misses, and the table comes from DRAM.
+    #[inline(always)]
+    unsafe fn slice(words: *const B128, out: *mut __m512i, next: *const B128) {
+        let mut tiles = core::mem::MaybeUninit::<[[__m512i; 16]; 8]>::uninit();
+        let tiles_ptr = tiles.as_mut_ptr() as *mut __m512i;
+        for t in 0..8 {
+            for i in 0..16 {
+                _mm_prefetch::<{ _MM_HINT_T0 }>((next as *const i8).add(1024 * t + 64 * i));
+            }
+            transpose_tile(words.add(64 * t), tiles_ptr.add(16 * t));
+        }
+        let perm = _mm512_load_si512(PERM.0.as_ptr() as *const __m512i);
+        let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
+        for b in 0..16 {
+            let rows = core::array::from_fn(|t| {
+                _mm512_permutexvar_epi8(
+                    perm,
+                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_load_si512(tiles_ptr.add(16 * t + b))),
+                )
+            });
+            let planes = transpose8x8_q(rows);
+            for p in 0..8 {
+                _mm512_store_si512(out.add(8 * b + p), planes[p]);
+            }
+        }
+    }
+
+    /// Three equally weighted bit planes -> sum and double-weight carry.
+    #[inline(always)]
+    unsafe fn csa(sum: &mut __m512i, a: __m512i, b: __m512i) -> __m512i {
+        // `vpternlogq` overwrites its first operand, so taking both outputs from the three
+        // originals costs a register copy per full adder. Instead the sum is formed in place
+        // and the carry is read off `(a, sum', b)`: with `sum = sum' ^ a ^ b`, the majority is
+        // `a` when `a == b` and `!sum'` otherwise, truth table 0xb2. The carry can then land on
+        // `a` or `b`, both dead afterwards.
+        *sum = _mm512_ternarylogic_epi64::<0x96>(*sum, a, b);
+        _mm512_ternarylogic_epi64::<0xb2>(a, *sum, b)
+    }
+
+    /// [`csa`] of `sum` and the complements of `a` and `b`: the sum is the same (the two
+    /// complements cancel), and the carry `maj(sum, !a, !b)` is `!a` when `a == b` and the
+    /// complement of the new sum otherwise, truth table 0x17 on `(a, sum', b)`.
+    #[inline(always)]
+    unsafe fn csa_neg(sum: &mut __m512i, a: __m512i, b: __m512i) -> __m512i {
+        *sum = _mm512_ternarylogic_epi64::<0x96>(*sum, a, b);
+        _mm512_ternarylogic_epi64::<0x17>(a, *sum, b)
+    }
+
+    // Isolate the counter's register allocation from the transpose's many vector constants.
+    #[allow(dead_code)]
+    #[inline(never)]
+    unsafe fn accumulate(planes: *const __m512i, terms: &[u16], acc: *mut __m512i) {
+        let planes = planes as *const u64;
+        let mut b0 = _mm512_load_si512(acc);
+        let mut b1 = _mm512_load_si512(acc.add(1));
+        let mut b2 = _mm512_load_si512(acc.add(2));
+        let mut b3 = _mm512_load_si512(acc.add(3));
+        let mut b4 = _mm512_load_si512(acc.add(4));
+        let mut b5 = _mm512_load_si512(acc.add(5));
+        let mut b6 = _mm512_load_si512(acc.add(6));
+        let mut b7 = _mm512_load_si512(acc.add(7));
+        let mut b8 = _mm512_load_si512(acc.add(8));
+        let mut b9 = _mm512_load_si512(acc.add(9));
+        let mut b10 = _mm512_load_si512(acc.add(10));
+        let mut b11 = _mm512_load_si512(acc.add(11));
+        let mut b12 = _mm512_load_si512(acc.add(12));
+        let mut b13 = _mm512_load_si512(acc.add(13));
+        let mut b14 = _mm512_load_si512(acc.add(14));
+        for input in terms.chunks_exact(64) {
+            let t = input.as_ptr();
+            macro_rules! two {
+                ($off:expr) => {{
+                    let a = _mm512_load_si512(planes.add(*t.add($off) as usize) as *const __m512i);
+                    let b = _mm512_load_si512(planes.add(*t.add($off + 1) as usize) as *const __m512i);
+                    csa(&mut b0, a, b)
+                }};
+            }
+            macro_rules! four {
+                ($off:expr) => {{ let a = two!($off); let b = two!($off + 2); csa(&mut b1, a, b) }};
+            }
+            macro_rules! eight {
+                ($off:expr) => {{ let a = four!($off); let b = four!($off + 4); csa(&mut b2, a, b) }};
+            }
+            macro_rules! sixteen {
+                ($off:expr) => {{ let a = eight!($off); let b = eight!($off + 8); csa(&mut b3, a, b) }};
+            }
+            macro_rules! thirty_two {
+                ($off:expr) => {{ let a = sixteen!($off); let b = sixteen!($off + 16); csa(&mut b4, a, b) }};
+            }
+            let a = thirty_two!(0);
+            let b = thirty_two!(32);
+            let mut carry = csa(&mut b5, a, b);
+            macro_rules! ripple {
+                ($bit:ident) => {{
+                    let old = $bit;
+                    $bit = _mm512_xor_si512(old, carry);
+                    carry = _mm512_and_si512(old, carry);
+                }};
+            }
+            ripple!(b6); ripple!(b7); ripple!(b8); ripple!(b9);
+            ripple!(b10); ripple!(b11); ripple!(b12); ripple!(b13);
+            b14 = _mm512_xor_si512(b14, carry);
+        }
+        _mm512_store_si512(acc, b0);
+        _mm512_store_si512(acc.add(1), b1);
+        _mm512_store_si512(acc.add(2), b2);
+        _mm512_store_si512(acc.add(3), b3);
+        _mm512_store_si512(acc.add(4), b4);
+        _mm512_store_si512(acc.add(5), b5);
+        _mm512_store_si512(acc.add(6), b6);
+        _mm512_store_si512(acc.add(7), b7);
+        _mm512_store_si512(acc.add(8), b8);
+        _mm512_store_si512(acc.add(9), b9);
+        _mm512_store_si512(acc.add(10), b10);
+        _mm512_store_si512(acc.add(11), b11);
+        _mm512_store_si512(acc.add(12), b12);
+        _mm512_store_si512(acc.add(13), b13);
+        _mm512_store_si512(acc.add(14), b14);
+    }
+
+    /// Two consecutive slots at once: every scheduled offset is the plane of the even slot, and
+    /// the odd slot's plane is the next one, so one scalar offset serves two vector loads. Each
+    /// slot keeps the six low counter bits of a 64-input tree in registers, plus a three-bit
+    /// counter of the trees' weight-64 carries; every seventh chunk that counter is added into
+    /// the nine upper counter bits in memory. The `pos` entries add their planes, the `neg`
+    /// entries their complements (leaf full adders by [`csa_neg`]).
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f"))]
+    #[inline(never)]
+    unsafe fn accumulate_pair(planes: *const __m512i, pos: &[u16], neg: &[u16], acc: *mut __m512i) {
+        let planes = planes as *const u64;
+        let (even, odd) = (acc, acc.add(BITS));
+        let mut s0: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(even.add(b)));
+        let mut s1: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(odd.add(b)));
+        // The weight-64 carries of up to seven chunks, in registers at weights 64, 128 and 256;
+        // every seventh chunk they are added into the nine upper counter bits in memory.
+        let zero = _mm512_setzero_si512();
+        let (mut h0, mut h1) = ([zero; 3], [zero; 3]);
+        let mut pending = 0usize;
+        macro_rules! flush {
+            ($slot:ident, $h:ident) => {{
+                let p = $slot.add(6);
+                let m6 = _mm512_load_si512(p);
+                _mm512_store_si512(p, _mm512_xor_si512(m6, $h[0]));
+                let mut carry = _mm512_and_si512(m6, $h[0]);
+                let p = $slot.add(7);
+                let m7 = _mm512_load_si512(p);
+                let x = _mm512_ternarylogic_epi64::<0x96>(m7, $h[1], carry);
+                _mm512_store_si512(p, x);
+                carry = _mm512_ternarylogic_epi64::<0xb2>($h[1], x, carry);
+                let p = $slot.add(8);
+                let m8 = _mm512_load_si512(p);
+                let x = _mm512_ternarylogic_epi64::<0x96>(m8, $h[2], carry);
+                _mm512_store_si512(p, x);
+                carry = _mm512_ternarylogic_epi64::<0xb2>($h[2], x, carry);
+                for b in 9..BITS - 1 {
+                    let p = $slot.add(b);
+                    let old = _mm512_load_si512(p);
+                    _mm512_store_si512(p, _mm512_xor_si512(old, carry));
+                    carry = _mm512_and_si512(old, carry);
+                }
+                let p = $slot.add(BITS - 1);
+                _mm512_store_si512(p, _mm512_xor_si512(_mm512_load_si512(p), carry));
+            }};
+        }
+        let mut t: *const u16;
+        macro_rules! two {
+            ($off:expr, $leaf:ident) => {{
+                if PF_AHEAD > 0 {
+                    let fa = planes.add(*t.add($off + PF_AHEAD) as usize) as *const i8;
+                    let fb = planes.add(*t.add($off + 1 + PF_AHEAD) as usize) as *const i8;
+                    _mm_prefetch::<_MM_HINT_T0>(fa);
+                    _mm_prefetch::<_MM_HINT_T0>(fa.add(64));
+                    _mm_prefetch::<_MM_HINT_T0>(fb);
+                    _mm_prefetch::<_MM_HINT_T0>(fb.add(64));
+                }
+                let pa = planes.add(*t.add($off) as usize);
+                let pb = planes.add(*t.add($off + 1) as usize);
+                let a0 = _mm512_load_si512(pa as *const __m512i);
+                let b0 = _mm512_load_si512(pb as *const __m512i);
+                let a1 = _mm512_load_si512(pa.add(8) as *const __m512i);
+                let b1 = _mm512_load_si512(pb.add(8) as *const __m512i);
+                ($leaf(&mut s0[0], a0, b0), $leaf(&mut s1[0], a1, b1))
+            }};
+        }
+        macro_rules! level {
+            ($bit:literal, $lower:ident, $off:expr, $leaf:ident) => {{
+                let (x0, x1) = $lower!($off, $leaf);
+                let (y0, y1) = $lower!($off + (1 << $bit), $leaf);
+                (csa(&mut s0[$bit], x0, y0), csa(&mut s1[$bit], x1, y1))
+            }};
+        }
+        macro_rules! four { ($off:expr, $leaf:ident) => { level!(1, two, $off, $leaf) }; }
+        macro_rules! eight { ($off:expr, $leaf:ident) => { level!(2, four, $off, $leaf) }; }
+        macro_rules! sixteen { ($off:expr, $leaf:ident) => { level!(3, eight, $off, $leaf) }; }
+        macro_rules! thirty_two { ($off:expr, $leaf:ident) => { level!(4, sixteen, $off, $leaf) }; }
+        // Three-bit register counters of the weight-64 carries: seven fit before a flush.
+        macro_rules! add_carry64 {
+            ($c0:expr, $c1:expr) => {{
+                let (c0, c1) = ($c0, $c1);
+                let u0 = _mm512_and_si512(h0[0], c0);
+                let v0 = _mm512_and_si512(h0[1], u0);
+                h0[0] = _mm512_xor_si512(h0[0], c0);
+                h0[1] = _mm512_xor_si512(h0[1], u0);
+                h0[2] = _mm512_xor_si512(h0[2], v0);
+                let u1 = _mm512_and_si512(h1[0], c1);
+                let v1 = _mm512_and_si512(h1[1], u1);
+                h1[0] = _mm512_xor_si512(h1[0], c1);
+                h1[1] = _mm512_xor_si512(h1[1], u1);
+                h1[2] = _mm512_xor_si512(h1[2], v1);
+            }};
+        }
+        macro_rules! step_pending {
+            () => {{
+                pending += 1;
+                if pending == 7 {
+                    flush!(even, h0);
+                    flush!(odd, h1);
+                    h0 = [zero; 3];
+                    h1 = [zero; 3];
+                    pending = 0;
+                }
+            }};
+        }
+        // A carry of weight `2^$bit` from a partial tree, through half adders at that level and
+        // above: what leaves level 5 is a weight-64 carry like a whole chunk's. Because the
+        // partial trees of a remainder total at most 62 < 64 inputs and `s0[0..6] <= 63`,
+        // `63 + 62 = 125 < 128`, so across the entire remainder `s0[0..6]` wraps modulo 64 at
+        // most once per lane (`pending` advances by 1 for the whole non-empty remainder).
+        macro_rules! half_adders {
+            ($c0:expr, $c1:expr, $($bit:literal),+) => {{
+                let (mut c0, mut c1) = ($c0, $c1);
+                $(
+                    let (u0, u1) = (_mm512_and_si512(s0[$bit], c0), _mm512_and_si512(s1[$bit], c1));
+                    s0[$bit] = _mm512_xor_si512(s0[$bit], c0);
+                    s1[$bit] = _mm512_xor_si512(s1[$bit], c1);
+                    (c0, c1) = (u0, u1);
+                )+
+                add_carry64!(c0, c1);
+            }};
+        }
+        macro_rules! entries {
+            ($terms:expr, $leaf:ident) => {{
+                let terms: &[u16] = $terms;
+                for input in terms.chunks_exact(64) {
+                    t = input.as_ptr();
+                    let (c0, c1) = level!(5, thirty_two, 0, $leaf);
+                    add_carry64!(c0, c1);
+                    step_pending!();
+                }
+                // The schedule pads each sign of a slot pair to a multiple of 2: the remainder
+                // (at most 62 inputs) decomposes into binary partial trees of sizes 32, 16, 8, 4, 2.
+                let rest = terms.chunks_exact(64).remainder();
+                debug_assert!(rest.len() % 2 == 0);
+                if !rest.is_empty() {
+                    t = rest.as_ptr();
+                    let n = rest.len();
+                    if n & 32 != 0 {
+                        let (c0, c1) = thirty_two!(0, $leaf);
+                        half_adders!(c0, c1, 5);
+                        t = t.add(32);
+                    }
+                    if n & 16 != 0 {
+                        let (c0, c1) = sixteen!(0, $leaf);
+                        half_adders!(c0, c1, 4, 5);
+                        t = t.add(16);
+                    }
+                    if n & 8 != 0 {
+                        let (c0, c1) = eight!(0, $leaf);
+                        half_adders!(c0, c1, 3, 4, 5);
+                        t = t.add(8);
+                    }
+                    if n & 4 != 0 {
+                        let (c0, c1) = four!(0, $leaf);
+                        half_adders!(c0, c1, 2, 3, 4, 5);
+                        t = t.add(4);
+                    }
+                    if n & 2 != 0 {
+                        let (c0, c1) = two!(0, $leaf);
+                        half_adders!(c0, c1, 1, 2, 3, 4, 5);
+                    }
+                    step_pending!();
+                }
+            }};
+        }
+        entries!(pos, csa);
+        entries!(neg, csa_neg);
+        if pending != 0 {
+            flush!(even, h0);
+            flush!(odd, h1);
+        }
+        for b in 0..6 {
+            _mm512_store_si512(even.add(b), s0[b]);
+            _mm512_store_si512(odd.add(b), s1[b]);
+        }
+    }
+
+    /// Inverse bit transpose to 512 ordinary 16-bit lane counts.
+    /// `out` addresses 512 writable `i16` values; they need not be initialized.
+    #[inline(always)]
+    unsafe fn unslice(acc: *const __m512i, out: *mut i16) {
+        let zero = _mm512_setzero_si512();
+        let lo = transpose8x8_q(core::array::from_fn(|b| _mm512_load_si512(acc.add(b))));
+        let hi = transpose8x8_q(core::array::from_fn(|b| {
+            if b == 7 { zero } else { _mm512_load_si512(acc.add(8 + b)) }
+        }));
+        let perm = _mm512_load_si512(BACK.0.as_ptr() as *const __m512i);
+        let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
+        for t in 0..8 {
+            let l = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, lo[t]));
+            let h = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, hi[t]));
+            let dst = out.add(64 * t) as *mut __m512i;
+            _mm512_storeu_si512(dst, _mm512_unpacklo_epi8(l, h));
+            _mm512_storeu_si512(dst.add(1), _mm512_unpackhi_epi8(l, h));
+        }
+    }
+
+    /// Coefficient slots of `R_162`: slot `s` of the output takes counter `s` minus counter
+    /// `162 + s` below 81 and counter `s` plus counter `s + 81` from 81 on.
+    const OUT_SLOTS: usize = 162;
+
+    /// `vpermt2w` indices interleaving a 64-lane group's four components: `[word_of]` puts
+    /// component `k` of element `16 g + (r ^ 7)` on lane `64 g + 16 k + r`, so half `h` of the
+    /// result holds, in qword `j`, the four components of element `16 g + 8 h + 7 - j`.
+    static INTERLEAVE: Aligned<[[u16; 32]; 2]> = Aligned({
+        let mut a = [[0u16; 32]; 2];
+        let mut h = 0;
+        while h < 2 {
+            let mut p = 0;
+            while p < 32 {
+                a[h][p] = (16 * (p % 4) + 8 * h + p / 4) as u16;
+                p += 1;
+            }
+            h += 1;
+        }
+        a
+    });
+
+    /// A block's 243 counters, reduced modulo `Y^162 - Y^81 + 1` and with the bias removed, as
+    /// its 128 ring elements at `output` (uninitialised memory, every field written).
+    ///
+    /// Per output slot and 64-lane group the four components interleave into one qword per
+    /// element, and eight consecutive slots transpose into one 64-byte store per element. Each
+    /// counter minus its bias is exact in an i16 lane (both are at most 32767); the combination
+    /// is formed both wrapping and saturating, and any difference is the overflow the scalar
+    /// reference reports.
+    ///
+    /// # Safety
+    /// `acc` holds the 243 slots' counters; `output` addresses 128 writable elements.
+    #[cfg(test)]
+    #[inline(never)]
+    unsafe fn write_block(
+        acc: *const __m512i,
+        counts: &mut [[i16; LANES]],
+        bias: &[i32; SLOTS],
+        output: *mut RingElement,
+    ) {
+        debug_assert!(counts.len() >= SLOTS);
+        for s in 0..SLOTS {
+            unslice(acc.add(s * BITS), counts[s].as_mut_ptr());
+        }
+        write_counts(counts, None, bias, output);
+    }
+
+    /// The output stage of [`write_block`] from counts already unsliced (and optionally summed
+    /// with `other` from the other part of the column groups).
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni"))]
+    unsafe fn write_counts(
+        counts: &[[i16; LANES]],
+        other: Option<&[[i16; LANES]]>,
+        bias: &[i32; SLOTS],
+        output: *mut RingElement,
+    ) {
+        debug_assert!(counts.len() >= SLOTS && other.map_or(true, |o| o.len() >= SLOTS));
+        for e in 0..LANES / 4 {
+            core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
+        }
+        let idx0 = _mm512_load_si512(INTERLEAVE.0[0].as_ptr() as *const __m512i);
+        let idx1 = _mm512_load_si512(INTERLEAVE.0[1].as_ptr() as *const __m512i);
+        let counts_ptr = counts.as_ptr();
+        let other_ptr = other.map_or(core::ptr::null(), |o| o.as_ptr());
+        let mut overflow = 0u32;
+        for s0 in (0..OUT_SLOTS).step_by(8) {
+            let n = (OUT_SLOTS - s0).min(8);
+            let mask = ((1u32 << n) - 1) as __mmask8;
+            for g in 0..LANES / 64 {
+                macro_rules! row {
+                    ($ds:literal) => {{
+                        let s = (s0 + $ds).min(OUT_SLOTS - 1);
+                        let below = s < 81;
+                        let t = if below { 162 + s } else { s + 81 };
+                        let bs = _mm512_set1_epi16(*bias.get_unchecked(s) as i16);
+                        let bt = _mm512_set1_epi16(*bias.get_unchecked(t) as i16);
+                        let cs_base = (*counts_ptr.add(s)).as_ptr().add(64 * g);
+                        let ct_base = (*counts_ptr.add(t)).as_ptr().add(64 * g);
+                        let mut cs0 = _mm512_loadu_si512(cs_base as *const __m512i);
+                        let mut ct0 = _mm512_loadu_si512(ct_base as *const __m512i);
+                        let mut cs1 = _mm512_loadu_si512(cs_base.add(32) as *const __m512i);
+                        let mut ct1 = _mm512_loadu_si512(ct_base.add(32) as *const __m512i);
+                        if !other_ptr.is_null() {
+                            let os_base = (*other_ptr.add(s)).as_ptr().add(64 * g);
+                            let ot_base = (*other_ptr.add(t)).as_ptr().add(64 * g);
+                            cs0 = _mm512_add_epi16(cs0, _mm512_loadu_si512(os_base as *const __m512i));
+                            ct0 = _mm512_add_epi16(ct0, _mm512_loadu_si512(ot_base as *const __m512i));
+                            cs1 = _mm512_add_epi16(cs1, _mm512_loadu_si512(os_base.add(32) as *const __m512i));
+                            ct1 = _mm512_add_epi16(ct1, _mm512_loadu_si512(ot_base.add(32) as *const __m512i));
+                        }
+                        let x0 = _mm512_sub_epi16(cs0, bs);
+                        let y0 = if below { _mm512_sub_epi16(bt, ct0) } else { _mm512_sub_epi16(ct0, bt) };
+                        let v0 = _mm512_add_epi16(x0, y0);
+                        overflow |= _mm512_cmpneq_epi16_mask(v0, _mm512_adds_epi16(x0, y0));
+
+                        let x1 = _mm512_sub_epi16(cs1, bs);
+                        let y1 = if below { _mm512_sub_epi16(bt, ct1) } else { _mm512_sub_epi16(ct1, bt) };
+                        let v1 = _mm512_add_epi16(x1, y1);
+                        overflow |= _mm512_cmpneq_epi16_mask(v1, _mm512_adds_epi16(x1, y1));
+
+                        (
+                            _mm512_permutex2var_epi16(v0, idx0, v1),
+                            _mm512_permutex2var_epi16(v0, idx1, v1),
+                        )
+                    }};
+                }
+                let (r0_0, r1_0) = row!(0);
+                let (r0_1, r1_1) = row!(1);
+                let (r0_2, r1_2) = row!(2);
+                let (r0_3, r1_3) = row!(3);
+                let (r0_4, r1_4) = row!(4);
+                let (r0_5, r1_5) = row!(5);
+                let (r0_6, r1_6) = row!(6);
+                let (r0_7, r1_7) = row!(7);
+                for (h, rows) in [
+                    [r0_0, r0_1, r0_2, r0_3, r0_4, r0_5, r0_6, r0_7],
+                    [r1_0, r1_1, r1_2, r1_3, r1_4, r1_5, r1_6, r1_7],
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let t = transpose8x8_q(rows);
+                    for j in 0..8 {
+                        let e = 16 * g + 8 * h + 7 - j;
+                        let dst = (core::ptr::addr_of_mut!((*output.add(e)).v) as *mut i16).add(4 * s0);
+                        if n == 8 {
+                            _mm512_storeu_si512(dst as *mut __m512i, t[j]);
+                        } else {
+                            _mm512_mask_storeu_epi64(dst as *mut i64, mask, t[j]);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(overflow == 0, "integer fold overflow");
+    }
+
+    // Direct full-accumulator output from PR162; valid only for the one-part path.
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni"))]
+    unsafe fn write_acc(
+        acc: *const __m512i,
+        bias: &[i32; SLOTS],
+        output: *mut RingElement,
+    ) {
+        for e in 0..LANES / 4 {
+            core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
+        }
+        let zero = _mm512_setzero_si512();
+        let perm = _mm512_load_si512(BACK.0.as_ptr() as *const __m512i);
+        let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
+        let idx0 = _mm512_load_si512(INTERLEAVE.0[0].as_ptr() as *const __m512i);
+        let idx1 = _mm512_load_si512(INTERLEAVE.0[1].as_ptr() as *const __m512i);
+        let mut overflow = 0u32;
+        for s0 in (0..OUT_SLOTS).step_by(8) {
+            let n = (OUT_SLOTS - s0).min(8);
+            let mask = ((1u32 << n) - 1) as __mmask8;
+            let mut s_lo = [[zero; 8]; 8];
+            let mut s_hi = [[zero; 8]; 8];
+            let mut t_lo = [[zero; 8]; 8];
+            let mut t_hi = [[zero; 8]; 8];
+            for ds in 0..8 {
+                let s = (s0 + ds).min(OUT_SLOTS - 1);
+                let t = if s < 81 { 162 + s } else { s + 81 };
+                let as_ptr = acc.add(s * BITS);
+                let at_ptr = acc.add(t * BITS);
+                s_lo[ds] = transpose8x8_q(core::array::from_fn(|b| _mm512_load_si512(as_ptr.add(b))));
+                s_hi[ds] = transpose8x8_q(core::array::from_fn(|b| {
+                    if b == 7 { zero } else { _mm512_load_si512(as_ptr.add(8 + b)) }
+                }));
+                t_lo[ds] = transpose8x8_q(core::array::from_fn(|b| _mm512_load_si512(at_ptr.add(b))));
+                t_hi[ds] = transpose8x8_q(core::array::from_fn(|b| {
+                    if b == 7 { zero } else { _mm512_load_si512(at_ptr.add(8 + b)) }
+                }));
+            }
+            for g in 0..LANES / 64 {
+                macro_rules! row {
+                    ($ds:literal) => {{
+                        let s = (s0 + $ds).min(OUT_SLOTS - 1);
+                        let below = s < 81;
+                        let t = if below { 162 + s } else { s + 81 };
+                        let bs = _mm512_set1_epi16(*bias.get_unchecked(s) as i16);
+                        let bt = _mm512_set1_epi16(*bias.get_unchecked(t) as i16);
+                        let sl = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, s_lo[$ds][g]));
+                        let sh = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, s_hi[$ds][g]));
+                        let tl = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, t_lo[$ds][g]));
+                        let th = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, t_hi[$ds][g]));
+                        let cs0 = _mm512_unpacklo_epi8(sl, sh);
+                        let cs1 = _mm512_unpackhi_epi8(sl, sh);
+                        let ct0 = _mm512_unpacklo_epi8(tl, th);
+                        let ct1 = _mm512_unpackhi_epi8(tl, th);
+
+                        let x0 = _mm512_sub_epi16(cs0, bs);
+                        let y0 = if below { _mm512_sub_epi16(bt, ct0) } else { _mm512_sub_epi16(ct0, bt) };
+                        let v0 = _mm512_add_epi16(x0, y0);
+                        overflow |= _mm512_cmpneq_epi16_mask(v0, _mm512_adds_epi16(x0, y0));
+
+                        let x1 = _mm512_sub_epi16(cs1, bs);
+                        let y1 = if below { _mm512_sub_epi16(bt, ct1) } else { _mm512_sub_epi16(ct1, bt) };
+                        let v1 = _mm512_add_epi16(x1, y1);
+                        overflow |= _mm512_cmpneq_epi16_mask(v1, _mm512_adds_epi16(x1, y1));
+
+                        (
+                            _mm512_permutex2var_epi16(v0, idx0, v1),
+                            _mm512_permutex2var_epi16(v0, idx1, v1),
+                        )
+                    }};
+                }
+                let (r0_0, r1_0) = row!(0);
+                let (r0_1, r1_1) = row!(1);
+                let (r0_2, r1_2) = row!(2);
+                let (r0_3, r1_3) = row!(3);
+                let (r0_4, r1_4) = row!(4);
+                let (r0_5, r1_5) = row!(5);
+                let (r0_6, r1_6) = row!(6);
+                let (r0_7, r1_7) = row!(7);
+                for (h, rows) in [
+                    [r0_0, r0_1, r0_2, r0_3, r0_4, r0_5, r0_6, r0_7],
+                    [r1_0, r1_1, r1_2, r1_3, r1_4, r1_5, r1_6, r1_7],
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let t = transpose8x8_q(rows);
+                    for j in 0..8 {
+                        let e = 16 * g + 8 * h + 7 - j;
+                        let dst = (core::ptr::addr_of_mut!((*output.add(e)).v) as *mut i16).add(4 * s0);
+                        if n == 8 {
+                            _mm512_storeu_si512(dst as *mut __m512i, t[j]);
+                        } else {
+                            _mm512_mask_storeu_epi64(dst as *mut i64, mask, t[j]);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(overflow == 0, "integer fold overflow");
+    }
+
+    /// Allocate capacity for `SLOTS` counts; `unslice` initializes every lane before `set_len`.
+    #[inline]
+    fn uninit_counts() -> Vec<[i16; LANES]> {
+        Vec::with_capacity(SLOTS)
+    }
+
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni"))]
+    unsafe fn run_worker<const GROUP: usize, const FUSED: bool>(
+        worker: usize,
+        words: &[B128],
+        column_words: usize,
+        groups: &[Group],
+        bias: &[i32; SLOTS],
+        cuts: &[usize],
+        parts: usize,
+        tasks: usize,
+        pending: &[std::sync::Mutex<Option<Vec<[i16; LANES]>>>],
+        free: &std::sync::Mutex<Vec<Vec<[i16; LANES]>>>,
+        next: &std::sync::atomic::AtomicUsize,
+        out_addr: usize,
+        #[cfg(test)] profile: bool,
+    ) -> u32 {
+        let mut ran = 0u32;
+        #[cfg(test)]
+        let mut times = [std::time::Duration::ZERO; 3];
+        #[cfg(not(test))]
+        let _ = worker;
+        let zero = _mm512_setzero_si512();
+        // Zero everywhere the columns do not write: the guards and the padding pair.
+        let mut planes: Vec<__m512i> = Vec::with_capacity(GUARD + GROUP * STRIDE);
+        planes.as_mut_ptr().write(zero);
+        planes.as_mut_ptr().add(1).write(zero);
+        for j in 0..GROUP {
+            planes.as_mut_ptr().add(GUARD + j * STRIDE + 128).write(zero);
+        }
+        let mut acc: Vec<__m512i> = Vec::with_capacity(2 * PAIRS * BITS);
+        let mut counts = if FUSED { Vec::new() } else { uninit_counts() };
+        loop {
+            let task = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if task >= tasks {
+                break;
+            }
+            ran += 1;
+            let (block, part) = (tasks / parts - 1 - task / parts, task % parts);
+            for p in 0..2 * PAIRS * BITS {
+                _mm512_store_si512(acc.as_mut_ptr().add(p), zero);
+            }
+            let range = cuts[part]..cuts[part + 1];
+            for gi in range.clone() {
+                let group = &groups[gi];
+                #[cfg(test)]
+                let start = profile.then(std::time::Instant::now);
+                for j in 0..group.columns {
+                    let src = words.as_ptr().add((group.first + j) * column_words + block * LANES);
+                    // What the next call slices: this group's next column, else the next
+                    // group's first, else this block's start (harmless).
+                    let next_src = if j + 1 < group.columns {
+                        src.add(column_words)
+                    } else if gi + 1 < range.end {
+                        words.as_ptr().add(groups[gi + 1].first * column_words + block * LANES)
+                    } else {
+                        src
+                    };
+                    slice(src, planes.as_mut_ptr().add(GUARD + j * STRIDE), next_src);
+                }
+                #[cfg(test)]
+                if let Some(start) = start { times[0] += start.elapsed(); }
+                #[cfg(test)]
+                let start = profile.then(std::time::Instant::now);
+                for q in 0..PAIRS {
+                    accumulate_pair(
+                        planes.as_ptr(),
+                        &group.terms[group.offsets[q]..group.mid[q]],
+                        &group.terms[group.mid[q]..group.offsets[q + 1]],
+                        acc.as_mut_ptr().add(2 * q * BITS),
+                    );
+                }
+                #[cfg(test)]
+                if let Some(start) = start { times[1] += start.elapsed(); }
+            }
+            #[cfg(test)]
+            let start = profile.then(std::time::Instant::now);
+            if FUSED {
+                let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
+                write_acc(acc.as_ptr(), bias, output);
+                #[cfg(test)]
+                if let Some(start) = start { times[2] += start.elapsed(); }
+                continue;
+            }
+            for s in 0..SLOTS {
+                unslice(acc.as_ptr().add(s * BITS), counts.as_mut_ptr().add(s).cast());
+            }
+            counts.set_len(SLOTS);
+            let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
+            if parts == 1 {
+                write_counts(&counts, None, bias, output);
+                #[cfg(test)]
+                if let Some(start) = start { times[2] += start.elapsed(); }
+                continue;
+            }
+            let first = {
+                let mut slot = pending[block].lock().unwrap();
+                match slot.take() {
+                    None => {
+                        let next_buf = free.lock().unwrap().pop().unwrap_or_else(uninit_counts);
+                        *slot = Some(core::mem::replace(&mut counts, next_buf));
+                        #[cfg(test)]
+                        if let Some(start) = start { times[2] += start.elapsed(); }
+                        continue;
+                    }
+                    Some(first) => first,
+                }
+            };
+            write_counts(&counts, Some(&first), bias, output);
+            free.lock().unwrap().push(first);
+            #[cfg(test)]
+            if let Some(start) = start { times[2] += start.elapsed(); }
+        }
+        #[cfg(test)]
+        if profile {
+            eprintln!("bitfold worker={} slice_us={} add_us={} output_us={}",
+                worker, times[0].as_micros(), times[1].as_micros(), times[2].as_micros());
+        }
+        ran
+    }
+
+    pub(super) fn fold_words(
+        words: &[B128],
+        challenges: &[ShortChallenge],
+        column_words: usize,
+        workers: usize,
+    ) -> Vec<RingElement> {
+        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers)
+    }
+
+    fn fold_config<const GROUP: usize, const FUSED: bool>(
+        words: &[B128],
+        challenges: &[ShortChallenge],
+        column_words: usize,
+        workers: usize,
+    ) -> Vec<RingElement> {
+        assert!(GROUP > 0 && (GUARD + GROUP * STRIDE) * 8 <= u16::MAX as usize);
+        #[cfg(test)]
+        let profile = std::env::var_os("LABINIUS_BITFOLD_PROFILE").is_some();
+        #[cfg(test)]
+        let plan_start = std::time::Instant::now();
+        let (groups, bias) = plan::<GROUP>(challenges, workers);
+        #[cfg(test)]
+        if profile {
+            eprintln!("bitfold plan_us={}", plan_start.elapsed().as_micros());
+        }
+        let blocks = column_words / LANES;
+        let len = column_words / 4;
+        // Counters and bias are at most the total weight (checked by the caller), which is
+        // what lets the output stage subtract them in i16 lanes.
+        assert!(bias.iter().all(|&b| (0..=i16::MAX as i32).contains(&b)));
+        // Tasks are (block, part of the column groups), handed out dynamically so a busy or
+        // shared core does fewer of them; the second part of a block to finish adds its counts
+        // to the first's in `write_counts` (counts are additive and stay within the total weight)
+        // and writes.
+        let parts = if FUSED { 1 } else { PARTS.min(groups.len().max(1)) };
+        let cuts: Vec<usize> = (0..=parts).map(|i| groups.len() * i / parts).collect();
+        let tasks = blocks * parts;
+        let pending: Vec<std::sync::Mutex<Option<Vec<[i16; LANES]>>>> =
+            if FUSED { Vec::new() } else { (0..blocks).map(|_| std::sync::Mutex::new(None)).collect() };
+        let free: std::sync::Mutex<Vec<Vec<[i16; LANES]>>> =
+            std::sync::Mutex::new(Vec::new());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut out: Vec<RingElement> = Vec::with_capacity(len);
+        let out_addr = out.as_mut_ptr() as usize;
+        let t0 = std::time::Instant::now();
+        let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
+        crate::par::pool().run(workers.clamp(1, tasks), |worker| unsafe {
+            let ran = run_worker::<GROUP, FUSED>(
+                worker,
+                words,
+                column_words,
+                groups,
+                bias,
+                cuts,
+                parts,
+                tasks,
+                pending,
+                free,
+                next,
+                out_addr,
+                #[cfg(test)]
+                profile,
+            );
+            if worker < 16 {
+                use std::sync::atomic::Ordering::Relaxed;
+                super::FOLD_END_US[worker].store(t0.elapsed().as_micros() as u32, Relaxed);
+                super::FOLD_TASKS[worker].store(ran, Relaxed);
+            }
+        });
+        // Every task wrote its whole range.
+        unsafe { out.set_len(len) };
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::challenge::{sample_short_challenge, Transcript, DEFAULT_BOUND, DEFAULT_WEIGHT};
+
+        fn table(n: usize) -> Vec<B128> {
+            let mut h = blake3::Hasher::new_keyed(&[81; 32]);
+            h.update(b"labinius-fast/binary-table/v1");
+            let mut out = vec![B128(0); n];
+            let bytes = unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, 16 * n) };
+            h.finalize_xof().fill(bytes);
+            out
+        }
+
+        fn challenges(n: usize) -> Vec<ShortChallenge> {
+            let mut t = Transcript::new(b"labinius/test/bitfold");
+            (0..n).map(|_| sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0).collect()
+        }
+
+        #[test]
+        fn bitfold_transpose_and_counter() {
+            let words = table(LANES);
+            unsafe {
+                let zero = _mm512_setzero_si512();
+                let mut planes = vec![zero; STRIDE];
+                slice(words.as_ptr(), planes.as_mut_ptr(), words.as_ptr());
+                for p in 0..128 {
+                    let bits: [u64; 8] = core::mem::transmute(planes[p]);
+                    for lane in 0..LANES {
+                        let expected = (words[word_of(lane)].0 >> p) as u64 & 1;
+                        assert_eq!(bits[lane / 64] >> (lane % 64) & 1, expected, "plane {p}, lane {lane}");
+                    }
+                }
+                assert!((128..STRIDE).all(|p| core::mem::transmute::<_, [u64; 8]>(planes[p]) == [0u64; 8]));
+                let mut acc = vec![zero; BITS];
+                let terms: Vec<u16> = (0..128u16).cycle().take(32704).collect();
+                let offsets: Vec<u16> = terms.iter().map(|p| 8 * p).collect();
+                accumulate(planes.as_ptr(), &offsets, acc.as_mut_ptr());
+                let mut counts = [0i16; LANES];
+                unslice(acc.as_ptr(), counts.as_mut_ptr());
+                for lane in 0..LANES {
+                    let expected: usize = terms.iter().map(|&p| (words[word_of(lane)].0 >> p & 1) as usize).sum();
+                    assert_eq!(counts[lane] as usize, expected, "lane {lane}");
+                }
+                // Exercise the very top of the declared counter range, including zero padding.
+                acc.fill(zero);
+                planes[0] = zero;
+                planes[1] = _mm512_set1_epi32(-1);
+                let mut terms = vec![8; 32768];
+                terms[32767] = 0;
+                accumulate(planes.as_ptr(), &terms, acc.as_mut_ptr());
+                unslice(acc.as_ptr(), counts.as_mut_ptr());
+                assert_eq!(counts, [32767; LANES]);
+            }
+        }
+
+        /// The slot-pair kernel on schedules of every length class the plan pads to (whole
+        /// chunks plus a 16-, 32- or 48-input tail), in pieces as a block's groups call it, and
+        /// up to the top of the counter range.
+        #[test]
+        fn bitfold_pair_kernel_partial_chunks() {
+            let mut x = 0x0123_4567_89AB_CDEFu64;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            unsafe {
+                let zero = _mm512_setzero_si512();
+                let mut planes = vec![zero; 66];
+                for p in planes.iter_mut().skip(2) {
+                    let w: [u64; 8] = core::array::from_fn(|_| next() & next());
+                    *p = core::mem::transmute(w);
+                }
+                let bits: Vec<[u64; 8]> = planes.iter().map(|p| core::mem::transmute(*p)).collect();
+                let bit = |p: usize, l: usize| (bits[p][l / 64] >> (l % 64) & 1) as usize;
+                // Each call takes `n` positive entries and the next length's worth of negative
+                // ones (`lens` cycled), so both signs meet every length class, alone and mixed.
+                for lens in [
+                    vec![16usize],
+                    vec![32],
+                    vec![48],
+                    vec![2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62],
+                    vec![80, 112, 144],
+                    vec![64 * 7 + 48; 9],
+                    vec![16; 40],
+                    vec![16000, 752, 15232],
+                    vec![0, 64],
+                ] {
+                    let mut acc = vec![zero; 2 * BITS];
+                    let mut want = [[0usize; LANES]; 2];
+                    for (i, &n) in lens.iter().enumerate() {
+                        let m = lens[(i + 1) % lens.len()];
+                        let mut terms = |n: usize| -> Vec<u16> {
+                            (0..n).map(|i| {
+                                // a sprinkling of padding entries (offset 0: two zero planes)
+                                if i % 13 == 5 { 0 } else { (8 * (2 + next() % 63)) as u16 }
+                            }).collect()
+                        };
+                        let (pos, neg) = (terms(n), terms(m));
+                        for (list, complement) in [(&pos, 0), (&neg, 1)] {
+                            for &o in list {
+                                let p = o as usize / 8;
+                                for l in 0..LANES {
+                                    want[0][l] += bit(p, l) ^ complement;
+                                    want[1][l] += bit(p + 1, l) ^ complement;
+                                }
+                            }
+                        }
+                        accumulate_pair(planes.as_ptr(), &pos, &neg, acc.as_mut_ptr());
+                    }
+                    for slot in 0..2 {
+                        let mut got = [0i16; LANES];
+                        unslice(acc.as_ptr().add(slot * BITS), got.as_mut_ptr());
+                        for l in 0..LANES {
+                            assert_eq!(got[l] as usize, want[slot][l] & 0x7fff, "lens {lens:?} slot {slot} lane {l}");
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The vector output stage against the scalar reduction it replaced, on random
+        /// counters (the full 15-bit range) and biases chosen so that every value fits, and its
+        /// overflow report.
+        #[test]
+        fn bitfold_write_block_matches_scalar() {
+            for l in 0..LANES {
+                let (g, k, r) = (l / 64, l % 64 / 16, l % 16);
+                assert_eq!(word_of(l), 64 * g + 4 * (r ^ 7) + k, "lane {l}");
+            }
+            let mut x = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            unsafe {
+                let zero = _mm512_setzero_si512();
+                for round in 0..3 {
+                    let mut acc = vec![zero; SLOTS * BITS + BITS];
+                    for v in acc.iter_mut() {
+                        let w: [u64; 8] = core::array::from_fn(|_| next());
+                        *v = core::mem::transmute(w);
+                    }
+                    let mut counts = vec![[0i16; LANES]; SLOTS];
+                    for s in 0..SLOTS {
+                        unslice(acc.as_ptr().add(s * BITS), counts[s].as_mut_ptr());
+                    }
+                    // Slots s and their partner t: bias such that the reference fits i16.
+                    let mut bias = [0i32; SLOTS];
+                    for s in 0..SLOTS {
+                        bias[s] = (next() % 32768) as i32;
+                    }
+                    if round > 0 {
+                        for s in 0..81 {
+                            // x - z = (a - b_s) - (c - b_t): keep it in range by matching biases
+                            // to the counters' means.
+                            bias[s] = 16384;
+                            bias[162 + s] = 16384;
+                            bias[81 + s] = 16384 + (next() % 8) as i32;
+                        }
+                    }
+                    let fits = (0..81).all(|i| {
+                        (0..LANES).all(|l| {
+                            let (a, b, c) = (counts[i][l] as i32, counts[81 + i][l] as i32, counts[162 + i][l] as i32);
+                            let lo = (a - bias[i]) - (c - bias[162 + i]);
+                            let hi = (b - bias[81 + i]) + (c - bias[162 + i]);
+                            i16::try_from(lo).is_ok() && i16::try_from(hi).is_ok()
+                        })
+                    });
+                    let mut want = vec![RingElement::zero(Representation::Coefficients); LANES / 4];
+                    if fits {
+                        for i in 0..81 {
+                            for l in 0..LANES {
+                                let w = word_of(l);
+                                let (a, b, c) = (counts[i][l] as i32, counts[81 + i][l] as i32, counts[162 + i][l] as i32);
+                                want[w / 4].v[4 * i + w % 4] = ((a - bias[i]) - (c - bias[162 + i])) as i16;
+                                want[w / 4].v[4 * (81 + i) + w % 4] = ((b - bias[81 + i]) + (c - bias[162 + i])) as i16;
+                            }
+                        }
+                    }
+                    let mut got: Vec<RingElement> = Vec::with_capacity(LANES / 4);
+                    let mut scratch = vec![[0i16; LANES]; SLOTS];
+                    let result = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+                        write_block(acc.as_ptr(), &mut scratch, &bias, got.as_mut_ptr());
+                    }));
+                    assert_eq!(result.is_ok(), fits, "round {round}: overflow report");
+                    if fits {
+                        got.set_len(LANES / 4);
+                        assert_eq!(got, want, "round {round}");
+                    }
+                }
+            }
+        }
+
+        // Independent schoolbook reduction, including the high terms requiring two reductions.
+        fn scalar(words: &[B128], cs: &[ShortChallenge], column_words: usize) -> Vec<RingElement> {
+            (0..column_words / 4).map(|r| {
+                let mut raw = [0i32; 4 * (128 + 162)];
+                for (j, c) in cs.iter().enumerate() {
+                    for t in 0..c.weight {
+                        let m = c.positions[t] as usize;
+                        let sign = if ((c.signs >> t) & 1 != 0) ^ (m % 2 != 0) { -1 } else { 1 };
+                        for k in 0..4 {
+                            let w = words[j * column_words + 4 * r + k].0;
+                            for p in 0..128 {
+                                raw[4 * (p + m) + k] += sign * ((w >> p) & 1) as i32;
+                            }
+                        }
+                    }
+                }
+                for d in (648..raw.len()).rev() {
+                    let value = raw[d];
+                    raw[d - 324] += value;
+                    raw[d - 648] -= value;
+                }
+                let mut out = RingElement::zero(Representation::Coefficients);
+                for (v, x) in out.v.iter_mut().zip(raw) { *v = i16::try_from(x).unwrap(); }
+                out
+            }).collect()
+        }
+
+        #[test]
+        fn bitfold_matches_schoolbook_and_ntt() {
+            let columns = (COL_GROUP + 2).next_multiple_of(2);
+            let words = table(columns * LANES);
+            let cs = challenges(columns);
+            let exact = fold_words(&words, &cs, LANES, 2);
+            assert_eq!(exact, scalar(&words, &cs, LANES));
+            let multi = table(columns * 3 * LANES);
+            assert_eq!(fold_words(&multi, &cs, 3 * LANES, 2), scalar(&multi, &cs, 3 * LANES));
+            for q in [3889, 2917, 4861, 9721, 12637, 17497, 19441] {
+                assert_eq!(exact, super::super::fold_witness_streaming(&words, columns, &cs, 4, q, 2), "q {q}");
+            }
+            // All degrees, both signs, all four X components, and zero/all-one input patterns.
+            for sign in [0, 1] {
+                let cs: Vec<_> = (0..162).map(|m| {
+                    let mut c = ShortChallenge::zero();
+                    c.positions[0] = m;
+                    c.weight = 1;
+                    c.signs = sign;
+                    c
+                }).collect();
+                let words: Vec<_> = (0..cs.len() * LANES).map(|i| B128(if i % 7 == 0 { 0 } else { u128::MAX })).collect();
+                assert_eq!(fold_words(&words, &cs, LANES, 2), scalar(&words, &cs, LANES));
+            }
+        }
+
+        #[test]
+        #[ignore = "full 2^24-word timing; run explicitly on the box"]
+        fn bitfold_bench_full() {
+            let words = table(1 << 24);
+            let cs = challenges(1024);
+            let workers = crate::par::threads();
+            let mut first: Option<Vec<RingElement>> = None;
+            let mut times = Vec::new();
+            for _ in 0..7 {
+                let start = std::time::Instant::now();
+                let v = fold_words(&words, &cs, 1 << 14, workers);
+                times.push(start.elapsed().as_micros());
+                if let Some(f) = &first { assert_eq!(&v, f); } else { first = Some(v); }
+            }
+            eprintln!("bitfold bench workers={} us={:?}", workers, times);
+        }
+
+        #[test]
+        #[ignore = "full 2^24-word challenge instance; run explicitly on the box"]
+        fn bitfold_full_instance_matches_streaming() {
+            let words = table(1 << 24);
+            let cs = challenges(1024);
+            let mut exact = None;
+            for (group, workers) in [(16, 4), (31, 4), (31, 2), (16, 2)] {
+                let start = std::time::Instant::now();
+                let v = match group {
+                    16 => fold_config::<16, false>(&words, &cs, 1 << 14, workers),
+                    31 => fold_config::<31, false>(&words, &cs, 1 << 14, workers),
+                    _ => unreachable!(),
+                };
+                eprintln!("bitfold group={} workers={} exact_us={}", group, workers, start.elapsed().as_micros());
+                if let Some(previous) = &exact {
+                    assert_eq!(&v, previous);
+                } else {
+                    exact = Some(v);
+                }
+            }
+            let start = std::time::Instant::now();
+            let old = super::super::fold_witness_streaming(&words, 1024, &cs, 128, 3889, 4);
+            eprintln!("bitfold ntt_us={}", start.elapsed().as_micros());
+            assert_eq!(exact.unwrap(), old);
+        }
+    }
+
 }

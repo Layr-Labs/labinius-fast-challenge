@@ -178,27 +178,20 @@ impl Stream {
         }
         debug_assert_eq!(at, x);
         let plain = &self.tail;
-        let cvs: Vec<ChainingValue> = crate::par::map_blocks(pieces.len(), threads.min(pieces.len()), 1, |_t, lo, hi| {
-            (lo..hi)
-                .map(|i| {
-                    let (start, len) = pieces[i];
-                    if start == 0 {
-                        // The first piece continues the stream absorbed so far.
-                        let mut h = plain.clone();
-                        h.update(&bytes[..(len - head) as usize]);
-                        h.finalize_non_root()
-                    } else {
-                        let mut h = Hasher::new();
-                        h.set_input_offset(start);
-                        h.update(&bytes[(start - head) as usize..(start + len - head) as usize]);
-                        h.finalize_non_root()
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .flatten()
-        .collect();
+        let cvs = crate::par::pool().map(pieces.len(), |i| {
+            let (start, len) = pieces[i];
+            if start == 0 {
+                // The first piece continues the stream absorbed so far.
+                let mut h = plain.clone();
+                h.update(&bytes[..(len - head) as usize]);
+                h.finalize_non_root()
+            } else {
+                let mut h = Hasher::new();
+                h.set_input_offset(start);
+                h.update(&bytes[(start - head) as usize..(start + len - head) as usize]);
+                h.finalize_non_root()
+            }
+        });
         let mut left = [[0u8; 32]; MAX_DEPTH];
         for (d, &(first, count)) in subtrees.iter().enumerate() {
             // Aligned siblings merge pairwise up to the subtree's root; more input follows.
@@ -244,9 +237,9 @@ impl Transcript {
         Transcript { state, counter: 0 }
     }
 
-    /// [`absorb_bytes`](Self::absorb_bytes), with a large input hashed on up to `threads` workers:
-    /// the same transcript, bit for bit (blake3 is a tree hash; the complete subtrees are hashed
-    /// separately and merged as a sequential hasher merges them).
+    /// [`absorb_bytes`](Self::absorb_bytes), with a large input hashed on up to `threads`
+    /// runners of the pool: the same transcript, bit for bit (blake3 is a tree hash; the
+    /// complete subtrees are hashed separately and merged as a sequential hasher merges them).
     pub fn absorb_bytes_parallel(&mut self, bytes: &[u8], threads: usize) {
         self.state.update(&(bytes.len() as u64).to_le_bytes());
         self.state.update_parallel(bytes, threads);
@@ -326,18 +319,10 @@ impl Transcript {
     /// The same derivation as [`fill`](Self::fill), as a stream — for samplers that consume a
     /// number of bytes they do not know in advance.
     fn reader(&mut self, label: &[u8]) -> blake3::OutputReader {
-        let r = derive(&self.state, self.counter, label);
+        let out = self.reader_at(label, 0);
         self.counter += 1;
-        r
+        out
     }
-}
-
-fn derive(state: &Stream, counter: u64, label: &[u8]) -> blake3::OutputReader {
-    let mut state = state.clone();
-    state.update(&counter.to_le_bytes());
-    state.update(&(label.len() as u64).to_le_bytes());
-    state.update(label);
-    state.finalize_xof()
 }
 
 /// A buffered view of one XOF derivation.
@@ -414,8 +399,13 @@ pub struct ShortChallenge {
     pub weight: usize,
 }
 
-static SIGN_KEY: LazyLock<Hasher> =
-    LazyLock::new(|| Hasher::new_derive_key("labinius 2026 challenge signs v1"));
+static SIGN_KEY: LazyLock<([u32; 8], blake3::platform::Platform)> = LazyLock::new(|| {
+    let key = hazmat::hash_derive_key_context("labinius 2026 challenge signs v1");
+    (
+        blake3::platform::words_from_le_bytes_32(&key),
+        blake3::platform::Platform::detect(),
+    )
+});
 
 impl ShortChallenge {
     /// The zero element (weight 0).
@@ -437,13 +427,15 @@ impl ShortChallenge {
     }
 
     pub fn signed(&self) -> Self {
-        let mut h = SIGN_KEY.clone();
-        h.update(&(self.weight as u64).to_le_bytes());
-        h.update(&self.positions[..self.weight]);
-        let bits = u32::from_le_bytes(h.finalize().as_bytes()[..4].try_into().unwrap());
+        let &(mut cv, platform) = &*SIGN_KEY;
+        let mut block = [0u8; 64];
+        block[..8].copy_from_slice(&(self.weight as u64).to_le_bytes());
+        block[8..8 + self.weight].copy_from_slice(&self.positions[..self.weight]);
+        // Single-block derive-key material: CHUNK_START(1) | CHUNK_END(2) | ROOT(8) | DERIVE_KEY_MATERIAL(64) = 75.
+        platform.compress_in_place(&mut cv, &block, (8 + self.weight) as u8, 0, 75);
         let mask = ((1u64 << self.weight) - 1) as u32;
         ShortChallenge {
-            signs: bits & mask,
+            signs: cv[0] & mask,
             ..*self
         }
     }
@@ -526,18 +518,30 @@ pub static UNITS: LazyLock<[u16; N162]> = LazyLock::new(|| {
 /// and the first [`HALF`] units: 162 x 88 f64 each, ~228 KB together.
 static PHASE: LazyLock<(Vec<f64>, Vec<f64>)> = LazyLock::new(|| {
     let units = &*UNITS;
+    let roots: [(f64, f64); CONDUCTOR243] = core::array::from_fn(|m| {
+        let angle = 2.0 * PI * (m as f64) / (CONDUCTOR243 as f64);
+        (angle.cos(), angle.sin())
+    });
     let mut re = vec![0.0f64; N162 * LANES];
     let mut im = vec![0.0f64; N162 * LANES];
     for p in 0..N162 {
         for k in 0..HALF {
-            let m = (p * units[k] as usize) % CONDUCTOR243;
-            let angle = 2.0 * PI * (m as f64) / (CONDUCTOR243 as f64);
-            re[p * LANES + k] = angle.cos();
-            im[p * LANES + k] = angle.sin();
+            let (r, i) = roots[(p * units[k] as usize) % CONDUCTOR243];
+            re[p * LANES + k] = r;
+            im[p * LANES + k] = i;
         }
     }
     (re, im)
 });
+
+/// Build the sampler's lazily computed tables (the phase table, the sign key) now, on this
+/// thread. Left to the first sample, the 26k-entry phase table is built by one thread of the
+/// parallel sampler while the others block on it.
+pub fn warm() {
+    LazyLock::force(&UNITS);
+    LazyLock::force(&PHASE);
+    LazyLock::force(&SIGN_KEY);
+}
 
 #[inline(always)]
 unsafe fn accumulate<const V: usize>(
@@ -611,12 +615,6 @@ pub fn canonical_inf_norm_sq(c: &ShortChallenge) -> f64 {
     unsafe { norm_sq_blocks(c) }
 }
 
-/// Build the public phase and signing tables off the prover's critical path.
-pub fn warm() {
-    LazyLock::force(&PHASE);
-    LazyLock::force(&SIGN_KEY);
-}
-
 /// `canonical_inf_norm_sq(c) <= bound_sq`, one block of roots at a time so that a rejection stops
 /// as soon as some root exceeds the bound. This is what the rejection loop calls: at the default
 /// bound the great majority of attempts die in the first block.
@@ -671,13 +669,11 @@ fn attempt(x: &mut Xof, weight: usize, perm: &mut [u8; N162]) -> ShortChallenge 
     }
     let mut out = ShortChallenge::zero();
     out.weight = weight;
+    let mut seen = [0u64; N162.div_ceil(64)];
     for i in 0..weight {
         let j = i + x.below((N162 - i) as u16) as usize;
-        perm.swap(i, j);
-    }
-    let out_positions = &perm[..weight];
-    let mut seen = [0u64; N162.div_ceil(64)];
-    for &p in out_positions {
+        let p = perm[j];
+        perm[j] = perm[i];
         seen[p as usize >> 6] |= 1u64 << (p & 63);
     }
     let mut n = 0;
@@ -700,42 +696,6 @@ fn attempt(x: &mut Xof, weight: usize, perm: &mut [u8; N162]) -> ShortChallenge 
 /// function of what has been absorbed and takes one transcript finalisation however many attempts
 /// the bound needs; the per-attempt work is then the Fisher-Yates, the sign hash of the candidate,
 /// and the blocked evaluation, with no allocation.
-/// [`sample_short_challenge`] `n` times in a row. Each challenge reads only its own transcript
-/// derivation, so the derivations are taken here in order (one counter step each, as the loop of
-/// single calls takes them) and the rejection sampling runs on the workers: the challenges, and
-/// the transcript afterwards, are exactly those of the sequential loop.
-pub fn sample_short_challenges(
-    t: &mut Transcript,
-    n: usize,
-    weight: usize,
-    bound: f64,
-) -> Vec<ShortChallenge> {
-    const LABEL: &[u8] = b"short-challenge";
-    let base = t.counter;
-    let state = &t.state;
-    let bound_sq = bound * bound + 1e-12;
-    let parts = crate::par::workers(n, 32);
-    let out: Vec<ShortChallenge> = crate::par::map_blocks(n, parts, 1, |_, s, e| {
-        let mut perm = [0u8; N162];
-        (s..e)
-            .map(|i| {
-                let mut x = Xof::new(derive(state, base + i as u64, LABEL));
-                loop {
-                    let c = attempt(&mut x, weight, &mut perm).signed();
-                    if within(&c, bound_sq) {
-                        return c;
-                    }
-                }
-            })
-            .collect::<Vec<_>>()
-    })
-    .into_iter()
-    .flatten()
-    .collect();
-    t.counter += n as u64;
-    out
-}
-
 pub fn sample_short_challenge(
     t: &mut Transcript,
     weight: usize,
@@ -754,47 +714,115 @@ pub fn sample_short_challenge(
     }
 }
 
-#[cfg(test)]
-mod batch_tests {
-    use super::*;
+// =============================================================================================
+// parallel sampling
+// =============================================================================================
 
-    #[test]
-    fn batched_challenges_match_the_sequential_ones() {
-        for n in [1usize, 5, 100, 1024] {
-            let mut a = Transcript::new(b"labinius/test/batch");
-            a.absorb_u64(n as u64);
-            let mut b = a.clone();
-            let seq: Vec<ShortChallenge> = (0..n)
-                .map(|_| sample_short_challenge(&mut a, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
-                .collect();
-            let par = sample_short_challenges(&mut b, n, DEFAULT_WEIGHT, DEFAULT_BOUND);
-            assert_eq!(seq, par);
-            assert_eq!(a.sample_b128(b"after", 1), b.sample_b128(b"after", 1));
+impl Transcript {
+    /// The derivation [`reader`](Self::reader) would make `offset` samples from now, without
+    /// advancing the counter: what lets `n` consecutive samples be taken on several threads.
+    fn reader_at(&self, label: &[u8], offset: u64) -> blake3::OutputReader {
+        let mut buf = [0u8; 32];
+        let n = 16 + label.len();
+        if n <= buf.len()
+            && (self.state.depth == 0 || self.state.tail.count() + n as u64 <= self.state.lowest())
+        {
+            buf[..8].copy_from_slice(&(self.counter + offset).to_le_bytes());
+            buf[8..16].copy_from_slice(&(label.len() as u64).to_le_bytes());
+            buf[16..n].copy_from_slice(label);
+            let mut tail = self.state.tail.clone();
+            tail.update(&buf[..n]);
+            if self.state.depth == 0 {
+                return tail.finalize_xof();
+            }
+            let mut right = tail.finalize_non_root();
+            for i in (1..self.state.depth).rev() {
+                right = hazmat::merge_subtrees_non_root(&self.state.left[i], &right, Mode::Hash);
+            }
+            return hazmat::merge_subtrees_root_xof(&self.state.left[0], &right, Mode::Hash);
+        }
+        let mut state = self.state.clone();
+        state.update(&(self.counter + offset).to_le_bytes());
+        state.update(&(label.len() as u64).to_le_bytes());
+        state.update(label);
+        state.finalize_xof()
+    }
+
+    /// Advance the sample counter by `n`, as `n` derivations would have.
+    fn skip(&mut self, n: u64) {
+        self.counter += n;
+    }
+}
+
+/// The same challenge [`sample_short_challenge`] draws from the derivation `reader`.
+fn sample_short_challenge_from(
+    reader: blake3::OutputReader,
+    weight: usize,
+    bound: f64,
+) -> ShortChallenge {
+    let bound_sq = bound * bound + 1e-12;
+    let mut x = Xof::new(reader);
+    let mut perm = [0u8; N162];
+    loop {
+        let c = attempt(&mut x, weight, &mut perm).signed();
+        if within(&c, bound_sq) {
+            return c;
         }
     }
 }
 
+/// `n` consecutive [`sample_short_challenge`]s, bit for bit the same challenges in the same
+/// order, drawn on up to `threads` threads. Sample `i` is one derivation of the transcript at
+/// counter `base + i` whatever the other samples did, so the samples are independent work; the
+/// counter is advanced by `n` at the end exactly as `n` sequential calls would have left it.
+pub fn sample_short_challenges_parallel(
+    t: &mut Transcript,
+    n: usize,
+    weight: usize,
+    bound: f64,
+    threads: usize,
+) -> Vec<ShortChallenge> {
+    let threads = threads.clamp(1, n.max(1));
+    let mut out = vec![ShortChallenge::zero(); n];
+    if n > 0 {
+        let runs = crate::par::ranges(n, threads, 1);
+        let t_ref = &*t;
+        let out_addr = out.as_mut_ptr() as usize;
+        crate::par::pool().run(runs.len(), |w| {
+            // Run `w` owns `out[runs[w]]`.
+            for i in runs[w].clone() {
+                let reader = t_ref.reader_at(b"short-challenge", i as u64);
+                let c = sample_short_challenge_from(reader, weight, bound);
+                unsafe { (out_addr as *mut ShortChallenge).add(i).write(c) };
+            }
+        });
+    }
+    t.skip(n as u64);
+    out
+}
+
 #[cfg(test)]
-mod parallel_absorb_tests {
+mod parallel_tests {
     use super::*;
 
-    /// `absorb_bytes_parallel` is `absorb_bytes`: the same transcript for every size and prefix,
-    /// including after more input is absorbed.
+    /// The tree-parallel absorb leaves the transcript a sequential absorb leaves: every later
+    /// absorb and sample agrees, across prefix lengths, input lengths at and around chunk and
+    /// power-of-two boundaries, and later absorbs that fill and merge the tail subtrees.
     #[test]
     fn parallel_absorb_matches_sequential() {
-        let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let data: Vec<u8> = (0..(5 << 20))
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                x as u8
-            })
-            .collect();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut data = vec![0u8; (1 << 22) + 5000];
+        for b in data.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
         let k = 1024usize;
         let sizes = [
             0, 1, 1000, 4 * 64 * k - 1, 4 * 64 * k, 4 * 64 * k + 1, 300_000, 1 << 20,
-            (1 << 21) - 112, (1 << 21) - 111, 3_317_760, 3 << 20, 1 << 22,
+            (1 << 21) - 112, (1 << 21) - 111, (1 << 21) - 113, (1 << 21) - 112 + 1024,
+            3_317_760, 3 << 20, (1 << 22) - 8 - 112, 1 << 22,
         ];
         for prefix in [0usize, 7, 112, 1016, 1024, 5000, 64 * k - 30, 64 * k + 1] {
             for &n in &sizes {
@@ -806,15 +834,54 @@ mod parallel_absorb_tests {
                 let (mut a, mut b) = (make(), make());
                 a.absorb_bytes(&data[1000..1000 + n]);
                 b.absorb_bytes_parallel(&data[1000..1000 + n], 8);
-                for more in [0usize, 16, 2072, 70_000, 1 << 20] {
-                    a.absorb_bytes(&data[..more]);
-                    b.absorb_bytes(&data[..more]);
+                // The tree form is taken (the length prefix is 8 more bytes of the stream).
+                let head = 8 + 24 + 8 + prefix;
+                assert_eq!(b.state.depth > 0, n >= 4 * 64 * k && head + 8 < 64 * k, "prefix {prefix} n {n}");
+                let check = |a: &mut Transcript, b: &mut Transcript, step: &str| {
                     let (mut u, mut v) = ([0u8; 80], [0u8; 80]);
                     a.fill(b"check", &mut u);
                     b.fill(b"check", &mut v);
-                    assert_eq!(u, v, "prefix {prefix} n {n} more {more}");
+                    assert_eq!(u, v, "prefix {prefix} n {n}: {step}");
+                };
+                check(&mut a, &mut b, "after absorb");
+                let (u, v) = (a.clone().sample_b128(b"r", 7), b.clone().sample_b128(b"r", 7));
+                assert_eq!(u, v, "prefix {prefix} n {n}: clone");
+                for (i, more) in [16usize, 2072, 900, 20_736, 70_000, 300_000, 1 << 20].iter().enumerate() {
+                    a.absorb_bytes(&data[..*more]);
+                    b.absorb_bytes(&data[..*more]);
+                    check(&mut a, &mut b, &format!("after more {i}"));
+                    let (u, v) = (a.reader_at(b"at", 3), b.reader_at(b"at", 3));
+                    let (mut p, mut q) = (u, v);
+                    let (mut s, mut t) = ([0u8; 40], [0u8; 40]);
+                    p.fill(&mut s);
+                    q.fill(&mut t);
+                    assert_eq!(s, t, "prefix {prefix} n {n}: reader_at {i}");
                 }
             }
         }
+    }
+
+    #[test]
+    fn parallel_sampling_matches_sequential() {
+        let mut a = Transcript::new(b"labinius/parallel-sampling");
+        a.absorb_bytes(b"some prefix");
+        let mut b = a.clone();
+        let sequential: Vec<ShortChallenge> = (0..37)
+            .map(|_| sample_short_challenge(&mut a, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
+            .collect();
+        let parallel = sample_short_challenges_parallel(&mut b, 37, DEFAULT_WEIGHT, DEFAULT_BOUND, 5);
+        assert_eq!(sequential, parallel);
+        for c in &parallel {
+            let mut h = Hasher::new_derive_key("labinius 2026 challenge signs v1");
+            h.update(&(c.weight as u64).to_le_bytes());
+            h.update(&c.positions[..c.weight]);
+            let bits = u32::from_le_bytes(h.finalize().as_bytes()[..4].try_into().unwrap());
+            assert_eq!(c.signs, bits & (((1u64 << c.weight) - 1) as u32));
+        }
+        let mut x = [0u8; 16];
+        let mut y = [0u8; 16];
+        a.fill(b"after", &mut x);
+        b.fill(b"after", &mut y);
+        assert_eq!(x, y, "the counter advanced the same way");
     }
 }

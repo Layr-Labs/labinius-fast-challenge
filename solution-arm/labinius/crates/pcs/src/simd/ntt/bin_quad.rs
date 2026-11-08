@@ -651,7 +651,7 @@ unsafe fn permb_m(idx: __m512i, p: *const u8) -> __m512i {
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 unsafe fn permb_m(idx: __m512i, p: *const u8) -> __m512i {
-    _mm512_permutexvar_epi8(idx, _mm512_loadu_si512(p))
+    _mm512_permutexvar_epi8(idx, _mm512_loadu_si512(p as *const __m512i))
 }
 
 /// `vpmulhw`. stdarch's `_mm512_mulhi_epi16` is written as sext -> mul -> shr -> trunc; LLVM

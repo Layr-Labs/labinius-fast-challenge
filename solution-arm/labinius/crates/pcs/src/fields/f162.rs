@@ -100,3 +100,31 @@ pub unsafe fn reduce_soa8(p: [__m512i; 12]) -> [__m512i; 3] {
 pub unsafe fn mul_soa8(a: [__m512i; 3], b: [__m512i; 3]) -> [__m512i; 3] {
     reduce_soa8(prods_soa8(a, b))
 }
+
+/// Rectangular 162-by-128 multiplication: the word's third limb is zero.
+/// Keep the accumulator layout of f162::mac_soa8, but omit its zero product.
+#[inline(always)]
+pub(crate) unsafe fn mac_soa8_word(acc: &mut [__m512i; 12], a: [__m512i; 3], b: [__m512i; 3]) {
+    let sa = _mm512_xor_si512(a[0], a[1]);
+    let sb = _mm512_xor_si512(b[0], b[1]);
+    let p = [
+        _mm512_clmulepi64_epi128::<0x00>(a[0], b[0]),
+        _mm512_clmulepi64_epi128::<0x11>(a[0], b[0]),
+        _mm512_clmulepi64_epi128::<0x00>(a[1], b[1]),
+        _mm512_clmulepi64_epi128::<0x11>(a[1], b[1]),
+        _mm512_setzero_si512(), _mm512_setzero_si512(),
+        _mm512_clmulepi64_epi128::<0x00>(sa, sb),
+        _mm512_clmulepi64_epi128::<0x11>(sa, sb),
+        _mm512_clmulepi64_epi128::<0x00>(a[2], b[0]),
+        _mm512_clmulepi64_epi128::<0x11>(a[2], b[0]),
+        _mm512_clmulepi64_epi128::<0x00>(a[2], b[1]),
+        _mm512_clmulepi64_epi128::<0x11>(a[2], b[1]),
+    ];
+    for i in 0..12 {
+        let v = match i {
+            8..=11 => _mm512_xor_si512(p[i], p[i - 8]),
+            _ => p[i],
+        };
+        acc[i] = _mm512_xor_si512(acc[i], v);
+    }
+}

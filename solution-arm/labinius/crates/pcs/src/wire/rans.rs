@@ -413,12 +413,12 @@ mod avx512 {
     use super::{scatter, Decoder, WireError, LANES, RANS_LOW, SCALE, SCALE_BITS};
     use crate::params::N;
     use crate::ring::RingElement;
-    use core::arch::x86_64::*;
+    use crate::arch::*;
     const VECTORS: usize = LANES / 16;
 
     /// `groups` full groups: sixteen states per vector, the slot lookup two eight-lane gathers
     /// on the table, the renormalisation a compare mask and an expand of the next sixteen words.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f,avx512bw,avx512vl"))]
     pub(super) unsafe fn decode_groups(
         d: &Decoder,
         x: &mut [u32; LANES],

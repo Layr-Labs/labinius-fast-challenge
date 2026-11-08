@@ -112,24 +112,6 @@ impl Expansion {
 /// prime and transform. `A` depends on the fixed seed and on `q` alone, never on
 /// `LABINIUS_SEED`, so a prover may precompute it.
 pub fn ajtai_matrix(q: u128, elements: usize) -> Vec<u128> {
-    let workers = labinius::par::threads();
-    let per = elements.div_ceil(workers);
-    let mut matrix = vec![0u128; elements * N];
-    std::thread::scope(|scope| {
-        for (block, base) in matrix.chunks_mut(per * N).zip((0..).step_by(per)) {
-            scope.spawn(move || {
-                for (i, element) in block.chunks_mut(N).enumerate() {
-                    ajtai_element(q, elements, base + i, element);
-                }
-            });
-        }
-    });
-    matrix
-}
-
-/// Element `index` of [`ajtai_matrix`]`(q, elements)`: its `N` coefficients, written to `out`.
-pub fn ajtai_element(q: u128, elements: usize, index: usize, out: &mut [u128]) {
-    assert_eq!(out.len(), N);
     let width = coefficient_bytes(q);
     let bits = modulus_bits(q);
     let mask = if bits == 128 {
@@ -137,16 +119,28 @@ pub fn ajtai_element(q: u128, elements: usize, index: usize, out: &mut [u128]) {
     } else {
         (1u128 << bits) - 1
     };
-    let mut expansion = Expansion::new(q, elements, index);
-    for slot in out.iter_mut() {
-        loop {
-            let candidate = expansion.draw(width) & mask;
-            if candidate < q {
-                *slot = candidate;
-                break;
-            }
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = elements.div_ceil(workers);
+    let mut matrix = vec![0u128; elements * N];
+    std::thread::scope(|scope| {
+        for (block, base) in matrix.chunks_mut(per * N).zip((0..).step_by(per)) {
+            scope.spawn(move || {
+                for (i, element) in block.chunks_mut(N).enumerate() {
+                    let mut expansion = Expansion::new(q, elements, base + i);
+                    for slot in element.iter_mut() {
+                        loop {
+                            let candidate = expansion.draw(width) & mask;
+                            if candidate < q {
+                                *slot = candidate;
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
         }
-    }
+    });
+    matrix
 }
 
 /// Fold a raw polynomial product of degree below `2 N - 1` into `R_Q`, using
@@ -156,11 +150,7 @@ pub fn ajtai_element(q: u128, elements: usize, index: usize, out: &mut [u128]) {
 /// down, so index `k` below `N` receives at most two contributions of magnitude below `q` and
 /// the caller's bound on `raw` only has to leave `2 q` of room.
 pub fn fold_into_ring(raw: &mut [i128], q: u128) -> Vec<u128> {
-    assert_eq!(
-        raw.len(),
-        2 * N - 1,
-        "a raw product is 2 N - 1 coefficients"
-    );
+    assert_eq!(raw.len(), 2 * N - 1, "a raw product is 2 N - 1 coefficients");
     let modulus = q as i128;
     for k in (N..2 * N - 1).rev() {
         let value = raw[k].rem_euclid(modulus);
@@ -179,10 +169,7 @@ pub fn fold_into_ring(raw: &mut [i128], q: u128) -> Vec<u128> {
 /// `scalar::mul_mod_phi`. The caller keeps `N max|a| max|b|` below `2^127`.
 #[cfg(test)]
 pub fn mul(a: &[u128], b: &[i64], q: u128) -> Vec<u128> {
-    assert!(
-        a.len() == N && b.len() == N,
-        "both factors are N coefficients"
-    );
+    assert!(a.len() == N && b.len() == N, "both factors are N coefficients");
     let mut raw = vec![0i128; 2 * N - 1];
     for (j, &c) in b.iter().enumerate() {
         for (i, &x) in a.iter().enumerate() {
@@ -236,11 +223,7 @@ pub fn a_times_v(a: &[u128], v: &[i16], q: u128) -> Vec<u128> {
 /// `R_648` as `c(-X^4)`: its coefficient of `X^{4 m}` is the sign of position `m` times
 /// `(-1)^m`, and every other coefficient is zero. Each term is therefore one shifted add of 648
 /// coefficients, and the whole combination is 28 of them per column.
-pub fn challenge_combination(
-    columns: &[u128],
-    challenges: &[ShortChallenge],
-    q: u128,
-) -> Vec<u128> {
+pub fn challenge_combination(columns: &[u128], challenges: &[ShortChallenge], q: u128) -> Vec<u128> {
     assert_eq!(
         columns.len(),
         challenges.len() * N,
@@ -251,8 +234,7 @@ pub fn challenge_combination(
     for (j, (column, challenge)) in columns.chunks_exact(N).zip(challenges).enumerate() {
         for t in 0..challenge.weight {
             let m = challenge.positions[t] as usize;
-            let sign =
-                (1 - 2 * ((challenge.signs >> t) & 1) as i32) * if m % 2 == 0 { 1 } else { -1 };
+            let sign = (1 - 2 * ((challenge.signs >> t) & 1) as i32) * if m % 2 == 0 { 1 } else { -1 };
             let window = &mut raw[4 * m..4 * m + N];
             if sign > 0 {
                 for (slot, &x) in window.iter_mut().zip(column) {
@@ -281,11 +263,7 @@ pub fn challenge_combination(
 /// [`fold_into_ring`] wants `2 q` of room on top, which the assertion checks.
 pub fn commit_binary_column(matrix: &[u128], column: &[F162], q: u128) -> Vec<u128> {
     let elements = column.len() / 4;
-    assert_eq!(
-        matrix.len(),
-        elements * N,
-        "the matrix does not match the column"
-    );
+    assert_eq!(matrix.len(), elements * N, "the matrix does not match the column");
     assert!(
         (elements * N) as u128 + 2 <= (1u128 << 127) / q,
         "the accumulator would overflow at this modulus and column length"
@@ -312,21 +290,7 @@ pub fn commit_binary_column(matrix: &[u128], column: &[F162], q: u128) -> Vec<u1
 /// index order and with no header: the shape comes from the parameters the verifier holds.
 pub fn pack_ring_elements(coefficients: &[u128], q: u128) -> Vec<u8> {
     let width = coefficient_bytes(q);
-    let len = width * coefficients.len();
-    // room for one whole word past the last coefficient
-    let mut out: Vec<u8> = Vec::with_capacity(len + 8);
-    if width <= 8 {
-        let p = out.as_mut_ptr();
-        for (i, &x) in coefficients.iter().enumerate() {
-            debug_assert!(x < q, "a coefficient is not reduced");
-            // SAFETY: `i width + 8 <= len + 8`, the capacity. Each write leaves the bytes above
-            // `width` zero and the next coefficient overwrites them.
-            unsafe { (p.add(i * width) as *mut u64).write_unaligned((x as u64).to_le()) };
-        }
-        // SAFETY: the first `len` bytes were written above.
-        unsafe { out.set_len(len) };
-        return out;
-    }
+    let mut out = Vec::with_capacity(width * coefficients.len());
     for &x in coefficients {
         debug_assert!(x < q, "a coefficient is not reduced");
         out.extend_from_slice(&x.to_le_bytes()[..width]);

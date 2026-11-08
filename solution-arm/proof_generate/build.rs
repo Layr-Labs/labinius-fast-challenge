@@ -1,73 +1,100 @@
-//! Precompute the commitment matrix of the default (single-transform SMS) modulus: its seven
-//! transformed rows per element, the digit chunks' mean residues, the means' weighted total, and
-//! the reconstruction margin and failure bound, certified here from the public matrix alone.
-//! `A` is public parameter data: a function of the fixed matrix seed, the modulus and the element
-//! count alone, never of the instance seed. So it is computed here, once, at build time, with the
-//! prover's own NEON kernels, and embedded in the binary (the x86 track embeds its key the same
-//! way). On a build host that is not AArch64, an empty image is written and the prover builds the
-//! matrix when it runs.
-#![allow(dead_code, unused_imports)]
+//! Precompute the commitment key of the default modulus. `A` is public parameter data — a
+//! function of the fixed matrix seed and the modulus alone, never of the instance seed — so the
+//! prover may precompute it, and here it is computed once at build time with the library's own
+//! kernels and embedded in the binary: on the scored Graviton the native AArch64 build runs the
+//! `arch` port of the kernels here. An x86-64 build host without the AVX-512 features the
+//! kernels need writes an empty image and the prover builds the key when it runs.
+#![allow(dead_code)]
 use std::env;
 use std::path::PathBuf;
 
-#[cfg(target_arch = "aarch64")]
-#[path = "src/ntt.rs"]
-mod ntt;
-#[cfg(target_arch = "aarch64")]
+#[path = "src/keygen.rs"]
+mod keygen;
+#[path = "src/modulus_choice.rs"]
+mod modulus_choice;
+#[path = "src/parameters.rs"]
+mod parameters;
 #[path = "src/rq.rs"]
 mod rq;
 
-/// Ring elements per column (`parameters`: 2^24 words / 1024 columns / 4); the prover checks the
-/// image's length before it uses it.
-const RING_ELEMENTS: usize = 4096;
-
 fn main() {
     let dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    for f in ["build.rs", "src/ntt.rs", "src/ntt_neon.rs", "src/ntt_hybrid.rs", "src/ntt_sms.rs", "src/sms_lattice.rs", "src/rq.rs"] {
-        println!("cargo:rerun-if-changed={f}");
-    }
-    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
-    // The hybrid matrix is no longer the default's: its image stays empty and `--modulus` with
-    // the hybrid modulus builds it at run time.
-    std::fs::write(dir.join("hybrid-matrix.bin"), Vec::<u8>::new()).expect("write the matrix image");
-    let [data, means, mu, meta] = sms_images();
-    for (name, bytes) in [("sms-data.bin", data), ("sms-means.bin", means), ("sms-mu.bin", mu), ("sms-meta.bin", meta)] {
-        std::fs::write(dir.join(name), bytes).expect("write an SMS image");
-    }
+    println!("cargo:rerun-if-changed=src/keygen.rs");
+    println!("cargo:rerun-if-changed=src/modulus_choice.rs");
+    println!("cargo:rerun-if-changed=src/parameters.rs");
+    println!("cargo:rerun-if-changed=src/rq.rs");
+    println!("cargo:rerun-if-changed=build.rs");
+    // 2 MiB segment alignment, so the 2 MiB-aligned key image (main.rs) can be mapped with PMD
+    // entries instead of ~11.7k 4 KiB ones (e-man07, submission 721d445d).
+    println!("cargo:rustc-link-arg-bins=-Wl,-z,max-page-size=0x200000");
+    let (image, tail, hybrid, pairs) = images();
+    std::fs::write(dir.join("pair-key.bin"), pairs).expect("write the column-pair key image");
+    std::fs::write(dir.join("key.bin"), image).expect("write the key image");
+    std::fs::write(dir.join("tail-key.bin"), tail).expect("write the auxiliary key image");
+    std::fs::write(dir.join("hybrid-key.bin"), hybrid).expect("write the arranged hybrid key image");
+    let (pairs, mur, mu) = sms_images();
+    std::fs::write(dir.join("sms-pairs.bin"), pairs).expect("write the single-transform key image");
+    std::fs::write(dir.join("sms-mur.bin"), mur).expect("write the chunk mean image");
+    std::fs::write(dir.join("sms-mu.bin"), mu).expect("write the mean total image");
 }
 
-#[cfg(target_arch = "aarch64")]
-fn sms_images() -> [Vec<u8>; 4] {
-    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
-        return Default::default();
+/// For the single-transform modulus: the seven streams' keys in the lockstep layout, the digit
+/// chunks' mean residues and the means' total (`labinius::simd::commit::sms::SmsKeyData`), with
+/// the reconstruction margin checked here, at build time, from the public matrix alone.
+fn sms_images() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    if !host_can_run() || parameters::MODULUS != modulus_choice::SMS_MODULUS {
+        return (Vec::new(), Vec::new(), Vec::new());
     }
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
-    // `matrix` asserts the margin and the column failure bound.
-    let m = ntt::neon::sms::matrix(RING_ELEMENTS, workers);
-    println!(
-        "cargo:warning=SMS reconstruction margin {:.3} sigma, Hoeffding failure bound {:.3e} per column, {:.3e} per 1024-column proof",
-        m.margin, m.column_failure, 1024.0 * m.column_failure
-    );
-    m.images()
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn sms_images() -> [Vec<u8>; 4] {
-    Default::default()
-}
-
-#[cfg(target_arch = "aarch64")]
-fn image() -> Vec<u8> {
-    // The build script runs on the host; embed only for an AArch64 target as well.
-    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
-        return Vec::new();
+    let matrix = rq::ajtai_matrix(parameters::MODULUS, parameters::RING_ELEMENTS);
+    let data = labinius::simd::commit::sms::SmsKeyData::build(&matrix, parameters::RING_ELEMENTS);
+    println!("cargo:warning=single-transform reconstruction margin {:.3} sigma", data.margin);
+    for (d, m) in data.margins.iter().enumerate() {
+        println!("cargo:warning=digit {d}: margin {:.3} at chunk {} coefficient {} |mean| {}", m.0, m.1, m.2, m.3);
     }
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let m = ntt::neon::hybrid::matrix(RING_ELEMENTS, workers);
-    m.data.iter().flat_map(|v| v.to_le_bytes()).collect()
+    // Public lattice coefficient banks: certify every public chunk, digit and coefficient.
+    // No instance data enters the key image or this reconstruction-margin check.
+    assert!(data.margin >= 7.5, "the public matrix leaves too small a reconstruction margin");
+    (
+        data.pairs.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        data.mur.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        data.mu.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-fn image() -> Vec<u8> {
-    Vec::new()
+/// The build script runs on the build host, so this is about the host: off x86-64 the kernels
+/// are the portable `arch` port and always run.
+#[cfg(not(target_arch = "x86_64"))]
+fn host_can_run() -> bool {
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+fn host_can_run() -> bool {
+    is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vl")
+        && is_x86_feature_detected!("avx512vbmi")
+        && is_x86_feature_detected!("avx512vbmi2")
+        && is_x86_feature_detected!("avx512vnni")
+        && is_x86_feature_detected!("gfni")
+}
+
+/// For the hybrid modulus, precomputes only `pair-key.bin` (leaving `key.bin`, `tail-key.bin`,
+/// and `hybrid-key.bin` empty so the binary does not embed 41 MiB of unused keys); for any other
+/// default modulus, precomputes `key.bin`.
+fn images() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    // The library's kernels need these features at run time. A build host without them (for
+    // instance a cross-build for the scored CPU) writes empty images and the prover builds the
+    // keys when it runs; the scored runner has every one of them.
+    if !host_can_run() || parameters::MODULUS == modulus_choice::SMS_MODULUS {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
+    let key = keygen::build_key(parameters::MODULUS);
+    if parameters::MODULUS != modulus_choice::HYBRID_MODULUS {
+        return (keygen::key_image(&key), Vec::new(), Vec::new(), Vec::new());
+    }
+    let tail = keygen::build_tail_key(parameters::MODULUS);
+    let pairs = labinius::simd::commit::hybrid::pair_keys(&key, &tail, labinius::par::threads());
+    let pairs: Vec<u8> = pairs.iter().flat_map(|w| w.to_le_bytes()).collect();
+    (Vec::new(), Vec::new(), Vec::new(), pairs)
 }

@@ -25,6 +25,10 @@ pub struct __m128i([u64; 2]);
 #[repr(C, align(64))]
 pub struct __m512d([f64; 8]);
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(64))]
+pub struct __m512([f32; 16]);
+
 pub type __mmask8 = u8;
 pub type __mmask16 = u16;
 pub type __mmask32 = u32;
@@ -34,6 +38,22 @@ pub const _MM_HINT_T0: i32 = 3;
 pub const _MM_HINT_T1: i32 = 2;
 pub const _MM_HINT_T2: i32 = 1;
 pub const _MM_HINT_NTA: i32 = 0;
+
+pub const _MM_CMPINT_EQ: i32 = 0x00;
+pub const _MM_CMPINT_LT: i32 = 0x01;
+pub const _MM_CMPINT_LE: i32 = 0x02;
+pub const _MM_CMPINT_FALSE: i32 = 0x03;
+pub const _MM_CMPINT_NE: i32 = 0x04;
+pub const _MM_CMPINT_NLT: i32 = 0x05;
+pub const _MM_CMPINT_NLE: i32 = 0x06;
+pub const _MM_CMPINT_TRUE: i32 = 0x07;
+
+pub const _MM_FROUND_TO_NEAREST_INT: i32 = 0x00;
+pub const _MM_FROUND_TO_NEG_INF: i32 = 0x01;
+pub const _MM_FROUND_TO_POS_INF: i32 = 0x02;
+pub const _MM_FROUND_TO_ZERO: i32 = 0x03;
+pub const _MM_FROUND_CUR_DIRECTION: i32 = 0x04;
+pub const _MM_FROUND_NO_EXC: i32 = 0x08;
 
 pub const _CMP_EQ_OQ: i32 = 0x00;
 pub const _CMP_LT_OS: i32 = 0x01;
@@ -91,6 +111,9 @@ macro_rules! views {
     };
 }
 
+views!(__m128i:
+    u8x16 / from_u8x16: [u8; 16],
+);
 views!(__m512i:
     i8x64 / from_i8x64: [i8; 64],
     u8x64 / from_u8x64: [u8; 64],
@@ -104,6 +127,7 @@ views!(__m512i:
 views!(__m256i:
     i16x16 / from_i16x16: [i16; 16],
     u16x16 / from_u16x16: [u16; 16],
+    u8x32 / from_u8x32: [u8; 32],
     i32x8 / from_i32x8: [i32; 8],
     u64x4 / from_u64x4: [u64; 4],
 );
@@ -178,24 +202,24 @@ macro_rules! cmp_mask {
 // ---------------------------------------------------------------------------------------------
 
 #[inline(always)]
-pub unsafe fn _mm512_load_si512<T>(p: *const T) -> __m512i {
-    (p as *const __m512i).read_unaligned()
+pub unsafe fn _mm512_load_si512(p: *const __m512i) -> __m512i {
+    p.read_unaligned()
 }
 #[inline(always)]
-pub unsafe fn _mm512_loadu_si512<T>(p: *const T) -> __m512i {
-    (p as *const __m512i).read_unaligned()
+pub unsafe fn _mm512_loadu_si512(p: *const __m512i) -> __m512i {
+    p.read_unaligned()
 }
 #[inline(always)]
 pub unsafe fn _mm512_loadu_epi32<T>(p: *const T) -> __m512i {
     (p as *const __m512i).read_unaligned()
 }
 #[inline(always)]
-pub unsafe fn _mm512_store_si512<T>(p: *mut T, a: __m512i) {
-    (p as *mut __m512i).write_unaligned(a)
+pub unsafe fn _mm512_store_si512(p: *mut __m512i, a: __m512i) {
+    p.write_unaligned(a)
 }
 #[inline(always)]
-pub unsafe fn _mm512_storeu_si512<T>(p: *mut T, a: __m512i) {
-    (p as *mut __m512i).write_unaligned(a)
+pub unsafe fn _mm512_storeu_si512(p: *mut __m512i, a: __m512i) {
+    p.write_unaligned(a)
 }
 #[inline(always)]
 pub unsafe fn _mm512_storeu_epi32<T>(p: *mut T, a: __m512i) {
@@ -340,8 +364,20 @@ pub unsafe fn _mm512_i32gather_epi32<const SCALE: i32>(
     from_i32x16(r)
 }
 
+/// A cache hint only: on AArch64 the matching `prfm` (T0 to L1, T1 to L2, T2 to L3, NTA as a
+/// streaming L1 fill); elsewhere nothing.
 #[inline(always)]
-pub unsafe fn _mm_prefetch<T>(_p: *const T, _strategy: i32) {}
+pub unsafe fn _mm_prefetch<const STRATEGY: i32>(p: *const i8) {
+    #[cfg(target_arch = "aarch64")]
+    match STRATEGY {
+        _MM_HINT_T0 => core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags)),
+        _MM_HINT_T1 => core::arch::asm!("prfm pldl2keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags)),
+        _MM_HINT_T2 => core::arch::asm!("prfm pldl3keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags)),
+        _ => core::arch::asm!("prfm pldl1strm, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags)),
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = p;
+}
 #[inline(always)]
 pub unsafe fn _mm_sfence() {
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -508,6 +544,24 @@ pub fn _mm512_mul_epu32(a: __m512i, b: __m512i) -> __m512i {
 }
 #[inline(always)]
 pub fn _mm512_madd_epi16(a: __m512i, b: __m512i) -> __m512i {
+    // `smull` / `smull2` give the eight word products of each 128-bit chunk, `addp` sums the
+    // adjacent pairs: dword `j` = `a[2j] b[2j] + a[2j+1] b[2j+1]`, wrapping, as `vpmaddwd`.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline; the views are 64-byte arrays.
+    unsafe {
+        use core::arch::aarch64::*;
+        let (a, b) = (i16x32(a), i16x32(b));
+        let mut r = [0i32; 16];
+        for c in 0..4 {
+            let x = vld1q_s16(a.as_ptr().add(8 * c));
+            let y = vld1q_s16(b.as_ptr().add(8 * c));
+            let lo = vmull_s16(vget_low_s16(x), vget_low_s16(y));
+            let hi = vmull_high_s16(x, y);
+            vst1q_s32(r.as_mut_ptr().add(4 * c), vpaddq_s32(lo, hi));
+        }
+        return from_i32x16(r);
+    }
+    #[allow(unreachable_code)]
     let (a, b) = (i16x32(a), i16x32(b));
     let mut r = [0i32; 16];
     for j in 0..16 {
@@ -804,6 +858,24 @@ pub fn _mm512_permutex2var_epi16(a: __m512i, idx: __m512i, b: __m512i) -> __m512
 }
 #[inline(always)]
 pub fn _mm512_permutex2var_epi8(a: __m512i, idx: __m512i, b: __m512i) -> __m512i {
+    // `tbl` over `a` for indices below 64 (zero above), then `tbx` over `b` with the index
+    // lowered by 64, which leaves the lanes whose lowered index wrapped past 63 untouched.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline; the views are 64-byte arrays.
+    unsafe {
+        use core::arch::aarch64::*;
+        let (ta, ix, tb) = (u8x64(a), u8x64(idx), u8x64(b));
+        let mut r = [0u8; 64];
+        let (lo, hi) = (vld1q_u8_x4(ta.as_ptr()), vld1q_u8_x4(tb.as_ptr()));
+        let (seven, sixty_four) = (vdupq_n_u8(127), vdupq_n_u8(64));
+        for c in 0..4 {
+            let i = vandq_u8(vld1q_u8(ix.as_ptr().add(16 * c)), seven);
+            let x = vqtbl4q_u8(lo, i);
+            vst1q_u8(r.as_mut_ptr().add(16 * c), vqtbx4q_u8(x, hi, vsubq_u8(i, sixty_four)));
+        }
+        return from_u8x64(r);
+    }
+    #[allow(unreachable_code)]
     let (a, ix, b) = (u8x64(a), u8x64(idx), u8x64(b));
     from_u8x64(core::array::from_fn(|i| {
         let j = (ix[i] & 63) as usize;
@@ -814,6 +886,33 @@ pub fn _mm512_permutex2var_epi8(a: __m512i, idx: __m512i, b: __m512i) -> __m512i
 /// `b` starting at bit `a.byte[j] & 63`, wrapping around the lane.
 #[inline(always)]
 pub fn _mm512_multishift_epi64_epi8(a: __m512i, b: __m512i) -> __m512i {
+    // Control `s = 8k + r` reads bits `r..` of byte `k` and the rest from byte `(k + 1) & 7` of
+    // the same qword: two `tbl` lookups give that byte pair as a word, a variable `ushl` by
+    // `-r` aligns it, and `uzp1` keeps the low bytes.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline; the views are 64-byte arrays.
+    unsafe {
+        use core::arch::aarch64::*;
+        let (ctrl, data) = (u8x64(a), u8x64(b));
+        let mut r = [0u8; 64];
+        let table = vld1q_u8_x4(data.as_ptr());
+        let qbase: [u8; 16] = core::array::from_fn(|p| 8 * (p as u8 / 8));
+        let (m63, seven, one) = (vdupq_n_u8(63), vdupq_n_u8(7), vdupq_n_u8(1));
+        for c in 0..4 {
+            let s = vandq_u8(vld1q_u8(ctrl.as_ptr().add(16 * c)), m63);
+            let k = vshrq_n_u8::<3>(s);
+            let base = vaddq_u8(vld1q_u8(qbase.as_ptr()), vdupq_n_u8(16 * c as u8));
+            let lo = vqtbl4q_u8(table, vaddq_u8(base, k));
+            let hi = vqtbl4q_u8(table, vaddq_u8(base, vandq_u8(vaddq_u8(k, one), seven)));
+            // `-r` per byte, sign-extended to the word lanes it shifts.
+            let neg = vnegq_s8(vreinterpretq_s8_u8(vandq_u8(s, seven)));
+            let w0 = vshlq_u16(vreinterpretq_u16_u8(vzip1q_u8(lo, hi)), vmovl_s8(vget_low_s8(neg)));
+            let w1 = vshlq_u16(vreinterpretq_u16_u8(vzip2q_u8(lo, hi)), vmovl_high_s8(neg));
+            vst1q_u8(r.as_mut_ptr().add(16 * c), vuzp1q_u8(vreinterpretq_u8_u16(w0), vreinterpretq_u8_u16(w1)));
+        }
+        return from_u8x64(r);
+    }
+    #[allow(unreachable_code)]
     let (ctrl, data) = (u8x64(a), u64x8(b));
     from_u8x64(core::array::from_fn(|i| {
         data[i / 8].rotate_right((ctrl[i] & 63) as u32) as u8
@@ -892,6 +991,38 @@ pub fn _mm512_cvtepi16_epi32(a: __m256i) -> __m512i {
 /// the 64-bit lane of `a` holding that byte.
 #[inline(always)]
 pub fn _mm512_gf2p8affine_epi64_epi8<const B: i32>(x: __m512i, a: __m512i) -> __m512i {
+    // Bit `i` of result byte `j` is the parity of `A.byte[7 - i] & x.byte[j]` in its qword:
+    // per `i`, `tbl` broadcasts row `7 - i` across the qword, `cnt` gives the parities, and
+    // `sli` inserts them at bit `i` above the bits already placed.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline; the views are 64-byte arrays.
+    unsafe {
+        use core::arch::aarch64::*;
+        let (xb, ab) = (u8x64(x), u8x64(a));
+        let mut r = [0u8; 64];
+        let one = vdupq_n_u8(1);
+        let bias = vdupq_n_u8(B as u8);
+        for c in 0..4 {
+            let xv = vld1q_u8(xb.as_ptr().add(16 * c));
+            let av = vld1q_u8(ab.as_ptr().add(16 * c));
+            let row = |i: u8| -> uint8x16_t {
+                let sel: [u8; 16] = core::array::from_fn(|p| 8 * (p as u8 / 8) + 7 - i);
+                let m = vandq_u8(vqtbl1q_u8(av, vld1q_u8(sel.as_ptr())), xv);
+                vandq_u8(vcntq_u8(m), one)
+            };
+            let mut acc = row(0);
+            acc = vsliq_n_u8::<1>(acc, row(1));
+            acc = vsliq_n_u8::<2>(acc, row(2));
+            acc = vsliq_n_u8::<3>(acc, row(3));
+            acc = vsliq_n_u8::<4>(acc, row(4));
+            acc = vsliq_n_u8::<5>(acc, row(5));
+            acc = vsliq_n_u8::<6>(acc, row(6));
+            acc = vsliq_n_u8::<7>(acc, row(7));
+            vst1q_u8(r.as_mut_ptr().add(16 * c), veorq_u8(acc, bias));
+        }
+        return from_u8x64(r);
+    }
+    #[allow(unreachable_code)]
     let (xb, aq) = (u8x64(x), u64x8(a));
     let mut r = [0u8; 64];
     for q in 0..8 {
@@ -1058,6 +1189,211 @@ pub fn _mm512_cmp_pd_mask<const IMM8: i32>(a: __m512d, b: __m512d) -> __mmask8 {
             _ => true,
         }
     })
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// further integer, mask and float operations
+// ---------------------------------------------------------------------------------------------
+
+/// The `_MM_CMPINT_*` predicate `imm` (low three bits) on an ordered pair.
+#[inline(always)]
+fn cmpint<T: PartialOrd>(x: T, y: T, imm: i32) -> bool {
+    match imm & 7 {
+        _MM_CMPINT_EQ => x == y,
+        _MM_CMPINT_LT => x < y,
+        _MM_CMPINT_LE => x <= y,
+        _MM_CMPINT_FALSE => false,
+        _MM_CMPINT_NE => x != y,
+        _MM_CMPINT_NLT => x >= y,
+        _MM_CMPINT_NLE => x > y,
+        _ => true,
+    }
+}
+#[inline(always)]
+pub fn _mm512_cmp_epi32_mask(a: __m512i, b: __m512i, imm: i32) -> __mmask16 {
+    cmp_mask!(i32x16, __mmask16, a, b, |x, y| cmpint(x, y, imm))
+}
+#[inline(always)]
+pub fn _mm512_cmp_epu32_mask(a: __m512i, b: __m512i, imm: i32) -> __mmask16 {
+    cmp_mask!(u32x16, __mmask16, a, b, |x, y| cmpint(x, y, imm))
+}
+#[inline(always)]
+pub fn _mm512_cmp_epi16_mask(a: __m512i, b: __m512i, imm: i32) -> __mmask32 {
+    cmp_mask!(i16x32, __mmask32, a, b, |x, y| cmpint(x, y, imm))
+}
+#[inline(always)]
+pub fn _mm512_cmplt_epi32_mask(a: __m512i, b: __m512i) -> __mmask16 {
+    cmp_mask!(i32x16, __mmask16, a, b, |x, y| x < y)
+}
+#[inline(always)]
+pub fn _mm512_cmpneq_epi16_mask(a: __m512i, b: __m512i) -> __mmask32 {
+    cmp_mask!(i16x32, __mmask32, a, b, |x, y| x != y)
+}
+#[inline(always)]
+pub fn _mm512_adds_epi16(a: __m512i, b: __m512i) -> __m512i {
+    map2!(i16x32, from_i16x32, a, b, |x, y| x.saturating_add(y))
+}
+#[inline(always)]
+pub fn _mm512_mask_or_epi32(src: __m512i, k: __mmask16, a: __m512i, b: __m512i) -> __m512i {
+    masked2!(u32x16, from_u32x16, src, k, a, b, |x, y| x | y)
+}
+#[inline(always)]
+pub fn _mm512_srai_epi32<const IMM8: u32>(a: __m512i) -> __m512i {
+    map1!(i32x16, from_i32x16, a, |x| x >> IMM8.min(31))
+}
+#[inline(always)]
+pub fn _mm512_srli_epi16<const IMM8: u32>(a: __m512i) -> __m512i {
+    map1!(u16x32, from_u16x32, a, |x| if IMM8 > 15 { 0 } else { x >> IMM8 })
+}
+/// `vpackssdw`: per 128-bit lane, four saturated words of `a` then four of `b`.
+#[inline(always)]
+pub fn _mm512_packs_epi32(a: __m512i, b: __m512i) -> __m512i {
+    let (a, b) = (i32x16(a), i32x16(b));
+    let sat = |x: i32| x.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    let mut r = [0i16; 32];
+    for l in 0..4 {
+        for i in 0..4 {
+            r[8 * l + i] = sat(a[4 * l + i]);
+            r[8 * l + 4 + i] = sat(b[4 * l + i]);
+        }
+    }
+    from_i16x32(r)
+}
+/// `vpshufd`: dword `i` of each 128-bit lane is dword `(MASK >> 2 i) & 3` of that lane.
+#[inline(always)]
+pub fn _mm512_shuffle_epi32<const MASK: i32>(a: __m512i) -> __m512i {
+    let a = u32x16(a);
+    let mut r = [0u32; 16];
+    for l in 0..4 {
+        for i in 0..4 {
+            r[4 * l + i] = a[4 * l + ((MASK as usize >> (2 * i)) & 3)];
+        }
+    }
+    from_u32x16(r)
+}
+#[inline(always)]
+pub fn _mm512_permutexvar_epi64(idx: __m512i, a: __m512i) -> __m512i {
+    let (idx, a) = (u64x8(idx), u64x8(a));
+    from_u64x8(core::array::from_fn(|i| a[(idx[i] & 7) as usize]))
+}
+#[inline(always)]
+pub fn _mm512_permutexvar_epi16(idx: __m512i, a: __m512i) -> __m512i {
+    // Word index `k = idx & 31` becomes the byte pair `(2k, 2k + 1)` of a 64-byte `tbl`.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is part of the aarch64 baseline; the views are 64-byte arrays.
+    unsafe {
+        use core::arch::aarch64::*;
+        let (ix, ta) = (u16x32(idx), u8x64(a));
+        let mut r = [0u8; 64];
+        let table = vld1q_u8_x4(ta.as_ptr());
+        let (mask, pair) = (vdupq_n_u16(31), vdupq_n_u16(0x0100));
+        for c in 0..4 {
+            let k = vandq_u16(vld1q_u16(ix.as_ptr().add(8 * c)), mask);
+            let k2 = vshlq_n_u16::<1>(k);
+            let bytes = vreinterpretq_u8_u16(vaddq_u16(vorrq_u16(k2, vshlq_n_u16::<8>(k2)), pair));
+            vst1q_u8(r.as_mut_ptr().add(16 * c), vqtbl4q_u8(table, bytes));
+        }
+        return from_u8x64(r);
+    }
+    #[allow(unreachable_code)]
+    let (idx, a) = (u16x32(idx), u16x32(a));
+    from_u16x32(core::array::from_fn(|i| a[(idx[i] & 31) as usize]))
+}
+#[inline(always)]
+pub fn _mm512_broadcast_i32x4(a: __m128i) -> __m512i {
+    __m512i([a.0[0], a.0[1], a.0[0], a.0[1], a.0[0], a.0[1], a.0[0], a.0[1]])
+}
+/// `vpsrldq`: each 128-bit lane shifted right by `IMM8` bytes, zeros shifted in.
+#[inline(always)]
+pub fn _mm512_bsrli_epi128<const IMM8: i32>(a: __m512i) -> __m512i {
+    let a = u8x64(a);
+    let s = (IMM8 as u32 & 0xff) as usize;
+    from_u8x64(core::array::from_fn(|i| {
+        let (l, j) = (i / 16, i % 16);
+        if s > 15 || j + s > 15 { 0 } else { a[16 * l + j + s] }
+    }))
+}
+/// `vpslldq`: each 128-bit lane shifted left by `IMM8` bytes, zeros shifted in.
+#[inline(always)]
+pub fn _mm512_bslli_epi128<const IMM8: i32>(a: __m512i) -> __m512i {
+    let a = u8x64(a);
+    let s = (IMM8 as u32 & 0xff) as usize;
+    from_u8x64(core::array::from_fn(|i| {
+        let (l, j) = (i / 16, i % 16);
+        if s > 15 || j < s { 0 } else { a[16 * l + j - s] }
+    }))
+}
+#[inline(always)]
+pub fn _mm_xor_si128(a: __m128i, b: __m128i) -> __m128i {
+    __m128i([a.0[0] ^ b.0[0], a.0[1] ^ b.0[1]])
+}
+/// `pslldq`: the 128 bits shifted left by `IMM8` bytes.
+#[inline(always)]
+pub fn _mm_slli_si128<const IMM8: i32>(a: __m128i) -> __m128i {
+    let a = u8x16(a);
+    let s = (IMM8 as u32 & 0xff) as usize;
+    from_u8x16(core::array::from_fn(|j| if s > 15 || j < s { 0 } else { a[j - s] }))
+}
+#[inline(always)]
+pub fn _mm256_and_si256(a: __m256i, b: __m256i) -> __m256i {
+    __m256i(core::array::from_fn(|i| a.0[i] & b.0[i]))
+}
+#[inline(always)]
+pub fn _mm256_add_epi16(a: __m256i, b: __m256i) -> __m256i {
+    let (a, b) = (i16x16(a), i16x16(b));
+    from_i16x16(core::array::from_fn(|i| a[i].wrapping_add(b[i])))
+}
+#[inline(always)]
+pub fn _mm256_set1_epi16(a: i16) -> __m256i {
+    from_i16x16([a; 16])
+}
+#[inline(always)]
+pub unsafe fn _mm512_maskz_loadu_epi32(k: __mmask16, p: *const i32) -> __m512i {
+    let mut r = [0i32; 16];
+    for i in 0..16 {
+        if (k >> i) & 1 == 1 {
+            r[i] = p.add(i).read_unaligned();
+        }
+    }
+    from_i32x16(r)
+}
+#[inline(always)]
+pub unsafe fn _mm512_mask_storeu_epi16(p: *mut i16, k: __mmask32, a: __m512i) {
+    let a = i16x32(a);
+    for i in 0..32 {
+        if (k >> i) & 1 == 1 {
+            p.add(i).write_unaligned(a[i]);
+        }
+    }
+}
+#[inline(always)]
+pub fn _mm512_set1_ps(a: f32) -> __m512 {
+    __m512([a; 16])
+}
+#[inline(always)]
+pub fn _mm512_mul_ps(a: __m512, b: __m512) -> __m512 {
+    __m512(core::array::from_fn(|i| a.0[i] * b.0[i]))
+}
+/// `vcvtdq2ps`: round to nearest even, as under the default MXCSR.
+#[inline(always)]
+pub fn _mm512_cvtepi32_ps(a: __m512i) -> __m512 {
+    let a = i32x16(a);
+    __m512(core::array::from_fn(|i| a[i] as f32))
+}
+/// `vcvtps2dq` with an explicit rounding: NaN and values outside `i32` give `0x80000000`.
+#[inline(always)]
+pub fn _mm512_cvt_roundps_epi32<const ROUNDING: i32>(a: __m512) -> __m512i {
+    from_i32x16(core::array::from_fn(|i| {
+        let x = a.0[i];
+        let r = match ROUNDING & 7 {
+            _MM_FROUND_TO_NEG_INF => x.floor(),
+            _MM_FROUND_TO_POS_INF => x.ceil(),
+            _MM_FROUND_TO_ZERO => x.trunc(),
+            _ => x.round_ties_even(),
+        };
+        if r.is_nan() || r < -2147483648.0 || r >= 2147483648.0 { i32::MIN } else { r as i32 }
+    }))
 }
 
 #[cfg(test)]

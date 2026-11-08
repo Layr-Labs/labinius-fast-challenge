@@ -478,12 +478,12 @@ pub fn f162_bytes(count: usize) -> usize {
 mod avx512 {
     use super::{residue_bits, WireError};
     use crate::ring::{PowerOfThreeRingElementWithLimbs, N162};
-    use core::arch::x86_64::*;
+    use crate::arch::*;
 
     /// Sixteen `bits`-wide fields starting `phase` bits into a 64-byte load: the byte permute
     /// that brings each field's four bytes into its dword lane, and the shift that then aligns
     /// it.
-    #[target_feature(enable = "avx512f")]
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f"))]
     unsafe fn field_lanes(bits: u32, phase: u32) -> (__m512i, __m512i) {
         let mut bytes = [0u8; 64];
         let mut shifts = [0i32; 16];
@@ -502,7 +502,7 @@ mod avx512 {
 
     /// The residues of every limb of every element out of the bit-packed `bytes`, sixteen
     /// fields per step, range-checked and centred in the lanes.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+    #[cfg_attr(target_arch = "x86_64", target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi"))]
     pub(super) unsafe fn unpack_residues(
         primes: &[u16],
         bytes: &[u8],

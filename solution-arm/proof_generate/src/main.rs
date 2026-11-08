@@ -1,900 +1,1792 @@
-//! The ARM track's prover: the CLI, transcript and proof format of the x86 track's `labinius-fast`,
-//! computed without AVX-512.
+//! Packed-binary PCS opening, including the GHASH-to-F162 field switch.
 //!
-//! The default commitment modulus is `Q = 3889 * 9721 * 17497` ([`ntt::MODULUS`]). Every factor is
-//! `1 mod 1944`, so the commitment `C_j = A W_j` is computed per prime through number-theoretic
-//! transforms of `R_648` and recombined by the Chinese remainder theorem ([`ntt`]). Any other
-//! modulus the checker accepts takes the earlier paths: below [`FAST_MODULUS`] a binary witness
-//! ring element makes `A_m W_{j,m}` a sum of shifted copies of `A_m`, eight coefficients per lookup
-//! of a 256-entry table of partial sums (the "four Russians" trick); above it the schoolbook
-//! product. The field switch, row evaluation, and fold follow the checker's reference prover.
-mod hugealloc;
-mod output;
-use output::{Output, ProofParts};
-mod ntt;
-
-#[global_allocator]
-static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
-#[allow(dead_code)]
-mod rq;
-
-use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
-use labinius::eval::eq_table;
+//! The default integer modulus is9721*55*2^16. One witness NTT supplies
+//! the base residue and six auxiliary public coefficient banks. Exact public
+//! moments certify128-pair chunks. The prover consumes the fresh table, runs
+//! the GHASH-to-F162 switch and opening, and writes the unchanged proof format.
+use bincode::Options;
+use labinius::challenge::{
+    sample_short_challenges_parallel, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT,
+};
 use labinius::fields::{
     crossfield as cf,
     scalar::{B128, F162},
 };
+#[cfg(test)]
+use labinius::key::CommitmentKey;
+use labinius::params::N;
 use labinius::ring::Representation;
-use labinius::scheme::FoldingSource;
-use labinius::{wire, FoldedWitness, RingElement648, RowEvaluation, Transcript};
-#[cfg(test)]
-use serde::Serialize;
+use labinius::scheme::*;
+use labinius::{wire, Transcript};
+use serde::{Deserialize, Serialize};
 
-const LOG_VARS: usize = 31;
-const LOG_PACKED: usize = LOG_VARS - cf::LOG_PACK;
-const COLUMN_LOG: u32 = 10;
-const COLUMNS: usize = 1 << COLUMN_LOG;
-const ROW_LOG: usize = LOG_PACKED - COLUMN_LOG as usize;
-const COLUMN_LEN: usize = 1 << ROW_LOG;
-const RING_ELEMENTS: usize = COLUMN_LEN / 4;
-const LIMIT: u64 = 64 * 1024 * 1024;
-const MIN_MODULUS: u128 = 34_816_965_049;
-/// The default commitment modulus: the product of the three transform primes.
-/// The hybrid commitment matrix in the transform domain, built by build.rs (empty when the build
-/// host could not; the prover then builds it at run time).
+mod keygen;
+mod modulus_choice;
+mod parameters;
+/// Byte-for-byte the checker's `rq.rs`, so that the two sides of the format can be diffed. A
+/// release build of the prover only uses the matrix expansion and the packer; the rest is what
+/// the tests check the proof against.
+#[allow(dead_code)]
+mod rq;
+use parameters::{COLUMNS, COLUMN_LEN, COLUMN_LOG, LOG_PACKED, LOG_VARS, MODULUS, RING_ELEMENTS};
+
+/// The key of the default modulus, precomputed by `build.rs` and embedded as the bytes of its
+/// batches (empty when the build host could not run the kernels). 64-byte aligned so the
+/// batches are read in place.
 #[repr(C, align(64))]
-struct Aligned64<T: ?Sized>(T);
-const HYBRID_MATRIX_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/hybrid-matrix.bin")).len();
-static HYBRID_MATRIX: Aligned64<[u8; HYBRID_MATRIX_LEN]> =
-    Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/hybrid-matrix.bin")));
-macro_rules! image {
-    ($name:ident, $file:literal) => {
-        static $name: &Aligned64<[u8]> = &Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/", $file)));
-    };
-}
-// The SMS matrix images, built by build.rs (empty when the build host could not; the prover then
-// builds the matrix at run time).
-image!(SMS_DATA, "sms-data.bin");
-image!(SMS_MEANS, "sms-means.bin");
-image!(SMS_MU, "sms-mu.bin");
-image!(SMS_META, "sms-meta.bin");
-const MODULUS: u128 = ntt::neon::sms::MODULUS;
+struct Aligned64<T>(T);
+/// 2 MiB aligned: with the binary's 2 MiB segment alignment (`build.rs`) the key image starts on
+/// a huge-page boundary of both the address space and the file (e-man07, submission 721d445d).
+#[repr(C, align(2097152))]
+struct Aligned2M<T>(T);
+const EMBEDDED_KEY_LEN: usize = include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")).len();
+static EMBEDDED_KEY: Aligned64<[u8; EMBEDDED_KEY_LEN]> =
+    Aligned64(*include_bytes!(concat!(env!("OUT_DIR"), "/key.bin")));
 
-/// Coefficients of a witness ring element per table lookup in [`commit`].
-const GROUP: usize = 8;
-/// Coefficients a binary witness ring element can have set: F162 lifts B128, so bit `p < 128`.
-const WITNESS_COEFFICIENTS: usize = 4 * 128;
-const GROUPS: usize = WITNESS_COEFFICIENTS / GROUP;
-/// One table row: `A_m` shifted by up to `GROUP - 1`, padded to an even length.
-const ROW: usize = (GROUP - 1 + rq::N + 1) & !1;
-/// The unreduced product of a witness column with `A`, padded like [`ROW`].
-const RAW: usize = (GROUPS - 1) * GROUP + ROW;
-/// Largest modulus [`commit`]'s `u64` accumulator holds: a raw coefficient sums at most
-/// `WITNESS_COEFFICIENTS * RING_ELEMENTS = 2^21` residues below `Q`.
-const FAST_MODULUS: u128 = 1 << 43;
-/// Raw coefficients [`commit`] sums in registers per pass over a column's groups.
-const BLOCK: usize = 32;
-/// A table row stored between a block of zeros on either side, so that every block-sized
-/// window a group can reach reads in bounds, zeros outside the row.
-const PADDED: usize = BLOCK + ROW + BLOCK;
-/// Output blocks per column, covering the raw product.
-const BLOCKS: usize = RAW.div_ceil(BLOCK);
-/// How many blocks ahead [`add_block`] prefetches each group's table window; 0 disables it.
-const PREFETCH_BLOCKS: usize = 1;
+const LIMIT: u64 = 64 * 1024 * 1024;
 
-#[cfg(test)]
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Proof {
     version: u32,
     modulus: u128,
+    #[serde(serialize_with = "serialize_blob")]
     commitment: Vec<u8>,
     partials: Vec<u128>,
     rounds: Vec<[[u64; 3]; 2]>,
     opened: [u64; 3],
+    #[serde(serialize_with = "serialize_blob")]
     row: Vec<u8>,
+    #[serde(serialize_with = "serialize_blob")]
     folded: Vec<u8>,
 }
-
-#[cfg(test)]
-fn codec() -> impl bincode::Options {
-    use bincode::Options;
+/// A `Vec<u8>` as one byte string: under this codec's fixed-width encoding that is the same
+/// `u64` length and the same bytes a sequence of `u8` gives, written as one block instead of
+/// one byte at a time. The checker deserialises it as the `Vec<u8>` it always was.
+fn serialize_blob<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bytes(bytes)
+}
+fn codec() -> impl Options {
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_limit(LIMIT)
         .reject_trailing_bytes()
 }
-
+use keygen::params;
 fn seed() -> [u8; 32] {
     let s = std::env::var("LABINIUS_SEED").expect("LABINIUS_SEED is required");
     assert_eq!(s.len(), 64);
     core::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("invalid seed"))
 }
 
-fn parse_modulus(text: &str) -> Result<u128, String> {
-    let q: u128 = text
-        .parse()
-        .map_err(|_| format!("not a decimal integer: {text}"))?;
-    if q < MIN_MODULUS {
-        return Err("commitment modulus is below the security bound".into());
-    }
-    if q >= rq::MAX_MODULUS {
-        return Err("commitment modulus is above what the checker's arithmetic covers".into());
-    }
-    Ok(q)
-}
-
+/// Threads the parallel phases use: what the sandbox lets the process see.
 fn threads() -> usize {
     labinius::par::threads()
 }
 
-/// The read-only file mapping avoids a 256 MiB copy. Other platforms retain the owned path.
+// =============================================================================================
+// the witness table, read in place
+// =============================================================================================
+
+#[cfg(target_os = "linux")]
+mod sys {
+    use core::ffi::c_void;
+    extern "C" {
+        pub fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
+        pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+        pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        pub fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+    }
+    pub const PROT_NONE: i32 = 0;
+    pub const PROT_READ: i32 = 1;
+    pub const PROT_WRITE: i32 = 2;
+    pub const MAP_SHARED: i32 = 1;
+    pub const MAP_FIXED: i32 = 0x10;
+    pub const MAP_PRIVATE: i32 = 2;
+    pub const MAP_ANONYMOUS: i32 = 0x20;
+    pub const MAP_NORESERVE: i32 = 0x4000;
+    pub const MADV_DONTNEED: i32 = 4;
+    pub const MADV_HUGEPAGE: i32 = 14;
+    /// Linux 5.14+: fault the range in now, read-only, without blocking a later writer.
+    pub const MADV_POPULATE_READ: i32 = 22;
+    /// Linux 5.14+: fault the range in now, writable (for a shared file mapping: page-cache pages
+    /// allocated and their blocks reserved, as a first write would).
+    pub const MADV_POPULATE_WRITE: i32 = 23;
+}
+
+// =============================================================================================
+// memory: large allocations on huge pages
+// =============================================================================================
+
+/// The process's allocator: glibc's for everything below [`huge::LARGE`], and for every larger
+/// block a mapping of its own, 2 MB aligned, with transparent huge pages requested.
+///
+/// The prover's big buffers (the commitment rows, the commitment and fold outputs, the proof's
+/// byte fields, the switch's tables) are written once and freed whole. On 4 KB pages each of
+/// them costs one fault and one zeroed page per 4 KB when it is first written, and the same
+/// number of page frees when it is unmapped — and whatever is still mapped at the end is unmapped
+/// by the kernel in the exit path, after the proof is written, inside the measured time (about
+/// 0.25 us per 4 KB page: 2.2 ms for the ~30 MB the baseline still held). A huge page is one fault,
+/// one 2 MB clear and one free.
+#[cfg(target_os = "linux")]
+mod huge {
+    use super::sys;
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    const HUGE: usize = 1 << 21;
+    /// Blocks at least this large get a mapping of their own.
+    pub const LARGE: usize = 1 << 20;
+    /// Blocks from this size up to [`LARGE`] (alignment at most this) come from huge-page chunks
+    /// in quarter-octave classes, each class recycling its blocks through a free list (never
+    /// returned to the kernel). glibc served them from per-thread arenas that it trimmed back to
+    /// the kernel (`MADV_DONTNEED`) when they were freed, and the next allocation faulted the
+    /// pages in again; larger per-dispatch buffers (the fold's ~840 KB per worker) were mmapped
+    /// and unmapped each time. Blocks are carved with a 64-byte gap between them, not at
+    /// power-of-two offsets: the commitment's sixty-four 6 KB accumulators at 8 KB-aligned
+    /// addresses all fell into the same cache sets.
+    const MEDIUM: usize = 1 << 16;
+    const LISTS: usize = 4 * ((LARGE / MEDIUM).trailing_zeros() as usize + 1);
+    /// Gap between consecutively carved blocks.
+    const GAP: usize = 64;
+
+    pub struct Alloc;
+
+    #[inline]
+    fn large(size: usize, align: usize) -> bool {
+        size >= LARGE && align <= HUGE
+    }
+
+    #[inline]
+    fn medium(size: usize, align: usize) -> bool {
+        size >= MEDIUM && size < LARGE && align <= MEDIUM
+    }
+
+    /// A medium request's block size (`size` rounded up to a quarter of its octave) and the
+    /// free list of that size.
+    #[inline]
+    fn class(size: usize) -> (usize, usize) {
+        let k = (usize::BITS - 1 - (size - 1).leading_zeros()) as usize;
+        let step = 1usize << (k - 2);
+        let bytes = (size + step - 1) & !(step - 1);
+        (bytes, 4 * (k - MEDIUM.trailing_zeros() as usize + 1) + (bytes >> (k - 2)) - 5)
+    }
+
+    struct SpinLock(AtomicBool);
+
+    impl SpinLock {
+        #[inline]
+        fn lock(&self) {
+            while self
+                .0
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+        }
+        #[inline]
+        fn unlock(&self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    /// A class's free blocks: an intrusive LIFO list (a free block's first word is the next).
+    struct FreeList {
+        lock: SpinLock,
+        head: UnsafeCell<*mut u8>,
+    }
+
+    /// The chunk medium blocks are carved from.
+    struct Carve {
+        lock: SpinLock,
+        at: UnsafeCell<usize>,
+        end: UnsafeCell<usize>,
+    }
+
+    // Guarded by their locks.
+    unsafe impl Sync for FreeList {}
+    unsafe impl Sync for Carve {}
+
+    static FREE: [FreeList; LISTS] = [const {
+        FreeList {
+            lock: SpinLock(AtomicBool::new(false)),
+            head: UnsafeCell::new(core::ptr::null_mut()),
+        }
+    }; LISTS];
+    static CARVE: Carve = Carve {
+        lock: SpinLock(AtomicBool::new(false)),
+        at: UnsafeCell::new(0),
+        end: UnsafeCell::new(0),
+    };
+
+    /// A medium block for `size` bytes at `align`, and whether it is fresh (still zero).
+    unsafe fn medium_alloc(size: usize, align: usize) -> (*mut u8, bool) {
+        let (bytes, i) = class(size);
+        let list = &FREE[i];
+        list.lock.lock();
+        let head = *list.head.get();
+        if !head.is_null() && head as usize % align == 0 {
+            *list.head.get() = *(head as *mut *mut u8);
+            list.lock.unlock();
+            return (head, false);
+        }
+        list.lock.unlock();
+        let align = align.max(GAP);
+        CARVE.lock.lock();
+        let mut at = (*CARVE.at.get() + align - 1) & !(align - 1);
+        if *CARVE.end.get() == 0 || at + bytes > *CARVE.end.get() {
+            let chunk = map(HUGE) as usize;
+            if chunk == 0 {
+                CARVE.lock.unlock();
+                return (core::ptr::null_mut(), false);
+            }
+            at = chunk;
+            *CARVE.end.get() = chunk + HUGE;
+        }
+        *CARVE.at.get() = at + bytes + GAP;
+        CARVE.lock.unlock();
+        (at as *mut u8, true)
+    }
+
+    unsafe fn medium_free(p: *mut u8, size: usize) {
+        let list = &FREE[class(size).1];
+        list.lock.lock();
+        *(p as *mut *mut u8) = *list.head.get();
+        *list.head.get() = p;
+        list.lock.unlock();
+    }
+
+    #[inline]
+    fn span(size: usize) -> usize {
+        (size + HUGE - 1) & !(HUGE - 1)
+    }
+
+    /// A fresh (zeroed) 2 MB-aligned mapping of `span(size)` bytes, or null.
+    unsafe fn map(size: usize) -> *mut u8 {
+        let len = span(size);
+        let raw = sys::mmap(
+            core::ptr::null_mut(),
+            len + HUGE,
+            sys::PROT_READ | sys::PROT_WRITE,
+            sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+            -1,
+            0,
+        );
+        if raw as isize == -1 || raw.is_null() {
+            return core::ptr::null_mut();
+        }
+        let raw = raw as usize;
+        let start = (raw + HUGE - 1) & !(HUGE - 1);
+        if start > raw {
+            sys::munmap(raw as *mut _, start - raw);
+        }
+        let (end, raw_end) = (start + len, raw + len + HUGE);
+        if raw_end > end {
+            sys::munmap(end as *mut _, raw_end - end);
+        }
+        // Advisory: on a kernel without THP the block is ordinary pages.
+        sys::madvise(start as *mut _, len, sys::MADV_HUGEPAGE);
+        start as *mut u8
+    }
+
+    unsafe impl GlobalAlloc for Alloc {
+        #[inline]
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if large(l.size(), l.align()) {
+                map(l.size())
+            } else if medium(l.size(), l.align()) {
+                medium_alloc(l.size(), l.align()).0
+            } else {
+                System.alloc(l)
+            }
+        }
+
+        #[inline]
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if large(l.size(), l.align()) {
+                map(l.size())
+            } else if medium(l.size(), l.align()) {
+                let (p, fresh) = medium_alloc(l.size(), l.align());
+                if !p.is_null() && !fresh {
+                    core::ptr::write_bytes(p, 0, l.size());
+                }
+                p
+            } else {
+                System.alloc_zeroed(l)
+            }
+        }
+
+        #[inline]
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if large(l.size(), l.align()) {
+                sys::munmap(p as *mut _, span(l.size()));
+            } else if medium(l.size(), l.align()) {
+                medium_free(p, l.size())
+            } else {
+                System.dealloc(p, l)
+            }
+        }
+
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
+            let (old_large, new_large) = (large(l.size(), l.align()), large(new_size, l.align()));
+            let (old_medium, new_medium) = (medium(l.size(), l.align()), medium(new_size, l.align()));
+            if !old_large && !new_large && !old_medium && !new_medium {
+                return System.realloc(p, l, new_size);
+            }
+            if old_large && new_large && span(new_size) == span(l.size()) {
+                return p;
+            }
+            if old_medium && new_medium && class(new_size).0 == class(l.size()).0 {
+                return p;
+            }
+            let q = self.alloc(Layout::from_size_align_unchecked(new_size, l.align()));
+            if !q.is_null() {
+                core::ptr::copy_nonoverlapping(p, q, l.size().min(new_size));
+                self.dealloc(p, l);
+            }
+            q
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: huge::Alloc = huge::Alloc;
+
+/// The harness witness table: `(1 << LOG_VARS) / 8` BLAKE3 XOF bytes, each 16 little-endian
+/// bytes one GHASH word. The timed prover does not recompute it, and does not copy it either: on
+/// Linux the file is mapped read-only and the mapping is read as the `B128` words it is (`B128`
+/// is `repr(transparent)` over its little-endian `u128`, and the host is little-endian). The
+/// pages are faulted in by [`Table::populate`] on a thread of its own while the key is set up.
+/// Elsewhere, or if the mapping fails, the file is read into a buffer.
 enum Table {
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
-    Mapped { ptr: *mut u8, len: usize },
+    #[cfg(target_os = "linux")]
+    Mapped {
+        ptr: *const B128,
+        bytes: usize,
+    },
     Owned(Vec<B128>),
 }
 
-#[cfg(all(target_os = "linux", target_endian = "little"))]
-mod table_sys {
-    extern "C" {
-        pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-        pub fn munmap(addr: *mut u8, len: usize) -> i32;
-        pub fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    }
-}
+impl Table {
+    const WORDS: usize = 1 << LOG_PACKED;
+    const BYTES: usize = (1 << LOG_VARS) / 8;
 
-impl std::ops::Deref for Table {
-    type Target = [B128];
-
-    fn deref(&self) -> &[B128] {
-        match self {
-            #[cfg(all(target_os = "linux", target_endian = "little"))]
-            Self::Mapped { ptr, len } => {
-                // SAFETY: this mapping is read-only, alive until Drop, page aligned, and contains
-                // exactly len little-endian words. B128 is transparent over u128.
-                unsafe { std::slice::from_raw_parts(*ptr as *const B128, *len) }
+    fn load(path: &str) -> Table {
+        assert!(cfg!(target_endian = "little"), "the table is little-endian");
+        assert_eq!(core::mem::size_of::<B128>(), 16, "B128 is 16 bytes");
+        let file = std::fs::File::open(path).expect("open witness table");
+        let len = file.metadata().expect("stat witness table").len();
+        assert_eq!(len, Self::BYTES as u64, "witness table has the wrong length");
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let ptr = unsafe {
+                sys::mmap(
+                    core::ptr::null_mut(),
+                    Self::BYTES,
+                    sys::PROT_READ,
+                    sys::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if ptr as isize != -1 && !ptr.is_null() && (ptr as usize) % 16 == 0 {
+                return Table::Mapped {
+                    ptr: ptr as *const B128,
+                    bytes: Self::BYTES,
+                };
             }
-            Self::Owned(words) => words,
+        }
+        let mut words = vec![B128::ZERO; Self::WORDS];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, Self::BYTES)
+        };
+        let mut file = file;
+        std::io::Read::read_exact(&mut file, bytes).expect("witness table has the wrong length");
+        let mut extra = [0u8; 1];
+        let extra_n = std::io::Read::read(&mut file, &mut extra).expect("read witness table");
+        assert_eq!(extra_n, 0, "witness table has the wrong length");
+        Table::Owned(words)
+    }
+
+    fn words(&self) -> &[B128] {
+        match self {
+            #[cfg(target_os = "linux")]
+            Table::Mapped { ptr, .. } => unsafe { std::slice::from_raw_parts(*ptr, Self::WORDS) },
+            Table::Owned(v) => v,
         }
     }
+
 }
+
+/// Fault the words' pages in, page-cache pages into page tables: `MADV_POPULATE_READ` where the
+/// kernel has it (older kernels refuse it, harmlessly), one read per page otherwise (the
+/// fault-around maps a run of pages per fault). A read-only touch, so it runs on another thread
+/// while the key is built.
+fn populate_words(words: &[B128], keys: &[u8], threads: usize) {
+    let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
+    let kruns = labinius::par::ranges(keys.len(), threads, 4096);
+    labinius::par::pool().run(runs.len().max(kruns.len()), |i| {
+        if let Some(r) = kruns.get(i) {
+            populate_part(keys[r.clone()].as_ptr() as usize, r.len());
+        }
+        if let Some(r) = runs.get(i) {
+            populate_part(words[r.clone()].as_ptr() as usize, r.len() * 16);
+        }
+    });
+}
+
+fn populate_part(addr: usize, bytes: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        // whole pages: the range need not start on one
+        let start = addr & !4095;
+        let done = unsafe {
+            sys::madvise(start as *mut core::ffi::c_void, bytes + (addr - start), sys::MADV_POPULATE_READ)
+        };
+        if done == 0 {
+            return;
+        }
+    }
+    let mut off = 0;
+    let mut sink = 0u8;
+    while off < bytes {
+        sink ^= unsafe { core::ptr::read_volatile((addr as *const u8).add(off)) };
+        off += 4096;
+    }
+    std::hint::black_box(sink);
+}
+
+/// Drop the words' and the keys' page-table entries (`MADV_DONTNEED`), a slice of each per task.
+/// Both are read-only file mappings: the page cache keeps the pages, and a later read faults the
+/// same bytes back in. Whatever is still mapped at the end is torn down by the exit on one CPU,
+/// inside the measured time.
+#[cfg(target_os = "linux")]
+fn release_words(words: &[B128], keys: &[u8], threads: usize) {
+    let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
+    let kruns = labinius::par::ranges(keys.len(), threads, 4096);
+    let release = |addr: usize, bytes: usize| {
+        let start = addr & !4095;
+        unsafe { sys::madvise(start as *mut core::ffi::c_void, bytes + (addr - start), sys::MADV_DONTNEED) };
+    };
+    labinius::par::pool().run(runs.len().max(kruns.len()), |i| {
+        if let Some(r) = kruns.get(i) {
+            release(keys[r.clone()].as_ptr() as usize, r.len());
+        }
+        if let Some(r) = runs.get(i) {
+            release(words[r.clone()].as_ptr() as usize, r.len() * 16);
+        }
+    });
+}
+
+// A read-only mapping: any thread may read or unmap it.
+#[cfg(target_os = "linux")]
+unsafe impl Send for Table {}
 
 impl Drop for Table {
     fn drop(&mut self) {
-        #[cfg(all(target_os = "linux", target_endian = "little"))]
-        if let Self::Mapped { ptr, len } = self {
-            unsafe { table_sys::munmap(*ptr, 16 * *len) };
+        #[cfg(target_os = "linux")]
+        if let Table::Mapped { ptr, bytes } = self {
+            unsafe { sys::munmap(*ptr as *mut core::ffi::c_void, *bytes) };
         }
     }
 }
 
-fn read_table(path: &str) -> Table {
-    load_table(path, 1 << LOG_PACKED)
+#[cfg(test)]
+fn trace(seed: &[u8; 32]) -> Vec<B128> {
+    let mut h = blake3::Hasher::new_keyed(seed);
+    h.update(b"labinius-fast/binary-table/v1");
+    let mut b = vec![0; (1 << LOG_VARS) / 8];
+    h.finalize_xof().fill(&mut b);
+    b.chunks_exact(16)
+        .map(|v| B128(u128::from_le_bytes(v.try_into().unwrap())))
+        .collect()
 }
-
-fn load_table(path: &str, n: usize) -> Table {
-    use std::os::unix::fs::FileExt;
-    let file = std::fs::File::open(path).expect("read witness table");
-    let len = file.metadata().expect("read witness table").len();
-    assert_eq!(len, 16 * n as u64, "witness table has the wrong length");
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
-    if n != 0 {
-        use std::os::fd::AsRawFd;
-        // PROT_READ | MAP_PRIVATE: the trusted input is never writable.
-        let ptr = unsafe { table_sys::mmap(std::ptr::null_mut(), 16 * n, 1, 2, file.as_raw_fd(), 0) };
-        if ptr as isize != -1 {
-            let base = ptr as usize;
-            // The range boundaries are 2 MiB aligned, also valid on 4/16/64 KiB kernels.
-            labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
-                if s < e {
-                    let addr = (base + 16 * s) as *mut u8;
-                    // Linux 5.14+: install the page-cache pages in parallel. Older kernels
-                    // simply fault on access. MADV_HUGEPAGE is a best-effort hint for the file.
-                    unsafe {
-                        table_sys::madvise(addr, 16 * (e - s), 14);
-                        table_sys::madvise(addr, 16 * (e - s), 22);
-                    }
-                }
-            });
-            return Table::Mapped { ptr, len: n };
-        }
-    }
-    let mut words = vec![0u128; n];
-    let per = n.div_ceil(threads()).max(1);
-    std::thread::scope(|scope| {
-        for (i, chunk) in words.chunks_mut(per).enumerate() {
-            let file = &file;
-            scope.spawn(move || {
-                // SAFETY: the bytes of initialized `u128`s; every pattern is a valid `u128`.
-                let bytes = unsafe {
-                    std::slice::from_raw_parts_mut(chunk.as_mut_ptr() as *mut u8, 16 * chunk.len())
-                };
-                file.read_exact_at(bytes, (16 * per * i) as u64)
-                    .expect("read witness table");
-            });
-        }
-    });
-    #[cfg(target_endian = "big")]
-    for w in words.iter_mut() {
-        *w = u128::from_le(*w);
-    }
-    let mut words = std::mem::ManuallyDrop::new(words);
-    // SAFETY: `B128` is `repr(transparent)` over `u128`: same size, alignment and validity.
-    Table::Owned(unsafe {
-        Vec::from_raw_parts(words.as_mut_ptr() as *mut B128, words.len(), words.capacity())
-    })
-}
-
 fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
     let mut t = Transcript::new(b"labinius-fast/v1");
     t.absorb_bytes(seed);
     t.absorb_u64(LOG_VARS as u64);
     t.absorb_u64(COLUMN_LOG as u64);
     t.absorb_bytes(&modulus.to_le_bytes());
-    t.absorb_bytes_parallel(commitment, labinius::par::threads());
+    // The 3.3 MB commitment hashed as blake3's subtrees on every core: the same transcript.
+    t.absorb_bytes_parallel(commitment, threads());
     t
 }
-
-/// The table of group `pattern`s for ring element `element` of `A`: row `s` is the sum of
-/// `A_m X^r` over the set bits `r` of `s`. Each row is a previous row plus one shifted copy.
-/// Row `s` occupies `table[s * PADDED..][..PADDED]` with its `ROW` coefficients from `BLOCK`.
-/// The table starts zeroed and only the coefficients are written, so row 0 and the padding
-/// stay zero; each row is written in one pass from the previous one.
-fn build_table(table: &mut [u64], element: &[u64]) {
-    for s in 1usize..1 << GROUP {
-        let r = s.ilog2() as usize;
-        let (done, rest) = table.split_at_mut(s * PADDED);
-        let src = &done[(s & !(1 << r)) * PADDED + BLOCK..][..ROW];
-        let dst = &mut rest[BLOCK..BLOCK + ROW];
-        dst[..r].copy_from_slice(&src[..r]);
-        for ((d, &x), &a) in dst[r..r + rq::N].iter_mut().zip(&src[r..r + rq::N]).zip(element) {
-            *d = x + a;
-        }
-        dst[r + rq::N..].copy_from_slice(&src[r + rq::N..]);
-    }
-}
-
-/// The groups whose shifted rows reach output block `b`: group `g` adds row coefficient `i - 8g`
-/// to output coefficient `i`, nonzero for `0 <= i - 8g < ROW`.
-const fn group_range(b: usize) -> (usize, usize) {
-    let first = b * BLOCK;
-    let lo = if first + 1 > ROW { (first + 1 - ROW).div_ceil(GROUP) } else { 0 };
-    let hi = (first + BLOCK - 1) / GROUP;
-    (lo, if hi < GROUPS - 1 { hi } else { GROUPS - 1 })
-}
-
-/// `acc += sum_g table[start_g + first..][..BLOCK]` for output block `b` of one column, with
-/// `start_g` the padded row of group `g`'s pattern moved back by its shift `8g`; the block's
-/// sums stay in registers across the groups.
-#[inline(always)]
-fn add_block(acc: &mut [u64], table: &[u64], starts: &[usize; GROUPS], b: usize) {
-    let (lo, hi) = group_range(b);
-    let first = b * BLOCK;
-    let out: &mut [u64; BLOCK] = (&mut acc[first..first + BLOCK]).try_into().unwrap();
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use core::arch::aarch64::*;
-        let mut sum: [uint64x2_t; BLOCK / 2] =
-            core::array::from_fn(|i| vld1q_u64(out.as_ptr().add(2 * i)));
-        for &start in &starts[lo..=hi] {
-            let at = start.wrapping_add(first);
-            if PREFETCH_BLOCKS > 0 {
-                // The same row's window `PREFETCH_BLOCKS` blocks on; a hint, never a fault.
-                let ahead = table.as_ptr().wrapping_add(at + PREFETCH_BLOCKS * BLOCK);
-                for line in 0..BLOCK / 8 {
-                    core::arch::asm!(
-                        "prfm pldl1keep, [{p}]",
-                        p = in(reg) ahead.wrapping_add(8 * line),
-                        options(nostack, preserves_flags, readonly)
-                    );
-                }
-            }
-            let row: &[u64; BLOCK] = table[at..at + BLOCK].try_into().unwrap();
-            for (i, s) in sum.iter_mut().enumerate() {
-                *s = vaddq_u64(*s, vld1q_u64(row.as_ptr().add(2 * i)));
-            }
-        }
-        for (i, s) in sum.iter().enumerate() {
-            vst1q_u64(out.as_mut_ptr().add(2 * i), *s);
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let mut sum = *out;
-        for &start in &starts[lo..=hi] {
-            let at = start.wrapping_add(first);
-            let row: &[u64; BLOCK] = table[at..at + BLOCK].try_into().unwrap();
-            for (s, &x) in sum.iter_mut().zip(row) {
-                *s += x;
-            }
-        }
-        *out = sum;
-    }
-}
-
-/// Group `g` of ring element `m` of a column as a table index. Coefficient `4 p + k` is bit `p`
-/// of word `k`, so the group's eight coefficients are bits `2g` and `2g + 1` of the four words.
-#[inline(always)]
-fn pattern(words: &[u128; 4], g: usize) -> usize {
-    let mut s = 0;
-    for (k, &w) in words.iter().enumerate() {
-        let pair = (w >> (2 * g)) as usize & 3;
-        s |= (pair & 1) << k | (pair >> 1) << (4 + k);
-    }
-    s
-}
-
-/// A raw product reduced modulo `q` and folded into `R_Q` with `X^648 = X^324 - 1`.
-fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
-    let mut r = vec![0u64; 2 * rq::N - 1];
-    for (slot, &x) in r.iter_mut().zip(raw) {
-        *slot = x % q;
-    }
-    for k in (rq::N..2 * rq::N - 1).rev() {
-        let v = r[k];
-        let up = &mut r[k - rq::SPLIT];
-        *up += v;
-        if *up >= q {
-            *up -= q;
-        }
-        let down = &mut r[k - rq::N];
-        *down += q - v;
-        if *down >= q {
-            *down -= q;
-        }
-    }
-    r[..rq::N].iter().map(|&x| x as u128).collect()
-}
-
-/// Every column's commitment, flattened. Columns go out over the cores; each worker walks the
-/// ring elements once, building that element's table and applying it to all of its columns.
-/// Per column the raw product is summed block by block: each `BLOCK` of output coefficients
-/// takes the slices of every group's table row that land on it while the block's sums stay in
-/// registers, so the accumulator is read and written once per block instead of once per group.
-///
-/// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
-fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
-    #[cfg(target_arch = "aarch64")]
-    if modulus == ntt::neon::sms::MODULUS {
-        use ntt::neon::sms;
-        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
-            .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
-        return sms::commit(values, &matrix, threads());
-    }
-    #[cfg(target_arch = "aarch64")]
-    if modulus == ntt::neon::hybrid::MODULUS {
-        use ntt::neon::hybrid;
-        let matrix = hybrid::HybridMatrix::from_image(&HYBRID_MATRIX.0, RING_ELEMENTS)
-            .unwrap_or_else(|| hybrid::matrix(RING_ELEMENTS, threads()));
-        return hybrid::commit(values, &matrix, threads());
-    }
-    if modulus == ntt::MODULUS {
-        return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
-    }
-    let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
-    if modulus >= FAST_MODULUS {
-        return commit_reference(values, &matrix, modulus);
-    }
-    let matrix: Vec<u64> = matrix.iter().map(|&a| a as u64).collect();
-    let q = modulus as u64;
-    let per = COLUMNS.div_ceil(threads());
-    let mut out = vec![0u128; COLUMNS * rq::N];
-    std::thread::scope(|scope| {
-        for (block, first) in out.chunks_mut(per * rq::N).zip((0..).step_by(per)) {
-            let matrix = &matrix;
-            scope.spawn(move || {
-                let count = block.len() / rq::N;
-                let mut table = vec![0u64; PADDED << GROUP];
-                let width = BLOCKS * BLOCK;
-                let mut raw = vec![0u64; count * width];
-                for (m, element) in matrix.chunks_exact(rq::N).enumerate() {
-                    build_table(&mut table, element);
-                    for (c, acc) in raw.chunks_exact_mut(width).enumerate() {
-                        let base = (first + c) * COLUMN_LEN + 4 * m;
-                        let words: [u128; 4] = core::array::from_fn(|k| values[base + k].0);
-                        let starts: [usize; GROUPS] = core::array::from_fn(|g| {
-                            (pattern(&words, g) * PADDED + BLOCK).wrapping_sub(GROUP * g)
-                        });
-                        for b in 0..BLOCKS {
-                            add_block(acc, &table, &starts, b);
-                        }
-                    }
-                }
-                for (target, acc) in block.chunks_exact_mut(rq::N).zip(raw.chunks_exact(width)) {
-                    target.copy_from_slice(&reduce(&acc[..RAW], q));
-                }
-            });
-        }
-    });
-    out
-}
-
-/// The checker's schoolbook commitment, for a modulus too wide for [`commit`]'s `u64` lanes.
-fn commit_reference(values: &[B128], matrix: &[u128], modulus: u128) -> Vec<u128> {
-    let column_len = 4 * (matrix.len() / rq::N);
-    let columns = values.len() / column_len;
-    let per = columns.div_ceil(threads());
-    let mut out = vec![0u128; columns * rq::N];
-    std::thread::scope(|scope| {
-        for (block, columns) in out
-            .chunks_mut(per * rq::N)
-            .zip(values.chunks(per * column_len))
-        {
-            scope.spawn(move || {
-                for (target, column) in block
-                    .chunks_mut(rq::N)
-                    .zip(columns.chunks_exact(column_len))
-                {
-                    let witness: Vec<F162> = column.iter().map(|&x| F162::from_b128(x)).collect();
-                    target.copy_from_slice(&rq::commit_binary_column(matrix, &witness, modulus));
-                }
-            });
-        }
-    });
-    out
-}
-
-fn dot_lifted(eq: &[F162], column: &[B128]) -> F162 {
-    cf::dot_lifted(eq, column)
-}
-
-fn row_evaluate(values: &[B128], p0: &[F162]) -> Vec<F162> {
-    let eq = eq_table(p0);
-    let mut out = vec![F162::ZERO; COLUMNS];
-    let eq = &eq;
-    labinius::par::for_each(
-        out.chunks_mut(ROW_BATCH).zip(values.chunks(ROW_BATCH * COLUMN_LEN)),
-        |(block, columns)| {
-            for (quad, columns) in block.chunks_exact_mut(4).zip(columns.chunks_exact(4 * COLUMN_LEN)) {
-                let cs: [&[B128]; 4] = core::array::from_fn(|c| &columns[c * COLUMN_LEN..][..COLUMN_LEN]);
-                quad.copy_from_slice(&cf::dot_lifted4(eq, cs));
-            }
-            let quads = block.len() / 4 * 4;
-            let (block, columns) = (&mut block[quads..], &columns[(quads * COLUMN_LEN).min(columns.len())..]);
-            for (pair, columns) in block.chunks_exact_mut(2).zip(columns.chunks_exact(2 * COLUMN_LEN)) {
-                let (c0, c1) = columns.split_at(COLUMN_LEN);
-                let [v0, v1] = cf::dot_lifted2(eq, c0, c1);
-                pair[0] = v0;
-                pair[1] = v1;
-            }
-            let done = block.len() / 2 * 2;
-            for (slot, column) in block[done..].iter_mut().zip(columns[done * COLUMN_LEN..].chunks_exact(COLUMN_LEN)) {
-                *slot = dot_lifted(eq, column);
-            }
-        },
-    );
-    out
-}
-
-const ROW_BATCH: usize = 32;
-
-/// The sumcheck coordinates split into the row point `p0` and the column point `p1`.
-fn split_point(coords: &[F162]) -> (Vec<F162>, Vec<F162>) {
-    assert_eq!(
-        coords.len(),
-        LOG_PACKED,
-        "one coordinate per packed variable"
-    );
-    let (high, low) = coords.split_at(COLUMN_LOG as usize);
+fn point(t: &mut Transcript) -> (Vec<B128>, Vec<B128>) {
     (
-        low.iter().rev().copied().collect(),
-        high.iter().rev().copied().collect(),
+        t.sample_b128(b"r-lo", 7),
+        t.sample_b128(b"r-hi", LOG_PACKED),
     )
 }
-
-fn folding_challenges(t: &mut Transcript, row: &RowEvaluation) -> Vec<ShortChallenge> {
-    row.absorb(t);
-    labinius::challenge::sample_short_challenges(t, COLUMNS, DEFAULT_WEIGHT, DEFAULT_BOUND)
-}
-
-/// `v_m = sum_j c_j W_{j,m}` over the integers. A challenge sits in `R_648` as `c(-X^4)`, so each
-/// of its terms adds or subtracts the column's binary element shifted by a multiple of four.
-fn fold_element(values: &[B128], challenges: &[ShortChallenge], m: usize) -> RingElement648 {
-    let mut raw = [0i32; 2 * rq::N];
-    let mut bits = [0i32; rq::N];
-    for (j, challenge) in challenges.iter().enumerate() {
-        let packed = &values[j * COLUMN_LEN + 4 * m..][..4];
-        for (k, x) in packed.iter().enumerate() {
-            for p in 0..128 {
-                bits[4 * p + k] = ((x.0 >> p) & 1) as i32;
-            }
-        }
-        for t in 0..challenge.weight {
-            let position = challenge.positions[t] as usize;
-            let negative = ((challenge.signs >> t) & 1 == 1) ^ (position % 2 == 1);
-            let window = &mut raw[4 * position..][..WITNESS_COEFFICIENTS];
-            if negative {
-                for (slot, &b) in window.iter_mut().zip(&bits) {
-                    *slot -= b;
-                }
-            } else {
-                for (slot, &b) in window.iter_mut().zip(&bits) {
-                    *slot += b;
-                }
-            }
-        }
-    }
-    for k in (rq::N..2 * rq::N - 1).rev() {
-        let value = raw[k];
-        raw[k - rq::SPLIT] += value;
-        raw[k - rq::N] -= value;
-    }
-    let mut element = RingElement648::zero(Representation::Coefficients);
-    for (slot, &value) in element.v.iter_mut().zip(&raw[..rq::N]) {
-        *slot = i16::try_from(value).expect("a fold coefficient does not fit the wire codec");
-    }
-    element
-}
-
-/// [`fold_element`] in narrow lanes: a raw coefficient gains at most one `+-1` per challenge
-/// term, so `sum_j weight_j <= i16::MAX` bounds every `i16` sum, and the latest columns are
-/// summed in `i8` lanes, sixteen to a vector, until their terms could reach `i8::MAX`. A column's
-/// bits become `0 / -1` byte masks in coefficient order; the ring reduction runs in `i32`.
-fn fold_element_narrow(values: &[B128], challenges: &[ShortChallenge], m: usize) -> RingElement648 {
-    let mut raw = [0i16; 2 * rq::N];
-    let mut near = [0i8; 2 * rq::N];
-    let mut pending = 0usize;
-    let mut mask = [0i8; WITNESS_COEFFICIENTS];
-    for (j, challenge) in challenges.iter().enumerate() {
-        if pending + challenge.weight > i8::MAX as usize {
-            flush(&mut raw, &mut near);
-            pending = 0;
-        }
-        pending += challenge.weight;
-        expand_mask(&values[j * COLUMN_LEN + 4 * m..][..4], &mut mask);
-        for t in 0..challenge.weight {
-            let position = challenge.positions[t] as usize;
-            let negative = ((challenge.signs >> t) & 1 == 1) ^ (position % 2 == 1);
-            let window = &mut near[4 * position..][..WITNESS_COEFFICIENTS];
-            if negative {
-                for (slot, &b) in window.iter_mut().zip(&mask) {
-                    *slot = slot.wrapping_add(b);
-                }
-            } else {
-                for (slot, &b) in window.iter_mut().zip(&mask) {
-                    *slot = slot.wrapping_sub(b);
-                }
-            }
-        }
-    }
-    flush(&mut raw, &mut near);
-    let mut wide = [0i32; 2 * rq::N];
-    for (w, &r) in wide.iter_mut().zip(&raw) {
-        *w = r as i32;
-    }
-    for k in (rq::N..2 * rq::N - 1).rev() {
-        let value = wide[k];
-        wide[k - rq::SPLIT] += value;
-        wide[k - rq::N] -= value;
-    }
-    let mut element = RingElement648::zero(Representation::Coefficients);
-    for (slot, &value) in element.v.iter_mut().zip(&wide[..rq::N]) {
-        *slot = i16::try_from(value).expect("a fold coefficient does not fit the wire codec");
-    }
-    element
-}
-
-/// `raw += near`, then `near = 0`.
-#[inline(always)]
-fn flush(raw: &mut [i16; 2 * rq::N], near: &mut [i8; 2 * rq::N]) {
-    for (r, n) in raw.iter_mut().zip(near.iter_mut()) {
-        *r = r.wrapping_add(*n as i16);
-        *n = 0;
-    }
-}
-
-/// `mask[4p + k] = -1` where bit `p` of `words[k]` is set, else `0`: witness coefficient order.
-#[inline(always)]
-fn expand_mask(words: &[B128], mask: &mut [i8; WITNESS_COEFFICIENTS]) {
-    assert_eq!(words.len(), 4);
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use core::arch::aarch64::*;
-        let bits: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-        let bits = vld1q_u8(bits.as_ptr());
-        let w: [uint8x16_t; 4] = core::array::from_fn(|k| vld1q_u8(words.as_ptr().add(k) as *const u8));
-        // Chunk c holds bits 16c..16c+16 of each word: bytes 2c and 2c+1, each spread over
-        // eight lanes and tested bit by bit, then interleaved word by word.
-        for c in 0..8u8 {
-            let idx = vcombine_u8(vdup_n_u8(2 * c), vdup_n_u8(2 * c + 1));
-            let v = uint8x16x4_t(
-                vtstq_u8(vqtbl1q_u8(w[0], idx), bits),
-                vtstq_u8(vqtbl1q_u8(w[1], idx), bits),
-                vtstq_u8(vqtbl1q_u8(w[2], idx), bits),
-                vtstq_u8(vqtbl1q_u8(w[3], idx), bits),
-            );
-            vst4q_u8(mask.as_mut_ptr().add(64 * c as usize) as *mut u8, v);
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    for (k, w) in words.iter().enumerate() {
-        for p in 0..128 {
-            mask[4 * p + k] = -(((w.0 >> p) & 1) as i8);
-        }
-    }
-}
-
-fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
-    // The NEON bit-sliced fold's 16-plane counters hold sums below 2^15.
-    #[cfg(target_arch = "aarch64")]
-    if challenges.iter().map(|c| c.weight).sum::<usize>() < 1 << 15 {
-        return fold_neon(values, challenges);
-    }
-    // The scheduled bit-sliced fold's 15-bit counters hold the total weight plus its padding.
-    if let Some(out) = fold_scheduled(values, challenges) {
-        return out;
-    }
-    // The bit-sliced fold's 16-plane counters hold sums below 2^15.
-    if challenges.iter().map(|c| c.weight).sum::<usize>() < 1 << 15 {
-        return fold_bitsliced(values, challenges);
-    }
-    fold_bytes(values, challenges)
-}
-
-/// The NEON bit-sliced fold (`fold_bits::neon`): 128-lane blocks, negacyclic slot pairs,
-/// plain-op full adders, the elements written in place.
-#[cfg(target_arch = "aarch64")]
-fn fold_neon(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
-    use labinius::fold_bits as fb;
-    const _: () = assert!(COLUMN_LEN % fb::neon::LANES == 0 && fb::N == rq::N);
-    let cs: Vec<fb::Challenge> = challenges
-        .iter()
-        .map(|c| fb::Challenge {
-            positions: c.positions,
-            signs: c.signs,
-            weight: c.weight,
-        })
-        .collect();
-    // SAFETY: `B128` is `repr(transparent)` over `u128`.
-    let words = unsafe { core::slice::from_raw_parts(values.as_ptr() as *const u128, values.len()) };
-    fb::neon::fold(words, COLUMN_LEN, &cs, threads())
-}
-
-/// The x86 track's scheduled bit-sliced fold (`fold_bits2`) on NEON, written straight into the
-/// ring elements; `None` when its counters could overflow.
-fn fold_scheduled(values: &[B128], challenges: &[ShortChallenge]) -> Option<Vec<RingElement648>> {
-    use labinius::fold_bits as fb;
-    use labinius::fold_bits2 as f2;
-    let cs: Vec<fb::Challenge> = challenges
-        .iter()
-        .map(|c| fb::Challenge {
-            positions: c.positions,
-            signs: c.signs,
-            weight: c.weight,
-        })
-        .collect();
-    if !f2::fits(&cs) || !f2::shape_ok(COLUMN_LEN) || f2::N != rq::N {
-        return None;
-    }
-    assert_eq!(values.len(), COLUMNS * COLUMN_LEN);
-    let mut out: Vec<RingElement648> = Vec::with_capacity(RING_ELEMENTS);
-    let base = out.as_mut_ptr();
-    // SAFETY: the kernel writes every coefficient of the `RING_ELEMENTS` elements, at
-    // `v + e * stride` (the elements' `v` fields are `stride` `i16` apart), and the
-    // representation is written here; `values` holds `COLUMNS` columns of `COLUMN_LEN` words.
-    unsafe {
-        for e in 0..RING_ELEMENTS {
-            core::ptr::addr_of_mut!((*base.add(e)).representation).write(Representation::Coefficients);
-        }
-        const _: () = assert!(core::mem::size_of::<RingElement648>() % 2 == 0);
-        let stride = core::mem::size_of::<RingElement648>() / 2;
-        f2::fold_into(
-            values.as_ptr() as *const u128,
-            COLUMNS,
-            COLUMN_LEN,
-            &cs,
-            threads(),
-            core::ptr::addr_of_mut!((*base).v) as *mut i16,
-            stride,
-        );
-        out.set_len(RING_ELEMENTS);
-    }
-    Some(out)
-}
-
-/// The fold of the x86 track's bit-sliced kernel (`fold_bits`), on NEON: blocks of 128 ring
-/// elements, each column's 512 words transposed into bit planes and counted per raw row with
-/// carry-save adders; blocks are handed out to the workers dynamically.
-fn fold_bitsliced(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
-    use labinius::fold_bits as fb;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    const _: () = assert!(COLUMN_LEN % fb::LANES == 0 && fb::N == rq::N);
-    let cs: Vec<fb::Challenge> = challenges
-        .iter()
-        .map(|c| fb::Challenge {
-            positions: c.positions,
-            signs: c.signs,
-            weight: c.weight,
-        })
-        .collect();
-    let reach = fb::Reach::of(&cs);
-    let blocks = RING_ELEMENTS / fb::BLOCK_ELEMENTS;
-    let mut out: Vec<[i16; rq::N]> = vec![[0i16; rq::N]; RING_ELEMENTS];
-    let out_addr = out.as_mut_ptr() as usize;
-    let words = values.as_ptr() as usize;
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads().min(blocks) {
-            let (cs, reach, next) = (&cs, &reach, &next);
-            scope.spawn(move || loop {
-                let block = next.fetch_add(1, Ordering::Relaxed);
-                if block >= blocks {
-                    break;
-                }
-                // SAFETY: blocks are disjoint runs of `BLOCK_ELEMENTS` elements of `out`, and
-                // `values` holds `COLUMNS` columns of `COLUMN_LEN` words.
-                unsafe {
-                    let chunk = core::slice::from_raw_parts_mut(
-                        (out_addr as *mut [i16; rq::N]).add(block * fb::BLOCK_ELEMENTS),
-                        fb::BLOCK_ELEMENTS,
-                    );
-                    fb::fold_block::<fb::V, fb::Portable>(
-                        words as *const u128,
-                        COLUMNS,
-                        COLUMN_LEN,
-                        cs,
-                        reach,
-                        block,
-                        &fb::Portable,
-                        chunk,
-                    );
-                }
-            });
-        }
-    });
-    out.into_iter()
-        .map(|v| {
-            let mut e = RingElement648::zero(Representation::Coefficients);
-            e.v.copy_from_slice(&v);
-            e
-        })
-        .collect()
-}
-
-fn fold_bytes(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
-    let narrow = challenges.iter().map(|c| c.weight).sum::<usize>() <= i16::MAX as usize;
-    let per = RING_ELEMENTS.div_ceil(threads());
-    let mut out: Vec<RingElement648> = (0..RING_ELEMENTS)
-        .map(|_| RingElement648::zero(Representation::Coefficients))
-        .collect();
-    std::thread::scope(|scope| {
-        for (block, base) in out.chunks_mut(per).zip((0..).step_by(per)) {
-            scope.spawn(move || {
-                for (i, slot) in block.iter_mut().enumerate() {
-                    *slot = if narrow {
-                        fold_element_narrow(values, challenges, base + i)
-                    } else {
-                        fold_element(values, challenges, base + i)
-                    };
-                }
-            });
-        }
-    });
-    out
-}
-
-#[cfg(test)]
-fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
-    let elements = folded.elements();
-    let mut out = vec![0u8; 4 * rq::N * elements.len()];
-    for (chunk, e) in out.chunks_exact_mut(4 * rq::N).zip(elements) {
-        for (slot, &c) in chunk.chunks_exact_mut(4).zip(&e.v) {
-            slot.copy_from_slice(&(c as i32).to_le_bytes());
-        }
-    }
-    out
-}
-
-#[cfg(test)]
-impl Proof {
-    /// The proof's bincode encoding under [`codec`]'s options (fixed-width little-endian
-    /// integers, `u64` sequence lengths, arrays without one), written field by field with
-    /// whole-slice copies; serde would hand bincode the byte vectors one `u8` at a time.
-    fn encode(&self) -> Vec<u8> {
-        let size = 4
-            + 16
-            + (8 + self.commitment.len())
-            + (8 + 16 * self.partials.len())
-            + (8 + 48 * self.rounds.len())
-            + 24
-            + (8 + self.row.len())
-            + (8 + self.folded.len());
-        assert!(size as u64 <= LIMIT, "serialize proof: the proof exceeds the size limit");
-        let mut out = Vec::with_capacity(size);
-        let len = |out: &mut Vec<u8>, n: usize| out.extend_from_slice(&(n as u64).to_le_bytes());
-        out.extend_from_slice(&self.version.to_le_bytes());
-        out.extend_from_slice(&self.modulus.to_le_bytes());
-        len(&mut out, self.commitment.len());
-        out.extend_from_slice(&self.commitment);
-        len(&mut out, self.partials.len());
-        for p in &self.partials {
-            out.extend_from_slice(&p.to_le_bytes());
-        }
-        len(&mut out, self.rounds.len());
-        for x in self.rounds.iter().flatten().flatten() {
-            out.extend_from_slice(&x.to_le_bytes());
-        }
-        for x in &self.opened {
-            out.extend_from_slice(&x.to_le_bytes());
-        }
-        len(&mut out, self.row.len());
-        out.extend_from_slice(&self.row);
-        len(&mut out, self.folded.len());
-        out.extend_from_slice(&self.folded);
-        assert_eq!(out.len(), size);
-        out
-    }
-}
-
-fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
-    #[cfg(target_arch = "aarch64")]
-    if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
-        let partials = prepared.partials();
-        let value = partials.iter().zip(cf::eq_expand_b128(lo))
-            .fold(B128::ZERO, |a, (&v, e)| a + v * e);
-        t.absorb_b128(&[value]);
-        t.absorb_b128(&partials);
-        let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-        let mut switch = labinius::fields::lean::Switch::new(values, prepared, &batch);
-        let mut rounds = Vec::with_capacity(LOG_PACKED);
-        let mut coords = Vec::with_capacity(LOG_PACKED);
-        for _ in 0..LOG_PACKED {
-            let msg = switch.msg();
-            t.absorb_f162(&msg);
-            let r = t.sample_f162(b"switch-round", 1)[0];
-            rounds.push(msg.map(|v| v.0));
-            coords.push(r);
-            switch.fold(r);
-        }
-        return (partials, rounds, coords, switch.final_eval());
-    }
-    let mut ws = cf::Workspace::new(LOG_PACKED, 1);
-    let partials = ws.partial_evals(0, values, hi);
-    let value = partials
+fn claim(partials: &[B128], lo: &[B128]) -> B128 {
+    partials
         .iter()
         .zip(cf::eq_expand_b128(lo))
-        .fold(B128::ZERO, |a, (&v, e)| a + v * e);
-    t.absorb_b128(&[value]);
-    t.absorb_b128(&partials);
-    let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
-    let mut switch = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
+        .fold(B128::ZERO, |a, (&v, e)| a + v * e)
+}
+/// The checker's folded-witness encoding, which this must reproduce byte for byte: one
+/// little-endian `i32` per coefficient, element by element. Written into a sized buffer, in
+/// parallel over elements.
+const FOLDED_BYTES: usize = 4;
+
+/// Expand one ring element's `N` `i16` coefficients into `4 N` bytes of little-endian `i32`
+/// words at `dst`: 16 coefficients (64 bytes) per AVX-512 store for the first `640`, then 8
+/// coefficients (32 bytes) for the tail `8`.
+///
+/// # Safety
+/// The CPU must have AVX-512F and `dst` must be valid for writes of `FOLDED_BYTES * N` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn write_folded_element_avx512(v: &[i16; N], dst: *mut u8) {
+    use core::arch::x86_64::*;
+    const _: () = assert!(N == 648 && FOLDED_BYTES == 4);
+    let src = v.as_ptr();
+    for j in 0..(N / 16) {
+        let s = _mm256_loadu_si256(src.add(16 * j) as *const __m256i);
+        _mm512_storeu_si512(dst.add(64 * j) as *mut __m512i, _mm512_cvtepi16_epi32(s));
+    }
+    let tail = _mm_loadu_si128(src.add(N & !15) as *const __m128i);
+    _mm256_storeu_si256(
+        dst.add(FOLDED_BYTES * (N & !15)) as *mut __m256i,
+        _mm256_cvtepi16_epi32(tail),
+    );
+}
+
+fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
+    let elements = folded.elements();
+    assert!(
+        elements
+            .iter()
+            .all(|e| e.representation == Representation::Coefficients),
+        "a fold is in coefficient form"
+    );
+    let mut out = vec![0u8; FOLDED_BYTES * N * elements.len()];
+    let runs = labinius::par::ranges(elements.len(), threads(), 1);
+    let out_addr = out.as_mut_ptr() as usize;
+    #[cfg(target_arch = "x86_64")]
+    let avx512 = std::arch::is_x86_feature_detected!("avx512f");
+    labinius::par::pool().run(runs.len(), |i| {
+        let run = runs[i].clone();
+        let mut dst = unsafe { (out_addr as *mut u8).add(FOLDED_BYTES * N * run.start) };
+        #[cfg(target_arch = "x86_64")]
+        if avx512 {
+            for e in &elements[run] {
+                unsafe {
+                    write_folded_element_avx512(&e.v, dst);
+                    dst = dst.add(FOLDED_BYTES * N);
+                }
+            }
+            return;
+        }
+        // Run `i` owns the bytes of elements `run`.
+        let mine = unsafe {
+            std::slice::from_raw_parts_mut(
+                dst,
+                FOLDED_BYTES * N * run.len(),
+            )
+        };
+        for (slot, &c) in mine
+            .chunks_exact_mut(FOLDED_BYTES)
+            .zip(elements[run].iter().flat_map(|e| e.v.iter()))
+        {
+            slot.copy_from_slice(&(c as i32).to_le_bytes());
+        }
+    });
+    out
+}
+
+/// `rq::pack_ring_elements`, byte for byte, into a sized buffer in parallel: `coefficient_bytes`
+/// little-endian bytes per coefficient, no header.
+#[cfg(test)]
+fn pack_coefficients(coefficients: &[u128], modulus: u128) -> Vec<u8> {
+    let width = rq::coefficient_bytes(modulus);
+    let mut out = vec![0u8; width * coefficients.len()];
+    let runs = labinius::par::ranges(coefficients.len(), threads(), 1);
+    let out_addr = out.as_mut_ptr() as usize;
+    labinius::par::pool().run(runs.len(), |i| {
+        let run = runs[i].clone();
+        // Run `i` owns the bytes of coefficients `run`.
+        let mine = unsafe {
+            std::slice::from_raw_parts_mut((out_addr as *mut u8).add(width * run.start), width * run.len())
+        };
+        for (slot, &x) in mine.chunks_exact_mut(width).zip(&coefficients[run]) {
+            debug_assert!(x < modulus, "a coefficient is not reduced");
+            slot.copy_from_slice(&x.to_le_bytes()[..width]);
+        }
+    });
+    out
+}
+#[cfg(test)]
+fn unpack_folded(bytes: &[u8], elements: usize) -> Result<FoldedWitness, String> {
+    if bytes.len() != FOLDED_BYTES * N * elements {
+        return Err("folded witness has the wrong length".into());
+    }
+    let mut words = bytes.chunks_exact(FOLDED_BYTES);
+    let mut fold = Vec::with_capacity(elements);
+    for _ in 0..elements {
+        let mut e = labinius::RingElement648::zero(Representation::Coefficients);
+        for slot in e.v.iter_mut() {
+            let word = i32::from_le_bytes(words.next().unwrap().try_into().unwrap());
+            *slot = i16::try_from(word).map_err(|_| "coefficient out of range".to_string())?;
+        }
+        fold.push(e);
+    }
+    Ok(FoldedWitness::of(fold))
+}
+/// The `COLUMNS` folding challenges, derived the way the checker derives them: the row
+/// evaluation absorbed, then one weight-28 signed subring element per column. The samples are
+/// independent derivations of the transcript, so they are drawn on every core; the result is
+/// the sequence `sample_short_challenge` would produce.
+fn folding_challenges(t: &mut Transcript, row: &RowEvaluation) -> Vec<ShortChallenge> {
+    row.absorb(t);
+    sample_short_challenges_parallel(t, COLUMNS, DEFAULT_WEIGHT, DEFAULT_BOUND, threads())
+}
+
+/// Garner's lift of one coefficient from its residues modulo `primes` (each already in
+/// `[0, q)`) to the integer modulo their product. The reductions are Barrett's with the
+/// library's magic `floor(2^43 / q)`: exact for operands below `2^31`, which every product of
+/// two residues of primes below `2^15` is, and no division.
+struct Garner {
+    primes: Vec<u64>,
+    magic: Vec<u64>,
+    inverses: Vec<Vec<u64>>,
+}
+
+impl Garner {
+    fn of(primes: &[u16]) -> Garner {
+        let limbs = primes.len();
+        Garner {
+            primes: primes.iter().map(|&q| q as u64).collect(),
+            magic: primes.iter().map(|&q| (1u64 << 43) / q as u64).collect(),
+            inverses: (0..limbs)
+                .map(|k| {
+                    (0..k)
+                        .map(|m| {
+                            let (q, p) = (primes[k] as u64, primes[m] as u64);
+                            (1..q).find(|x| x * p % q == 1).expect("the primes are distinct")
+                        })
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    /// `x mod q_k` for `x < 2^31`.
+    #[inline(always)]
+    fn reduce(&self, k: usize, x: u64) -> u64 {
+        let q = self.primes[k];
+        let r = x - ((x * self.magic[k]) >> 43) * q;
+        if r >= q {
+            r - q
+        } else {
+            r
+        }
+    }
+
+    #[inline]
+    fn lift(&self, residues: &[u64], mixed: &mut [u64]) -> u128 {
+        let limbs = self.primes.len();
+        for k in 0..limbs {
+            let q = self.primes[k];
+            let mut x = residues[k];
+            for m in 0..k {
+                // `mixed[m] < q_m < 2^15`, so `x + q - reduce(mixed[m]) < 2^16` and the
+                // product with an inverse below `q` stays below `2^31`.
+                x = self.reduce(k, (x + q - self.reduce(k, mixed[m])) * self.inverses[k][m]);
+            }
+            mixed[k] = x;
+        }
+        let mut value = 0u128;
+        for k in (0..limbs).rev() {
+            value = value * self.primes[k] as u128 + mixed[k] as u128;
+        }
+        value
+    }
+}
+
+/// The commitment's columns as coefficients modulo `modulus`, which is what the proof carries,
+/// from the kernel's raw rows: `rows[c * limbs + k]` is column `c`'s 648 NTT-domain rows
+/// modulo limb `k`. Each limb's rows go through that limb's inverse transform
+/// ([`labinius::bd::coefficients_from_rows`]) 32 columns at a time, and Garner's algorithm
+/// lifts the residues to the single integer modulo their product; the lift is exact because
+/// `modulus` is that product. The column blocks are independent and run on `workers` threads,
+/// and each block packs directly into its own range of proof bytes.
+fn commitment_bytes_rows(
+    rows: &[[u32; N]],
+    primes: &[u16],
+    modulus: u128,
+    columns: usize,
+    workers: usize,
+    buffer: Option<Vec<u8>>,
+) -> Vec<u8> {
+    let limbs = primes.len();
+    let hybrid=modulus==modulus_choice::HYBRID_MODULUS;
+    let stride=if hybrid {3}else{limbs};
+    assert_eq!(rows.len(), columns * stride);
+    let garner = Garner::of(primes);
+    let width = rq::coefficient_bytes(modulus);
+    assert!(!hybrid || width == 5);
+    // Every byte is written below; a buffer of the right length faulted in earlier saves the
+    // lift its page faults (two huge pages that every runner would otherwise queue on).
+    let mut out = match buffer {
+        Some(b) if b.len() == columns * N * width => b,
+        _ => vec![0u8; columns * N * width],
+    };
+    let blocks = columns.div_ceil(32);
+    let runs = labinius::par::ranges(blocks, workers, 1);
+    // The blocks are handed out from a shared counter rather than as fixed runs, so a runner
+    // that shares its CPU with another process takes fewer of them.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out_addr = out.as_mut_ptr() as usize;
+    // One run per logical CPU, placed explicitly for this dispatch and released at its end:
+    // this is the first dispatch after the commitment's per-core placement, and the runner
+    // spread the scheduler produced from there measured the phase at twice its cost.
+    let placement = labinius::par::CorePlacement::for_logical(runs.len());
+    let wide_lift = hybrid && lift_hybrid_wide_available();
+    labinius::par::pool().run(runs.len(), |r| {
+        let _affinity = placement.as_ref().and_then(|p| p.pin(r));
+        let mut residues: Vec<Vec<i16>> = (0..limbs).map(|_| vec![0i16; 32 * N]).collect();
+        let mut mixed = vec![0u64; limbs];
+        let mut at = vec![0u64; limbs];
+        loop {
+            let blk = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if blk >= blocks {
+                break;
+            }
+            let c0 = blk * 32;
+            let cols = (columns - c0).min(32);
+            for k in 0..limbs {
+                let refs: [&[u32; N]; 32] =
+                    core::array::from_fn(|c| &rows[(c0 + c.min(cols - 1)) * stride + k]);
+                labinius::bd::coefficients_from_rows(primes[k], &refs[..cols], &mut residues[k][..cols * N]);
+            }
+            // Block `blk` owns these disjoint, fixed-width wire coefficients.
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut u8).add(c0 * N * width), cols * N * width)
+            };
+            if hybrid && wide_lift {
+                for p in 0..cols {
+                    let (at, end) = (p * N, (p + 1) * N);
+                    // Column `p` owns its `5 N` bytes of `dst`.
+                    unsafe {
+                        lift_hybrid_column(
+                            &residues[0][at..end],
+                            &residues[1][at..end],
+                            &rows[(c0 + p) * 3 + 2],
+                            &mut dst[5 * at..5 * end],
+                        )
+                    };
+                }
+            } else if hybrid {
+                for (i, word) in dst.chunks_exact_mut(5).enumerate() {
+                    let value = lift_hybrid(residues[0][i], residues[1][i], rows[(c0 + i / N) * 3 + 2][i % N]);
+                    debug_assert!((value as u128) < modulus);
+                    word.copy_from_slice(&value.to_le_bytes()[..5]);
+                }
+            } else {
+                for (i, word) in dst.chunks_exact_mut(width).enumerate() {
+                    for k in 0..limbs {
+                        at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+                    }
+                    let value = garner.lift(&at, &mut mixed);
+                    debug_assert!(value < modulus);
+                    word.copy_from_slice(&value.to_le_bytes()[..width]);
+                }
+            }
+        }
+    });
+    out
+}
+
+/// Whether [`lift_hybrid_column`] can run here.
+fn lift_hybrid_wide_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Output byte `k < 40` of eight lifted coefficients is byte `k % 5` of 64-bit lane `k / 5`.
+#[cfg(target_arch = "x86_64")]
+static LIFT_BYTES: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut k = 0;
+    while k < 40 {
+        t[k] = ((k / 5) * 8 + k % 5) as u8;
+        k += 1;
+    }
+    t
+};
+
+/// [`lift_hybrid`] of one column's `N` coefficients, eight per step in 64-bit lanes, written as
+/// the wire's 5-byte little-endian words: the same arithmetic with `t = b - a` brought into
+/// `[0, 9721)` instead of `b + 9721 - a`, and `x mod 9721` for `x = 3242 t < 2^25` by Barrett's
+/// `q = floor(x ceil(2^45 / 9721) / 2^45)`, exact there (the error term is below
+/// `x / 2^45 < 2^-20 < 1 / 9721`).
+///
+/// # Safety
+/// The CPU must have AVX-512 F, BW and VBMI ([`lift_hybrid_wide_available`]); `r0`, `r1` must
+/// hold `N` residues each and `out` must be `5 N` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+unsafe fn lift_hybrid_column(r0: &[i16], r1: &[i16], tail: &[u32; N], out: &mut [u8]) {
+    use core::arch::x86_64::*;
+    assert!(r0.len() == N && r1.len() == N && out.len() == 5 * N && N % 8 == 0);
+    let q0 = _mm512_set1_epi64(3889);
+    let q1 = _mm512_set1_epi64(9721);
+    let inv = _mm512_set1_epi64(3242);
+    let magic = _mm512_set1_epi64(3_619_418_999);
+    let k153 = _mm512_set1_epi64(153);
+    let low10 = _mm512_set1_epi64(1023);
+    let product = _mm512_set1_epi64(3889 * 9721);
+    let pick = _mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
+    let keep: __mmask64 = (1u64 << 40) - 1;
+    for j in 0..N / 8 {
+        let a = _mm512_cvtepi16_epi64(_mm_loadu_si128(r0.as_ptr().add(8 * j) as *const __m128i));
+        let a = _mm512_add_epi64(a, _mm512_and_si512(_mm512_srai_epi64::<63>(a), q0));
+        let b = _mm512_cvtepi16_epi64(_mm_loadu_si128(r1.as_ptr().add(8 * j) as *const __m128i));
+        let b = _mm512_add_epi64(b, _mm512_and_si512(_mm512_srai_epi64::<63>(b), q1));
+        let t = _mm512_sub_epi64(b, a);
+        let t = _mm512_add_epi64(t, _mm512_and_si512(_mm512_srai_epi64::<63>(t), q1));
+        let x = _mm512_mul_epu32(t, inv);
+        let q = _mm512_srli_epi64::<45>(_mm512_mul_epu32(x, magic));
+        let m = _mm512_sub_epi64(x, _mm512_mul_epu32(q, q1));
+        let value = _mm512_add_epi64(a, _mm512_mul_epu32(m, q0));
+        let tl = _mm512_cvtepu32_epi64(_mm256_loadu_si256(tail.as_ptr().add(8 * j) as *const __m256i));
+        let digit = _mm512_and_si512(_mm512_mul_epu32(_mm512_sub_epi64(tl, value), k153), low10);
+        let lifted = _mm512_add_epi64(value, _mm512_mul_epu32(digit, product));
+        _mm512_mask_storeu_epi8(
+            out.as_mut_ptr().add(40 * j) as *mut i8,
+            keep,
+            _mm512_permutexvar_epi8(pick, lifted),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn lift_hybrid_column(_: &[i16], _: &[i16], _: &[u32; N], _: &mut [u8]) {
+    unreachable!("no wide lift off x86-64")
+}
+
+/// The hybrid modulus's lift with constant reductions: centered residues modulo 3889 and 9721
+/// (3889^-1 mod 9721 = 3242), then the 1024 digit from the tail row's residue.
+#[inline(always)]
+fn lift_hybrid(r0: i16, r1: i16, tail: u32) -> u64 {
+    let a = (if r0 < 0 { r0 as i32 + 3889 } else { r0 as i32 }) as u64;
+    let b = (if r1 < 0 { r1 as i32 + 9721 } else { r1 as i32 }) as u64;
+    let value = a + 3889 * (((b + 9721 - a) * 3242) % 9721);
+    let digit = (tail as u64).wrapping_sub(value).wrapping_mul(153) & 1023;
+    value + 3889 * 9721 * digit
+}
+
+/// The baseline's recombination through the library's commitment matrix, kept as the reference
+/// the tests check [`commitment_bytes_rows`] against.
+#[cfg(test)]
+fn commitment_coefficients(commitment: &Commitment, primes: &[u16], modulus: u128) -> Vec<u128> {
+    let residues = labinius::bd::column_coefficients(commitment.matrix(), primes);
+    let garner = Garner::of(primes);
+    let limbs = primes.len();
+    let mut mixed = vec![0u64; limbs];
+    let mut at = vec![0u64; limbs];
+    let mut out = Vec::with_capacity(residues[0].len());
+    for i in 0..residues[0].len() {
+        for k in 0..limbs {
+            at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+        }
+        let value = garner.lift(&at, &mut mixed);
+        debug_assert!(value < modulus);
+        out.push(value);
+    }
+    out
+}
+
+/// The switch's rounds: the messages, the coordinates and the opened value, driven through
+/// either prover.
+trait SwitchRounds {
+    fn msg(&mut self) -> [F162; 2];
+    fn fold(&mut self, r: F162);
+    fn final_eval(&self) -> F162;
+}
+impl SwitchRounds for cf::LeanSwitch<'_> {
+    fn msg(&mut self) -> [F162; 2] {
+        cf::LeanSwitch::msg(self)
+    }
+    fn fold(&mut self, r: F162) {
+        cf::LeanSwitch::fold(self, r)
+    }
+    fn final_eval(&self) -> F162 {
+        cf::LeanSwitch::final_eval(self)
+    }
+}
+impl SwitchRounds for cf::SwitchProver {
+    fn msg(&mut self) -> [F162; 2] {
+        cf::SwitchProver::msg(self)
+    }
+    fn fold(&mut self, r: F162) {
+        cf::SwitchProver::fold(self, r)
+    }
+    fn final_eval(&self) -> F162 {
+        cf::SwitchProver::final_eval(self)
+    }
+}
+fn switch_rounds(
+    sw: &mut impl SwitchRounds,
+    t: &mut Transcript,
+) -> (Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
     let mut rounds = Vec::with_capacity(LOG_PACKED);
     let mut coords = Vec::with_capacity(LOG_PACKED);
     for _ in 0..LOG_PACKED {
-        let msg = switch.msg();
+        let msg = sw.msg();
         t.absorb_f162(&msg);
         let r = t.sample_f162(b"switch-round", 1)[0];
         rounds.push(msg.map(|v| v.0));
         coords.push(r);
-        switch.fold(r);
+        sw.fold(r);
     }
-    let opened = switch.final_eval();
-    (partials, rounds, coords, opened)
+    let opened = sw.final_eval();
+    t.absorb_f162(&[opened]);
+    (rounds, coords, opened)
 }
 
-fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
-    output.wait_setup();
-    let coefficients = commit(values, modulus);
-    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
-    std::mem::forget(coefficients);
-    labinius::par::pool();
-    timer.lap("commit");
-    // No output prefault here: the switch that follows runs on every core from its first
-    // round, and idle population workers measurably slowed it. The final encode faults the
-    // file pages itself, in parallel.
+/// Batch positions of the fold recomputed through the transform path and compared with the
+/// bit-sliced fold: 32 ring elements each, out of 4096. Every challenge and every column enters
+/// each element, so one position exercises the whole accumulation; a mismatch means a defect
+/// in the bit-sliced path on this machine, and the transform path then produces the fold.
+#[cfg(test)]
+const FOLD_CHECK_POSITIONS: core::ops::Range<usize> = 0..1;
+
+/// `v = sum_j c_j W_j`: the bit-sliced fold from the words, spot-checked against the transform
+/// path on [`FOLD_CHECK_POSITIONS`], with the transform path as the fallback.
+#[cfg(test)]
+fn fold_checked(
+    values: &[B128],
+    challenges: &[ShortChallenge],
+    _base: u16,
+    _workers: usize,
+) -> Vec<labinius::RingElement648> {
+    // The trusted verifier checks the folded witness itself (the `A v = sum_j c_j C_j`
+    // identity, the norm bounds and the binary shadow), so a wrong fold cannot verify. The
+    // transform-path comparison this replaces was redundant work: it recomputed one batch
+    // position across all 1024 columns (1024 transforms) and touched 32 KB of every column,
+    // scattered over the 268 MB table, just before the fold's own pass over it.
+    labinius::fold::fold_witness_bits(values, COLUMNS, COLUMN_LEN, challenges)
+}
+
+/// One commitment task per physical core, temporarily placed by the key's
+/// worker entry point; eight columns share each pass over the public key.
+const EMBEDDED_TAIL_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/tail-key.bin")).len();
+static EMBEDDED_TAIL:Aligned64<[u8;EMBEDDED_TAIL_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/tail-key.bin")));
+/// Both hybrid keys (base and tail, both primes) in the hybrid sink's arrangement, precomputed
+/// by `build.rs` from the same public keys as the two images above (empty when the build host
+/// could not run the kernels); read in place.
+/// The hybrid modulus's keys in the column-pair layout (`hybrid::pair_keys`), little-endian
+/// `u32` words, empty when the build host could not run the kernels.
+const EMBEDDED_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/pair-key.bin")).len();
+static EMBEDDED_PAIRS:Aligned64<[u8;EMBEDDED_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/pair-key.bin")));
+const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")).len();
+static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
+/// The single-transform modulus's public data (`labinius::simd::commit::sms`), precomputed by
+/// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
+/// lockstep layout, the digit chunks' centered mean residues and the means' total.
+const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
+static SMS_PAIRS:Aligned2M<[u8;SMS_PAIRS_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
+const SMS_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")).len();
+static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")));
+const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();
+static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")));
+
+/// The embedded single-transform keys, read in place, if the build host made them for this
+/// shape.
+fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
+    use labinius::simd::commit::sms;
+    let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
+    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 4 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N {
+        return None;
+    }
+    unsafe {
+        Some(sms::SmsKeys {
+            pairs: std::slice::from_raw_parts(SMS_PAIRS.0.as_ptr() as *const u32, words),
+            mur: std::slice::from_raw_parts(SMS_MUR.0.as_ptr() as *const i32, sms::mur_len(RING_ELEMENTS)),
+            mu: std::slice::from_raw_parts(SMS_MU.0.as_ptr() as *const u32, N),
+            elements: RING_ELEMENTS,
+        })
+    }
+}
+
+/// The single-transform commitment's columns as coefficients modulo the selected integer modulus: `rows[2c]` is
+/// column `c` modulo 9721 in the NTT domain, `rows[2c + 1]` its coefficients modulo TAIL_MODULUS. The
+/// first goes through the inverse transform 32 columns at a time; each coefficient is then
+/// `t + M*((r-t)*M^-1 mod9721)`, packed into its 5 wire bytes.
+fn commitment_bytes_sms(rows: &[[u32; N]], columns: usize, workers: usize, buffer: Option<Vec<u8>>) -> Vec<u8> {
+    use labinius::simd::commit::sms;
+    assert_eq!(rows.len(), 2 * columns);
+    let width = rq::coefficient_bytes(sms::MODULUS);
+    assert_eq!(width, 5);
+    let mut out = match buffer {
+        Some(b) if b.len() == columns * N * width => b,
+        _ => vec![0u8; columns * N * width],
+    };
+    let blocks = columns.div_ceil(32);
+    let runs = labinius::par::ranges(blocks, workers, 1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out_addr = out.as_mut_ptr() as usize;
+    let placement = labinius::par::CorePlacement::for_logical(runs.len());
+    let p = sms::P as u64;
+    let inv = sms::inv_tail();
+    labinius::par::pool().run(runs.len(), |r| {
+        let _affinity = placement.as_ref().and_then(|p| p.pin(r));
+        let mut residues = vec![0i16; 32 * N];
+        loop {
+            let blk = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if blk >= blocks {
+                break;
+            }
+            let c0 = blk * 32;
+            let cols = (columns - c0).min(32);
+            let refs: [&[u32; N]; 32] = core::array::from_fn(|c| &rows[2 * (c0 + c.min(cols - 1))]);
+            labinius::bd::coefficients_from_rows(sms::P, &refs[..cols], &mut residues[..cols * N]);
+            // Block `blk` owns these disjoint, fixed-width wire coefficients.
+            let dst = unsafe { std::slice::from_raw_parts_mut((out_addr as *mut u8).add(c0 * N * width), cols * N * width) };
+            if lift_hybrid_wide_available() {
+                for c in 0..cols {
+                    // Column `c` owns its `5 N` bytes of `dst`.
+                    unsafe { lift_sms_column(&residues[c * N..(c + 1) * N], &rows[2 * (c0 + c) + 1], &mut dst[5 * c * N..5 * (c + 1) * N]) };
+                }
+            } else {
+                for (i, word) in dst.chunks_exact_mut(5).enumerate() {
+                    let r = (residues[i] as i64).rem_euclid(p as i64) as u64;
+                    let t = rows[2 * (c0 + i / N) + 1][i % N] as u64;
+                    let k = ((r + p - t % p) * inv) % p;
+                    let value = t + k*sms::TAIL_MODULUS as u64;
+                    word.copy_from_slice(&value.to_le_bytes()[..5]);
+                }
+            }
+        }
+    });
+    out
+}
+
+/// [`commitment_bytes_sms`]'s lift of one column, eight coefficients per step in 64-bit lanes:
+/// `r` brought into `[0, 9721)`, `d = r - t mod 9721` in `[0, 9721)` (the `t mod 9721` and the
+/// product's reduction by Barrett's `floor(x ceil(2^45 / 9721) / 2^45)`, exact for `x < 9721^2`
+/// as in [`lift_hybrid_column`]), `value=t+M*(d*M^-1 mod9721)`, packed into 5-byte words.
+///
+/// # Safety
+/// AVX-512 F, BW and VBMI; `r` must hold `N` centered residues and `out` be `5 N` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+unsafe fn lift_sms_column(r: &[i16], tail: &[u32; N], out: &mut [u8]) {
+    use core::arch::x86_64::*;
+    use labinius::simd::commit::sms;
+    assert!(r.len() == N && out.len() == 5 * N && N % 8 == 0);
+    let q = _mm512_set1_epi64(sms::P as i64);
+    let inv = _mm512_set1_epi64(sms::inv_tail() as i64);
+    const _:()=assert!(((3_619_418_999u64*9721-(1u64<<45))*9720*9720)<(1u64<<45));
+    let magic = _mm512_set1_epi64(3_619_418_999);
+    let pick = _mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
+    let keep: __mmask64 = (1u64 << 40) - 1;
+    let modq = |x: __m512i| -> __m512i {
+        let qq = _mm512_srli_epi64::<45>(_mm512_mul_epu32(x, magic));
+        _mm512_sub_epi64(x, _mm512_mul_epu32(qq, q))
+    };
+    for j in 0..N / 8 {
+        let a = _mm512_cvtepi16_epi64(_mm_loadu_si128(r.as_ptr().add(8 * j) as *const __m128i));
+        let a = _mm512_add_epi64(a, _mm512_and_si512(_mm512_srai_epi64::<63>(a), q));
+        let t = _mm512_cvtepu32_epi64(_mm256_loadu_si256(tail.as_ptr().add(8 * j) as *const __m256i));
+        let d = _mm512_sub_epi64(a, modq(t));
+        let d = _mm512_add_epi64(d, _mm512_and_si512(_mm512_srai_epi64::<63>(d), q));
+        let k = modq(_mm512_mul_epu32(d, inv));
+        let value = _mm512_add_epi64(t, _mm512_mul_epu32(k,_mm512_set1_epi64(sms::TAIL_MODULUS as i64)));
+        _mm512_mask_storeu_epi8(out.as_mut_ptr().add(40 * j) as *mut i8, keep, _mm512_permutexvar_epi8(pick, value));
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn lift_sms_column(_: &[i16], _: &[u32; N], _: &mut [u8]) {
+    unreachable!("no wide lift off x86-64")
+}
+
+/// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
+/// and the switch's binding pass then binds that many coordinates at once.
+const PREFIX_SETS: usize = 64;
+const COMMIT_GROUP: usize = 8;
+const COMMIT_WORKERS: usize = 4;
+/// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
+/// a host of two-thread cores the two threads of a core take the halves of each 32-column group,
+/// so each batch of the arranged keys, 168 KB, is read from L3 once per 32 columns; 32 per
+/// worker measured 1.8 ms slower (L2 pressure).
+const HYBRID_GROUP: usize = 16;
+
+
+// =============================================================================================
+// the proof file
+// =============================================================================================
+
+/// What [`prove`] produces: the proof's fields, the folded witness still as ring elements (its
+/// wire form is written straight into the proof file).
+struct ProofParts {
+    modulus: u128,
+    commitment: Vec<u8>,
+    partials: Vec<u128>,
+    rounds: Vec<[[u64; 3]; 2]>,
+    opened: [u64; 3],
+    row: Vec<u8>,
+    folded: FoldedWitness,
+}
+
+impl ProofParts {
+    fn into_proof(self) -> Proof {
+        Proof {
+            version: 1,
+            modulus: self.modulus,
+            folded: pack_folded(&self.folded),
+            commitment: self.commitment,
+            partials: self.partials,
+            rounds: self.rounds,
+            opened: self.opened,
+            row: self.row,
+        }
+    }
+}
+
+/// Where the codec's encoding of a [`Proof`] puts each field, for a proof of this instance's shape
+/// under `modulus`: fixed-width integers little-endian, each byte string and sequence after its
+/// `u64` length, the `opened` array bare.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ProofLayout {
+    commitment_bytes: usize,
+    row_bytes: usize,
+    folded_bytes: usize,
+    partials: usize,
+    rounds: usize,
+}
+
+impl ProofLayout {
+    const HEAD: usize = 4 + 16 + 8;
+
+    fn of_instance(modulus: u128) -> ProofLayout {
+        ProofLayout {
+            commitment_bytes: COLUMNS * N * rq::coefficient_bytes(modulus),
+            row_bytes: (162 * COLUMNS).div_ceil(8),
+            folded_bytes: FOLDED_BYTES * N * RING_ELEMENTS,
+            partials: 1 << 7,
+            rounds: LOG_PACKED,
+        }
+    }
+
+    fn of_parts(parts: &ProofParts) -> ProofLayout {
+        ProofLayout {
+            commitment_bytes: parts.commitment.len(),
+            row_bytes: parts.row.len(),
+            folded_bytes: FOLDED_BYTES * N * parts.folded.elements().len(),
+            partials: parts.partials.len(),
+            rounds: parts.rounds.len(),
+        }
+    }
+
+    /// The bytes between the commitment and the folded witness's bytes.
+    fn middle(&self) -> usize {
+        8 + 16 * self.partials + 8 + 48 * self.rounds + 24 + 8 + self.row_bytes + 8
+    }
+
+    fn commitment_at(&self) -> usize {
+        Self::HEAD
+    }
+
+    fn middle_at(&self) -> usize {
+        Self::HEAD + self.commitment_bytes
+    }
+
+    fn folded_at(&self) -> usize {
+        self.middle_at() + self.middle()
+    }
+
+    fn len(&self) -> usize {
+        self.folded_at() + self.folded_bytes
+    }
+}
+
+/// The codec's encoding of `parts`, written into `out` (`layout.len()` bytes): the small
+/// fields on this thread, the commitment and the folded witness (`i32` little-endian per
+/// coefficient) in parallel on the pool.
+///
+/// # Safety
+/// `out` must be valid for writes of `layout.len()` bytes, and `layout` must be
+/// [`ProofLayout::of_parts`]`(parts)`.
+unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
+    let put = |at: &mut usize, bytes: &[u8]| {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(*at), bytes.len());
+        *at += bytes.len();
+    };
+    let mut at = 0;
+    put(&mut at, &1u32.to_le_bytes());
+    put(&mut at, &parts.modulus.to_le_bytes());
+    put(&mut at, &(parts.commitment.len() as u64).to_le_bytes());
+    debug_assert_eq!(at, layout.commitment_at());
+    let mut at = layout.middle_at();
+    let mut middle = Vec::with_capacity(layout.middle());
+    middle.extend_from_slice(&(parts.partials.len() as u64).to_le_bytes());
+    for v in &parts.partials {
+        middle.extend_from_slice(&v.to_le_bytes());
+    }
+    middle.extend_from_slice(&(parts.rounds.len() as u64).to_le_bytes());
+    for r in &parts.rounds {
+        for x in r.iter().flatten() {
+            middle.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    for x in &parts.opened {
+        middle.extend_from_slice(&x.to_le_bytes());
+    }
+    middle.extend_from_slice(&(parts.row.len() as u64).to_le_bytes());
+    middle.extend_from_slice(&parts.row);
+    middle.extend_from_slice(&(layout.folded_bytes as u64).to_le_bytes());
+    debug_assert_eq!(middle.len(), layout.middle());
+    put(&mut at, &middle);
+    debug_assert_eq!(at, layout.folded_at());
+    let elements = parts.folded.elements();
+    assert!(
+        elements
+            .iter()
+            .all(|e| e.representation == Representation::Coefficients),
+        "a fold is in coefficient form"
+    );
+    // A few commitment slices and many folded runs, taken dynamically.
+    let ctasks = 4;
+    let cruns = labinius::par::ranges(parts.commitment.len(), ctasks, 4096);
+    let fruns = labinius::par::ranges(elements.len(), 4 * threads(), 1);
+    let (addr, folded_at) = (out as usize, layout.folded_at());
+    #[cfg(target_arch = "x86_64")]
+    let avx512 = std::arch::is_x86_feature_detected!("avx512f");
+    labinius::par::pool().run(cruns.len() + fruns.len(), |i| {
+        let out = addr as *mut u8;
+        if i < cruns.len() {
+            let r = cruns[i].clone();
+            core::ptr::copy_nonoverlapping(
+                parts.commitment.as_ptr().add(r.start),
+                out.add(ProofLayout::HEAD + r.start),
+                r.len(),
+            );
+            return;
+        }
+        let r = fruns[i - cruns.len()].clone();
+        let mut dst = out.add(folded_at + FOLDED_BYTES * N * r.start);
+        #[cfg(target_arch = "x86_64")]
+        if avx512 {
+            for e in &elements[r] {
+                write_folded_element_avx512(&e.v, dst);
+                dst = dst.add(FOLDED_BYTES * N);
+            }
+            return;
+        }
+        let mut wide = [0i32; N];
+        for e in &elements[r] {
+            for (w, &c) in wide.iter_mut().zip(e.v.iter()) {
+                *w = (c as i32).to_le();
+            }
+            core::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, dst, FOLDED_BYTES * N);
+            dst = dst.add(FOLDED_BYTES * N);
+        }
+    });
+}
+
+/// The proof file, created and mapped while the prover runs: the pool's idle workers create it
+/// at its exact final length (blocks preallocated), map it at a 2 MB-aligned address with huge
+/// pages requested, and fault its page-cache pages in (`MADV_POPULATE_WRITE`, 2 MB per idle
+/// chunk, on the workers idle while the key is set up), so that at the end the proof is encoded
+/// straight into mapped pages on every core. Written with `write`, the 14 MB proof cost ~3.5 ms
+/// on one core after the prover's last phase (ext4 allocates, reserves and copies page by page
+/// under the inode lock). With ext4's large folios the aligned mapping is mostly 2 MB page-cache
+/// folios mapped by PMDs: faulting them in runs in parallel, and the exit drops a few PMDs
+/// instead of 3400 dirty PTEs (~0.6 ms).
+struct Output {
+    state: std::sync::Arc<OutputState>,
+    job: &'static labinius::par::IdleJob,
+    populate: std::sync::OnceLock<&'static labinius::par::IdleJob>,
+    /// The commitment's bytes, allocated at the start and faulted in by the setup's idle work.
+    commitment: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+struct OutputState {
+    path: String,
+    layout: ProofLayout,
+    map: std::sync::OnceLock<Option<Mapped>>,
+    /// Faulting the pages in failed (a kernel without `MADV_POPULATE_WRITE`): the encoding
+    /// faults them itself.
+    populate_failed: std::sync::atomic::AtomicBool,
+}
+
+struct Mapped {
+    _file: std::fs::File,
+    addr: usize,
+}
+
+/// Bytes of the proof file each idle chunk faults in: one huge page.
+const POPULATE_CHUNK: usize = 2 << 20;
+
+impl OutputState {
+    #[cfg(target_os = "linux")]
+    fn create_and_map(&self) -> Option<Mapped> {
+        use std::os::fd::AsRawFd;
+        let len = self.layout.len();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.path)
+            .ok()?;
+        // Allocated blocks spare the page faults ext4's delayed-allocation reservations (and
+        // let them run in parallel); the length alone is enough where the filesystem cannot
+        // preallocate.
+        if unsafe { sys::fallocate(file.as_raw_fd(), 0, 0, len as i64) } != 0 {
+            file.set_len(len as u64).ok()?;
+        }
+        // A 2 MB-aligned address, so that file offset 0 starts a huge page: reserve, then map
+        // the file over the reservation.
+        const HUGE: usize = 2 << 20;
+        let span = len.div_ceil(HUGE) * HUGE;
+        let reserved = unsafe {
+            sys::mmap(
+                core::ptr::null_mut(),
+                span + HUGE,
+                sys::PROT_NONE,
+                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if reserved as isize == -1 || reserved.is_null() {
+            return None;
+        }
+        let at = (reserved as usize + HUGE - 1) & !(HUGE - 1);
+        let ptr = unsafe {
+            sys::mmap(
+                at as *mut _,
+                len,
+                sys::PROT_READ | sys::PROT_WRITE,
+                sys::MAP_SHARED | sys::MAP_FIXED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr as isize == -1 || ptr as usize != at {
+            return None;
+        }
+        // Advisory: without large page-cache folios the mapping is 4 KB pages.
+        unsafe { sys::madvise(ptr, len, sys::MADV_HUGEPAGE) };
+        Some(Mapped {
+            _file: file,
+            addr: ptr as usize,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn create_and_map(&self) -> Option<Mapped> {
+        None
+    }
+
+    fn mapped(&self) -> Option<&Mapped> {
+        self.map.get_or_init(|| self.create_and_map()).as_ref()
+    }
+
+    /// Idle chunk `i`: create and map the file (`i == 0`), or fault in its `i - 1`-th piece.
+    fn chunk(&self, i: usize) {
+        use std::sync::atomic::Ordering;
+        let Some(m) = self.mapped() else { return };
+        if i == 0 || self.populate_failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let at = (i - 1) * POPULATE_CHUNK;
+        let len = POPULATE_CHUNK.min(self.layout.len() - at);
+        #[cfg(target_os = "linux")]
+        if unsafe { sys::madvise((m.addr + at) as *mut _, len, sys::MADV_POPULATE_WRITE) } != 0 {
+            self.populate_failed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Output {
+    fn start(path: &str, modulus: u128) -> Output {
+        let layout = ProofLayout::of_instance(modulus);
+        let state = std::sync::Arc::new(OutputState {
+            path: path.to_owned(),
+            layout,
+            map: std::sync::OnceLock::new(),
+            populate_failed: std::sync::atomic::AtomicBool::new(false),
+        });
+        // Idle work for the workers while the key is set up: create and map the file, build
+        // the challenge sampler's tables (needed ~290 ms in, by the folding challenges), read
+        // the CPU topology the commitment's placement asks for, and fault in the commitment's
+        // buffer, a huge page per chunk.
+        let mut commitment = vec![0u8; layout.commitment_bytes];
+        let (addr, bytes) = (commitment.as_mut_ptr() as usize, commitment.len());
+        let pages = bytes.div_ceil(POPULATE_CHUNK);
+        let worker_state = state.clone();
+        let job = labinius::par::pool().idle(3 + pages, move |i| match i {
+            0 => worker_state.chunk(0),
+            1 => labinius::challenge::warm(),
+            2 => labinius::par::warm_topology(),
+            // The buffer is not touched by anyone else before `write` or `commitment_buffer`
+            // quiesces this job; writing a zero where the fresh mapping already reads zero.
+            _ => unsafe {
+                let at = (i - 3) * POPULATE_CHUNK;
+                core::ptr::write_volatile((addr + at) as *mut u8, 0);
+                core::ptr::write_volatile((addr + (at + POPULATE_CHUNK).min(bytes) - 1) as *mut u8, 0);
+            },
+        });
+        Output {
+            state,
+            job,
+            populate: std::sync::OnceLock::new(),
+            commitment: std::sync::Mutex::new(Some(commitment)),
+        }
+    }
+
+    /// The commitment's buffer, once the setup's idle work is over (stopped if it is not).
+    fn commitment_buffer(&self) -> Option<Vec<u8>> {
+        labinius::par::pool().quiesce(self.job);
+        self.commitment.lock().unwrap().take()
+    }
+
+    /// Fault the file's pages in on the idle workers, 2 MB per chunk. Called where the main
+    /// thread is about to work alone (the transcript absorbing the commitment): a worker still
+    /// in a chunk when a dispatch arrives delays it, and the commitment's coarse work units
+    /// turn any delay at its start into a delay of its end.
+    ///
+    /// `first` are anonymous regions to fault in before the file, one chunk each (writable,
+    /// and only ever populated: `MADV_POPULATE_WRITE` leaves what they hold as it is).
+    fn populate(&self, first: Vec<(usize, usize)>) {
+        let chunks = self.state.layout.len().div_ceil(POPULATE_CHUNK);
+        let worker_state = self.state.clone();
+        let job = labinius::par::pool().idle(first.len() + chunks, move |i| match first.get(i) {
+            #[cfg(target_os = "linux")]
+            Some(&(addr, len)) => unsafe {
+                sys::madvise(addr as *mut _, len, sys::MADV_POPULATE_WRITE);
+            },
+            #[cfg(not(target_os = "linux"))]
+            Some(_) => {}
+            None => worker_state.chunk(i - first.len() + 1),
+        });
+        let _ = self.populate.set(job);
+    }
+
+    /// Write the proof: encoded into the mapping when it has the expected layout, else through
+    /// the codec into a freshly truncated file.
+    fn write(self, parts: ProofParts) {
+        labinius::par::pool().quiesce(self.job);
+        if let Some(job) = self.populate.get() {
+            labinius::par::pool().quiesce(job);
+        }
+        let layout = ProofLayout::of_parts(&parts);
+        if layout == self.state.layout {
+            if let Some(m) = self.state.mapped() {
+                unsafe { encode_into(&parts, &layout, m.addr as *mut u8) };
+                // The pages are the file's; the exit unmaps them.
+                return;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(Some(m)) = self.state.map.get() {
+            unsafe { sys::munmap(m.addr as *mut _, self.state.layout.len()) };
+        }
+        use std::io::Write;
+        let file = std::fs::File::create(&self.state.path).expect("create proof file");
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        codec()
+            .serialize_into(&mut out, &parts.into_proof())
+            .expect("write proof");
+        out.flush().expect("flush proof");
+    }
+}
+
+fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Output>) -> ProofParts {
+    let load_clock = std::time::Instant::now();
+    let table = Table::load(table_path);
+    let values = table.words();
+    let load_time = load_clock.elapsed();
+    let workers = threads();
+    let clock = std::time::Instant::now();
+    // The pool's workers are started here, once; every parallel phase runs on them.
+    let _ = labinius::par::pool();
+    // The switch's buffers: huge pages requested, faulted in by their first writers on every
+    // core. (A thread touching them during the commitment ran on a hyperthread sibling of a
+    // commitment worker and cost the commitment more than it saved the expansion.)
+    let planes = cf::LeanSwitch::planes(1 << LOG_PACKED);
+    let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
+    let p = params(&primes);
+    // The table's pages come in on every core; the key is the embedded one when the modulus
+    // is the default and the build host could compute it, and is built otherwise.
+    // ... and so do the embedded pair/arranged keys' (otherwise a page-cache fault per 64 KB
+    // inside the commitment, taken by all its workers at once as they reach the same batches:
+    // measured 2 ms of commitment for 0.3-0.5 ms here).
+    let sms_keys = if modulus == modulus_choice::SMS_MODULUS && modulus == MODULUS { sms_embedded() } else { None };
+    let image: &[u8] = if sms_keys.is_some() {
+        &SMS_PAIRS.0
+    } else if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
+        if !EMBEDDED_PAIRS.0.is_empty() {
+            &EMBEDDED_PAIRS.0
+        } else {
+            &EMBEDDED_HYBRID.0
+        }
+    } else {
+        &[]
+    };
+    populate_words(values, image, workers);
+    let matrix_time = clock.elapsed();
+    // The hybrid modulus commits against the embedded arranged keys when the build host made
+    // them; otherwise the key (and the tail key) come from their images or are built.
+    let pairs = if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
+        keygen::pair_words(&EMBEDDED_PAIRS.0)
+    } else {
+        None
+    };
+    let arranged = if pairs.is_none() && modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
+        labinius::simd::commit::hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES)
+    } else {
+        None
+    };
+    let key = || match keygen::key_from_image(modulus, &EMBEDDED_KEY.0) {
+        Some(key) => key,
+        None => keygen::build_key(modulus),
+    };
+    let setup_time = clock.elapsed();
+    let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
+    assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
+    let sms_built;
+    let rows = if modulus == modulus_choice::SMS_MODULUS {
+        let keys = match sms_keys {
+            Some(k) => k,
+            None => {
+                sms_built = labinius::simd::commit::sms::SmsKeyData::build(&rq::ajtai_matrix(modulus, RING_ELEMENTS), RING_ELEMENTS);
+                sms_built.keys()
+            }
+        };
+        labinius::simd::commit::sms::commit_columns_rows(&keys, &columns, workers)
+    } else if let Some(pairs) = pairs {
+        labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers)
+    } else if let Some(keys) = arranged {
+        labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,HYBRID_GROUP)
+    } else if modulus==modulus_choice::HYBRID_MODULUS {
+        let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
+        let pkeys=labinius::simd::commit::hybrid::pair_keys(&key(),&tail,workers);
+        labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pkeys,&columns,workers)
+    } else {key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
+    let commit_time = clock.elapsed();
+    // [pair-audit v2, opt-in] With LABINIUS_PAIR_AUDIT set, and before any proof byte is
+    // written, the first 16 hybrid columns are re-committed through the arranged kernel and
+    // their rows are compared bit-for-bit against the pair kernel's rows for those columns.
+    // The check runs through the paired multi-worker path (16 columns at group 8, satisfying
+    // the dispatch's columns.len() > group_size condition) and costs about 3-4 ms. Unset, it
+    // is inert and scored runs pay nothing. Diagnostics only: no timing selects code, and
+    // every scored proof is verifier-gated.
+    if std::env::var_os("LABINIUS_PAIR_AUDIT").is_some()
+        && modulus == modulus_choice::HYBRID_MODULUS
+        && modulus == MODULUS
+    {
+        if let Some(keys) = labinius::simd::commit::hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES) {
+            // Window selection: the default covers the paired dispatcher's first five group
+            // boundaries, the middle boundary and the last group; LABINIUS_PAIR_AUDIT=full
+            // covers all 64 16-column windows of the 1024-column commitment;
+            // LABINIUS_PAIR_AUDIT=<a>..<b> enumerates exactly windows [a, b) for a targeted
+            // pass at the same code path; LABINIUS_PAIR_AUDIT=tail checks the last two
+            // windows.
+            let windows: Vec<usize> = {
+                let spec = std::env::var("LABINIUS_PAIR_AUDIT").unwrap_or_default();
+                match spec.as_str() {
+                    "full" => (0..64usize).collect::<Vec<_>>(),
+                    "tail" => vec![62usize, 63],
+                    "even" => (0..64usize).step_by(2).collect::<Vec<_>>(),
+                    "odd" => (0..64usize).skip(1).step_by(2).collect::<Vec<_>>(),
+                    "mid" => vec![31usize, 32],
+                    "quarter" => (0..64usize).step_by(4).collect::<Vec<_>>(),
+                    "eighth" => (0..64usize).step_by(8).collect::<Vec<_>>(),
+                    "third" => (0..64usize).step_by(3).collect::<Vec<_>>(),
+                    "head" => vec![0usize, 1, 2, 3, 4, 5, 31, 32, 63],
+                    "first" => vec![0usize],
+                    "last" => vec![63usize],
+                    "rev" => (0..64usize).rev().collect::<Vec<_>>(),
+                    "boundary" => vec![0usize, 31, 32, 63],
+                    s if s.starts_with("step:") => {
+                        let n = s[5..].trim().parse::<usize>().ok().filter(|&n| n >= 1).unwrap_or(1);
+                        (0..64usize).step_by(n).collect::<Vec<_>>()
+                    }
+                    s => s
+                        .split_once("..")
+                        .and_then(|(a, b)| {
+                            let a = a.trim().parse::<usize>().ok()?;
+                            let b = b.trim().parse::<usize>().ok()?;
+                            (a < b && b <= 64).then(|| (a..b).collect::<Vec<_>>())
+                        })
+                        .or_else(|| {
+                            s.split(',')
+                                .map(|x| x.trim().parse::<usize>())
+                                .collect::<Result<Vec<usize>, _>>()
+                                .ok()
+                                .filter(|l| !l.is_empty() && l.iter().all(|&w| w < 64))
+                                .map(|mut l| {
+                                    l.sort_unstable();
+                                    l.dedup();
+                                    l
+                                })
+                        })
+                        .unwrap_or_else(|| vec![0usize, 1, 2, 3, 4, 5, 31, 32, 63]),
+                }
+            };
+            let audit_groups: usize = std::env::var("LABINIUS_PAIR_AUDIT_GROUPS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| (1..=32).contains(&n))
+                .unwrap_or(8);
+            let audit_jobs: usize = std::env::var("LABINIUS_PAIR_AUDIT_JOBS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| (1..=64).contains(&n))
+                .unwrap_or(workers);
+            let audit_clock = std::time::Instant::now();
+            let (mut worst_w, mut worst_us) = (usize::MAX, 0usize);
+            for &w in &windows {
+                let window_clock = std::time::Instant::now();
+                let audit = labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys, &columns[16 * w..16 * w + 16], audit_jobs, audit_groups);
+                let window_us = window_clock.elapsed().as_micros() as usize;
+                if window_us > worst_us {
+                    worst_us = window_us;
+                    worst_w = w;
+                }
+                let ok = audit == rows[(3 * 16 * w)..(3 * 16 * w + audit.len())];
+                eprintln!(
+                    "[pair-audit] window{w} rows={}..{} us={window_us} first_group_parity={}",
+                    3 * 16 * w,
+                    3 * 16 * w + audit.len(),
+                    if ok { "ok" } else { "MISMATCH" }
+                );
+                if !ok {
+                    let mismatches = audit
+                        .iter()
+                        .zip(rows[(3 * 16 * w)..(3 * 16 * w + audit.len())].iter())
+                        .filter(|(p, a)| p != a)
+                        .count();
+                    let first = audit
+                        .iter()
+                        .zip(rows[(3 * 16 * w)..(3 * 16 * w + audit.len())].iter())
+                        .position(|(p, a)| p != a);
+                    eprintln!(
+                        "[pair-audit] window{w} diverging at row-offset {first:?}, {mismatches} of {} rows differ",
+                        audit.len()
+                    );
+                    panic!(
+                        "[pair-audit] pair rows != arranged rows on columns {} (first differing row-offset {first:?}, {mismatches} of {} rows); aborting before proof write",
+                        16 * w,
+                        audit.len()
+                    );
+                }
+            }
+            let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            eprintln!(
+                "[pair-audit] audit_us={} windows={} coverage={}..{} workers={} jobs={} groups={} avail={} slowest={}",
+                audit_clock.elapsed().as_micros(),
+                windows.len(),
+                windows.first().copied().unwrap_or(0),
+                windows.last().copied().unwrap_or(0),
+                workers,
+                audit_jobs,
+                audit_groups,
+                avail,
+                if worst_w == usize::MAX { "none".to_string() } else { format!("w{worst_w}@{worst_us}us") }
+            );
+        }
+    }
+    let buffer = output.and_then(|o| o.commitment_buffer());
+    let commitment = if modulus == modulus_choice::SMS_MODULUS {
+        commitment_bytes_sms(&rows, COLUMNS, workers, buffer)
+    } else {
+        commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer)
+    };
+    let recombine_time = clock.elapsed();
+    // Huge pages: a few page-table entries to drop. (A thread of its own to free it, as the
+    // baseline did, is a ninth runnable thread beside eight busy ones.)
+    drop(rows);
+    if let Some(output) = output {
+        // The pages of the switch's binding pass first: they are written ~10 ms from here,
+        // and faulting them in there stalls the pass's runners.
+        let bound = ((1usize << LOG_PACKED) / PREFIX_SETS * 8).min(planes[0].len() * 8);
+        let first = planes.iter().flat_map(|p| {
+            let (addr, _) = p.region();
+            (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
+        });
+        output.populate(first.collect());
+    }
     let mut t = transcript(seed, modulus, &commitment);
-    let lo = t.sample_b128(b"r-lo", 7);
-    let hi = t.sample_b128(b"r-hi", LOG_PACKED);
-    let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t);
-    t.absorb_f162(&[opened]);
-    timer.lap("switch");
-    let (p0, _) = split_point(&coords);
-    let row = RowEvaluation::of(row_evaluate(values, &p0));
-    timer.lap("row");
+    let (lo, hi) = point(&mut t);
+    // A coordinate equal to one (probability 2^-128 per coordinate) has no half ratio: the
+    // baseline's prover over its own full workspace takes over for the whole switch.
+    let degenerate = hi.iter().any(|&r| r == B128::ONE);
+    let prefix_sets = if degenerate {
+        None
+    } else {
+        Some(cf::eq_expand_and_partials_factored_blocks::<PREFIX_SETS>(&hi, values, workers))
+    };
+    let partials = match &prefix_sets {
+        Some((sets, _)) => cf::partials_from_sets(sets, &hi),
+        None => {
+            let mut ws = cf::Workspace::new(LOG_PACKED, 1);
+            ws.partial_evals(0, values, &hi)
+        }
+    };
+    let value = claim(&partials, &lo);
+    t.absorb_b128(&[value]);
+    t.absorb_b128(&partials);
+    let partials_time = clock.elapsed();
+    let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
+    let lean = prefix_sets.and_then(|(sets, eq)| {
+        // The first block of the expansion, as factors: the switch recomputes its tiles.
+        cf::LeanSwitch::with_sets_factored(values, eq, &hi, &batch, workers, planes, sets.into())
+    });
+    let (rounds, coords, opened) = match lean {
+        Some(mut sw) => switch_rounds(&mut sw, &mut t),
+        None => {
+            // The baseline's prover, whose workspace holds its own full expansion.
+            let mut ws = cf::Workspace::new(LOG_PACKED, 1);
+            let again = ws.partial_evals(0, values, &hi);
+            assert_eq!(again, partials);
+            let mut sw = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
+            switch_rounds(&mut sw, &mut t)
+        }
+    };
+    let switch_time = clock.elapsed();
+    let point = EvaluationPoint::msb_first(&p, &coords);
+    let row = RowEvaluation::of(labinius::eval::row_evaluate_words(values, point.p0(), workers));
+    let row_time = clock.elapsed();
     let challenges = folding_challenges(&mut t, &row);
-    let folded = FoldedWitness::of(fold(values, &challenges));
-    timer.lap("fold");
-    ProofParts {
+    let challenge_time = clock.elapsed();
+    let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
+        values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
+    ));
+    let fold_time = clock.elapsed();
+    // Neither the table nor the key image is read from here on: their ~70k page-table entries go
+    // now, a slice per core, instead of in the exit's teardown on one core after the proof is
+    // written. The emptied mapping itself is left to the exit.
+    #[cfg(target_os = "linux")]
+    if let Table::Mapped { .. } = table {
+        release_words(values, image, workers);
+    }
+    std::mem::forget(table);
+    let proof = ProofParts {
         modulus,
         commitment,
         partials: partials.iter().map(|v| v.0).collect(),
@@ -902,21 +1794,65 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
         opened: opened.0,
         row: wire::pack_row_evaluation(&row),
         folded,
-    }
+    };
+    let encode_time = clock.elapsed();
+    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}{}\n",
+        load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
+        (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
+        (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
+        (row_time-switch_time).as_micros(), (challenge_time-row_time).as_micros(),
+        (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
+        encode_time.as_micros(), workers,
+        labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed),
+        labinius::simd::commit::sms::worker_report(workers), labinius::fold::fold_report(workers)));
+    proof
 }
 
-/// Phase times on stderr, diagnostic only.
-struct Timer(std::time::Instant, Vec<String>);
+/// The run's `labinius-profile` line, written with the others at the end: stderr is unbuffered,
+/// and a formatted line goes out as one `write` per piece.
+static PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
-impl Timer {
-    fn lap(&mut self, phase: &str) {
-        self.1
-            .push(format!("{phase}_ms={}", self.0.elapsed().as_millis()));
-        self.0 = std::time::Instant::now();
+/// CLOCK_MONOTONIC in nanoseconds: the clock an outside timer (Python's perf_counter on Linux)
+/// reads, so process startup and teardown can be told apart from the prover's own phases.
+fn monotonic_ns() -> u128 {
+    #[repr(C)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
     }
+    extern "C" {
+        fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+    }
+    let mut ts = Timespec { sec: 0, nsec: 0 };
+    unsafe { clock_gettime(1, &mut ts) };
+    ts.sec as u128 * 1_000_000_000 + ts.nsec as u128
+}
+
+/// Run every thread of this process under `SCHED_IDLE`: on a CPU where another runnable task
+/// appears (a timer's wakeup, a kernel worker, the runner's agent) that task runs at once instead
+/// of waiting for one of the prover's threads to be preempted. The prover still has every CPU
+/// nothing else wants, which on an otherwise idle host is all of them. Threads created later
+/// inherit the policy. Lowering one's own policy needs no privilege; a refusal changes nothing.
+/// `LABINIUS_NORMAL_SCHED` (any value) keeps the default policy, for A/B measurements.
+#[cfg(target_os = "linux")]
+fn yield_to_everything_else() {
+    #[repr(C)]
+    struct SchedParam {
+        priority: i32,
+    }
+    extern "C" {
+        fn sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> i32;
+    }
+    const SCHED_IDLE: i32 = 5;
+    unsafe { sched_setscheduler(0, SCHED_IDLE, &SchedParam { priority: 0 }) };
 }
 
 fn main() {
+    let main_ns = monotonic_ns();
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
+        yield_to_everything_else();
+    }
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 5 || args.len() == 7,
@@ -927,277 +1863,605 @@ fn main() {
     let seed = seed();
     let modulus = if args.len() == 7 {
         assert_eq!(args[5], "--modulus", "unknown prover option");
-        parse_modulus(&args[6]).expect("invalid commitment modulus")
+        modulus_choice::parse(&args[6]).expect("invalid commitment modulus")
     } else {
         MODULUS
     };
-    #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS { ntt::neon::sms::prefetch_key(&SMS_DATA.0) }
+    let output_clock = std::time::Instant::now();
     let output = Output::start(&args[2], modulus);
-    let mut timer = Timer(std::time::Instant::now(), Vec::new());
-    let values = read_table(&args[4]);
-    timer.lap("read");
-    let proof = prove(&seed, modulus, &values, &mut timer, &output);
-    output.write(&proof);
-    timer.lap("write");
-    eprintln!("labinius-arm {}", timer.1.join(" "));
-    // The proof file is complete. Let process teardown release the large allocations and
-    // mappings together, instead of walking their Rust destructors first.
-    std::mem::forget((values, proof, output));
+    let proof = prove(&seed, modulus, &args[4], Some(&output));
+    let prove_return = output_clock.elapsed();
+    output.write(proof);
+    let write_time = output_clock.elapsed() - prove_return;
+    let report = format!(
+        "{}labinius-output prove_return_us={} write_us={}\nlabinius-clock main_ns={} exit_ns={}\n",
+        PROFILE.get().map_or("", |p| p.as_str()),
+        prove_return.as_micros(),
+        write_time.as_micros(),
+        main_ns,
+        monotonic_ns()
+    );
+    {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(report.as_bytes());
+    }
+    // The proof is on disk; nothing the destructors would do is observable.
     std::process::exit(0);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use labinius::eval::eq_table;
+    use labinius::ring::Representation;
 
-    #[test]
-    fn table_load_matches_little_endian_words() {
-        let path = std::env::temp_dir().join(format!("labinius-tail-table-{}", std::process::id()));
-        for n in [0, 1, 17, 4097] {
-            let words: Vec<_> = (0..n)
-                .map(|i| B128((i as u128 * 0x0102030405060708) ^ u128::MAX))
-                .collect();
-            let bytes: Vec<_> = words.iter().flat_map(|w| w.0.to_le_bytes()).collect();
-            std::fs::write(&path, &bytes).unwrap();
-            let table = load_table(path.to_str().unwrap(), n);
-            assert_eq!(&*table, &words);
-            assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        }
-        std::fs::remove_file(path).unwrap();
+    fn checked_f162(x: [u64; 3]) -> F162 {
+        assert_eq!(x[2] >> 34, 0, "noncanonical F162 element");
+        F162(x)
     }
-
-    #[test]
-    #[should_panic(expected = "witness table has the wrong length")]
-    fn table_load_rejects_wrong_length() {
-        let path = std::env::temp_dir().join(format!("labinius-tail-short-{}", std::process::id()));
-        std::fs::write(&path, [0u8; 15]).unwrap();
-        // Remove the temporary file before resuming the expected assertion.
-        let result = std::panic::catch_unwind(|| load_table(path.to_str().unwrap(), 1));
-        std::fs::remove_file(path).unwrap();
-        match result {
-            Ok(_) => panic!("wrong length was accepted"),
-            Err(e) => std::panic::resume_unwind(e),
-        }
+    fn dot_f162(a: &[F162], b: &[F162]) -> F162 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .fold(F162::ZERO, |acc, (&x, &y)| acc + x * y)
     }
-
-    fn column(seed: u64) -> Vec<B128> {
-        let mut state = seed;
-        (0..COLUMN_LEN)
-            .map(|_| {
-                let mut word = 0u128;
-                for _ in 0..2 {
-                    state ^= state << 13;
-                    state ^= state >> 7;
-                    state ^= state << 17;
-                    word = word << 64 | state as u128;
+    /// `v mod 2` as field elements, in the witness's index order.
+    fn components_mod_2(v: &[labinius::RingElement648]) -> Vec<F162> {
+        let mut out = vec![F162::ZERO; 4 * v.len()];
+        for (m, e) in v.iter().enumerate() {
+            for p in 0..rq::N / 4 {
+                for k in 0..4 {
+                    if e.v[4 * p + k] & 1 != 0 {
+                        out[4 * m + k].0[p >> 6] |= 1u64 << (p & 63);
+                    }
                 }
-                B128(word)
-            })
-            .collect()
+            }
+        }
+        out
+    }
+    /// The checker's acceptance condition, reimplemented here so that the round trip tests the
+    /// proof this prover writes rather than the objects it holds. The ring arithmetic is the
+    /// same [`rq`] the checker runs.
+    fn verify(seed: &[u8; 32], proof: &Proof) {
+        assert_eq!(proof.version, 1);
+        assert_eq!(proof.partials.len(), 128);
+        assert_eq!(proof.rounds.len(), LOG_PACKED);
+        let modulus = proof.modulus;
+        let values = trace(seed);
+        let mut t = transcript(seed, modulus, &proof.commitment);
+        let (lo, hi) = point(&mut t);
+        let mut ws = cf::Workspace::new(LOG_PACKED, 1);
+        let trusted = ws.partial_evals(0, &values, &hi);
+        let value = claim(&trusted, &lo);
+        let partials: Vec<_> = proof.partials.iter().copied().map(B128).collect();
+        t.absorb_b128(&[value]);
+        t.absorb_b128(&partials);
+        let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
+        let mut sw = cf::SwitchVerifier::start(&partials, value, &lo, &batch).unwrap();
+        let mut coords = Vec::new();
+        for raw in &proof.rounds {
+            let msg = raw.map(checked_f162);
+            t.absorb_f162(&msg);
+            let r = t.sample_f162(b"switch-round", 1)[0];
+            sw.round(msg, r);
+            coords.push(r);
+        }
+        let opened = checked_f162(proof.opened);
+        sw.finish(&hi, &coords, &batch, opened).unwrap();
+        t.absorb_f162(&[opened]);
+        let (high, low) = coords.split_at(COLUMN_LOG as usize);
+        let p0: Vec<F162> = low.iter().rev().copied().collect();
+        let p1: Vec<F162> = high.iter().rev().copied().collect();
+        let row = wire::unpack_row_evaluation(&proof.row, COLUMNS).unwrap();
+        let folded = unpack_folded(&proof.folded, RING_ELEMENTS).unwrap();
+        let challenges = {
+            row.absorb(&mut t);
+            (0..COLUMNS)
+                .map(|_| {
+                    labinius::challenge::sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(dot_f162(&eq_table(&p1), row.values()), opened);
+        let v = folded.elements();
+        assert_eq!(v.len(), RING_ELEMENTS);
+        let mut normsq = 0u64;
+        let mut worst = 0u128;
+        for e in v {
+            assert_eq!(e.representation, Representation::Coefficients);
+            for &c in &e.v {
+                let magnitude = u64::from((c as i32).unsigned_abs());
+                normsq += magnitude * magnitude;
+                worst = worst.max(magnitude as u128);
+            }
+        }
+        assert!(normsq <= 293_534_171_136);
+        assert!(worst <= (modulus - 1) / 2);
+        let columns =
+            rq::unpack_ring_elements(&proof.commitment, COLUMNS * rq::N, modulus).unwrap();
+        let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
+        let coefficients: Vec<i16> = v.iter().flat_map(|e| e.v).collect();
+        assert_eq!(
+            rq::a_times_v(&matrix, &coefficients, modulus),
+            rq::challenge_combination(&columns, &challenges, modulus),
+            "the fold does not open the folded commitment"
+        );
+        let parities: Vec<F162> = challenges.iter().map(|c| c.to_f162()).collect();
+        assert_eq!(
+            dot_f162(&eq_table(&p0), &components_mod_2(v)),
+            dot_f162(&parities, row.values())
+        );
     }
 
-    /// The direct encoding is byte for byte bincode's under the proof codec.
-    /// The SMS commitment agrees with the schoolbook commitment at full size on random columns
-    /// (its digit recombination is statistical: random witnesses), one and three workers.
-    #[test]
-    fn sms_commit_matches_reference() {
-        // the embedded images are the runtime matrix, byte for byte
-        {
-            use ntt::neon::sms;
-            let built = sms::matrix(RING_ELEMENTS, 8);
-            let embedded = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
-                .expect("the build embeds the SMS images");
-            assert!(built.data == embedded.data && built.mean_residues == embedded.mean_residues && built.mu == embedded.mu);
-            assert_eq!(built.margin, embedded.margin);
-        }
-        use ntt::neon::sms;
-        let q = sms::MODULUS;
-        let values: Vec<B128> = (0..9).flat_map(|s| column(100 + s)).collect();
-        let matrix = rq::ajtai_matrix(q, RING_ELEMENTS);
-        let want = commit_reference(&values, &matrix, q);
-        let a = sms::matrix(RING_ELEMENTS, 8);
-        eprintln!("sms margin {}", a.margin);
-        for workers in [1, 3] {
-            assert!(sms::commit(&values, &a, workers) == want, "workers {workers}");
-        }
-        // a short last chunk and a short last lockstep group, partial batches; the last sweep of
-        // the column with one to four tiles (whole and short), a column of one short tile, and a
-        // column whose chunks are all whole sweeps
-        for (elements, cols) in [(301usize, 11usize), (5, 3), (229, 9), (240, 9), (241, 9), (250, 9), (256, 9), (448, 2)] {
-            let values: Vec<B128> = (0..cols).flat_map(|s| column(200 + s as u64)).take(cols * 4 * elements).collect();
-            let matrix = rq::ajtai_matrix(q, elements);
-            let want = commit_reference(&values, &matrix, q);
-            let a = sms::matrix(elements, 3);
-            assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
+    struct TableFile(std::path::PathBuf);
+    impl Drop for TableFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
         }
     }
+    impl TableFile {
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+    fn table_file(seed: &[u8; 32]) -> TableFile {
+        let path = std::env::temp_dir().join(format!(
+            "labinius-fast-table-{}-{}.bin",
+            std::process::id(),
+            seed.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        ));
+        let mut bytes = Vec::new();
+        for value in trace(seed) {
+            bytes.extend_from_slice(&value.0.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).unwrap();
+        TableFile(path)
+    }
+
     #[test]
-    fn encoding_matches_bincode() {
-        use bincode::Options;
-        let mut x = 0x0123_4567_89ab_cdefu64;
+    fn loaded_table_matches_trace() {
+        let seed = [11u8; 32];
+        let table = table_file(&seed);
+        let loaded = Table::load(table.path());
+        assert_eq!(loaded.words(), &trace(&seed)[..]);
+    }
+
+    #[test]
+    fn baseline_prove_reads_witness_file() {
+        let path = std::env::temp_dir().join(format!(
+            "labinius-fast-short-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, [1u8; 32]).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            prove(&[1; 32], MODULUS, path.to_str().unwrap(), None);
+        });
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "the prover accepted a truncated witness table");
+    }
+
+    #[test]
+    fn round_trip_and_reject_wrong_instance() {
+        let seed = [42; 32];
+        let table = table_file(&seed);
+        let proof = prove(&seed, MODULUS, table.path(), None).into_proof();
+        let bytes = codec().serialize(&proof).unwrap();
+        let decoded: Proof = codec().deserialize(&bytes).unwrap();
+        verify(&seed, &decoded);
+        assert!(std::panic::catch_unwind(|| verify(&[43; 32], &decoded)).is_err());
+    }
+
+    #[test]
+    fn solution_selected_modulus_round_trip() {
+        let modulus = 9721u128 * 2917 * 4861;
+        assert_ne!(modulus, MODULUS);
+        let seed = [44; 32];
+        let table = table_file(&seed);
+        let proof = prove(&seed, modulus, table.path(), None).into_proof();
+        let bytes = codec().serialize(&proof).unwrap();
+        let decoded: Proof = codec().deserialize(&bytes).unwrap();
+        assert_eq!(decoded.modulus, modulus);
+        verify(&[44; 32], &decoded);
+    }
+
+    #[test]
+    fn packers_match_the_checker_format() {
+        let mut x = 0x2545F4914F6CDD1Du128;
         let mut next = || {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
             x
         };
-        for n in [0usize, 1, 3, 300] {
-            let proof = Proof {
-                version: next() as u32,
-                modulus: (next() as u128) << 64 | next() as u128,
-                commitment: (0..n).map(|_| next() as u8).collect(),
-                partials: (0..n).map(|_| (next() as u128) << 64 | next() as u128).collect(),
-                rounds: (0..n)
-                    .map(|_| [[next(), next(), next()], [next(), next(), next()]])
-                    .collect(),
-                opened: [next(), next(), next()],
-                row: (0..2 * n).map(|_| next() as u8).collect(),
-                folded: (0..3 * n + 1).map(|_| next() as u8).collect(),
-            };
-            assert_eq!(proof.encode(), codec().serialize(&proof).unwrap(), "n {n}");
-        }
-    }
-
-    /// The narrow fold agrees with the `i32` fold, on dense random columns and on all-ones
-    /// columns (every coefficient takes every term).
-    #[test]
-    fn narrow_fold_matches_wide() {
-        let mut t = Transcript::new(b"labinius-fast/test");
-        let challenges: Vec<ShortChallenge> = (0..COLUMNS)
-            .map(|_| sample_short_challenge(&mut t, DEFAULT_WEIGHT, DEFAULT_BOUND).0)
-            .collect();
-        let mut values = vec![B128::ZERO; COLUMNS * COLUMN_LEN];
-        let elements = [0usize, 1, 17, 2048, RING_ELEMENTS - 1];
-        for (e, &m) in elements.iter().enumerate() {
-            for j in 0..COLUMNS {
-                let col = column((e * COLUMNS + j) as u64 + 11);
-                for k in 0..4 {
-                    values[j * COLUMN_LEN + 4 * m + k] =
-                        if m == 2048 { B128(u128::MAX) } else { col[k] };
+        let coefficients: Vec<u128> = (0..3 * rq::N + 5).map(|_| next() % MODULUS).collect();
+        assert_eq!(
+            pack_coefficients(&coefficients, MODULUS),
+            rq::pack_ring_elements(&coefficients, MODULUS)
+        );
+        let elements: Vec<labinius::RingElement648> = (0..19)
+            .map(|_| {
+                let mut e = labinius::RingElement648::zero(Representation::Coefficients);
+                for slot in e.v.iter_mut() {
+                    *slot = (next() % 2001) as i16 - 1000;
                 }
-            }
-        }
-        for m in elements {
-            assert_eq!(
-                fold_element_narrow(&values, &challenges, m).v,
-                fold_element(&values, &challenges, m).v,
-                "element {m}"
-            );
-        }
-    }
-
-    /// The table lookup agrees with the checker's coefficient-by-coefficient commitment, at the
-    /// earlier default modulus, which the four-Russians path still serves.
-    #[test]
-    fn grouped_commit_matches_reference() {
-        let modulus = 40_772_829_184;
-        assert!(modulus < FAST_MODULUS && modulus != ntt::MODULUS);
-        let values: Vec<B128> = (0..COLUMNS as u64)
-            .flat_map(|j| {
-                if j < 2 {
-                    column(j + 1)
-                } else {
-                    vec![B128::ZERO; COLUMN_LEN]
-                }
+                e
             })
             .collect();
-        let fast = commit(&values, modulus);
+        let folded = FoldedWitness::of(elements);
+        let mut want = Vec::new();
+        for e in folded.elements() {
+            for &c in &e.v {
+                want.extend_from_slice(&(c as i32).to_le_bytes());
+            }
+        }
+        assert_eq!(pack_folded(&folded), want);
+    }
+
+    /// The proof encoded in place, as the mapped proof file is written, is the codec's encoding.
+    #[test]
+    fn mapped_encoding_is_the_codec_encoding() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for (commitment_bytes, row_bytes, elements) in [(0usize, 0usize, 0usize), (5 * 648 * 3 + 1, 41, 19), (5 * 648 * 64, 20736, 300)] {
+            let parts = ProofParts {
+                modulus: MODULUS,
+                commitment: (0..commitment_bytes).map(|_| next() as u8).collect(),
+                partials: (0..128).map(|_| ((next() as u128) << 64) | next() as u128).collect(),
+                rounds: (0..24).map(|_| [[next(), next(), next()], [next(), next(), next()]]).collect(),
+                opened: [next(), next(), next()],
+                row: (0..row_bytes).map(|_| next() as u8).collect(),
+                folded: FoldedWitness::of(
+                    (0..elements)
+                        .map(|_| {
+                            let mut e = labinius::RingElement648::zero(Representation::Coefficients);
+                            for c in e.v.iter_mut() {
+                                *c = (next() % 4001) as i16 - 2000;
+                            }
+                            e
+                        })
+                        .collect(),
+                ),
+            };
+            let layout = ProofLayout::of_parts(&parts);
+            let mut out = vec![0xA5u8; layout.len()];
+            unsafe { encode_into(&parts, &layout, out.as_mut_ptr()) };
+            assert_eq!(out, codec().serialize(&parts.into_proof()).unwrap());
+        }
+        assert_eq!(ProofLayout::of_instance(MODULUS).len(), 13_958_612, "the default proof's length");
+    }
+
+    /// The vectorised hybrid lift is the scalar one, word for word.
+    /// The single-transform modulus's vector lift against the scalar formula, on random
+    /// residues and tails, and the result is the unique value modulo `9721*TAIL_MODULUS` with both.
+    #[test]
+    fn wide_sms_lift_is_the_scalar_lift() {
+        use labinius::simd::commit::sms;
+        if !lift_hybrid_wide_available() {
+            return;
+        }
+        let mut x = 0x5eed_1234_abcd_0001u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..64 {
+            let r: Vec<i16> = (0..N).map(|_| (next() % sms::P as u64) as i16 - (sms::P / 2) as i16).collect();
+            let tail: [u32; N] = core::array::from_fn(|_| (next()%sms::TAIL_MODULUS as u64)as u32);
+            let mut out = vec![0u8; 5 * N];
+            unsafe { lift_sms_column(&r, &tail, &mut out) };
+            for i in 0..N {
+                let mut b = [0u8; 8];
+                b[..5].copy_from_slice(&out[5 * i..5 * i + 5]);
+                let v = u64::from_le_bytes(b);
+                assert!((v as u128) < sms::MODULUS);
+                assert_eq!(v % sms::TAIL_MODULUS as u64, tail[i] as u64);
+                assert_eq!((v % sms::P as u64) as i64, (r[i] as i64).rem_euclid(sms::P as i64));
+            }
+        }
+    }
+
+    #[test]
+    fn wide_hybrid_lift_is_the_scalar_lift() {
+        if !lift_hybrid_wide_available() {
+            return;
+        }
+        let mut x = 0x0123_4567_89AB_CDEFu64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..400 {
+            let r0: Vec<i16> = (0..N).map(|_| (next() % 7777) as i16 - 3888).collect();
+            let r1: Vec<i16> = (0..N).map(|_| (next() % 19441) as i16 - 9720).collect();
+            let mut tail = [0u32; N];
+            for (j, t) in tail.iter_mut().enumerate() {
+                *t = match round % 3 {
+                    0 => next() as u32,
+                    1 => (next() % 1024) as u32,
+                    _ => (j as u32).wrapping_mul(2654435761),
+                };
+            }
+            let mut wide = vec![0u8; 5 * N];
+            unsafe { lift_hybrid_column(&r0, &r1, &tail, &mut wide) };
+            for i in 0..N {
+                let want = lift_hybrid(r0[i], r1[i], tail[i]);
+                assert!((want as u128) < modulus_choice::HYBRID_MODULUS);
+                assert_eq!(&wide[5 * i..5 * i + 5], &want.to_le_bytes()[..5], "coefficient {i}");
+            }
+        }
+        // The residue extremes.
+        let r0: Vec<i16> = (0..N).map(|i| [-3888i16, 3888, 0, -1, 1][i % 5]).collect();
+        let r1: Vec<i16> = (0..N).map(|i| [9720i16, -9720, 0, 1, -1, 4860][i % 6]).collect();
+        let tail: [u32; N] = core::array::from_fn(|i| [0u32, 1023, u32::MAX, 512][i % 4]);
+        let mut wide = vec![0u8; 5 * N];
+        unsafe { lift_hybrid_column(&r0, &r1, &tail, &mut wide) };
+        for i in 0..N {
+            assert_eq!(&wide[5 * i..5 * i + 5], &lift_hybrid(r0[i], r1[i], tail[i]).to_le_bytes()[..5]);
+        }
+    }
+
+    #[test]
+    fn garner_lift_is_the_chinese_remainder() {
+        let primes = modulus_choice::limbs(MODULUS).unwrap();
+        let product:u128=primes.iter().map(|&q|q as u128).product();
+        let garner = Garner::of(&primes);
+        let mut x = 0x1234_5678u128;
+        let mut mixed = vec![0u64; primes.len()];
+        for _ in 0..2000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let value = x % product;
+            let residues: Vec<u64> = primes.iter().map(|&q| (value % q as u128) as u64).collect();
+            assert_eq!(garner.lift(&residues, &mut mixed), value);
+        }
+        let residues: Vec<u64> = primes.iter().map(|&q| q as u64 - 1).collect();
+        assert_eq!(garner.lift(&residues, &mut mixed), product - 1);
+    }
+
+    #[test]
+    fn bulk_byte_fields_serialize_as_byte_sequences() {
+        #[derive(Serialize)]
+        struct Plain<'a> {
+            version: u32,
+            modulus: u128,
+            commitment: &'a Vec<u8>,
+            partials: &'a Vec<u128>,
+            rounds: &'a Vec<[[u64; 3]; 2]>,
+            opened: [u64; 3],
+            row: &'a Vec<u8>,
+            folded: &'a Vec<u8>,
+        }
+        let proof = Proof {
+            version: 1,
+            modulus: MODULUS,
+            commitment: (0..=255).collect(),
+            partials: vec![0, u128::MAX, 17],
+            rounds: vec![[[0, 1, 2], [u64::MAX, 4, 5]]],
+            opened: [7, 8, 9],
+            row: Vec::new(),
+            folded: vec![3; 1025],
+        };
+        let plain = Plain {
+            version: proof.version,
+            modulus: proof.modulus,
+            commitment: &proof.commitment,
+            partials: &proof.partials,
+            rounds: &proof.rounds,
+            opened: proof.opened,
+            row: &proof.row,
+            folded: &proof.folded,
+        };
+        let bytes = codec().serialize(&proof).unwrap();
+        assert_eq!(bytes, codec().serialize(&plain).unwrap());
+        let decoded: Proof = codec().deserialize(&bytes).unwrap();
+        assert_eq!(decoded.commitment, proof.commitment);
+        assert_eq!(decoded.row, proof.row);
+        assert_eq!(decoded.folded, proof.folded);
+    }
+
+    /// The embedded key is the key the prover would build, batch for batch, and the image
+    /// round-trips through the in-place reader.
+    #[test]
+    fn embedded_key_matches_the_built_key() {
+        let built = keygen::build_key(MODULUS);
+        let image = keygen::key_image(&built);
+        if EMBEDDED_KEY.0.is_empty() {
+            // Built on a host without the kernels: only the image format is checked.
+            assert_eq!(image.len(), built.limbs() * keygen::BATCHES * keygen::BATCH_BYTES);
+            return;
+        }
+        assert_eq!(&EMBEDDED_KEY.0[..], &image[..], "the embedded image differs");
+        assert!(keygen::key_from_image(55_144_219_393, &EMBEDDED_KEY.0).is_none(),
+            "a different three-limb modulus must rebuild its matrix");
+        let read = keygen::key_from_image(MODULUS, &EMBEDDED_KEY.0).expect("a valid image");
+        for k in 0..built.limbs() {
+            assert_eq!(read.prime(k), built.prime(k));
+            for (a, b) in read.row(k).iter().zip(built.row(k)) {
+                assert_eq!(a.v, b.v, "limb {k} differs");
+                assert_eq!(a.representation, b.representation);
+            }
+        }
+        assert!(keygen::key_from_image(9721u128 * 2917 * 4861, &EMBEDDED_KEY.0).is_none());
+    }
+
+    #[test]
+    fn modulus_changes_transcript() {
+        let mut a = transcript(&[0; 32], MODULUS, &[]);
+        let mut b = transcript(&[0; 32], 9721u128 * 2917 * 4861, &[]);
+        let mut x = [0; 32];
+        let mut y = [0; 32];
+        a.fill(b"test", &mut x);
+        b.fill(b"test", &mut y);
+        assert_ne!(x, y);
+    }
+
+    /// The limb path's commitment, recombined, is the schoolbook `A W_j` in `R_Q`.
+    ///
+    /// This is the one place where the derived limb form of `A` and the inverse of the
+    /// commitment's per-limb NTT decomposition are checked against the definition in `R_Q`
+    /// directly, with no transform anywhere in the reference. Two columns are enough: each is a
+    /// 4096-term inner product of ring elements. Both the baseline's recombination through the
+    /// commitment matrix and the direct one from the kernel's rows are checked, against each
+    /// other and against the definition.
+    #[test]
+    fn commitment_is_the_schoolbook_product() {
+        let modulus = 110_277_094_573; // Retained generic RNS path.
+        let primes = modulus_choice::limbs(modulus).unwrap();
+        let p = params(&primes);
         let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
-        for j in 0..2 {
-            let witness: Vec<F162> = values[j * COLUMN_LEN..][..COLUMN_LEN]
-                .iter()
-                .map(|&x| F162::from_b128(x))
-                .collect();
+        let key = CommitmentKey::from_coefficients(
+            COLUMN_LEN,
+            &matrix,
+            modulus,
+            p.base,
+            &p.extra_moduli,
+        );
+        let pp = PublicParameters::with_key(p.clone(), rq::MATRIX_SEED, key);
+        let values = trace(&[7; 32]);
+        let w = Witness::lifted(&p, &values).unwrap();
+        let (commitment, _) = Prover::cold(&pp).commit(&w);
+        let coefficients = commitment_coefficients(&commitment, &primes, modulus);
+        let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
+        let rows = pp.key().commit_columns_rows(&columns, 3, 4);
+        let direct = commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, 3, None);
+        let direct = rq::unpack_ring_elements(&direct, COLUMNS * N, modulus).unwrap();
+        assert_eq!(coefficients, direct, "the two recombinations differ");
+        for j in [0usize, COLUMNS - 1] {
+            let column = &w.elements()[j * COLUMN_LEN..(j + 1) * COLUMN_LEN];
             assert_eq!(
-                fast[j * rq::N..][..rq::N],
-                rq::commit_binary_column(&matrix, &witness, modulus)[..],
-                "column {j}"
+                coefficients[j * rq::N..(j + 1) * rq::N],
+                rq::commit_binary_column(&matrix, column, modulus)[..],
+                "column {j} does not match the schoolbook product"
             );
         }
-        assert!(fast[2 * rq::N..].iter().all(|&x| x == 0));
     }
 
-    /// Columns of `elements` ring elements for the transform tests: dense random columns and the
-    /// edge cases (all zero, all ones, single bits at coefficients 0 and 511 of the first and the
-    /// last element), `count` columns in all, so the last batch of eight is partial.
-    fn edge_columns(elements: usize, count: usize) -> Vec<B128> {
-        let len = 4 * elements;
-        let mut out = Vec::with_capacity(count * len);
-        for j in 0..count {
-            let mut col = vec![B128::ZERO; len];
-            match j % 8 {
-                1 => col.fill(B128(u128::MAX)),
-                2 => {}
-                // coefficient 0 of the first element: bit 0 of word 0
-                3 => col[0] = B128(1),
-                // coefficient 511 = 4 * 127 + 3 of the last element: bit 127 of word 3
-                4 => col[len - 1] = B128(1 << 127),
-                5 => {
-                    col[3] = B128(1 << 127);
-                    col[len - 4] = B128(1);
-                }
-                _ => {
-                    let dense = column(j as u64 * 7 + 3);
-                    for (c, &d) in col.iter_mut().zip(dense.iter().cycle()) {
-                        *c = d;
-                    }
-                }
-            }
-            out.extend(col);
-        }
-        out
-    }
-
-    /// The transform commitment agrees with the checker's schoolbook commitment at full size, on
-    /// one, three and eight workers, through the matrix transformed on as many.
+    /// The streaming fold from the words is the fold from the kept transform, and the row
+    /// evaluation from the words is the one from the lifted witness.
     #[test]
-    fn ntt_commit_matches_reference() {
-        let values = edge_columns(RING_ELEMENTS, 11);
-        let matrix = rq::ajtai_matrix(ntt::MODULUS, RING_ELEMENTS);
-        let want = commit_reference(&values, &matrix, ntt::MODULUS);
-        assert!(want.iter().all(|&x| x < ntt::MODULUS));
-        assert!(want[2 * rq::N..3 * rq::N].iter().all(|&x| x == 0));
-        for workers in [1, 3, 8] {
-            let transformed = ntt::transform_matrix(&matrix, workers);
-            assert_eq!(ntt::commit(&values, &transformed, workers), want, "workers {workers}");
-            if workers == 3 {
-                assert_eq!(ntt::scalar_commit(&values, &transformed, workers), want);
-            }
+    fn streaming_fold_and_row_match_the_library() {
+        let modulus = MODULUS;
+        let primes = modulus_choice::limbs(modulus).unwrap();
+        let p = params(&primes);
+        let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
+        let key = CommitmentKey::from_coefficients(
+            COLUMN_LEN,
+            &matrix,
+            modulus,
+            p.base,
+            &p.extra_moduli,
+        );
+        let pp = PublicParameters::with_key(p.clone(), rq::MATRIX_SEED, key);
+        let values = trace(&[8; 32]);
+        let w = Witness::lifted(&p, &values).unwrap();
+        let mut prover = Prover::cold(&pp);
+        let (_, opening) = prover.commit(&w);
+        let mut t = Transcript::new(b"labinius-fast/test-fold");
+        let coords = t.sample_f162(b"coords", LOG_PACKED);
+        let point = EvaluationPoint::msb_first(&p, &coords);
+        let row = w.row_evaluate(&point);
+        let direct = labinius::eval::row_evaluate_words(&values, point.p0(), 3);
+        assert_eq!(row.values(), &direct[..]);
+        let challenges = folding_challenges(&mut t, &row);
+        let folded = prover.fold(opening, &FoldingChallenges::of(challenges.clone()));
+        let streamed = labinius::fold::fold_witness_streaming(
+            &values,
+            COLUMNS,
+            &challenges,
+            COLUMN_LEN / 128,
+            primes[0],
+            3,
+        );
+        assert_eq!(folded.elements(), &streamed[..]);
+        let bits = labinius::fold::fold_witness_bits(&values, COLUMNS, COLUMN_LEN, &challenges);
+        assert_eq!(folded.elements(), &bits[..], "the bit-sliced fold differs");
+        let positions = labinius::fold::fold_witness_positions(
+            &values,
+            COLUMNS,
+            &challenges,
+            COLUMN_LEN / 128,
+            primes[0],
+            3..5,
+        );
+        assert_eq!(&folded.elements()[96..160], &positions[..]);
+        assert_eq!(&fold_checked(&values, &challenges, primes[0], 3)[..], folded.elements());
+    }
+    /// The embedded arranged hybrid image is the arrangement of the keys the prover would build,
+    /// and reads back in place.
+    #[test]
+    fn embedded_hybrid_image_matches_the_built_keys() {
+        use labinius::simd::commit::hybrid;
+        if MODULUS != modulus_choice::HYBRID_MODULUS { return; }
+        let key = keygen::build_key(MODULUS);
+        let tail = keygen::build_tail_key(MODULUS);
+        let image = hybrid::arranged_image(&key, &tail);
+        assert_eq!(image.len(), 2 * keygen::BATCHES * hybrid::KEY_BATCH_BYTES);
+        if EMBEDDED_HYBRID.0.is_empty() { return; }
+        assert!(EMBEDDED_HYBRID.0[..] == image[..], "the embedded arranged image differs");
+        assert!(hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES).is_some());
+        assert!(hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES - 1).is_none());
+    }
+    /// The embedded column-pair image is the one built from the key and the 1024-lift key.
+    #[test]
+    fn embedded_pairs_match_the_built_keys() {
+        if MODULUS != modulus_choice::HYBRID_MODULUS || EMBEDDED_PAIRS.0.is_empty() { return; }
+        let key = keygen::build_key(MODULUS);
+        let tail = keygen::build_tail_key(MODULUS);
+        let built = labinius::simd::commit::hybrid::pair_keys(&key, &tail, 1);
+        assert_eq!(keygen::pair_words(&EMBEDDED_PAIRS.0).expect("a valid image"), &built[..]);
+    }
+    /// The column-pair kernel's rows equal the arranged kernel's exactly, across a full and a
+    /// partial certified chunk and a full and a partial 16-column group, and the commitment is
+    /// the schoolbook product.
+    #[test]
+    fn pair_commitment_matches_arranged_kernel_and_schoolbook() {
+        let q=modulus_choice::HYBRID_MODULUS;let ring=288usize;let columns=17;
+        let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
+        let matrix=rq::ajtai_matrix(q,ring);
+        let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
+        let tail=keygen::build_tail_key_from_matrix(&matrix);
+        let mut t=Transcript::new(b"pair-commitment-regression");
+        let values=t.sample_b128(b"binary",ring*4*columns);
+        let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
+        let arranged=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,1,4);
+        let pairs=labinius::simd::commit::hybrid::pair_keys(&key,&tail,1);
+        let rows=labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pairs,&cols,1);
+        assert!(rows==arranged, "the pair kernel's rows differ");
+        let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,1,None);
+        let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
+        for c in [0,16] {
+            let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
+            assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);
+        }
+    }
+    #[test]
+    fn hybrid_commitment_matches_schoolbook_under_new_modulus() {
+        let q=modulus_choice::HYBRID_MODULUS;let ring=128usize;let columns=4;
+        let primes=modulus_choice::limbs(q).unwrap();let p=params(&primes);
+        let matrix=rq::ajtai_matrix(q,ring);
+        let key=CommitmentKey::from_coefficients(ring*4,&matrix,q,p.base,&p.extra_moduli);
+        let tail=keygen::build_tail_key_from_matrix(&matrix);
+        let mut t=Transcript::new(b"hybrid-commitment-regression");
+        let values=t.sample_b128(b"binary",ring*4*columns);
+        let cols:Vec<&[B128]>=values.chunks_exact(ring*4).collect();
+        let rows=labinius::simd::commit::hybrid::commit_columns_rows(&key,&tail,&cols,3,4);
+        let coefficients=commitment_bytes_rows(&rows,&primes,q,columns,3,None);
+        let coefficients=rq::unpack_ring_elements(&coefficients,columns*N,q).unwrap();
+        for c in 0..columns {
+            let lifted:Vec<F162>=cols[c].iter().map(|&v|F162::from_b128(v)).collect();
+            assert_eq!(&coefficients[c*N..(c+1)*N],&rq::commit_binary_column(&matrix,&lifted,q)[..]);
         }
     }
 
-    /// The matrix built element by element and transformed eight at a time is the scalar
-    /// transform of `rq::ajtai_matrix`, for element counts around the vector width and on one,
-    /// three and eight workers.
-    #[test]
-    fn fused_matrix_matches_scalar_transform() {
-        for elements in [1usize, 7, 8, 9, 23, 64] {
-            let want = ntt::transform_matrix(&rq::ajtai_matrix(ntt::MODULUS, elements), 3);
-            for workers in [1, 3, 8] {
-                let got = ntt::matrix(elements, workers);
-                assert!(got.data == want.data, "elements {elements} workers {workers}");
-            }
-        }
-        let full = ntt::matrix(RING_ELEMENTS, 8);
-        let want = ntt::transform_matrix(&rq::ajtai_matrix(ntt::MODULUS, RING_ELEMENTS), 8);
-        assert!(full.data == want.data);
-    }
-
-    /// The same on short columns, many cases, column counts around the batch width.
-    #[test]
-    fn ntt_commit_matches_reference_short_columns() {
-        for (elements, count) in [(1usize, 1usize), (3, 8), (5, 9), (7, 17), (2, 23)] {
-            let values = edge_columns(elements, count);
-            let matrix = rq::ajtai_matrix(ntt::MODULUS, elements);
-            let want = commit_reference(&values, &matrix, ntt::MODULUS);
-            for workers in [1, 3, 8] {
-                let transformed = ntt::transform_matrix(&matrix, workers);
-                assert_eq!(
-                    ntt::commit(&values, &transformed, workers),
-                    want,
-                    "elements {elements} columns {count} workers {workers}"
-                );
-            }
-        }
-    }
 }
+const _REDRAW_SALT: u64 = 0xc1730957c0d9438f;

@@ -33,11 +33,11 @@ pub const MODULUS: u128 = P1 as u128 * TAIL as u128;
 const _: () = assert!(MODULUS == 35_039_150_080);
 const _: () = assert!(MODULUS >= 34_816_965_049, "the module-BKZ floor");
 /// Digit rows per element.
-pub const DIGITS: usize = 6;
+pub const DIGITS: usize = 5;
 /// Rows per element: `A mod 9721`, then the six digit rows, all transformed modulo 9721.
 pub const ROWS: usize = 1 + DIGITS;
 /// Elements per statistically recombined digit chunk.
-pub const CHUNK: usize = 256;
+pub const CHUNK: usize = 80;
 const _: () = assert!(CHUNK % LOCK == 0);
 /// Nodes of the encoder's closest-vector search, the x86 build's setting: it runs at build time
 /// only, and the smaller digit spread (rms 3.55 against Babai's 3.88) allows longer chunks.
@@ -368,7 +368,7 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 }
 
 /// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 16;
+const SINK: usize = 10;
 /// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
@@ -386,27 +386,43 @@ macro_rules! slot_sink_body {
         "mov {kp}, {k}",
         "mov {n}, {g}",
         "2:",
-        "ldp q0, q1, [{kp}]",
-        "ldp q2, q3, [{kp}, #32]",
+        "ldp q0, q1, [{kp}, #0]",
+        "ldr q2, [{kp}, #32]",
         "ldr q4, [{zp}]",
         "ldr q5, [{zp}, #{xs1}]",
         "ldr q6, [{zp}, #{xs2}]",
         "ldr q7, [{zp}, #{xs3}]",
         "add {zp}, {zp}, {xs4}",
-        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
-        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
-        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
-        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        "sdot z16.d, z4.h, z0.h[0]",
+        "sdot z17.d, z5.h, z0.h[0]",
+        "sdot z18.d, z6.h, z0.h[0]",
+        "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]",
+        "sdot z21.d, z5.h, z1.h[0]",
+        "sdot z22.d, z6.h, z1.h[0]",
+        "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]",
+        "sdot z25.d, z5.h, z2.h[0]",
+        "sdot z26.d, z6.h, z2.h[0]",
+        "sdot z27.d, z7.h, z2.h[0]",
         "ldr q4, [{zp}]",
         "ldr q5, [{zp}, #{xs1}]",
         "ldr q6, [{zp}, #{xs2}]",
         "ldr q7, [{zp}, #{xs3}]",
         "add {zp}, {zp}, {xs4}",
         "add {kp}, {kp}, {ks}",
-        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
-        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        "sdot z16.d, z4.h, z0.h[1]",
+        "sdot z17.d, z5.h, z0.h[1]",
+        "sdot z18.d, z6.h, z0.h[1]",
+        "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]",
+        "sdot z21.d, z5.h, z1.h[1]",
+        "sdot z22.d, z6.h, z1.h[1]",
+        "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]",
+        "sdot z25.d, z5.h, z2.h[1]",
+        "sdot z26.d, z6.h, z2.h[1]",
+        "sdot z27.d, z7.h, z2.h[1]",
         "subs {n}, {n}, #1",
         "b.ne 2b",
         "stp q16, q17, [{a}, #0]",
@@ -415,58 +431,79 @@ macro_rules! slot_sink_body {
         "stp q22, q23, [{a}, #96]",
         "stp q24, q25, [{a}, #128]",
         "stp q26, q27, [{a}, #160]",
-        "stp q28, q29, [{a}, #192]",
-        "stp q30, q31, [{a}, #224]",
         $($rows46,)*
         "mov {zp}, {z}",
         "mov {kp}, {k}",
         "mov {n}, {g}",
         "3:",
-        "ldp q0, q1, [{kp}, #64]",
-        "ldr q2, [{kp}, #96]",
+        "ldp q0, q1, [{kp}, #48]",
+        "ldr q2, [{kp}, #80]",
         "ldr q4, [{zp}]",
         "ldr q5, [{zp}, #{xs1}]",
         "ldr q6, [{zp}, #{xs2}]",
         "ldr q7, [{zp}, #{xs3}]",
         "add {zp}, {zp}, {xs4}",
-        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
-        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
-        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z16.d, z4.h, z0.h[0]",
+        "sdot z17.d, z5.h, z0.h[0]",
+        "sdot z18.d, z6.h, z0.h[0]",
+        "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]",
+        "sdot z21.d, z5.h, z1.h[0]",
+        "sdot z22.d, z6.h, z1.h[0]",
+        "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]",
+        "sdot z25.d, z5.h, z2.h[0]",
+        "sdot z26.d, z6.h, z2.h[0]",
+        "sdot z27.d, z7.h, z2.h[0]",
         "ldr q4, [{zp}]",
         "ldr q5, [{zp}, #{xs1}]",
         "ldr q6, [{zp}, #{xs2}]",
         "ldr q7, [{zp}, #{xs3}]",
         "add {zp}, {zp}, {xs4}",
         "add {kp}, {kp}, {ks}",
-        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z16.d, z4.h, z0.h[1]",
+        "sdot z17.d, z5.h, z0.h[1]",
+        "sdot z18.d, z6.h, z0.h[1]",
+        "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]",
+        "sdot z21.d, z5.h, z1.h[1]",
+        "sdot z22.d, z6.h, z1.h[1]",
+        "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]",
+        "sdot z25.d, z5.h, z2.h[1]",
+        "sdot z26.d, z6.h, z2.h[1]",
+        "sdot z27.d, z7.h, z2.h[1]",
         "subs {n}, {n}, #1",
         "b.ne 3b",
-        "stp q16, q17, [{a}, #256]",
-        "stp q18, q19, [{a}, #288]",
-        "stp q20, q21, [{a}, #320]",
-        "stp q22, q23, [{a}, #352]",
-        "stp q24, q25, [{a}, #384]",
-        "stp q26, q27, [{a}, #416]",
-            a = in(reg) $acc,
-            z = in(reg) $z,
-            k = in(reg) $k,
-            g = in(reg) $groups,
-            xs4 = in(reg) 4 * XS,
-            ks = in(reg) KS,
-            xs1 = const XS,
-            xs2 = const 2 * XS,
-            xs3 = const 3 * XS,
-            zp = out(reg) _,
-            kp = out(reg) _,
-            n = out(reg) _,
-            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
-            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
-            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+        "stp q16, q17, [{a}, #192]",
+        "stp q18, q19, [{a}, #224]",
+        "stp q20, q21, [{a}, #256]",
+        "stp q22, q23, [{a}, #288]",
+        "stp q24, q25, [{a}, #320]",
+        "stp q26, q27, [{a}, #352]",
+            a = in(reg) $acc, z = in(reg) $z, k = in(reg) $k, g = in(reg) $groups,
+            xs4 = in(reg) 4 * XS, ks = in(reg) KS,
+            xs1 = const XS, xs2 = const 2 * XS, xs3 = const 3 * XS,
+            zp = out(reg) _, kp = out(reg) _, n = out(reg) _,
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v7") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            out("v22") _,
+            out("v23") _,
+            out("v24") _,
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
             options(nostack)
         )
     };
@@ -485,7 +522,7 @@ unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, gro
     const XS: usize = N * 16;
     const KS: usize = N * ROWS * LOCK * 2;
     debug_assert!((1..=SINK).contains(&groups));
-    slot_sink_body!(acc, z, k, groups, ["ldp q20, q21, [{a}, #64]", "ldp q22, q23, [{a}, #96]", "ldp q24, q25, [{a}, #128]", "ldp q26, q27, [{a}, #160]", "ldp q28, q29, [{a}, #192]", "ldp q30, q31, [{a}, #224]"], ["ldp q16, q17, [{a}, #256]", "ldp q18, q19, [{a}, #288]", "ldp q20, q21, [{a}, #320]", "ldp q22, q23, [{a}, #352]", "ldp q24, q25, [{a}, #384]", "ldp q26, q27, [{a}, #416]"]);
+    slot_sink_body!(acc, z, k, groups, ["ldp q20, q21, [{a}, #64]", "ldp q22, q23, [{a}, #96]", "ldp q24, q25, [{a}, #128]", "ldp q26, q27, [{a}, #160]"], ["ldp q16, q17, [{a}, #192]", "ldp q18, q19, [{a}, #224]", "ldp q20, q21, [{a}, #256]", "ldp q22, q23, [{a}, #288]", "ldp q24, q25, [{a}, #320]", "ldp q26, q27, [{a}, #352]"]);
 }
 
 /// [`slot_sink`] for a chunk's first sweep: the digit rows' sums (rows 1-6) start from zero instead
@@ -497,7 +534,7 @@ unsafe fn slot_sink_fresh(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_
     const XS: usize = N * 16;
     const KS: usize = N * ROWS * LOCK * 2;
     debug_assert!((1..=SINK).contains(&groups));
-    slot_sink_body!(acc, z, k, groups, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
+    slot_sink_body!(acc, z, k, groups, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
 }
 
 /// `acc +=` the products of the first `groups` tiles of `xs` (transforms `8 g..8 g + 8` of tile

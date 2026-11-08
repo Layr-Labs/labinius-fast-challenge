@@ -1355,6 +1355,23 @@ pub fn fold_witness_bitsliced(
     bitsliced::fold_words(words, challenges, 128 * bpc, workers)
 }
 
+/// Compute the exact integer fold directly as little-endian `i32` coefficients.
+/// Returns `false` without changing `dst` when the general streaming path is required.
+/// Each worker owns complete, disjoint blocks of the destination until it returns.
+pub fn fold_witness_bitsliced_into(
+    words: &[B128], columns: usize, challenges: &[ShortChallenge], bpc: usize,
+    workers: usize, dst: &mut [i32],
+) -> bool {
+    assert_eq!(challenges.len(), columns, "one challenge per column");
+    assert!(bpc > 0 && words.len() == columns * 128 * bpc, "the words are not whole columns");
+    assert_eq!(dst.len(), bpc * 32 * N, "the destination has one word per coefficient");
+    if !cfg!(target_endian = "little") || bpc % 4 != 0 || !bitsliced::fits(challenges) {
+        return false;
+    }
+    bitsliced::fold_words_into(words, challenges, 128 * bpc, workers, dst);
+    true
+}
+
 // Exact fold of the binary witness, independent of commitment-modulus arithmetic.
 mod bitsliced {
     //! Integer convolution in Z[Y]/(Y^243 + 1), followed by reduction modulo
@@ -2100,13 +2117,16 @@ mod bitsliced {
 
     // Direct full-accumulator output from PR162; valid only for the one-part path.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-    unsafe fn write_acc(
+    unsafe fn write_acc<const WIRE: bool>(
         acc: *const __m512i,
         bias: &[i32; SLOTS],
-        output: *mut RingElement,
+        output: usize,
     ) {
-        for e in 0..LANES / 4 {
-            core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
+        if !WIRE {
+            let output = output as *mut RingElement;
+            for e in 0..LANES / 4 {
+                core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
+            }
         }
         let zero = _mm512_setzero_si512();
         let perm = _mm512_load_si512(BACK.0.as_ptr() as *const __m512i);
@@ -2186,11 +2206,27 @@ mod bitsliced {
                     let t = transpose8x8_q(rows);
                     for j in 0..8 {
                         let e = 16 * g + 8 * h + 7 - j;
-                        let dst = (core::ptr::addr_of_mut!((*output.add(e)).v) as *mut i16).add(4 * s0);
-                        if n == 8 {
-                            _mm512_storeu_si512(dst as *mut __m512i, t[j]);
+                        if WIRE {
+                            let dst = (output as *mut i32).add(crate::params::N * e + 4 * s0);
+                            let valid = 4 * n;
+                            let lo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(t[j]));
+                            let ml = ((1u32 << valid.min(16)) - 1) as __mmask16;
+                            _mm512_mask_storeu_epi32(dst, ml, lo);
+                            // The last slot group contains only eight coefficients. Do not
+                            // form a pointer beyond the allocation even for a zero-mask store.
+                            if valid > 16 {
+                                let hi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64::<1>(t[j]));
+                                let mh = ((1u32 << (valid - 16)) - 1) as __mmask16;
+                                _mm512_mask_storeu_epi32(dst.add(16), mh, hi);
+                            }
                         } else {
-                            _mm512_mask_storeu_epi64(dst as *mut i64, mask, t[j]);
+                            let output = output as *mut RingElement;
+                            let dst = (core::ptr::addr_of_mut!((*output.add(e)).v) as *mut i16).add(4 * s0);
+                            if n == 8 {
+                                _mm512_storeu_si512(dst as *mut __m512i, t[j]);
+                            } else {
+                                _mm512_mask_storeu_epi64(dst as *mut i64, mask, t[j]);
+                            }
                         }
                     }
                 }
@@ -2206,7 +2242,7 @@ mod bitsliced {
     }
 
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-    unsafe fn run_worker<const GROUP: usize, const FUSED: bool>(
+    unsafe fn run_worker<const GROUP: usize, const FUSED: bool, const WIRE: bool>(
         worker: usize,
         words: &[B128],
         column_words: usize,
@@ -2221,6 +2257,7 @@ mod bitsliced {
         out_addr: usize,
         #[cfg(test)] profile: bool,
     ) -> u32 {
+        assert!(!WIRE || FUSED, "wire output requires a whole block");
         let mut ran = 0u32;
         #[cfg(test)]
         let mut times = [std::time::Duration::ZERO; 3];
@@ -2282,8 +2319,13 @@ mod bitsliced {
             #[cfg(test)]
             let start = profile.then(std::time::Instant::now);
             if FUSED {
-                let output = (out_addr as *mut RingElement).add(block * (LANES / 4));
-                write_acc(acc.as_ptr(), bias, output);
+                let element = block * (LANES / 4);
+                let output = if WIRE {
+                    out_addr + element * crate::params::N * core::mem::size_of::<i32>()
+                } else {
+                    out_addr + element * core::mem::size_of::<RingElement>()
+                };
+                write_acc::<WIRE>(acc.as_ptr(), bias, output);
                 #[cfg(test)]
                 if let Some(start) = start { times[2] += start.elapsed(); }
                 continue;
@@ -2331,15 +2373,26 @@ mod bitsliced {
         column_words: usize,
         workers: usize,
     ) -> Vec<RingElement> {
-        fold_config::<COL_GROUP, true>(words, challenges, column_words, workers)
+        fold_config::<COL_GROUP, true, false>(words, challenges, column_words, workers, None)
     }
 
-    fn fold_config<const GROUP: usize, const FUSED: bool>(
+    pub(super) fn fold_words_into(
+        words: &[B128], challenges: &[ShortChallenge], column_words: usize,
+        workers: usize, dst: &mut [i32],
+    ) {
+        let empty = fold_config::<COL_GROUP, true, true>(words, challenges, column_words, workers, Some(dst));
+        debug_assert!(empty.is_empty());
+    }
+
+    fn fold_config<const GROUP: usize, const FUSED: bool, const WIRE: bool>(
         words: &[B128],
         challenges: &[ShortChallenge],
         column_words: usize,
         workers: usize,
+        wire: Option<&mut [i32]>,
     ) -> Vec<RingElement> {
+        assert_eq!(WIRE, wire.is_some());
+        assert!(!WIRE || FUSED);
         assert!(GROUP > 0 && (GUARD + GROUP * STRIDE) * 8 <= u16::MAX as usize);
         #[cfg(test)]
         let profile = std::env::var_os("LABINIUS_BITFOLD_PROFILE").is_some();
@@ -2367,12 +2420,17 @@ mod bitsliced {
         let free: std::sync::Mutex<Vec<Vec<[i16; LANES]>>> =
             std::sync::Mutex::new(Vec::new());
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let mut out: Vec<RingElement> = Vec::with_capacity(len);
-        let out_addr = out.as_mut_ptr() as usize;
+        let mut out: Vec<RingElement> = Vec::with_capacity(if WIRE { 0 } else { len });
+        let out_addr = if let Some(dst) = wire {
+            assert_eq!(dst.len(), len * crate::params::N);
+            dst.as_mut_ptr() as usize
+        } else {
+            out.as_mut_ptr() as usize
+        };
         let t0 = std::time::Instant::now();
         let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
         crate::par::pool().run(workers.clamp(1, tasks), |worker| unsafe {
-            let ran = run_worker::<GROUP, FUSED>(
+            let ran = run_worker::<GROUP, FUSED, WIRE>(
                 worker,
                 words,
                 column_words,
@@ -2395,10 +2453,24 @@ mod bitsliced {
             }
         });
         // Every task wrote its whole range.
-        unsafe { out.set_len(len) };
+        if !WIRE { unsafe { out.set_len(len) }; }
         out
     }
 
+    #[cfg(test)]mod wire_guards{use super::*;
+    #[test]fn wire_writer_matches_i16_extremes_and_tail(){unsafe{
+      use crate::params::N;
+      let mut acc=vec![_mm512_setzero_si512();2*PAIRS*BITS];let bias=[16384i32;SLOTS];let mut state=0x31235af743u64;
+      for fixture in 0..12{
+       for slot in 0..SLOTS {let counts:[u16;LANES]=core::array::from_fn(|lane|{state^=state<<13;state^=state>>7;state^=state<<17;match fixture{0=>0,1=>32767,2=>16384,3=>if (lane+slot)&1==0{0}else{32767},_=>(state&32767)as u16}});
+        for bit in 0..BITS {let bits:[u64;8]=core::array::from_fn(|word|{let mut v=0;for b in 0..64{v|=(((counts[64*word+b]>>bit)&1)as u64)<<b;}v});acc[slot*BITS+bit]=core::mem::transmute(bits);}}
+       let mut old:Vec<RingElement>=Vec::with_capacity(LANES/4);write_acc::<false>(acc.as_ptr(),&bias,old.as_mut_ptr() as usize);old.set_len(LANES/4);
+       let mut got=vec![0x1a2b3c4di32;(LANES/4)*N+64];write_acc::<true>(acc.as_ptr(),&bias,got.as_mut_ptr().add(32) as usize);
+       assert!(got[..32].iter().chain(got[32+LANES/4*N..].iter()).all(|&x|x==0x1a2b3c4d));
+       for (i,e)in old.iter().enumerate(){for j in 0..N{assert_eq!(got[32+i*N+j],e.v[j]as i32,"fixture={fixture} e={i} j={j}");}}
+      }
+    }}
+    }
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -2676,8 +2748,8 @@ mod bitsliced {
             for (group, workers) in [(16, 4), (31, 4), (31, 2), (16, 2)] {
                 let start = std::time::Instant::now();
                 let v = match group {
-                    16 => fold_config::<16, false>(&words, &cs, 1 << 14, workers),
-                    31 => fold_config::<31, false>(&words, &cs, 1 << 14, workers),
+                    16 => fold_config::<16, false, false>(&words, &cs, 1 << 14, workers, None),
+                    31 => fold_config::<31, false, false>(&words, &cs, 1 << 14, workers, None),
                     _ => unreachable!(),
                 };
                 eprintln!("bitfold group={} workers={} exact_us={}", group, workers, start.elapsed().as_micros());
@@ -2694,4 +2766,29 @@ mod bitsliced {
         }
     }
 
+}
+
+#[cfg(test)]mod wire_api_tests {
+    use super::*;
+    use crate::challenge::{sample_short_challenge, Transcript, DEFAULT_WEIGHT, DEFAULT_BOUND};
+    #[test]fn supplied_wire_matches_integer_fold_and_preserves_fallback() {
+        let mut state=0x234598734u64;
+        let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
+        for columns in [1usize,2,31,32,33,34,65] { for blocks in [1usize,3] {
+            let mut t=Transcript::new(b"fold-wire-shape");
+            let cs:Vec<_>=(0..columns).map(|_|sample_short_challenge(&mut t,DEFAULT_WEIGHT,DEFAULT_BOUND).0).collect();
+            let words:Vec<B128>=(0..columns*512*blocks).map(|_|B128(next()as u128|((next()as u128)<<64))).collect();
+            let old=fold_witness_bitsliced(&words,columns,&cs,4*blocks,9721,8);
+            for workers in [1usize,8] {
+                let mut guarded=vec![0x12345678;old.len()*N+10];
+                assert!(fold_witness_bitsliced_into(&words,columns,&cs,4*blocks,workers,&mut guarded[5..5+old.len()*N]));
+                assert!(guarded[..5].iter().chain(guarded[5+old.len()*N..].iter()).all(|&x|x==0x12345678));
+                for(i,e)in old.iter().enumerate(){for j in 0..N{assert_eq!(guarded[5+i*N+j],e.v[j]as i32);}}
+            }
+        }}
+        let mut c=ShortChallenge::zero();c.weight=1;
+        let words=vec![B128(0);128];let mut dst=vec![0x12345678;32*N];
+        assert!(!fold_witness_bitsliced_into(&words,1,&[c],1,1,&mut dst));
+        assert!(dst.iter().all(|&x|x==0x12345678));
+    }
 }

@@ -1277,6 +1277,57 @@ unsafe fn partials_row(
     acc: &mut [RawAcc], words: *const B128, stride: usize, eq: *const B128, groups: usize,
     scratch: &mut RowScratch, next_row: *const B128,
 ) {
+    const K:usize=8;
+    debug_assert!(groups % 2 == 0 && scratch.xs.len() >= groups);
+    let ident = _mm512_set1_epi64(GF_IDENT);
+    let idx = [
+        _mm512_load_si512(GROUP_IDX.0[0].as_ptr() as *const __m512i),
+        _mm512_load_si512(GROUP_IDX.0[1].as_ptr() as *const __m512i),
+    ];
+    let xs = scratch.xs.as_mut_ptr();
+    for g in 0..groups {
+        *xs.add(g) = slice_group(eq.add(8 * g), &idx, ident);
+    }
+    let aps = scratch.aps.as_mut_ptr();
+    let blocks = acc.len();
+    for (q, acc_q) in acc.iter_mut().enumerate() {
+        let w = words.add(q * stride);
+        for g in 0..groups {
+            *aps.add(g) = slice_group(w.add(8 * g), &idx, ident);
+        }
+        let next = if q + 1 < blocks { w.add(stride) } else { next_row };
+        for bank in 0..16/K {
+            let mut a:[[__m512i;K];2]=core::array::from_fn(|h|core::array::from_fn(|k|acc_q[h][bank*K+k]));
+            let mut g=0;
+            while g<groups {
+                if !next.is_null() {
+                    // Partition the same next-block hint sequence across the two banks.
+                    let count=16/K;
+                    for off in 0..2/count {
+                        let pg=bank*groups/count+g/count+off;
+                        let p=next.add(8*pg)as*const i8;
+                        _mm_prefetch::<_MM_HINT_T1>(p);_mm_prefetch::<_MM_HINT_T1>(p.add(64));
+                    }
+                }
+                let x0=*xs.add(g);let x1=*xs.add(g+1);
+                let m0=aps.add(g)as*const i64;let m1=aps.add(g+1)as*const i64;
+                for k in 0..K {
+                    let b0=_mm512_set1_epi64(*m0.add(bank*K+k));let b1=_mm512_set1_epi64(*m1.add(bank*K+k));
+                    for h in 0..2 {a[h][k]=xor3(a[h][k],affine(x0[h],b0),affine(x1[h],b1));}
+                }
+                g+=2;
+            }
+            for h in 0..2 {acc_q[h][bank*K..bank*K+K].copy_from_slice(&a[h]);}
+        }
+    }
+}
+
+#[cfg(test)]
+#[inline(never)]
+unsafe fn partials_row_reference(
+    acc: &mut [RawAcc], words: *const B128, stride: usize, eq: *const B128, groups: usize,
+    scratch: &mut RowScratch, next_row: *const B128,
+) {
     debug_assert!(groups % 2 == 0 && scratch.xs.len() >= groups);
     let ident = _mm512_set1_epi64(GF_IDENT);
     let idx = [
@@ -2821,4 +2872,27 @@ mod live_byte_tests {
             }
         }
     }
+}
+
+#[cfg(test)]mod partial_halves_regression {
+use super::*;
+#[test]fn shared_matrices_match_separate_halves(){unsafe{
+ let mut state=0x79a627c343u64;let mut next=||{state^=state<<13;state^=state>>7;state^=state<<17;state};
+ for groups in [8usize,16,64,256] {for blocks in [1usize,2,3,7,64] {
+  let stride=8*groups;
+  let words:Vec<B128>=(0..stride*(blocks+1)).map(|_|B128((next()as u128)<<64|next()as u128)).collect();
+  let eq:Vec<B128>=(0..stride).map(|_|B128((next()as u128)<<64|next()as u128)).collect();
+  let mut a:Vec<RawAcc>=vec![[[_mm512_setzero_si512();16];2];blocks];
+  for block in &mut a {for half in block {for value in half {*value=_mm512_set_epi64(next()as i64,next()as i64,next()as i64,next()as i64,next()as i64,next()as i64,next()as i64,next()as i64);}}}
+  let mut b=a.clone();let mut sa=RowScratch::new(groups);let mut sb=RowScratch::new(groups);
+  for lookahead in [false,true] {
+   let next=if lookahead{words.as_ptr().add(stride*blocks)}else{core::ptr::null()};
+   partials_row(&mut a,words.as_ptr(),stride,eq.as_ptr(),groups,&mut sa,next);
+   partials_row_reference(&mut b,words.as_ptr(),stride,eq.as_ptr(),groups,&mut sb,next);
+   for q in 0..blocks {for h in 0..2 {for k in 0..16 {
+    assert_eq!(_mm512_cmpeq_epi64_mask(a[q][h][k],b[q][h][k]),255,"groups={groups} blocks={blocks} q={q} h={h} k={k} lookahead={lookahead}");
+   }}}
+  }
+ }}
+}}
 }

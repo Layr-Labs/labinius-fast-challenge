@@ -685,3 +685,5 @@ pub unsafe fn slice_b128_staged_into(
 }
 
 include!("transpose_legacy_fused.rs");
+
+include!("transpose_sms_joint.rs");

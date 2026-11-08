@@ -37,7 +37,7 @@ const COLUMNS: usize = 1 << COLUMN_LOG;
 const ROW_LOG: usize = LOG_PACKED - COLUMN_LOG as usize;
 const COLUMN_LEN: usize = 1 << ROW_LOG;
 const RING_ELEMENTS: usize = COLUMN_LEN / 4;
-const LIMIT: u64 = 64 * 1024 * 1024;
+const LIMIT: u64 = 1 << 26;
 const MIN_MODULUS: u128 = 34_816_965_049;
 /// The default commitment modulus: the product of the three transform primes.
 /// The hybrid commitment matrix in the transform domain, built by build.rs (empty when the build

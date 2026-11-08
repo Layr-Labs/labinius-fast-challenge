@@ -47,18 +47,18 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
 
     for k in 0..4 {
         if FUSED && k == 0 {
-            for h in 0..core::hint::black_box(H) {
+            let lut = t.lut.as_ptr().add(12 * k) as *const u8;
+            let l = |s2: usize, r: usize, ab: usize| -> __m512i {
+                _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
+            };
+            let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
+            let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
+            let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
+            // Opaque trip counts keep one copy of each loop body: unrolled, the eight inlined tails
+            // and prefixes outgrow the instruction cache and the decoded-uop cache.
+            let hs = core::hint::black_box(H);
+            for h in 0..hs {
                 fill(h, idx.add(h));
-                let lut = t.lut.as_ptr().add(12 * k) as *const u8;
-                let l = |s2: usize, r: usize, ab: usize| -> __m512i {
-                    _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
-                };
-                let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
-                let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
-                let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
-                // Opaque trip counts keep one copy of each loop body: unrolled, the eight inlined tails
-                // and prefixes outgrow the instruction cache and the decoded-uop cache.
-
                 let (ip, bp) = (ips[h], bps[h]);
                 for i in 0..27 {
                     let n0 = ldb(ip, i);

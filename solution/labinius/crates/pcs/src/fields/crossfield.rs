@@ -1474,15 +1474,19 @@ fn apply_images(images: &[F162], x: B128) -> F162 {
 
 /// `L o (x -> d x)` as images: `L'(e_i) = L(d e_i)`.
 fn compose_scale(images: &[F162], d: B128) -> Vec<F162> {
+    let m = eq_matrices(images);
+    compose_scale_matrix(&m, d)
+}
+
+fn compose_scale_matrix(m: &[[u64; 16]; 24], d: B128) -> Vec<F162> {
     // Apply the same tiled linear map used by the long passes to the 128 scaled
     // basis words. This avoids 128 unpredictable bit tests for every image.
     let words: [B128; PACK] = core::array::from_fn(|i| B128(1u128 << i) * d);
-    let m = eq_matrices(images);
     let mut out = vec![F162::ZERO; PACK];
     unsafe {
         for t in 0..PACK / TILE {
             let mut mapped = [[_mm512_setzero_si512(); 8]; 3];
-            map_tile(words.as_ptr().add(TILE * t), &m, &mut mapped);
+            map_tile(words.as_ptr().add(TILE * t), m, &mut mapped);
             let lanes: [[[u64; 8]; 8]; 3] = core::mem::transmute(mapped);
             for g in 0..8 {
                 for i in 0..8 {
@@ -2000,6 +2004,7 @@ pub struct LeanSwitch<'a> {
     pi0: &'a [B128],
     eq: EqView<'a>,
     r_hi: &'a [B128],
+    inv_r_hi: Vec<B128>,
     /// `L_k`, as the images of the 128 basis words.
     l: Vec<F162>,
     /// `L'_k = L_k o (x -> d_k x)`.
@@ -2123,12 +2128,14 @@ impl<'a> LeanSwitch<'a> {
         if r_hi.iter().any(|&r| r == B128::ONE) {
             return None;
         }
+        let inv_r_hi: Vec<B128> = r_hi.iter().map(|&r| b128_inv(B128::ONE + r)).collect();
         let l = batch.to_vec();
-        let lp = compose_scale(&l, b128_inv(B128::ONE + r_hi[0]));
+        let lp = compose_scale(&l, inv_r_hi[0]);
         Some(LeanSwitch {
             pi0,
             eq,
             r_hi,
+            inv_r_hi,
             l,
             lp,
             p: planes,
@@ -2370,8 +2377,11 @@ impl<'a> LeanSwitch<'a> {
         for i in 0..PACK {
             self.l[i] = self.l[i] + r * self.lp[i];
         }
+        let mut ml = None;
         if !last {
-            self.lp = compose_scale(&self.l, b128_inv(B128::ONE + self.r_hi[self.round + 1]));
+            let m = eq_matrices(&self.l);
+            self.lp = compose_scale_matrix(&m, self.inv_r_hi[self.round + 1]);
+            ml = Some(m);
         }
         if last {
             debug_assert_eq!(half, 1);
@@ -2455,7 +2465,7 @@ impl<'a> LeanSwitch<'a> {
             self.round += 1;
             return;
         }
-        let ml = eq_matrices(&self.l);
+        let ml = ml.unwrap();
         let mlp = eq_matrices(&self.lp);
         let eq = self.eq.src();
         let dst = dst.map(|p| p as usize);

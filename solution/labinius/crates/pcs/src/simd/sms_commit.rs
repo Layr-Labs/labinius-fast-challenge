@@ -425,7 +425,7 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-const PREFETCH_SLOTS: usize = 10;
+const PREFETCH_SLOTS: usize = 114;
 
 /// The sink folds once per reconstruction chunk, in the chunk's last lockstep step. [`PP`] is the
 /// worst case over every witness: a key of the public matrix and a transform lane both at their

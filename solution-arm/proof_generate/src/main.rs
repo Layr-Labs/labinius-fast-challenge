@@ -185,14 +185,19 @@ fn load_table(path: &str, n: usize) -> Table {
         if ptr as isize != -1 {
             let base = ptr as usize;
             // The range boundaries are 2 MiB aligned, also valid on 4/16/64 KiB kernels.
+            // Populate by faulting: minor faults take the mmap lock shared, so the blocks run
+            // on every core. MADV_POPULATE_READ takes it exclusively, which serialised the
+            // eight blocks into one 8 x 1.4 ms chain here, and the file has no huge pages.
             labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
                 if s < e {
-                    let addr = (base + 16 * s) as *mut u8;
-                    // Linux 5.14+: install the page-cache pages in parallel. Older kernels
-                    // simply fault on access. MADV_HUGEPAGE is a best-effort hint for the file.
-                    unsafe {
-                        table_sys::madvise(addr, 16 * (e - s), 14);
-                        table_sys::madvise(addr, 16 * (e - s), 22);
+                    let addr = (base + 16 * s) as *const u8;
+                    let bytes = 16 * (e - s);
+                    let mut at = 0;
+                    while at < bytes {
+                        // SAFETY: the mapping is read-only and covers `bytes`; the volatile
+                        // read only faults the page in.
+                        unsafe { core::ptr::read_volatile(addr.add(at)) };
+                        at += 4096;
                     }
                 }
             });

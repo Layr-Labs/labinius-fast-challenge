@@ -42,23 +42,29 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
     // Prefix blocks use the callback buffer's block-major layout. A leaf loads
     // all 27 input vectors before storing any output, so its pointers may alias.
     let bps: [*mut i16; H] = core::array::from_fn(|h| wbuf.add(32 * 27 * h));
-    let buf = |kk: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk % 6) + h))) };
-    let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
+    let bufs_mut: [[*mut i16; H]; 6] = core::array::from_fn(|j| {
+        let base = wbuf.add(32 * 27 * H * j);
+        core::array::from_fn(|h| base.add(32 * 27 * h))
+    });
+    let bufs_ro: [[*const i16; H]; 6] = core::array::from_fn(|j| {
+        let base = wbuf.add(32 * 27 * H * j) as *const i16;
+        core::array::from_fn(|h| base.add(32 * 27 * h))
+    });
 
     for k in 0..4 {
         if FUSED && k == 0 {
-            for h in 0..core::hint::black_box(H) {
+            let lut = t.lut.as_ptr().add(12 * k) as *const u8;
+            let l = |s2: usize, r: usize, ab: usize| -> __m512i {
+                _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
+            };
+            let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
+            let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
+            let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
+            // Opaque trip counts keep one copy of each loop body: unrolled, the eight inlined tails
+            // and prefixes outgrow the instruction cache and the decoded-uop cache.
+            let hs = core::hint::black_box(H);
+            for h in 0..hs {
                 fill(h, idx.add(h));
-                let lut = t.lut.as_ptr().add(12 * k) as *const u8;
-                let l = |s2: usize, r: usize, ab: usize| -> __m512i {
-                    _mm512_load_si512(lut.add(64 * (((s2 * 3) + r) * 2 + ab)) as *const __m512i)
-                };
-                let (l000, l001) = (l(0, 0, 0), l(0, 0, 1));
-                let (l010, l011) = (l(0, 1, 0), l(0, 1, 1));
-                let (l020, l021) = (l(0, 2, 0), l(0, 2, 1));
-                // Opaque trip counts keep one copy of each loop body: unrolled, the eight inlined tails
-                // and prefixes outgrow the instruction cache and the decoded-uop cache.
-
                 let (ip, bp) = (ips[h], bps[h]);
                 for i in 0..27 {
                     let n0 = ldb(ip, i);
@@ -144,7 +150,7 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
         let tail_blocks = core::hint::black_box(6usize);
         for j in 0..tail_blocks {
             let kk = 6 * k + j;
-            let os = buf(kk);
+            let os = bufs_mut[j];
             let (t4, t5, t6) = if Q == 9721 {
                 (SMS_TWIDDLES.t4.as_ptr().add(4 * kk).cast::<u32>(),
                 SMS_TWIDDLES.t5.as_ptr().add(12 * kk).cast::<u32>(),
@@ -161,7 +167,7 @@ pub(crate) unsafe fn ntt_bin_batch32_batched_source<
         }
         for j in 0..6 {
             let kk = 6 * k + j;
-            sink.rows(kk, ro(buf(kk)), 0, 27);
+            sink.rows(kk, bufs_ro[j], 0, 27);
         }
     }
 }

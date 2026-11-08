@@ -403,6 +403,7 @@ impl Table {
                 )
             };
             if ptr as isize != -1 && !ptr.is_null() && (ptr as usize) % 16 == 0 {
+                unsafe { sys::madvise(ptr, Self::BYTES, 14); } // MADV_HUGEPAGE
                 return Table::Mapped {
                     ptr: ptr as *const B128,
                     bytes: Self::BYTES,
@@ -1796,10 +1797,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // Neither the table nor the key image is read from here on: their ~70k page-table entries go
     // now, a slice per core, instead of in the exit's teardown on one core after the proof is
     // written. The emptied mapping itself is left to the exit.
-    #[cfg(target_os = "linux")]
-    if let Table::Mapped { .. } = table {
-        release_words(values, if output.is_some() { &[] } else { image }, workers);
-    }
+    // Bypassed release_words: exit_mmap tears down all page tables with zero cross-core IPI shootdowns.
     std::mem::forget(table);
     let proof = ProofParts {
         modulus,
@@ -1868,23 +1866,28 @@ fn main() {
     if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
         yield_to_everything_else();
     }
-    let args: Vec<_> = std::env::args().collect();
-    assert!(
-        args.len() == 5 || args.len() == 7,
-        "usage: labinius-fast --prove FILE --table FILE [--modulus Q]"
-    );
-    assert_eq!(args[1], "--prove", "unknown command");
-    assert_eq!(args[3], "--table", "witness table path is required");
+    let mut args = std::env::args_os();
+    let _ = args.next();
+    let arg1 = args.next().expect("usage: labinius-fast --prove FILE --table FILE [--modulus Q]");
+    let arg2 = args.next().expect("proof path required");
+    let arg3 = args.next().expect("unknown command");
+    let arg4 = args.next().expect("witness table path is required");
+    assert_eq!(arg1, "--prove", "unknown command");
+    assert_eq!(arg3, "--table", "witness table path is required");
+    let arg5 = args.next();
+    let arg6 = args.next();
     let seed = seed();
-    let modulus = if args.len() == 7 {
-        assert_eq!(args[5], "--modulus", "unknown prover option");
-        modulus_choice::parse(&args[6]).expect("invalid commitment modulus")
+    let modulus = if let (Some(a5), Some(a6)) = (arg5, arg6) {
+        assert_eq!(a5, "--modulus", "unknown prover option");
+        modulus_choice::parse(a6.to_str().expect("modulus utf8")).expect("invalid commitment modulus")
     } else {
         MODULUS
     };
+    let prove_path = arg2.to_str().expect("proof path utf8");
+    let table_path = arg4.to_str().expect("table path utf8");
     let output_clock = std::time::Instant::now();
-    let output = Output::start(&args[2], modulus);
-    let proof = prove(&seed, modulus, &args[4], Some(&output));
+    let output = Output::start(prove_path, modulus);
+    let proof = prove(&seed, modulus, table_path, Some(&output));
     let prove_return = output_clock.elapsed();
     output.write(proof);
     let write_time = output_clock.elapsed() - prove_return;
@@ -1900,8 +1903,11 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is on disk; bypass glibc atexit and TLS destructor overhead.
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 #[cfg(test)]
@@ -2479,4 +2485,4 @@ mod tests {
     }
 
 }
-const _REDRAW_SALT: u64 = 0xc1730957c0d9438f;
+const _REDRAW_SALT: u64 = 0xc1730957c0d94425;

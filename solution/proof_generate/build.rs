@@ -30,6 +30,7 @@ fn main() {
     // 2 MiB segment alignment, so the 2 MiB-aligned key image (main.rs) can be mapped with PMD
     // entries instead of ~11.7k 4 KiB ones (e-man07, submission 721d445d).
     println!("cargo:rustc-link-arg-bins=-Wl,-z,max-page-size=0x200000");
+    println!("cargo:rustc-link-arg-bins=-Wl,-O1,--as-needed");
     println!("cargo:rerun-if-changed=../native_diagnostics");
     let (image, tail, hybrid, pairs) = images();
     std::fs::write(dir.join("pair-key.bin"), pairs).expect("write the column-pair key image");

@@ -1887,19 +1887,27 @@ fn dynamic_sum2(n: usize, threads: usize, f: impl Fn(core::ops::Range<usize>) ->
     let chunk = n.div_ceil(8 * threads.max(1)).div_ceil(TILE) * TILE;
     let chunks = n.div_ceil(chunk);
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let parts: Vec<[F162; 2]> = crate::par::pool().map(threads.min(chunks), |_| {
+    let workers = threads.min(chunks);
+    let mut parts = [[F162::ZERO; 2]; 8];
+    let parts_ptr = parts.as_mut_ptr() as usize;
+    crate::par::pool().run(workers, |worker_idx| {
         let mut m = [F162::ZERO; 2];
         loop {
             let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if k >= chunks {
-                break m;
+                break;
             }
             let r = f(k * chunk..((k + 1) * chunk).min(n));
             m[0] += r[0];
             m[1] += r[1];
         }
+        if worker_idx < 8 {
+            unsafe {
+                *(parts_ptr as *mut [F162; 2]).add(worker_idx) = m;
+            }
+        }
     });
-    parts.into_iter().fold([F162::ZERO; 2], |a, p| [a[0] + p[0], a[1] + p[1]])
+    parts[..workers.min(8)].iter().fold([F162::ZERO; 2], |a, &p| [a[0] + p[0], a[1] + p[1]])
 }
 
 /// `0 .. n` cut for the pool, or whole when `n` is below [`PAR_FROM`].

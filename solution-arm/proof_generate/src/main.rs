@@ -872,17 +872,36 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
     (partials, rounds, coords, opened)
 }
 
-fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
+fn prove<'a>(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &'a Output) -> ProofParts<'a> {
     output.wait_setup();
-    let coefficients = commit(values, modulus);
-    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
-    std::mem::forget(coefficients);
+    let (dst_ptr, dst_len) = output.commitment_buffer();
+    {
+        let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr, dst_len) };
+        #[cfg(target_arch = "aarch64")]
+        if modulus == ntt::neon::sms::MODULUS {
+            use ntt::neon::sms;
+            let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
+                .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+            sms::commit_packed(values, &matrix, threads(), dst);
+        } else {
+            let coefficients = commit(values, modulus);
+            output::pack_commitment_into(&coefficients, modulus, dst);
+            std::mem::forget(coefficients);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let coefficients = commit(values, modulus);
+            output::pack_commitment_into(&coefficients, modulus, dst);
+            std::mem::forget(coefficients);
+        }
+    }
+    let commitment = unsafe { std::slice::from_raw_parts(dst_ptr, dst_len) };
     labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
     // round, and idle population workers measurably slowed it. The final encode faults the
     // file pages itself, in parallel.
-    let mut t = transcript(seed, modulus, &commitment);
+    let mut t = transcript(seed, modulus, commitment);
     let lo = t.sample_b128(b"r-lo", 7);
     let hi = t.sample_b128(b"r-hi", LOG_PACKED);
     let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t);

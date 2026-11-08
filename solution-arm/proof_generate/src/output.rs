@@ -5,9 +5,9 @@ use labinius::par;
 use labinius::ring::Representation;
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub(super) struct ProofParts {
+pub(super) struct ProofParts<'a> {
     pub modulus: u128,
-    pub commitment: Vec<u8>,
+    pub commitment: &'a [u8],
     pub partials: Vec<u128>,
     pub rounds: Vec<[[u64; 3]; 2]>,
     pub opened: [u64; 3],
@@ -80,7 +80,8 @@ unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
     let elements = p.folded.elements();
     assert!(elements.iter().all(|e| e.representation == Representation::Coefficients));
     let addr = out as usize;
-    let ctasks = if p.commitment.is_empty() { 0 } else { 4 };
+    let in_place = out.add(Layout::HEAD) == p.commitment.as_ptr();
+    let ctasks = if p.commitment.is_empty() || in_place { 0 } else { 4 };
     let ftasks = if elements.is_empty() { 0 } else { 4 * par::threads() };
     par::pool().run(ctasks + ftasks, |i| {
         let out = addr as *mut u8;
@@ -168,31 +169,31 @@ pub(super) struct Output {
     state: Arc<State>,
     setup: Mutex<Option<std::thread::JoinHandle<()>>>,
     populate: OnceLock<&'static par::IdleJob>,
-    commitment: Mutex<Option<Vec<u8>>>,
+    fallback: Mutex<Option<Vec<u8>>>,
 }
 impl Output {
     pub fn start(path: &str, q: u128) -> Self {
         let layout = Layout::instance(q);
         let state = Arc::new(State { path: path.to_owned(), layout, map: OnceLock::new() });
-        let mut commitment = vec![0u8; layout.commitment];
-        let addr = commitment.as_mut_ptr() as usize;
-        let bytes = commitment.len();
         let worker = Arc::downgrade(&state);
         // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
         let setup = std::thread::spawn(move || {
             let state = worker.upgrade();
-            if let Some(state) = &state { let _ = state.mapped(); }
-            labinius::challenge::warm();
-            for offset in (0..bytes).step_by(4096) {
-                unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
-            }
-            // Fault the whole proof mapping while the table read still runs on the other
-            // cores: the write phase then only has to encode, not populate file pages.
             if let Some(state) = &state {
-                for i in 0..state.layout.len().div_ceil(CHUNK) { state.populate(i); }
+                if let Some(map) = state.mapped() {
+                    let addr = map.addr + Layout::HEAD;
+                    let bytes = state.layout.commitment;
+                    for offset in (0..bytes).step_by(4096) {
+                        unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
+                    }
+                    for i in 0..state.layout.len().div_ceil(CHUNK) {
+                        state.populate(i);
+                    }
+                }
             }
+            labinius::challenge::warm();
         });
-        Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
+        Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), fallback: Mutex::new(None) }
     }
     pub fn wait_setup(&self) {
         self.finish_setup();
@@ -202,9 +203,15 @@ impl Output {
             thread.join().expect("output preparation thread panicked");
         }
     }
-    pub fn commitment_buffer(&self) -> Vec<u8> {
+    pub fn commitment_buffer(&self) -> (*mut u8, usize) {
         self.finish_setup();
-        self.commitment.lock().unwrap().take().expect("commitment buffer used once")
+        if let Some(map) = self.state.mapped() {
+            ((map.addr + Layout::HEAD) as *mut u8, self.state.layout.commitment)
+        } else {
+            let mut fb = self.fallback.lock().unwrap();
+            let buf = fb.get_or_insert_with(|| vec![0u8; self.state.layout.commitment]);
+            (buf.as_mut_ptr(), buf.len())
+        }
     }
     /// Called before transcript absorb, while the caller is about to run alone. Avoid file
     /// population chunks at commitment dispatch: they can delay a coarse commitment task.
@@ -243,14 +250,13 @@ fn encode_vec(p: &ProofParts) -> Vec<u8> {
     bytes
 }
 
-/// Pack commitment coefficients into the buffer faulted in by idle workers. The ring math and
-/// transcript absorb stay unchanged; chunks cover disjoint, whole coefficient encodings.
-pub(super) fn pack_commitment(values: &[u128], q: u128, mut bytes: Vec<u8>) -> Vec<u8> {
+/// Pack commitment coefficients into the buffer.
+pub(super) fn pack_commitment_into(values: &[u128], q: u128, dst: &mut [u8]) {
     let width = rq::coefficient_bytes(q);
-    assert_eq!(bytes.len(), width * values.len());
+    assert_eq!(dst.len(), width * values.len());
     let per = values.len().div_ceil(par::threads()).max(1);
     std::thread::scope(|scope| {
-        for (dst, values) in bytes.chunks_mut(per * width).zip(values.chunks(per)) {
+        for (dst, values) in dst.chunks_mut(per * width).zip(values.chunks(per)) {
             scope.spawn(move || {
                 for (slot, &x) in dst.chunks_exact_mut(width).zip(values) {
                     debug_assert!(x < q, "a coefficient is not reduced");
@@ -259,6 +265,10 @@ pub(super) fn pack_commitment(values: &[u128], q: u128, mut bytes: Vec<u8>) -> V
             });
         }
     });
+}
+
+pub(super) fn pack_commitment(values: &[u128], q: u128, mut bytes: Vec<u8>) -> Vec<u8> {
+    pack_commitment_into(values, q, &mut bytes);
     bytes
 }
 
@@ -268,7 +278,7 @@ mod tests {
     use crate::{codec, pack_folded, Proof, RingElement648};
     use bincode::Options;
 
-    fn fixture(n: usize) -> (ProofParts, Vec<u8>) {
+    fn fixture(n: usize) -> (ProofParts<'static>, Vec<u8>) {
         let mut state = 0x123456789abcdef0u64;
         let mut next = || {
             state ^= state << 13; state ^= state >> 7; state ^= state << 17; state
@@ -281,9 +291,11 @@ mod tests {
         if let Some(first) = elements.first_mut() {
             first.v[..5].copy_from_slice(&[i16::MIN, -1, 0, 1, i16::MAX]);
         }
+        let commitment: Vec<u8> = (0..n * 648 + 3).map(|_| next() as u8).collect();
+        let commitment: &'static [u8] = Box::leak(commitment.into_boxed_slice());
         let p = ProofParts {
             modulus: 35039150080,
-            commitment: (0..n * 648 + 3).map(|_| next() as u8).collect(),
+            commitment,
             partials: (0..n + 2).map(|_| (next() as u128) << 64 | next() as u128).collect(),
             rounds: (0..n + 1).map(|_| [[next(), next(), next()], [next(), next(), next()]]).collect(),
             opened: [next(), next(), next()],
@@ -291,7 +303,7 @@ mod tests {
             folded: FoldedWitness::of(elements),
         };
         let reference = Proof {
-            version: 1, modulus: p.modulus, commitment: p.commitment.clone(),
+            version: 1, modulus: p.modulus, commitment: p.commitment.to_vec(),
             partials: p.partials.clone(), rounds: p.rounds.clone(), opened: p.opened,
             row: p.row.clone(), folded: pack_folded(&p.folded),
         };
@@ -332,7 +344,7 @@ mod tests {
             state: Arc::new(State { path: path.to_owned(), layout, map }),
             setup: Mutex::new(None),
             populate: OnceLock::new(),
-            commitment: Mutex::new(None),
+            fallback: Mutex::new(None),
         }
     }
 

@@ -816,6 +816,76 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     out
 }
 
+/// Directly writes the 5-byte packed commitment coefficients for every column of `values` into `out`.
+/// Avoids intermediate `Vec<u128>` allocation and separate packing pass.
+pub fn commit_packed(values: &[B128], a: &SmsMatrix, workers: usize, out: &mut [u8]) {
+    let len = 4 * a.elements;
+    assert_eq!(values.len() % len, 0);
+    let columns = values.len() / len;
+    assert_eq!(out.len(), columns * N * 5);
+    for_blocks(out, N * 5, LANES, workers, |first, block| unsafe {
+        let arena = Arena::new();
+        let Scratch { xs, acc, dev, m, nib, y, tail } = &mut *arena.0;
+        let p = P1 as i16;
+        let count = block.len() / (N * 5);
+        for (b, target) in block.chunks_mut(LANES * N * 5).enumerate() {
+            let col0 = first + LANES * b;
+            let here = (count - LANES * b).min(LANES);
+            let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
+                if c < here {
+                    (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
+                } else {
+                    (ZERO_WORDS.as_ptr() as *const u8, 0)
+                }
+            });
+            dev.fill(vdupq_n_s32(0));
+            sums(&words, a, m, nib, xs, acc, y, dev);
+            let pv = vdupq_n_s16(p);
+            let mut base = [[0u16; LANES]; N];
+            for (k, b) in base.iter_mut().enumerate() {
+                let v = y[k];
+                let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+                vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
+            }
+            let tail = &mut *tail;
+            for k in 0..N / 2 {
+                let h = k + N / 2;
+                let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
+                let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
+                for d in 0..DIGITS {
+                    let (u, v) = lattice::WEIGHTS[d];
+                    let w = u + v;
+                    for half in 0..2 {
+                        let x = dev[d * 2 * N + 2 * k + half];
+                        let y = dev[d * 2 * N + 2 * h + half];
+                        let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
+                        let (i, j) = (2 * half, 2 * half + 1);
+                        lo[i] = vmlal_n_s32(lo[i], xl, u);
+                        lo[j] = vmlal_high_n_s32(lo[j], x, u);
+                        lo[i] = vmlsl_n_s32(lo[i], yl, v);
+                        lo[j] = vmlsl_high_n_s32(lo[j], y, v);
+                        hi[i] = vmlal_n_s32(hi[i], xl, v);
+                        hi[j] = vmlal_high_n_s32(hi[j], x, v);
+                        hi[i] = vmlal_n_s32(hi[i], yl, w);
+                        hi[j] = vmlal_high_n_s32(hi[j], y, w);
+                    }
+                }
+                for q in 0..4 {
+                    vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
+                    vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
+                }
+            }
+            for (c, col_bytes) in target.chunks_exact_mut(N * 5).enumerate() {
+                for (k, slot) in col_bytes.chunks_exact_mut(5).enumerate() {
+                    let x = crt(base[k][c] as u32, tail[k][c]) as u64;
+                    slot[..4].copy_from_slice(&(x as u32).to_le_bytes());
+                    slot[4] = (x >> 32) as u8;
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod chunk_bench {
     use super::*;

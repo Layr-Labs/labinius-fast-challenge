@@ -1866,7 +1866,7 @@ unsafe fn materialize_prefix_range(
 /// streams close enough to their consumers to avoid excess cache pressure.
 const BIND_WAYS: usize = 4;
 /// Outputs per sweep of the binding pass.
-const BIND_STRETCH: usize = 4096;
+const BIND_STRETCH: usize = 1024;
 
 /// Rounds over fewer elements than this run on the calling thread: below it, a dispatch costs
 /// more than the round's work. The switch's rounds follow each other within microseconds, so

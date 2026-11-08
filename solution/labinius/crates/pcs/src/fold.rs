@@ -2117,10 +2117,10 @@ mod bitsliced {
         for s0 in (0..OUT_SLOTS).step_by(8) {
             let n = (OUT_SLOTS - s0).min(8);
             let mask = ((1u32 << n) - 1) as __mmask8;
-            let mut s_lo = [[zero; 8]; 8];
-            let mut s_hi = [[zero; 8]; 8];
-            let mut t_lo = [[zero; 8]; 8];
-            let mut t_hi = [[zero; 8]; 8];
+            let mut s_lo: [[__m512i; 8]; 8] = core::mem::MaybeUninit::uninit().assume_init();
+            let mut s_hi: [[__m512i; 8]; 8] = core::mem::MaybeUninit::uninit().assume_init();
+            let mut t_lo: [[__m512i; 8]; 8] = core::mem::MaybeUninit::uninit().assume_init();
+            let mut t_hi: [[__m512i; 8]; 8] = core::mem::MaybeUninit::uninit().assume_init();
             for ds in 0..8 {
                 let s = (s0 + ds).min(OUT_SLOTS - 1);
                 let t = if s < 81 { 162 + s } else { s + 81 };
@@ -2243,9 +2243,7 @@ mod bitsliced {
             }
             ran += 1;
             let (block, part) = (tasks / parts - 1 - task / parts, task % parts);
-            for p in 0..2 * PAIRS * BITS {
-                _mm512_store_si512(acc.as_mut_ptr().add(p), zero);
-            }
+            core::ptr::write_bytes(acc.as_mut_ptr(), 0, 2 * PAIRS * BITS);
             let range = cuts[part]..cuts[part + 1];
             for gi in range.clone() {
                 let group = &groups[gi];

@@ -1940,7 +1940,7 @@ unsafe fn fold_message_range(
             for k in 0..3 {
                 for o in [j0, j0 + half, j0 + hh, j0 + hh + half] {
                     let a = p[k].wrapping_add(o + FOLD_AHEAD) as *const i8;
-                    for l in 0..(TILE * 8 / 64) {
+                    for l in (0..(TILE * 8 / 64)).step_by(2) {
                         _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64 * l));
                     }
                 }

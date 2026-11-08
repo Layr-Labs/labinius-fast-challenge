@@ -27,6 +27,7 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+overflow-checks = false
 
 # The build script runs the transforms to precompute the matrix; compile it optimised.
 [profile.release.build-override]

@@ -105,20 +105,11 @@ pub fn prefetch_key(image: &'static [u8]) {
     let job = std::thread::spawn(move || {
         let len = image.len();
         let mut v: Vec<u8> = Vec::with_capacity(len);
-        let dst = v.as_mut_ptr() as usize;
-        // pieces of whole 2 MiB pages, so that each thread faults in its own huge pages
-        let piece = len.div_ceil(8).next_multiple_of(2 << 20);
-        std::thread::scope(|s| {
-            for start in (0..len).step_by(piece) {
-                let n = piece.min(len - start);
-                s.spawn(move || {
-                    // SAFETY: disjoint ranges of the capacity and of the image.
-                    unsafe { core::ptr::copy_nonoverlapping(image.as_ptr().add(start), (dst as *mut u8).add(start), n) }
-                });
-            }
-        });
-        // SAFETY: every byte below `len` was written above.
-        unsafe { v.set_len(len) };
+        let dst = v.as_mut_ptr();
+        unsafe {
+            core::ptr::copy_nonoverlapping(image.as_ptr(), dst, len);
+            v.set_len(len);
+        }
         let _ = KEY.set((image.as_ptr() as usize, v));
     });
     *KEY_JOB.lock().unwrap() = Some(job);

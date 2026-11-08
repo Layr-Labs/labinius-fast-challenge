@@ -1,5 +1,5 @@
 use super::crossfield::{eq_expand_b128, eq_expand_f162};
-use super::neon::{self, ByteTables};
+use super::neon::{self, ByteTables, NibblePair};
 use super::scalar::{B128, F162};
 use crate::par;
 
@@ -198,8 +198,7 @@ impl<'a> Switch<'a> {
     }
 
     fn message(&self, half: usize) -> [F162; 2] {
-        let l = &self.lt;
-        let lp = ByteTables::new(&self.lp);
+        let pair = NibblePair::new(&self.l, &self.lp);
         let p = &self.planes;
         let parts = par::workers(half, 1 << 10);
         let sums = par::map_blocks(half, parts, 64.min(half), |_, start, end| unsafe {
@@ -208,11 +207,11 @@ impl<'a> Switch<'a> {
             for base in (start..end).step_by(64) {
                 let count = (end - base).min(64);
                 self.prepared.eq.fill(base, &mut eq[..count]);
-                let m = neon::linear_message(
+                let m = neon::linear_message_pair(
                     &eq[..count],
                     core::array::from_fn(|k| &p[k][base..base + count]),
                     core::array::from_fn(|k| &p[k][half + base..half + base + count]),
-                    &l, &lp,
+                    &pair,
                 );
                 out[0] += m[0];
                 out[1] += m[1];
@@ -249,8 +248,7 @@ impl<'a> Switch<'a> {
 
     fn fold_message(&mut self, r: F162) -> [F162; 2] {
         let hh = self.half / 2;
-        let l = &self.lt;
-        let lp = ByteTables::new(&self.lp);
+        let pair = NibblePair::new(&self.l, &self.lp);
         let eq = &self.prepared.eq;
         let parts = par::workers(hh, 1 << 10);
         let edges: Vec<_> = (0..parts).map(|t| par::block(hh, parts, t, 64.min(hh))).collect();
@@ -273,13 +271,13 @@ impl<'a> Switch<'a> {
                 let count = (end - base).min(64);
                 eq.fill(base, &mut tile[..count]);
                 let offset = base - start;
-                let m = neon::fold_linear_message(
+                let m = neon::fold_linear_message_pair(
                     &tile[..count],
                     [ &mut a0[offset..offset + count], &mut b0[offset..offset + count], &mut c0[offset..offset + count] ],
                     [ &mut a1[offset..offset + count], &mut b1[offset..offset + count], &mut c1[offset..offset + count] ],
                     [&ah0[base..base + count], &bh0[base..base + count], &ch0[base..base + count]],
                     [&ah1[base..base + count], &bh1[base..base + count], &ch1[base..base + count]],
-                    r, &l, &lp,
+                    r, &pair,
                 );
                 out[0] += m[0]; out[1] += m[1];
             }

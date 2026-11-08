@@ -1007,8 +1007,9 @@ mod tests {
             let built = sms::matrix(RING_ELEMENTS, 8);
             let embedded = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
                 .expect("the build embeds the SMS images");
-            assert!(built.data == embedded.data && built.mean_residues == embedded.mean_residues && built.mu == embedded.mu);
+            assert!(built.data == embedded.decoded_keys_for_test() && built.mean_residues == embedded.mean_residues && built.mu == embedded.mu);
             assert_eq!(built.margin, embedded.margin);
+            embedded.assert_dispatch_for_test();
         }
         use ntt::neon::sms;
         let q = sms::MODULUS;
@@ -1019,6 +1020,9 @@ mod tests {
         eprintln!("sms margin {}", a.margin);
         for workers in [1, 3] {
             assert!(sms::commit(&values, &a, workers) == want, "workers {workers}");
+            let embedded=sms::SmsMatrix::from_images(&SMS_DATA.0,&SMS_MEANS.0,&SMS_MU.0,&SMS_META.0,RING_ELEMENTS).unwrap();
+            embedded.assert_dispatch_for_test();
+            assert!(sms::commit(&values,&embedded,workers)==want,"image workers {workers}");
         }
         // a short last chunk and a short last lockstep group, partial batches; the last sweep of
         // the column with one to four tiles (whole and short), a column of one short tile, and a
@@ -1029,6 +1033,10 @@ mod tests {
             let want = commit_reference(&values, &matrix, q);
             let a = sms::matrix(elements, 3);
             assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
+            let images=a.images();let [data,means,mu,meta]=images.map(|v|&*Box::leak(v.into_boxed_slice()));
+            let embedded=sms::SmsMatrix::from_images(data,means,mu,meta,elements).unwrap();
+            embedded.assert_dispatch_for_test();
+            assert!(sms::commit(&values,&embedded,3)==want,"image {elements} elements");
         }
     }
     #[test]

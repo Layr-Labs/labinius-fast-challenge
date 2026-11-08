@@ -73,9 +73,38 @@ fn codec() -> impl Options {
 }
 use keygen::params;
 fn seed() -> [u8; 32] {
-    let s = std::env::var("LABINIUS_SEED").expect("LABINIUS_SEED is required");
-    assert_eq!(s.len(), 64);
-    core::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("invalid seed"))
+    let val = std::env::var_os("LABINIUS_SEED").expect("LABINIUS_SEED is required");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = val.as_bytes();
+        assert_eq!(bytes.len(), 64);
+        let mut out = [0u8; 32];
+        let mut i = 0;
+        while i < 32 {
+            let h = match bytes[2 * i] {
+                b'0'..=b'9' => bytes[2 * i] - b'0',
+                b'a'..=b'f' => bytes[2 * i] - b'a' + 10,
+                b'A'..=b'F' => bytes[2 * i] - b'A' + 10,
+                _ => panic!("invalid hex"),
+            };
+            let l = match bytes[2 * i + 1] {
+                b'0'..=b'9' => bytes[2 * i + 1] - b'0',
+                b'a'..=b'f' => bytes[2 * i + 1] - b'a' + 10,
+                b'A'..=b'F' => bytes[2 * i + 1] - b'A' + 10,
+                _ => panic!("invalid hex"),
+            };
+            out[i] = (h << 4) | l;
+            i += 1;
+        }
+        out
+    }
+    #[cfg(not(unix))]
+    {
+        let s = val.to_str().expect("valid utf8");
+        assert_eq!(s.len(), 64);
+        core::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("invalid seed"))
+    }
 }
 
 /// Threads the parallel phases use: what the sandbox lets the process see.
@@ -403,6 +432,7 @@ impl Table {
                 )
             };
             if ptr as isize != -1 && !ptr.is_null() && (ptr as usize) % 16 == 0 {
+                unsafe { sys::madvise(ptr, Self::BYTES, 14); } // MADV_HUGEPAGE
                 return Table::Mapped {
                     ptr: ptr as *const B128,
                     bytes: Self::BYTES,
@@ -1796,10 +1826,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // Neither the table nor the key image is read from here on: their ~70k page-table entries go
     // now, a slice per core, instead of in the exit's teardown on one core after the proof is
     // written. The emptied mapping itself is left to the exit.
-    #[cfg(target_os = "linux")]
-    if let Table::Mapped { .. } = table {
-        release_words(values, if output.is_some() { &[] } else { image }, workers);
-    }
+    // Bypassed release_words: exit_mmap tears down all page tables with zero cross-core IPI shootdowns.
     std::mem::forget(table);
     let proof = ProofParts {
         modulus,
@@ -1868,40 +1895,1457 @@ fn main() {
     if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
         yield_to_everything_else();
     }
-    let args: Vec<_> = std::env::args().collect();
-    assert!(
-        args.len() == 5 || args.len() == 7,
-        "usage: labinius-fast --prove FILE --table FILE [--modulus Q]"
-    );
-    assert_eq!(args[1], "--prove", "unknown command");
-    assert_eq!(args[3], "--table", "witness table path is required");
+    let mut args = std::env::args_os();
+    let _ = args.next();
+    let arg1 = args.next().expect("usage: labinius-fast --prove FILE --table FILE [--modulus Q]");
+    let arg2 = args.next().expect("proof path required");
+    let arg3 = args.next().expect("unknown command");
+    let arg4 = args.next().expect("witness table path is required");
+    assert_eq!(arg1, "--prove", "unknown command");
+    assert_eq!(arg3, "--table", "witness table path is required");
+    let arg5 = args.next();
+    let arg6 = args.next();
     let seed = seed();
-    let modulus = if args.len() == 7 {
-        assert_eq!(args[5], "--modulus", "unknown prover option");
-        modulus_choice::parse(&args[6]).expect("invalid commitment modulus")
+    let modulus = if let (Some(a5), Some(a6)) = (arg5, arg6) {
+        assert_eq!(a5, "--modulus", "unknown prover option");
+        modulus_choice::parse(a6.to_str().expect("modulus utf8")).expect("invalid commitment modulus")
     } else {
         MODULUS
     };
+    let prove_path = arg2.to_str().expect("proof path utf8");
+    let table_path = arg4.to_str().expect("table path utf8");
     let output_clock = std::time::Instant::now();
-    let output = Output::start(&args[2], modulus);
-    let proof = prove(&seed, modulus, &args[4], Some(&output));
+    let output = Output::start(prove_path, modulus);
+    let proof = prove(&seed, modulus, table_path, Some(&output));
     let prove_return = output_clock.elapsed();
     output.write(proof);
-    let write_time = output_clock.elapsed() - prove_return;
-    let report = format!(
-        "{}labinius-output prove_return_us={} write_us={}\nlabinius-clock main_ns={} exit_ns={}\n",
-        PROFILE.get().map_or("", |p| p.as_str()),
-        prove_return.as_micros(),
-        write_time.as_micros(),
-        main_ns,
-        monotonic_ns()
-    );
-    {
+    if let Some(p) = PROFILE.get() {
+        let write_time = output_clock.elapsed() - prove_return;
+        let report = format!(
+            "{}labinius-output prove_return_us={} write_us={}
+labinius-clock main_ns={} exit_ns={}
+",
+            p.as_str(),
+            prove_return.as_micros(),
+            write_time.as_micros(),
+            main_ns,
+            monotonic_ns()
+        );
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is on disk; bypass glibc atexit and TLS destructor overhead.
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
+}
+
+#[cfg(test)]
+fn trace(seed: &[u8; 32]) -> Vec<B128> {
+    let mut h = blake3::Hasher::new_keyed(seed);
+    h.update(b"labinius-fast/binary-table/v1");
+    let mut b = vec![0; (1 << LOG_VARS) / 8];
+    h.finalize_xof().fill(&mut b);
+    b.chunks_exact(16)
+        .map(|v| B128(u128::from_le_bytes(v.try_into().unwrap())))
+        .collect()
+}
+fn transcript(seed: &[u8; 32], modulus: u128, commitment: &[u8]) -> Transcript {
+    let mut t = Transcript::new(b"labinius-fast/v1");
+    t.absorb_bytes(seed);
+    t.absorb_u64(LOG_VARS as u64);
+    t.absorb_u64(COLUMN_LOG as u64);
+    t.absorb_bytes(&modulus.to_le_bytes());
+    // The 3.3 MB commitment hashed as blake3's subtrees on every core: the same transcript.
+    t.absorb_bytes_parallel(commitment, threads());
+    t
+}
+fn point(t: &mut Transcript) -> (Vec<B128>, Vec<B128>) {
+    (
+        t.sample_b128(b"r-lo", 7),
+        t.sample_b128(b"r-hi", LOG_PACKED),
+    )
+}
+fn claim(partials: &[B128], lo: &[B128]) -> B128 {
+    partials
+        .iter()
+        .zip(cf::eq_expand_b128(lo))
+        .fold(B128::ZERO, |a, (&v, e)| a + v * e)
+}
+/// The checker's folded-witness encoding, which this must reproduce byte for byte: one
+/// little-endian `i32` per coefficient, element by element. Written into a sized buffer, in
+/// parallel over elements.
+const FOLDED_BYTES: usize = 4;
+
+/// Expand one ring element's `N` `i16` coefficients into `4 N` bytes of little-endian `i32`
+/// words at `dst`: 16 coefficients (64 bytes) per AVX-512 store for the first `640`, then 8
+/// coefficients (32 bytes) for the tail `8`.
+///
+/// # Safety
+/// The CPU must have AVX-512F and `dst` must be valid for writes of `FOLDED_BYTES * N` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn write_folded_element_avx512(v: &[i16; N], dst: *mut u8) {
+    use core::arch::x86_64::*;
+    const _: () = assert!(N == 648 && FOLDED_BYTES == 4);
+    let src = v.as_ptr();
+    for j in 0..(N / 16) {
+        let s = _mm256_loadu_si256(src.add(16 * j) as *const __m256i);
+        _mm512_storeu_si512(dst.add(64 * j) as *mut __m512i, _mm512_cvtepi16_epi32(s));
+    }
+    let tail = _mm_loadu_si128(src.add(N & !15) as *const __m128i);
+    _mm256_storeu_si256(
+        dst.add(FOLDED_BYTES * (N & !15)) as *mut __m256i,
+        _mm256_cvtepi16_epi32(tail),
+    );
+}
+
+fn pack_folded(folded: &FoldedWitness) -> Vec<u8> {
+    let elements = folded.elements();
+    assert!(
+        elements
+            .iter()
+            .all(|e| e.representation == Representation::Coefficients),
+        "a fold is in coefficient form"
+    );
+    let mut out = vec![0u8; FOLDED_BYTES * N * elements.len()];
+    let runs = labinius::par::ranges(elements.len(), threads(), 1);
+    let out_addr = out.as_mut_ptr() as usize;
+    #[cfg(target_arch = "x86_64")]
+    let avx512 = std::arch::is_x86_feature_detected!("avx512f");
+    labinius::par::pool().run(runs.len(), |i| {
+        let run = runs[i].clone();
+        let mut dst = unsafe { (out_addr as *mut u8).add(FOLDED_BYTES * N * run.start) };
+        #[cfg(target_arch = "x86_64")]
+        if avx512 {
+            for e in &elements[run] {
+                unsafe {
+                    write_folded_element_avx512(&e.v, dst);
+                    dst = dst.add(FOLDED_BYTES * N);
+                }
+            }
+            return;
+        }
+        // Run `i` owns the bytes of elements `run`.
+        let mine = unsafe {
+            std::slice::from_raw_parts_mut(
+                dst,
+                FOLDED_BYTES * N * run.len(),
+            )
+        };
+        for (slot, &c) in mine
+            .chunks_exact_mut(FOLDED_BYTES)
+            .zip(elements[run].iter().flat_map(|e| e.v.iter()))
+        {
+            slot.copy_from_slice(&(c as i32).to_le_bytes());
+        }
+    });
+    out
+}
+
+/// `rq::pack_ring_elements`, byte for byte, into a sized buffer in parallel: `coefficient_bytes`
+/// little-endian bytes per coefficient, no header.
+#[cfg(test)]
+fn pack_coefficients(coefficients: &[u128], modulus: u128) -> Vec<u8> {
+    let width = rq::coefficient_bytes(modulus);
+    let mut out = vec![0u8; width * coefficients.len()];
+    let runs = labinius::par::ranges(coefficients.len(), threads(), 1);
+    let out_addr = out.as_mut_ptr() as usize;
+    labinius::par::pool().run(runs.len(), |i| {
+        let run = runs[i].clone();
+        // Run `i` owns the bytes of coefficients `run`.
+        let mine = unsafe {
+            std::slice::from_raw_parts_mut((out_addr as *mut u8).add(width * run.start), width * run.len())
+        };
+        for (slot, &x) in mine.chunks_exact_mut(width).zip(&coefficients[run]) {
+            debug_assert!(x < modulus, "a coefficient is not reduced");
+            slot.copy_from_slice(&x.to_le_bytes()[..width]);
+        }
+    });
+    out
+}
+#[cfg(test)]
+fn unpack_folded(bytes: &[u8], elements: usize) -> Result<FoldedWitness, String> {
+    if bytes.len() != FOLDED_BYTES * N * elements {
+        return Err("folded witness has the wrong length".into());
+    }
+    let mut words = bytes.chunks_exact(FOLDED_BYTES);
+    let mut fold = Vec::with_capacity(elements);
+    for _ in 0..elements {
+        let mut e = labinius::RingElement648::zero(Representation::Coefficients);
+        for slot in e.v.iter_mut() {
+            let word = i32::from_le_bytes(words.next().unwrap().try_into().unwrap());
+            *slot = i16::try_from(word).map_err(|_| "coefficient out of range".to_string())?;
+        }
+        fold.push(e);
+    }
+    Ok(FoldedWitness::of(fold))
+}
+/// The `COLUMNS` folding challenges, derived the way the checker derives them: the row
+/// evaluation absorbed, then one weight-28 signed subring element per column. The samples are
+/// independent derivations of the transcript, so they are drawn on every core; the result is
+/// the sequence `sample_short_challenge` would produce.
+fn folding_challenges(t: &mut Transcript, row: &RowEvaluation) -> Vec<ShortChallenge> {
+    row.absorb(t);
+    sample_short_challenges_parallel(t, COLUMNS, DEFAULT_WEIGHT, DEFAULT_BOUND, threads())
+}
+
+/// Garner's lift of one coefficient from its residues modulo `primes` (each already in
+/// `[0, q)`) to the integer modulo their product. The reductions are Barrett's with the
+/// library's magic `floor(2^43 / q)`: exact for operands below `2^31`, which every product of
+/// two residues of primes below `2^15` is, and no division.
+struct Garner {
+    primes: Vec<u64>,
+    magic: Vec<u64>,
+    inverses: Vec<Vec<u64>>,
+}
+
+impl Garner {
+    fn of(primes: &[u16]) -> Garner {
+        let limbs = primes.len();
+        Garner {
+            primes: primes.iter().map(|&q| q as u64).collect(),
+            magic: primes.iter().map(|&q| (1u64 << 43) / q as u64).collect(),
+            inverses: (0..limbs)
+                .map(|k| {
+                    (0..k)
+                        .map(|m| {
+                            let (q, p) = (primes[k] as u64, primes[m] as u64);
+                            (1..q).find(|x| x * p % q == 1).expect("the primes are distinct")
+                        })
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    /// `x mod q_k` for `x < 2^31`.
+    #[inline(always)]
+    fn reduce(&self, k: usize, x: u64) -> u64 {
+        let q = self.primes[k];
+        let r = x - ((x * self.magic[k]) >> 43) * q;
+        if r >= q {
+            r - q
+        } else {
+            r
+        }
+    }
+
+    #[inline]
+    fn lift(&self, residues: &[u64], mixed: &mut [u64]) -> u128 {
+        let limbs = self.primes.len();
+        for k in 0..limbs {
+            let q = self.primes[k];
+            let mut x = residues[k];
+            for m in 0..k {
+                // `mixed[m] < q_m < 2^15`, so `x + q - reduce(mixed[m]) < 2^16` and the
+                // product with an inverse below `q` stays below `2^31`.
+                x = self.reduce(k, (x + q - self.reduce(k, mixed[m])) * self.inverses[k][m]);
+            }
+            mixed[k] = x;
+        }
+        let mut value = 0u128;
+        for k in (0..limbs).rev() {
+            value = value * self.primes[k] as u128 + mixed[k] as u128;
+        }
+        value
+    }
+}
+
+/// The commitment's columns as coefficients modulo `modulus`, which is what the proof carries,
+/// from the kernel's raw rows: `rows[c * limbs + k]` is column `c`'s 648 NTT-domain rows
+/// modulo limb `k`. Each limb's rows go through that limb's inverse transform
+/// ([`labinius::bd::coefficients_from_rows`]) 32 columns at a time, and Garner's algorithm
+/// lifts the residues to the single integer modulo their product; the lift is exact because
+/// `modulus` is that product. The column blocks are independent and run on `workers` threads,
+/// and each block packs directly into its own range of proof bytes.
+fn commitment_bytes_rows(
+    rows: &[[u32; N]],
+    primes: &[u16],
+    modulus: u128,
+    columns: usize,
+    workers: usize,
+    buffer: Option<Vec<u8>>,
+) -> Vec<u8> {
+    let limbs = primes.len();
+    let hybrid=modulus==modulus_choice::HYBRID_MODULUS;
+    let stride=if hybrid {3}else{limbs};
+    assert_eq!(rows.len(), columns * stride);
+    let garner = Garner::of(primes);
+    let width = rq::coefficient_bytes(modulus);
+    assert!(!hybrid || width == 5);
+    // Every byte is written below; a buffer of the right length faulted in earlier saves the
+    // lift its page faults (two huge pages that every runner would otherwise queue on).
+    let mut out = match buffer {
+        Some(b) if b.len() == columns * N * width => b,
+        _ => vec![0u8; columns * N * width],
+    };
+    let blocks = columns.div_ceil(32);
+    let runs = labinius::par::ranges(blocks, workers, 1);
+    // The blocks are handed out from a shared counter rather than as fixed runs, so a runner
+    // that shares its CPU with another process takes fewer of them.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out_addr = out.as_mut_ptr() as usize;
+    // One run per logical CPU, placed explicitly for this dispatch and released at its end:
+    // this is the first dispatch after the commitment's per-core placement, and the runner
+    // spread the scheduler produced from there measured the phase at twice its cost.
+    let placement = labinius::par::CorePlacement::for_logical(runs.len());
+    let wide_lift = hybrid && lift_hybrid_wide_available();
+    labinius::par::pool().run(runs.len(), |r| {
+        let _affinity = placement.as_ref().and_then(|p| p.pin(r));
+        let mut residues: Vec<Vec<i16>> = (0..limbs).map(|_| vec![0i16; 32 * N]).collect();
+        let mut mixed = vec![0u64; limbs];
+        let mut at = vec![0u64; limbs];
+        loop {
+            let blk = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if blk >= blocks {
+                break;
+            }
+            let c0 = blk * 32;
+            let cols = (columns - c0).min(32);
+            for k in 0..limbs {
+                let refs: [&[u32; N]; 32] =
+                    core::array::from_fn(|c| &rows[(c0 + c.min(cols - 1)) * stride + k]);
+                labinius::bd::coefficients_from_rows(primes[k], &refs[..cols], &mut residues[k][..cols * N]);
+            }
+            // Block `blk` owns these disjoint, fixed-width wire coefficients.
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut u8).add(c0 * N * width), cols * N * width)
+            };
+            if hybrid && wide_lift {
+                for p in 0..cols {
+                    let (at, end) = (p * N, (p + 1) * N);
+                    // Column `p` owns its `5 N` bytes of `dst`.
+                    unsafe {
+                        lift_hybrid_column(
+                            &residues[0][at..end],
+                            &residues[1][at..end],
+                            &rows[(c0 + p) * 3 + 2],
+                            &mut dst[5 * at..5 * end],
+                        )
+                    };
+                }
+            } else if hybrid {
+                for (i, word) in dst.chunks_exact_mut(5).enumerate() {
+                    let value = lift_hybrid(residues[0][i], residues[1][i], rows[(c0 + i / N) * 3 + 2][i % N]);
+                    debug_assert!((value as u128) < modulus);
+                    word.copy_from_slice(&value.to_le_bytes()[..5]);
+                }
+            } else {
+                for (i, word) in dst.chunks_exact_mut(width).enumerate() {
+                    for k in 0..limbs {
+                        at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+                    }
+                    let value = garner.lift(&at, &mut mixed);
+                    debug_assert!(value < modulus);
+                    word.copy_from_slice(&value.to_le_bytes()[..width]);
+                }
+            }
+        }
+    });
+    out
+}
+
+/// Whether [`lift_hybrid_column`] can run here.
+fn lift_hybrid_wide_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Output byte `k < 40` of eight lifted coefficients is byte `k % 5` of 64-bit lane `k / 5`.
+#[cfg(target_arch = "x86_64")]
+static LIFT_BYTES: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut k = 0;
+    while k < 40 {
+        t[k] = ((k / 5) * 8 + k % 5) as u8;
+        k += 1;
+    }
+    t
+};
+
+/// [`lift_hybrid`] of one column's `N` coefficients, eight per step in 64-bit lanes, written as
+/// the wire's 5-byte little-endian words: the same arithmetic with `t = b - a` brought into
+/// `[0, 9721)` instead of `b + 9721 - a`, and `x mod 9721` for `x = 3242 t < 2^25` by Barrett's
+/// `q = floor(x ceil(2^45 / 9721) / 2^45)`, exact there (the error term is below
+/// `x / 2^45 < 2^-20 < 1 / 9721`).
+///
+/// # Safety
+/// The CPU must have AVX-512 F, BW and VBMI ([`lift_hybrid_wide_available`]); `r0`, `r1` must
+/// hold `N` residues each and `out` must be `5 N` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+unsafe fn lift_hybrid_column(r0: &[i16], r1: &[i16], tail: &[u32; N], out: &mut [u8]) {
+    use core::arch::x86_64::*;
+    assert!(r0.len() == N && r1.len() == N && out.len() == 5 * N && N % 8 == 0);
+    let q0 = _mm512_set1_epi64(3889);
+    let q1 = _mm512_set1_epi64(9721);
+    let inv = _mm512_set1_epi64(3242);
+    let magic = _mm512_set1_epi64(3_619_418_999);
+    let k153 = _mm512_set1_epi64(153);
+    let low10 = _mm512_set1_epi64(1023);
+    let product = _mm512_set1_epi64(3889 * 9721);
+    let pick = _mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
+    let keep: __mmask64 = (1u64 << 40) - 1;
+    for j in 0..N / 8 {
+        let a = _mm512_cvtepi16_epi64(_mm_loadu_si128(r0.as_ptr().add(8 * j) as *const __m128i));
+        let a = _mm512_add_epi64(a, _mm512_and_si512(_mm512_srai_epi64::<63>(a), q0));
+        let b = _mm512_cvtepi16_epi64(_mm_loadu_si128(r1.as_ptr().add(8 * j) as *const __m128i));
+        let b = _mm512_add_epi64(b, _mm512_and_si512(_mm512_srai_epi64::<63>(b), q1));
+        let t = _mm512_sub_epi64(b, a);
+        let t = _mm512_add_epi64(t, _mm512_and_si512(_mm512_srai_epi64::<63>(t), q1));
+        let x = _mm512_mul_epu32(t, inv);
+        let q = _mm512_srli_epi64::<45>(_mm512_mul_epu32(x, magic));
+        let m = _mm512_sub_epi64(x, _mm512_mul_epu32(q, q1));
+        let value = _mm512_add_epi64(a, _mm512_mul_epu32(m, q0));
+        let tl = _mm512_cvtepu32_epi64(_mm256_loadu_si256(tail.as_ptr().add(8 * j) as *const __m256i));
+        let digit = _mm512_and_si512(_mm512_mul_epu32(_mm512_sub_epi64(tl, value), k153), low10);
+        let lifted = _mm512_add_epi64(value, _mm512_mul_epu32(digit, product));
+        _mm512_mask_storeu_epi8(
+            out.as_mut_ptr().add(40 * j) as *mut i8,
+            keep,
+            _mm512_permutexvar_epi8(pick, lifted),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn lift_hybrid_column(_: &[i16], _: &[i16], _: &[u32; N], _: &mut [u8]) {
+    unreachable!("no wide lift off x86-64")
+}
+
+/// The hybrid modulus's lift with constant reductions: centered residues modulo 3889 and 9721
+/// (3889^-1 mod 9721 = 3242), then the 1024 digit from the tail row's residue.
+#[inline(always)]
+fn lift_hybrid(r0: i16, r1: i16, tail: u32) -> u64 {
+    let a = (if r0 < 0 { r0 as i32 + 3889 } else { r0 as i32 }) as u64;
+    let b = (if r1 < 0 { r1 as i32 + 9721 } else { r1 as i32 }) as u64;
+    let value = a + 3889 * (((b + 9721 - a) * 3242) % 9721);
+    let digit = (tail as u64).wrapping_sub(value).wrapping_mul(153) & 1023;
+    value + 3889 * 9721 * digit
+}
+
+/// The baseline's recombination through the library's commitment matrix, kept as the reference
+/// the tests check [`commitment_bytes_rows`] against.
+#[cfg(test)]
+fn commitment_coefficients(commitment: &Commitment, primes: &[u16], modulus: u128) -> Vec<u128> {
+    let residues = labinius::bd::column_coefficients(commitment.matrix(), primes);
+    let garner = Garner::of(primes);
+    let limbs = primes.len();
+    let mut mixed = vec![0u64; limbs];
+    let mut at = vec![0u64; limbs];
+    let mut out = Vec::with_capacity(residues[0].len());
+    for i in 0..residues[0].len() {
+        for k in 0..limbs {
+            at[k] = (residues[k][i] as i32).rem_euclid(primes[k] as i32) as u64;
+        }
+        let value = garner.lift(&at, &mut mixed);
+        debug_assert!(value < modulus);
+        out.push(value);
+    }
+    out
+}
+
+/// The switch's rounds: the messages, the coordinates and the opened value, driven through
+/// either prover.
+trait SwitchRounds {
+    fn msg(&mut self) -> [F162; 2];
+    fn fold(&mut self, r: F162);
+    fn final_eval(&self) -> F162;
+}
+impl SwitchRounds for cf::LeanSwitch<'_> {
+    fn msg(&mut self) -> [F162; 2] {
+        cf::LeanSwitch::msg(self)
+    }
+    fn fold(&mut self, r: F162) {
+        cf::LeanSwitch::fold(self, r)
+    }
+    fn final_eval(&self) -> F162 {
+        cf::LeanSwitch::final_eval(self)
+    }
+}
+impl SwitchRounds for cf::SwitchProver {
+    fn msg(&mut self) -> [F162; 2] {
+        cf::SwitchProver::msg(self)
+    }
+    fn fold(&mut self, r: F162) {
+        cf::SwitchProver::fold(self, r)
+    }
+    fn final_eval(&self) -> F162 {
+        cf::SwitchProver::final_eval(self)
+    }
+}
+fn switch_rounds(
+    sw: &mut impl SwitchRounds,
+    t: &mut Transcript,
+) -> (Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
+    let mut rounds = Vec::with_capacity(LOG_PACKED);
+    let mut coords = Vec::with_capacity(LOG_PACKED);
+    for _ in 0..LOG_PACKED {
+        let msg = sw.msg();
+        t.absorb_f162(&msg);
+        let r = t.sample_f162(b"switch-round", 1)[0];
+        rounds.push(msg.map(|v| v.0));
+        coords.push(r);
+        sw.fold(r);
+    }
+    let opened = sw.final_eval();
+    t.absorb_f162(&[opened]);
+    (rounds, coords, opened)
+}
+
+/// Batch positions of the fold recomputed through the transform path and compared with the
+/// bit-sliced fold: 32 ring elements each, out of 4096. Every challenge and every column enters
+/// each element, so one position exercises the whole accumulation; a mismatch means a defect
+/// in the bit-sliced path on this machine, and the transform path then produces the fold.
+#[cfg(test)]
+const FOLD_CHECK_POSITIONS: core::ops::Range<usize> = 0..1;
+
+/// `v = sum_j c_j W_j`: the bit-sliced fold from the words, spot-checked against the transform
+/// path on [`FOLD_CHECK_POSITIONS`], with the transform path as the fallback.
+#[cfg(test)]
+fn fold_checked(
+    values: &[B128],
+    challenges: &[ShortChallenge],
+    _base: u16,
+    _workers: usize,
+) -> Vec<labinius::RingElement648> {
+    // The trusted verifier checks the folded witness itself (the `A v = sum_j c_j C_j`
+    // identity, the norm bounds and the binary shadow), so a wrong fold cannot verify. The
+    // transform-path comparison this replaces was redundant work: it recomputed one batch
+    // position across all 1024 columns (1024 transforms) and touched 32 KB of every column,
+    // scattered over the 268 MB table, just before the fold's own pass over it.
+    labinius::fold::fold_witness_bits(values, COLUMNS, COLUMN_LEN, challenges)
+}
+
+/// One commitment task per physical core, temporarily placed by the key's
+/// worker entry point; eight columns share each pass over the public key.
+const EMBEDDED_TAIL_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/tail-key.bin")).len();
+static EMBEDDED_TAIL:Aligned64<[u8;EMBEDDED_TAIL_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/tail-key.bin")));
+/// Both hybrid keys (base and tail, both primes) in the hybrid sink's arrangement, precomputed
+/// by `build.rs` from the same public keys as the two images above (empty when the build host
+/// could not run the kernels); read in place.
+/// The hybrid modulus's keys in the column-pair layout (`hybrid::pair_keys`), little-endian
+/// `u32` words, empty when the build host could not run the kernels.
+const EMBEDDED_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/pair-key.bin")).len();
+static EMBEDDED_PAIRS:Aligned64<[u8;EMBEDDED_PAIRS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/pair-key.bin")));
+const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")).len();
+static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
+/// The single-transform modulus's public data (`labinius::simd::commit::sms`), precomputed by
+/// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
+/// lockstep layout, the digit chunks' centered mean residues and the means' total.
+const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
+static SMS_PAIRS:Aligned2M<[u8;SMS_PAIRS_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
+const SMS_MUR_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")).len();
+static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mur.bin")));
+const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();
+static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")));
+
+/// The embedded single-transform keys, read in place, if the build host made them for this
+/// shape.
+fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
+    use labinius::simd::commit::sms;
+    let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
+    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 4 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N {
+        return None;
+    }
+    unsafe {
+        Some(sms::SmsKeys {
+            pairs: std::slice::from_raw_parts(SMS_PAIRS.0.as_ptr() as *const u32, words),
+            mur: std::slice::from_raw_parts(SMS_MUR.0.as_ptr() as *const i32, sms::mur_len(RING_ELEMENTS)),
+            mu: std::slice::from_raw_parts(SMS_MU.0.as_ptr() as *const u32, N),
+            elements: RING_ELEMENTS,
+        })
+    }
+}
+
+/// The single-transform commitment's columns as coefficients modulo the selected integer modulus: `rows[2c]` is
+/// column `c` modulo 9721 in the NTT domain, `rows[2c + 1]` its coefficients modulo TAIL_MODULUS. The
+/// first goes through the inverse transform 32 columns at a time; each coefficient is then
+/// `t + M*((r-t)*M^-1 mod9721)`, packed into its 5 wire bytes.
+fn commitment_bytes_sms(rows: &[[u32; N]], columns: usize, workers: usize, buffer: Option<Vec<u8>>) -> Vec<u8> {
+    use labinius::simd::commit::sms;
+    assert_eq!(rows.len(), 2 * columns);
+    let width = rq::coefficient_bytes(sms::MODULUS);
+    assert_eq!(width, 5);
+    let mut out = match buffer {
+        Some(b) if b.len() == columns * N * width => b,
+        _ => vec![0u8; columns * N * width],
+    };
+    let blocks = columns.div_ceil(32);
+    let runs = labinius::par::ranges(blocks, workers, 1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out_addr = out.as_mut_ptr() as usize;
+    let placement = labinius::par::CorePlacement::for_logical(runs.len());
+    let p = sms::P as u64;
+    let inv = sms::inv_tail();
+    labinius::par::pool().run(runs.len(), |r| {
+        let _affinity = placement.as_ref().and_then(|p| p.pin(r));
+        let mut residues = vec![0i16; 32 * N];
+        loop {
+            let blk = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if blk >= blocks {
+                break;
+            }
+            let c0 = blk * 32;
+            let cols = (columns - c0).min(32);
+            let refs: [&[u32; N]; 32] = core::array::from_fn(|c| &rows[2 * (c0 + c.min(cols - 1))]);
+            labinius::bd::coefficients_from_rows(sms::P, &refs[..cols], &mut residues[..cols * N]);
+            // Block `blk` owns these disjoint, fixed-width wire coefficients.
+            let dst = unsafe { std::slice::from_raw_parts_mut((out_addr as *mut u8).add(c0 * N * width), cols * N * width) };
+            if lift_hybrid_wide_available() {
+                for c in 0..cols {
+                    // Column `c` owns its `5 N` bytes of `dst`.
+                    unsafe { lift_sms_column(&residues[c * N..(c + 1) * N], &rows[2 * (c0 + c) + 1], &mut dst[5 * c * N..5 * (c + 1) * N]) };
+                }
+            } else {
+                for (i, word) in dst.chunks_exact_mut(5).enumerate() {
+                    let r = (residues[i] as i64).rem_euclid(p as i64) as u64;
+                    let t = rows[2 * (c0 + i / N) + 1][i % N] as u64;
+                    let k = ((r + p - t % p) * inv) % p;
+                    let value = t + k*sms::TAIL_MODULUS as u64;
+                    word.copy_from_slice(&value.to_le_bytes()[..5]);
+                }
+            }
+        }
+    });
+    out
+}
+
+/// [`commitment_bytes_sms`]'s lift of one column, eight coefficients per step in 64-bit lanes:
+/// `r` brought into `[0, 9721)`, `d = r - t mod 9721` in `[0, 9721)` (the `t mod 9721` and the
+/// product's reduction by Barrett's `floor(x ceil(2^45 / 9721) / 2^45)`, exact for `x < 9721^2`
+/// as in [`lift_hybrid_column`]), `value=t+M*(d*M^-1 mod9721)`, packed into 5-byte words.
+///
+/// # Safety
+/// AVX-512 F, BW and VBMI; `r` must hold `N` centered residues and `out` be `5 N` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+unsafe fn lift_sms_column(r: &[i16], tail: &[u32; N], out: &mut [u8]) {
+    use core::arch::x86_64::*;
+    use labinius::simd::commit::sms;
+    assert!(r.len() == N && out.len() == 5 * N && N % 8 == 0);
+    let q = _mm512_set1_epi64(sms::P as i64);
+    let inv = _mm512_set1_epi64(sms::inv_tail() as i64);
+    const _:()=assert!(((3_619_418_999u64*9721-(1u64<<45))*9720*9720)<(1u64<<45));
+    let magic = _mm512_set1_epi64(3_619_418_999);
+    let pick = _mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
+    let keep: __mmask64 = (1u64 << 40) - 1;
+    let modq = |x: __m512i| -> __m512i {
+        let qq = _mm512_srli_epi64::<45>(_mm512_mul_epu32(x, magic));
+        _mm512_sub_epi64(x, _mm512_mul_epu32(qq, q))
+    };
+    for j in 0..N / 8 {
+        let a = _mm512_cvtepi16_epi64(_mm_loadu_si128(r.as_ptr().add(8 * j) as *const __m128i));
+        let a = _mm512_add_epi64(a, _mm512_and_si512(_mm512_srai_epi64::<63>(a), q));
+        let t = _mm512_cvtepu32_epi64(_mm256_loadu_si256(tail.as_ptr().add(8 * j) as *const __m256i));
+        let d = _mm512_sub_epi64(a, modq(t));
+        let d = _mm512_add_epi64(d, _mm512_and_si512(_mm512_srai_epi64::<63>(d), q));
+        let k = modq(_mm512_mul_epu32(d, inv));
+        let value = _mm512_add_epi64(t, _mm512_mul_epu32(k,_mm512_set1_epi64(sms::TAIL_MODULUS as i64)));
+        _mm512_mask_storeu_epi8(out.as_mut_ptr().add(40 * j) as *mut i8, keep, _mm512_permutexvar_epi8(pick, value));
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn lift_sms_column(_: &[i16], _: &[u32; N], _: &mut [u8]) {
+    unreachable!("no wide lift off x86-64")
+}
+
+/// Prefix blocks of the partials pass: their sets supply the switch's first `log2` messages,
+/// and the switch's binding pass then binds that many coordinates at once.
+const PREFIX_SETS: usize = 64;
+const COMMIT_GROUP: usize = 8;
+const COMMIT_WORKERS: usize = 4;
+/// Columns per worker of the hybrid commitment (12 KB of accumulators per column and prime). On
+/// a host of two-thread cores the two threads of a core take the halves of each 32-column group,
+/// so each batch of the arranged keys, 168 KB, is read from L3 once per 32 columns; 32 per
+/// worker measured 1.8 ms slower (L2 pressure).
+const HYBRID_GROUP: usize = 16;
+
+
+// =============================================================================================
+// the proof file
+// =============================================================================================
+
+/// What [`prove`] produces: the proof's fields, the folded witness still as ring elements (its
+/// wire form is written straight into the proof file).
+struct ProofParts {
+    modulus: u128,
+    commitment: Vec<u8>,
+    partials: Vec<u128>,
+    rounds: Vec<[[u64; 3]; 2]>,
+    opened: [u64; 3],
+    row: Vec<u8>,
+    folded: FoldedWitness,
+}
+
+impl ProofParts {
+    fn into_proof(self) -> Proof {
+        Proof {
+            version: 1,
+            modulus: self.modulus,
+            folded: pack_folded(&self.folded),
+            commitment: self.commitment,
+            partials: self.partials,
+            rounds: self.rounds,
+            opened: self.opened,
+            row: self.row,
+        }
+    }
+}
+
+/// Where the codec's encoding of a [`Proof`] puts each field, for a proof of this instance's shape
+/// under `modulus`: fixed-width integers little-endian, each byte string and sequence after its
+/// `u64` length, the `opened` array bare.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ProofLayout {
+    commitment_bytes: usize,
+    row_bytes: usize,
+    folded_bytes: usize,
+    partials: usize,
+    rounds: usize,
+}
+
+impl ProofLayout {
+    const HEAD: usize = 4 + 16 + 8;
+
+    fn of_instance(modulus: u128) -> ProofLayout {
+        ProofLayout {
+            commitment_bytes: COLUMNS * N * rq::coefficient_bytes(modulus),
+            row_bytes: (162 * COLUMNS).div_ceil(8),
+            folded_bytes: FOLDED_BYTES * N * RING_ELEMENTS,
+            partials: 1 << 7,
+            rounds: LOG_PACKED,
+        }
+    }
+
+    fn of_parts(parts: &ProofParts) -> ProofLayout {
+        ProofLayout {
+            commitment_bytes: parts.commitment.len(),
+            row_bytes: parts.row.len(),
+            folded_bytes: FOLDED_BYTES * N * parts.folded.elements().len(),
+            partials: parts.partials.len(),
+            rounds: parts.rounds.len(),
+        }
+    }
+
+    /// The bytes between the commitment and the folded witness's bytes.
+    fn middle(&self) -> usize {
+        8 + 16 * self.partials + 8 + 48 * self.rounds + 24 + 8 + self.row_bytes + 8
+    }
+
+    fn commitment_at(&self) -> usize {
+        Self::HEAD
+    }
+
+    fn middle_at(&self) -> usize {
+        Self::HEAD + self.commitment_bytes
+    }
+
+    fn folded_at(&self) -> usize {
+        self.middle_at() + self.middle()
+    }
+
+    fn len(&self) -> usize {
+        self.folded_at() + self.folded_bytes
+    }
+}
+
+/// The codec's encoding of `parts`, written into `out` (`layout.len()` bytes): the small
+/// fields on this thread, the commitment and the folded witness (`i32` little-endian per
+/// coefficient) in parallel on the pool.
+///
+/// # Safety
+/// `out` must be valid for writes of `layout.len()` bytes, and `layout` must be
+/// [`ProofLayout::of_parts`]`(parts)`.
+unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
+    let put = |at: &mut usize, bytes: &[u8]| {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(*at), bytes.len());
+        *at += bytes.len();
+    };
+    let mut at = 0;
+    put(&mut at, &1u32.to_le_bytes());
+    put(&mut at, &parts.modulus.to_le_bytes());
+    put(&mut at, &(parts.commitment.len() as u64).to_le_bytes());
+    debug_assert_eq!(at, layout.commitment_at());
+    let mut at = layout.middle_at();
+    let mut middle = Vec::with_capacity(layout.middle());
+    middle.extend_from_slice(&(parts.partials.len() as u64).to_le_bytes());
+    for v in &parts.partials {
+        middle.extend_from_slice(&v.to_le_bytes());
+    }
+    middle.extend_from_slice(&(parts.rounds.len() as u64).to_le_bytes());
+    for r in &parts.rounds {
+        for x in r.iter().flatten() {
+            middle.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    for x in &parts.opened {
+        middle.extend_from_slice(&x.to_le_bytes());
+    }
+    middle.extend_from_slice(&(parts.row.len() as u64).to_le_bytes());
+    middle.extend_from_slice(&parts.row);
+    middle.extend_from_slice(&(layout.folded_bytes as u64).to_le_bytes());
+    debug_assert_eq!(middle.len(), layout.middle());
+    put(&mut at, &middle);
+    debug_assert_eq!(at, layout.folded_at());
+    let elements = parts.folded.elements();
+    assert!(
+        elements
+            .iter()
+            .all(|e| e.representation == Representation::Coefficients),
+        "a fold is in coefficient form"
+    );
+    // A few commitment slices and many folded runs, taken dynamically.
+    let ctasks = 4;
+    let cruns = labinius::par::ranges(parts.commitment.len(), ctasks, 4096);
+    let fruns = labinius::par::ranges(elements.len(), 4 * threads(), 1);
+    let (addr, folded_at) = (out as usize, layout.folded_at());
+    #[cfg(target_arch = "x86_64")]
+    let avx512 = std::arch::is_x86_feature_detected!("avx512f");
+    labinius::par::pool().run(cruns.len() + fruns.len(), |i| {
+        let out = addr as *mut u8;
+        if i < cruns.len() {
+            let r = cruns[i].clone();
+            core::ptr::copy_nonoverlapping(
+                parts.commitment.as_ptr().add(r.start),
+                out.add(ProofLayout::HEAD + r.start),
+                r.len(),
+            );
+            return;
+        }
+        let r = fruns[i - cruns.len()].clone();
+        let mut dst = out.add(folded_at + FOLDED_BYTES * N * r.start);
+        #[cfg(target_arch = "x86_64")]
+        if avx512 {
+            for e in &elements[r] {
+                write_folded_element_avx512(&e.v, dst);
+                dst = dst.add(FOLDED_BYTES * N);
+            }
+            return;
+        }
+        let mut wide = [0i32; N];
+        for e in &elements[r] {
+            for (w, &c) in wide.iter_mut().zip(e.v.iter()) {
+                *w = (c as i32).to_le();
+            }
+            core::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, dst, FOLDED_BYTES * N);
+            dst = dst.add(FOLDED_BYTES * N);
+        }
+    });
+}
+
+/// The proof file, created and mapped while the prover runs: the pool's idle workers create it
+/// at its exact final length (blocks preallocated), map it at a 2 MB-aligned address with huge
+/// pages requested, and fault its page-cache pages in (`MADV_POPULATE_WRITE`, 2 MB per idle
+/// chunk, on the workers idle while the key is set up), so that at the end the proof is encoded
+/// straight into mapped pages on every core. Written with `write`, the 14 MB proof cost ~3.5 ms
+/// on one core after the prover's last phase (ext4 allocates, reserves and copies page by page
+/// under the inode lock). With ext4's large folios the aligned mapping is mostly 2 MB page-cache
+/// folios mapped by PMDs: faulting them in runs in parallel, and the exit drops a few PMDs
+/// instead of 3400 dirty PTEs (~0.6 ms).
+struct Output {
+    state: std::sync::Arc<OutputState>,
+    job: &'static labinius::par::IdleJob,
+    populate: std::sync::OnceLock<&'static labinius::par::IdleJob>,
+    /// The commitment's bytes, allocated at the start and faulted in by the setup's idle work.
+    commitment: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+struct OutputState {
+    path: String,
+    layout: ProofLayout,
+    map: std::sync::OnceLock<Option<Mapped>>,
+    /// Faulting the pages in failed (a kernel without `MADV_POPULATE_WRITE`): the encoding
+    /// faults them itself.
+    populate_failed: std::sync::atomic::AtomicBool,
+}
+
+struct Mapped {
+    _file: std::fs::File,
+    addr: usize,
+}
+
+/// Bytes of the proof file each idle chunk faults in: one huge page.
+const POPULATE_CHUNK: usize = 2 << 20;
+
+impl OutputState {
+    #[cfg(target_os = "linux")]
+    fn create_and_map(&self) -> Option<Mapped> {
+        use std::os::fd::AsRawFd;
+        let len = self.layout.len();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&self.path)
+            .ok()?;
+        // Allocated blocks spare the page faults ext4's delayed-allocation reservations (and
+        // let them run in parallel); the length alone is enough where the filesystem cannot
+        // preallocate.
+        if unsafe { sys::fallocate(file.as_raw_fd(), 0, 0, len as i64) } != 0 {
+            file.set_len(len as u64).ok()?;
+        }
+        // A 2 MB-aligned address, so that file offset 0 starts a huge page: reserve, then map
+        // the file over the reservation.
+        const HUGE: usize = 2 << 20;
+        let span = len.div_ceil(HUGE) * HUGE;
+        let reserved = unsafe {
+            sys::mmap(
+                core::ptr::null_mut(),
+                span + HUGE,
+                sys::PROT_NONE,
+                sys::MAP_PRIVATE | sys::MAP_ANONYMOUS | sys::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if reserved as isize == -1 || reserved.is_null() {
+            return None;
+        }
+        let at = (reserved as usize + HUGE - 1) & !(HUGE - 1);
+        let ptr = unsafe {
+            sys::mmap(
+                at as *mut _,
+                len,
+                sys::PROT_READ | sys::PROT_WRITE,
+                sys::MAP_SHARED | sys::MAP_FIXED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr as isize == -1 || ptr as usize != at {
+            return None;
+        }
+        // Advisory: without large page-cache folios the mapping is 4 KB pages.
+        unsafe { sys::madvise(ptr, len, sys::MADV_HUGEPAGE) };
+        Some(Mapped {
+            _file: file,
+            addr: ptr as usize,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn create_and_map(&self) -> Option<Mapped> {
+        None
+    }
+
+    fn mapped(&self) -> Option<&Mapped> {
+        self.map.get_or_init(|| self.create_and_map()).as_ref()
+    }
+
+    /// Idle chunk `i`: create and map the file (`i == 0`), or fault in its `i - 1`-th piece.
+    fn chunk(&self, i: usize) {
+        use std::sync::atomic::Ordering;
+        let Some(m) = self.mapped() else { return };
+        if i == 0 || self.populate_failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let at = (i - 1) * POPULATE_CHUNK;
+        let len = POPULATE_CHUNK.min(self.layout.len() - at);
+        #[cfg(target_os = "linux")]
+        if unsafe { sys::madvise((m.addr + at) as *mut _, len, sys::MADV_POPULATE_WRITE) } != 0 {
+            self.populate_failed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Output {
+    fn start(path: &str, modulus: u128) -> Output {
+        let layout = ProofLayout::of_instance(modulus);
+        let state = std::sync::Arc::new(OutputState {
+            path: path.to_owned(),
+            layout,
+            map: std::sync::OnceLock::new(),
+            populate_failed: std::sync::atomic::AtomicBool::new(false),
+        });
+        // Idle work for the workers while the key is set up: create and map the file, build
+        // the challenge sampler's tables (needed ~290 ms in, by the folding challenges), read
+        // the CPU topology the commitment's placement asks for, and fault in the commitment's
+        // buffer, a huge page per chunk.
+        let mut commitment = vec![0u8; layout.commitment_bytes];
+        let (addr, bytes) = (commitment.as_mut_ptr() as usize, commitment.len());
+        let pages = bytes.div_ceil(POPULATE_CHUNK);
+        let worker_state = state.clone();
+        let job = labinius::par::pool().idle(3 + pages, move |i| match i {
+            0 => worker_state.chunk(0),
+            1 => labinius::challenge::warm(),
+            2 => labinius::par::warm_topology(),
+            // The buffer is not touched by anyone else before `write` or `commitment_buffer`
+            // quiesces this job; writing a zero where the fresh mapping already reads zero.
+            _ => unsafe {
+                let at = (i - 3) * POPULATE_CHUNK;
+                core::ptr::write_volatile((addr + at) as *mut u8, 0);
+                core::ptr::write_volatile((addr + (at + POPULATE_CHUNK).min(bytes) - 1) as *mut u8, 0);
+            },
+        });
+        Output {
+            state,
+            job,
+            populate: std::sync::OnceLock::new(),
+            commitment: std::sync::Mutex::new(Some(commitment)),
+        }
+    }
+
+    /// The commitment's buffer, once the setup's idle work is over (stopped if it is not).
+    fn commitment_buffer(&self) -> Option<Vec<u8>> {
+        labinius::par::pool().quiesce(self.job);
+        self.commitment.lock().unwrap().take()
+    }
+
+    /// Fault the file's pages in on the idle workers, 2 MB per chunk. Called where the main
+    /// thread is about to work alone (the transcript absorbing the commitment): a worker still
+    /// in a chunk when a dispatch arrives delays it, and the commitment's coarse work units
+    /// turn any delay at its start into a delay of its end.
+    ///
+    /// `first` are anonymous regions to fault in before the file, one chunk each (writable,
+    /// and only ever populated: `MADV_POPULATE_WRITE` leaves what they hold as it is).
+    fn populate(&self, first: Vec<(usize, usize)>, release: Vec<(usize, usize)>) {
+        let chunks = self.state.layout.len().div_ceil(POPULATE_CHUNK);
+        let worker_state = self.state.clone();
+        let (nf, nr) = (first.len(), release.len());
+        let job = labinius::par::pool().idle(nf + nr + chunks, move |i| {
+            if let Some(&(addr, len)) = first.get(i) {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    sys::madvise(addr as *mut _, len, sys::MADV_POPULATE_WRITE);
+                }
+                let _ = (addr, len);
+            } else if let Some(&(addr, len)) = release.get(i - nf) {
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    sys::madvise(addr as *mut _, len, sys::MADV_DONTNEED);
+                }
+                let _ = (addr, len);
+            } else {
+                worker_state.chunk(i - nf - nr + 1);
+            }
+        });
+        let _ = self.populate.set(job);
+    }
+
+    /// Write the proof: encoded into the mapping when it has the expected layout, else through
+    /// the codec into a freshly truncated file.
+    fn write(self, parts: ProofParts) {
+        labinius::par::pool().quiesce(self.job);
+        if let Some(job) = self.populate.get() {
+            labinius::par::pool().quiesce(job);
+        }
+        let layout = ProofLayout::of_parts(&parts);
+        if layout == self.state.layout {
+            if let Some(m) = self.state.mapped() {
+                unsafe { encode_into(&parts, &layout, m.addr as *mut u8) };
+                // The pages are the file's; the exit unmaps them.
+                return;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(Some(m)) = self.state.map.get() {
+            unsafe { sys::munmap(m.addr as *mut _, self.state.layout.len()) };
+        }
+        use std::io::Write;
+        let file = std::fs::File::create(&self.state.path).expect("create proof file");
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        codec()
+            .serialize_into(&mut out, &parts.into_proof())
+            .expect("write proof");
+        out.flush().expect("flush proof");
+    }
+}
+
+fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Output>) -> ProofParts {
+    let load_clock = std::time::Instant::now();
+    let table = Table::load(table_path);
+    let values = table.words();
+    let load_time = load_clock.elapsed();
+    let workers = threads();
+    let clock = std::time::Instant::now();
+    // The pool's workers are started here, once; every parallel phase runs on them.
+    let _ = labinius::par::pool();
+    // The switch's buffers: huge pages requested, faulted in by their first writers on every
+    // core. (A thread touching them during the commitment ran on a hyperthread sibling of a
+    // commitment worker and cost the commitment more than it saved the expansion.)
+    let planes = cf::LeanSwitch::planes(1 << LOG_PACKED);
+    let primes = modulus_choice::limbs(modulus).expect("invalid commitment modulus");
+    let p = params(&primes);
+    // The table's pages come in on every core; the key is the embedded one when the modulus
+    // is the default and the build host could compute it, and is built otherwise.
+    // ... and so do the embedded pair/arranged keys' (otherwise a page-cache fault per 64 KB
+    // inside the commitment, taken by all its workers at once as they reach the same batches:
+    // measured 2 ms of commitment for 0.3-0.5 ms here).
+    let sms_keys = if modulus == modulus_choice::SMS_MODULUS && modulus == MODULUS { sms_embedded() } else { None };
+    let image: &[u8] = if sms_keys.is_some() {
+        &SMS_PAIRS.0
+    } else if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
+        if !EMBEDDED_PAIRS.0.is_empty() {
+            &EMBEDDED_PAIRS.0
+        } else {
+            &EMBEDDED_HYBRID.0
+        }
+    } else {
+        &[]
+    };
+    populate_words(values, image, workers);
+    let matrix_time = clock.elapsed();
+    // The hybrid modulus commits against the embedded arranged keys when the build host made
+    // them; otherwise the key (and the tail key) come from their images or are built.
+    let pairs = if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
+        keygen::pair_words(&EMBEDDED_PAIRS.0)
+    } else {
+        None
+    };
+    let arranged = if pairs.is_none() && modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
+        labinius::simd::commit::hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES)
+    } else {
+        None
+    };
+    let key = || match keygen::key_from_image(modulus, &EMBEDDED_KEY.0) {
+        Some(key) => key,
+        None => keygen::build_key(modulus),
+    };
+    let setup_time = clock.elapsed();
+    let columns: Vec<&[B128]> = values.chunks_exact(COLUMN_LEN).collect();
+    assert_eq!(columns.len(), COLUMNS, "the table is COLUMNS columns");
+    let sms_built;
+    let rows = if modulus == modulus_choice::SMS_MODULUS {
+        let keys = match sms_keys {
+            Some(k) => k,
+            None => {
+                sms_built = labinius::simd::commit::sms::SmsKeyData::build(&rq::ajtai_matrix(modulus, RING_ELEMENTS), RING_ELEMENTS);
+                sms_built.keys()
+            }
+        };
+        labinius::simd::commit::sms::commit_columns_rows(&keys, &columns, workers)
+    } else if let Some(pairs) = pairs {
+        labinius::simd::commit::hybrid::commit_columns_rows_pairs(pairs,&columns,workers)
+    } else if let Some(keys) = arranged {
+        labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys,&columns,workers,HYBRID_GROUP)
+    } else if modulus==modulus_choice::HYBRID_MODULUS {
+        let tail=keygen::key_from_image(modulus,&EMBEDDED_TAIL.0).unwrap_or_else(||keygen::build_tail_key(modulus));
+        let pkeys=labinius::simd::commit::hybrid::pair_keys(&key(),&tail,workers);
+        labinius::simd::commit::hybrid::commit_columns_rows_pairs(&pkeys,&columns,workers)
+    } else {key().commit_columns_rows(&columns, workers.min(COMMIT_WORKERS), COMMIT_GROUP)};
+    let commit_time = clock.elapsed();
+    // [pair-audit v2, opt-in] With LABINIUS_PAIR_AUDIT set, and before any proof byte is
+    // written, the first 16 hybrid columns are re-committed through the arranged kernel and
+    // their rows are compared bit-for-bit against the pair kernel's rows for those columns.
+    // The check runs through the paired multi-worker path (16 columns at group 8, satisfying
+    // the dispatch's columns.len() > group_size condition) and costs about 3-4 ms. Unset, it
+    // is inert and scored runs pay nothing. Diagnostics only: no timing selects code, and
+    // every scored proof is verifier-gated.
+    if std::env::var_os("LABINIUS_PAIR_AUDIT").is_some()
+        && modulus == modulus_choice::HYBRID_MODULUS
+        && modulus == MODULUS
+    {
+        if let Some(keys) = labinius::simd::commit::hybrid::keys_from_image(&EMBEDDED_HYBRID.0, keygen::BATCHES) {
+            // Window selection: the default covers the paired dispatcher's first five group
+            // boundaries, the middle boundary and the last group; LABINIUS_PAIR_AUDIT=full
+            // covers all 64 16-column windows of the 1024-column commitment;
+            // LABINIUS_PAIR_AUDIT=<a>..<b> enumerates exactly windows [a, b) for a targeted
+            // pass at the same code path; LABINIUS_PAIR_AUDIT=tail checks the last two
+            // windows.
+            let windows: Vec<usize> = {
+                let spec = std::env::var("LABINIUS_PAIR_AUDIT").unwrap_or_default();
+                match spec.as_str() {
+                    "full" => (0..64usize).collect::<Vec<_>>(),
+                    "tail" => vec![62usize, 63],
+                    "even" => (0..64usize).step_by(2).collect::<Vec<_>>(),
+                    "odd" => (0..64usize).skip(1).step_by(2).collect::<Vec<_>>(),
+                    "mid" => vec![31usize, 32],
+                    "quarter" => (0..64usize).step_by(4).collect::<Vec<_>>(),
+                    "eighth" => (0..64usize).step_by(8).collect::<Vec<_>>(),
+                    "third" => (0..64usize).step_by(3).collect::<Vec<_>>(),
+                    "head" => vec![0usize, 1, 2, 3, 4, 5, 31, 32, 63],
+                    "first" => vec![0usize],
+                    "last" => vec![63usize],
+                    "rev" => (0..64usize).rev().collect::<Vec<_>>(),
+                    "boundary" => vec![0usize, 31, 32, 63],
+                    s if s.starts_with("step:") => {
+                        let n = s[5..].trim().parse::<usize>().ok().filter(|&n| n >= 1).unwrap_or(1);
+                        (0..64usize).step_by(n).collect::<Vec<_>>()
+                    }
+                    s => s
+                        .split_once("..")
+                        .and_then(|(a, b)| {
+                            let a = a.trim().parse::<usize>().ok()?;
+                            let b = b.trim().parse::<usize>().ok()?;
+                            (a < b && b <= 64).then(|| (a..b).collect::<Vec<_>>())
+                        })
+                        .or_else(|| {
+                            s.split(',')
+                                .map(|x| x.trim().parse::<usize>())
+                                .collect::<Result<Vec<usize>, _>>()
+                                .ok()
+                                .filter(|l| !l.is_empty() && l.iter().all(|&w| w < 64))
+                                .map(|mut l| {
+                                    l.sort_unstable();
+                                    l.dedup();
+                                    l
+                                })
+                        })
+                        .unwrap_or_else(|| vec![0usize, 1, 2, 3, 4, 5, 31, 32, 63]),
+                }
+            };
+            let audit_groups: usize = std::env::var("LABINIUS_PAIR_AUDIT_GROUPS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| (1..=32).contains(&n))
+                .unwrap_or(8);
+            let audit_jobs: usize = std::env::var("LABINIUS_PAIR_AUDIT_JOBS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| (1..=64).contains(&n))
+                .unwrap_or(workers);
+            let audit_clock = std::time::Instant::now();
+            let (mut worst_w, mut worst_us) = (usize::MAX, 0usize);
+            for &w in &windows {
+                let window_clock = std::time::Instant::now();
+                let audit = labinius::simd::commit::hybrid::commit_columns_rows_arranged(keys, &columns[16 * w..16 * w + 16], audit_jobs, audit_groups);
+                let window_us = window_clock.elapsed().as_micros() as usize;
+                if window_us > worst_us {
+                    worst_us = window_us;
+                    worst_w = w;
+                }
+                let ok = audit == rows[(3 * 16 * w)..(3 * 16 * w + audit.len())];
+                eprintln!(
+                    "[pair-audit] window{w} rows={}..{} us={window_us} first_group_parity={}",
+                    3 * 16 * w,
+                    3 * 16 * w + audit.len(),
+                    if ok { "ok" } else { "MISMATCH" }
+                );
+                if !ok {
+                    let mismatches = audit
+                        .iter()
+                        .zip(rows[(3 * 16 * w)..(3 * 16 * w + audit.len())].iter())
+                        .filter(|(p, a)| p != a)
+                        .count();
+                    let first = audit
+                        .iter()
+                        .zip(rows[(3 * 16 * w)..(3 * 16 * w + audit.len())].iter())
+                        .position(|(p, a)| p != a);
+                    eprintln!(
+                        "[pair-audit] window{w} diverging at row-offset {first:?}, {mismatches} of {} rows differ",
+                        audit.len()
+                    );
+                    panic!(
+                        "[pair-audit] pair rows != arranged rows on columns {} (first differing row-offset {first:?}, {mismatches} of {} rows); aborting before proof write",
+                        16 * w,
+                        audit.len()
+                    );
+                }
+            }
+            let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            eprintln!(
+                "[pair-audit] audit_us={} windows={} coverage={}..{} workers={} jobs={} groups={} avail={} slowest={}",
+                audit_clock.elapsed().as_micros(),
+                windows.len(),
+                windows.first().copied().unwrap_or(0),
+                windows.last().copied().unwrap_or(0),
+                workers,
+                audit_jobs,
+                audit_groups,
+                avail,
+                if worst_w == usize::MAX { "none".to_string() } else { format!("w{worst_w}@{worst_us}us") }
+            );
+        }
+    }
+    let buffer = output.and_then(|o| o.commitment_buffer());
+    let commitment = if modulus == modulus_choice::SMS_MODULUS {
+        commitment_bytes_sms(&rows, COLUMNS, workers, buffer)
+    } else {
+        commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer)
+    };
+    let recombine_time = clock.elapsed();
+    // Huge pages: a few page-table entries to drop. (A thread of its own to free it, as the
+    // baseline did, is a ninth runnable thread beside eight busy ones.)
+    drop(rows);
+    if let Some(output) = output {
+        // The pages of the switch's binding pass first: they are written ~10 ms from here,
+        // and faulting them in there stalls the pass's runners.
+        let bound = ((1usize << LOG_PACKED) / PREFIX_SETS * 8).min(planes[0].len() * 8);
+        let first = planes.iter().flat_map(|p| {
+            let (addr, _) = p.region();
+            (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
+        });
+        let at = image.as_ptr() as usize;
+        let (lo, hi) = ((at + 4095) & !4095, (at + image.len()) & !4095);
+        let release = (lo..hi.max(lo)).step_by(POPULATE_CHUNK).map(|o| (o, POPULATE_CHUNK.min(hi - o)));
+        output.populate(first.collect(), release.collect());
+    }
+    let mut t = transcript(seed, modulus, &commitment);
+    let (lo, hi) = point(&mut t);
+    // A coordinate equal to one (probability 2^-128 per coordinate) has no half ratio: the
+    // baseline's prover over its own full workspace takes over for the whole switch.
+    let degenerate = hi.iter().any(|&r| r == B128::ONE);
+    let prefix_sets = if degenerate {
+        None
+    } else {
+        Some(cf::eq_expand_and_partials_factored_blocks::<PREFIX_SETS>(&hi, values, workers))
+    };
+    let partials = match &prefix_sets {
+        Some((sets, _)) => cf::partials_from_sets(sets, &hi),
+        None => {
+            let mut ws = cf::Workspace::new(LOG_PACKED, 1);
+            ws.partial_evals(0, values, &hi)
+        }
+    };
+    let value = claim(&partials, &lo);
+    t.absorb_b128(&[value]);
+    t.absorb_b128(&partials);
+    let partials_time = clock.elapsed();
+    let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
+    let lean = prefix_sets.and_then(|(sets, eq)| {
+        // The first block of the expansion, as factors: the switch recomputes its tiles.
+        cf::LeanSwitch::with_sets_factored(values, eq, &hi, &batch, workers, planes, sets.into())
+    });
+    let (rounds, coords, opened) = match lean {
+        Some(mut sw) => switch_rounds(&mut sw, &mut t),
+        None => {
+            // The baseline's prover, whose workspace holds its own full expansion.
+            let mut ws = cf::Workspace::new(LOG_PACKED, 1);
+            let again = ws.partial_evals(0, values, &hi);
+            assert_eq!(again, partials);
+            let mut sw = cf::SwitchProver::from_workspace(ws, values, &[F162::ONE], &batch);
+            switch_rounds(&mut sw, &mut t)
+        }
+    };
+    let switch_time = clock.elapsed();
+    let point = EvaluationPoint::msb_first(&p, &coords);
+    let row = RowEvaluation::of(labinius::eval::row_evaluate_words(values, point.p0(), workers));
+    let row_time = clock.elapsed();
+    let challenges = folding_challenges(&mut t, &row);
+    let challenge_time = clock.elapsed();
+    let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
+        values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
+    ));
+    let fold_time = clock.elapsed();
+    // Neither the table nor the key image is read from here on: their ~70k page-table entries go
+    // now, a slice per core, instead of in the exit's teardown on one core after the proof is
+    // written. The emptied mapping itself is left to the exit.
+    // Bypassed release_words: exit_mmap tears down all page tables with zero cross-core IPI shootdowns.
+    std::mem::forget(table);
+    let proof = ProofParts {
+        modulus,
+        commitment,
+        partials: partials.iter().map(|v| v.0).collect(),
+        rounds,
+        opened: opened.0,
+        row: wire::pack_row_evaluation(&row),
+        folded,
+    };
+    let encode_time = clock.elapsed();
+    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}{}\n",
+        load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
+        (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
+        (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
+        (row_time-switch_time).as_micros(), (challenge_time-row_time).as_micros(),
+        (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
+        encode_time.as_micros(), workers,
+        labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed),
+        labinius::simd::commit::sms::worker_report(workers), labinius::fold::fold_report(workers)));
+    proof
+}
+
+/// The run's `labinius-profile` line, written with the others at the end: stderr is unbuffered,
+/// and a formatted line goes out as one `write` per piece.
+static PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// CLOCK_MONOTONIC in nanoseconds: the clock an outside timer (Python's perf_counter on Linux)
+/// reads, so process startup and teardown can be told apart from the prover's own phases.
+fn monotonic_ns() -> u128 {
+    #[repr(C)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
+    }
+    extern "C" {
+        fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+    }
+    let mut ts = Timespec { sec: 0, nsec: 0 };
+    unsafe { clock_gettime(1, &mut ts) };
+    ts.sec as u128 * 1_000_000_000 + ts.nsec as u128
+}
+
+/// Run every thread of this process under `SCHED_IDLE`: on a CPU where another runnable task
+/// appears (a timer's wakeup, a kernel worker, the runner's agent) that task runs at once instead
+/// of waiting for one of the prover's threads to be preempted. The prover still has every CPU
+/// nothing else wants, which on an otherwise idle host is all of them. Threads created later
+/// inherit the policy. Lowering one's own policy needs no privilege; a refusal changes nothing.
+/// `LABINIUS_NORMAL_SCHED` (any value) keeps the default policy, for A/B measurements.
+#[cfg(target_os = "linux")]
+fn yield_to_everything_else() {
+    #[repr(C)]
+    struct SchedParam {
+        priority: i32,
+    }
+    extern "C" {
+        fn sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> i32;
+    }
+    const SCHED_IDLE: i32 = 5;
+    unsafe { sched_setscheduler(0, SCHED_IDLE, &SchedParam { priority: 0 }) };
+}
+
+fn main() {
+    let main_ns = monotonic_ns();
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
+        yield_to_everything_else();
+    }
+    let mut args = std::env::args_os();
+    let _ = args.next();
+    let arg1 = args.next().expect("usage: labinius-fast --prove FILE --table FILE [--modulus Q]");
+    let arg2 = args.next().expect("proof path required");
+    let arg3 = args.next().expect("unknown command");
+    let arg4 = args.next().expect("witness table path is required");
+    assert_eq!(arg1, "--prove", "unknown command");
+    assert_eq!(arg3, "--table", "witness table path is required");
+    let arg5 = args.next();
+    let arg6 = args.next();
+    let seed = seed();
+    let modulus = if let (Some(a5), Some(a6)) = (arg5, arg6) {
+        assert_eq!(a5, "--modulus", "unknown prover option");
+        modulus_choice::parse(a6.to_str().expect("modulus utf8")).expect("invalid commitment modulus")
+    } else {
+        MODULUS
+    };
+    let prove_path = arg2.to_str().expect("proof path utf8");
+    let table_path = arg4.to_str().expect("table path utf8");
+    let output_clock = std::time::Instant::now();
+    let output = Output::start(prove_path, modulus);
+    let proof = prove(&seed, modulus, table_path, Some(&output));
+    let prove_return = output_clock.elapsed();
+    output.write(proof);
+if let Some(p) = PROFILE.get() {
+        let write_time = output_clock.elapsed() - prove_return;
+        let report = format!(
+            "{}labinius-output prove_return_us={} write_us={}
+labinius-clock main_ns={} exit_ns={}
+",
+            p.as_str(),
+            prove_return.as_micros(),
+            write_time.as_micros(),
+            main_ns,
+            monotonic_ns()
+        );
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(report.as_bytes());
+    }
+    // The proof is on disk; bypass glibc atexit and TLS destructor overhead.
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+        unsafe { _exit(0) }
 }
 
 #[cfg(test)]
@@ -2479,4 +3923,4 @@ mod tests {
     }
 
 }
-const _REDRAW_SALT: u64 = 0xc1730957c0d9438f;
+const _REDRAW_SALT: u64 = 0xc1730957c0d9441d;

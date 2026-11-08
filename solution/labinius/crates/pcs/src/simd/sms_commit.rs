@@ -973,12 +973,13 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
                     if other.load(Ordering::Acquire) + PAIR_LEAD >= d {
                         return;
                     }
-                    let start = std::time::Instant::now();
+                    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
                     let mut spins = 0u32;
+                    const SIBLING_WAIT_CYCLES: u64 = 9_000_000;
                     while other.load(Ordering::Acquire) + PAIR_LEAD < d {
                         core::hint::spin_loop();
                         spins += 1;
-                        if spins % 64 == 0 && start.elapsed() > SIBLING_WAIT {
+                        if spins % 64 == 0 && unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc) > SIBLING_WAIT_CYCLES {
                             coupled.store(false, Ordering::Relaxed);
                             let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
                             if k < 16 {

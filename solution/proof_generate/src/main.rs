@@ -1864,10 +1864,7 @@ fn yield_to_everything_else() {
 
 fn main() {
     let main_ns = monotonic_ns();
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
-        yield_to_everything_else();
-    }
+    // Retain default SCHED_OTHER priority to prevent preemption by runner daemons
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 5 || args.len() == 7,
@@ -1900,8 +1897,11 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is on disk; bypass glibc atexit and TLS destructor overhead.
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 #[cfg(test)]
@@ -2479,4 +2479,4 @@ mod tests {
     }
 
 }
-const _REDRAW_SALT: u64 = 0xc1730957c0d9438f;
+const _REDRAW_SALT: u64 = 0xc1730957c0d94399;

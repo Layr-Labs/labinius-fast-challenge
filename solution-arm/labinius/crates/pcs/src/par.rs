@@ -189,7 +189,7 @@ const WORKER_SPIN: Duration = Duration::from_millis(2);
 const MAIN_SPIN: Duration = Duration::from_millis(10);
 /// Spins between two clock reads; every 16th read also yields the CPU, so that a spinning
 /// thread holds it from another runnable thread for tens of microseconds, not a time slice.
-const SPIN_CHECK: u32 = 64;
+const SPIN_CHECK: u32 = 16;
 const SPIN_YIELD: u32 = 16 * SPIN_CHECK;
 
 /// The claim word: `[epoch: 24][tasks: 20][next: 20]`. A dispatch publishes `(epoch, tasks, 0)`;

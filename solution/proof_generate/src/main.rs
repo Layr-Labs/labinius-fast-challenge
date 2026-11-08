@@ -1103,6 +1103,7 @@ unsafe fn lift_sms_column(r: &[i16], tail: &[u32; N], out: &mut [u8]) {
     let magic = _mm512_set1_epi64(3_619_418_999);
     let pick = _mm512_loadu_si512(LIFT_BYTES.as_ptr() as *const _);
     let keep: __mmask64 = (1u64 << 40) - 1;
+    let tail_mod = _mm512_set1_epi64(sms::TAIL_MODULUS as i64);
     let modq = |x: __m512i| -> __m512i {
         let qq = _mm512_srli_epi64::<45>(_mm512_mul_epu32(x, magic));
         _mm512_sub_epi64(x, _mm512_mul_epu32(qq, q))
@@ -1114,7 +1115,7 @@ unsafe fn lift_sms_column(r: &[i16], tail: &[u32; N], out: &mut [u8]) {
         let d = _mm512_sub_epi64(a, modq(t));
         let d = _mm512_add_epi64(d, _mm512_and_si512(_mm512_srai_epi64::<63>(d), q));
         let k = modq(_mm512_mul_epu32(d, inv));
-        let value = _mm512_add_epi64(t, _mm512_mul_epu32(k,_mm512_set1_epi64(sms::TAIL_MODULUS as i64)));
+        let value = _mm512_add_epi64(t, _mm512_mul_epu32(k, tail_mod));
         _mm512_mask_storeu_epi8(out.as_mut_ptr().add(40 * j) as *mut i8, keep, _mm512_permutexvar_epi8(pick, value));
     }
 }
@@ -1733,6 +1734,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // Huge pages: a few page-table entries to drop. (A thread of its own to free it, as the
     // baseline did, is a ninth runnable thread beside eight busy ones.)
     drop(rows);
+    let mut t = transcript(seed, modulus, &commitment);
     if let Some(output) = output {
         // The pages of the switch's binding pass first: they are written ~10 ms from here,
         // and faulting them in there stalls the pass's runners.
@@ -1746,7 +1748,6 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         let release = (lo..hi.max(lo)).step_by(POPULATE_CHUNK).map(|o| (o, POPULATE_CHUNK.min(hi - o)));
         output.populate(first.collect(), release.collect());
     }
-    let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
     // A coordinate equal to one (probability 2^-128 per coordinate) has no half ratio: the
     // baseline's prover over its own full workspace takes over for the whole switch.

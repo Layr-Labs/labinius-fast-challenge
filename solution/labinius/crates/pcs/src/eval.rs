@@ -439,7 +439,7 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     // Columns handed out in even-sized chunks from a shared counter: a runner that starts late
     // or shares its core with another process takes fewer of them instead of holding the phase
     // up, and each pair of columns in a chunk shares one pass over `eq` via `dot_words2`.
-    let chunk = columns.div_ceil(32 * workers.max(1)).max(2).next_multiple_of(2);
+    let chunk = columns.div_ceil(8 * workers.max(1)).max(2).next_multiple_of(2);
     let chunks = columns.div_ceil(chunk);
     let out_addr = out.as_mut_ptr() as usize;
     let split = (wdim - wdim / TAIL_PARTS) & !7;

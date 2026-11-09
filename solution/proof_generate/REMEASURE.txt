@@ -1,0 +1,1 @@
+re-measurement 20 of x86 r3pc3 (record c5020814 + 107 fewer r3pair prefix Barretts, one predicate for kernel and proof) (first filed as 07fbc843-03a0-4e14-b6bf-c421c368e658)

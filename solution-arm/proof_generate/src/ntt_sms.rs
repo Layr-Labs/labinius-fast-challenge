@@ -589,7 +589,7 @@ unsafe fn pass_words(words: &[(*const u8, usize); LANES], elements: usize, e: us
 /// Transforms ahead whose input words [`prefetch_words`] requests (into L2): four transforms span one
 /// element group, so this is `PF_T / 4` element groups (of four elements, eight columns) ahead,
 /// running into the next sweep's first elements at a sweep's end.
-const PF_T: usize = 32;
+const PF_T: usize = 16;
 
 /// Prefetches the input words of transform `t` of a pass starting at element `e` (the lines
 /// [`pass_words`] would address: four consecutive 64-byte elements of two columns). The table

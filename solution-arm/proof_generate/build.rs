@@ -30,14 +30,22 @@ fn main() {
     // The hybrid matrix is no longer the default's: its image stays empty and `--modulus` with
     // the hybrid modulus builds it at run time.
     std::fs::write(dir.join("hybrid-matrix.bin"), Vec::<u8>::new()).expect("write the matrix image");
-    let [data, means, mu, meta] = sms_images();
-    for (name, bytes) in [("sms-data.bin", data), ("sms-means.bin", means), ("sms-mu.bin", mu), ("sms-meta.bin", meta)] {
+    let [data, means, mu, meta, digits, mean_int, threshold] = sms_images();
+    for (name, bytes) in [
+        ("sms-data.bin", data),
+        ("sms-means.bin", means),
+        ("sms-mu.bin", mu),
+        ("sms-meta.bin", meta),
+        ("sms-digits.bin", digits),
+        ("sms-mean-int.bin", mean_int),
+        ("sms-threshold.bin", threshold),
+    ] {
         std::fs::write(dir.join(name), bytes).expect("write an SMS image");
     }
 }
 
 #[cfg(target_arch = "aarch64")]
-fn sms_images() -> [Vec<u8>; 4] {
+fn sms_images() -> [Vec<u8>; 7] {
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
         return Default::default();
     }
@@ -45,14 +53,15 @@ fn sms_images() -> [Vec<u8>; 4] {
     // `matrix` asserts the margin and the column failure bound.
     let m = ntt::neon::sms::matrix(RING_ELEMENTS, workers);
     println!(
-        "cargo:warning=SMS reconstruction margin {:.3} sigma, Hoeffding failure bound {:.3e} per column, {:.3e} per 1024-column proof",
-        m.margin, m.column_failure, 1024.0 * m.column_failure
+        "cargo:warning=SMS recovery margin {:.3} sigma, Hoeffding failure bound {:.3e} per column, {:.3e} per 1024-column proof, repair thresholds {}..{}",
+        m.margin, m.column_failure, 1024.0 * m.column_failure,
+        m.threshold.iter().min().unwrap(), m.threshold.iter().max().unwrap()
     );
     m.images()
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-fn sms_images() -> [Vec<u8>; 4] {
+fn sms_images() -> [Vec<u8>; 7] {
     Default::default()
 }
 

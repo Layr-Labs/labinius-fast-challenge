@@ -427,6 +427,7 @@ static FOLD: Fold = Fold({
 
 // One slot's stream accumulators, round by round, with plain and folded variants.
 include!("sms_slot_gen.rs");
+include!("sms_wide16_gen.rs");
 // The parent SMS module supplies the identical P9721 slot macros.
 const _: () = assert!(STREAMS == 7 && LOCK == 8);
 
@@ -524,6 +525,79 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
                 else if FIRST { call_first!(sms_slot8, plain_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
                 else if RED { call!(sms_slot8, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
                 else { call!(sms_slot8, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+            } else if LOCK == 16 {
+                call!(sms_slot16, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK,
+                    x8 = 8 % LOCK, x9 = 9 % LOCK, x10 = 10 % LOCK, x11 = 11 % LOCK, x12 = 12 % LOCK, x13 = 13 % LOCK, x14 = 14 % LOCK, x15 = 15 % LOCK)
+            } else {
+                if RED { call!(sms_slot4, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3) }
+                else { call!(sms_slot4, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3) }
+            }
+        }
+    }
+}
+
+struct WideSink<const RED: bool, const FIRST: bool = false> {
+    k: *const u32,
+    acc: *mut i32,
+    b: *const i32,
+}
+impl<const RED: bool, const FIRST: bool> vb::SliceSink<16> for WideSink<RED, FIRST> {
+    #[inline(always)]
+    unsafe fn rows(&mut self, blk: usize, w: [*const i16; 16], r0: usize, r1: usize) {
+        // Every producer uses H contiguous 27-vector blocks in wbuf.
+        debug_assert!(w.iter().enumerate().all(|(h, &p)| p == w[0].wrapping_add(32 * 27 * h)));
+        wide_sink_rows::<RED, FIRST>(self.k, self.acc, self.b, blk, w[0], r0, r1);
+    }
+}
+
+/// [`WideSink::rows`], one copy for every call site: the transform's hot loop and this body together
+/// then fit the half of the decoded-uop cache a hyperthread gets.
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn wide_sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *mut i32, bias: *const i32, blk: usize, w0: *const i16, r0: usize, r1: usize) {
+    let s = WideSink::<RED, FIRST> { k: kp, acc: accp, b: bias };
+    s.rows_inline(blk, w0, r0, r1);
+}
+
+impl<const RED: bool, const FIRST: bool> WideSink<RED, FIRST> {
+    #[inline(always)]
+    unsafe fn rows_inline(&self, blk: usize, w0: *const i16, r0: usize, r1: usize) {
+        for i in r0..r1 {
+            let j = 27 * blk + i;
+            let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w0.add(32 * 27 * h) as *const __m512i).add(i)));
+            let k = self.k.add(j * STREAMS * LOCK);
+            let a = self.acc.add(j * STREAMS * 16);
+            if PREFETCH_SLOTS > 0 {
+                let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
+                let hi = lo + STREAMS * LOCK * 4;
+                let mut p = (lo + 63) & !63;
+                while p < hi {
+                    _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
+                    p += 64;
+                }
+            }
+            macro_rules! call {
+                ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
+                    core::arch::asm!(concat!($m!($mode), "/* {f} {w} */"), w = in(reg) w0.add(32*i), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                        $($xn = in(zmm_reg) x[$xi],)*
+                        out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
+                        out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("zmm30") _, out("k1") _, options(nostack, preserves_flags))
+                };
+            }
+            macro_rules! call_first {
+                ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
+                    core::arch::asm!(concat!($m!($mode), "/* {f} {w} */"), w = in(reg) w0.add(32*i), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                        b = in(reg) self.b.add(j * DIGITS),
+                        $($xn = in(zmm_reg) x[$xi],)*
+                        out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
+                        out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("zmm30") _, out("k1") _, options(nostack, preserves_flags))
+                };
+            }
+            if LOCK == 8 {
+                if RED && FIRST { call_first!(sms_wide16, reduce_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                else if FIRST { call_first!(sms_wide16, plain_first, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                else if RED { call!(sms_wide16, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
+                else { call!(sms_wide16, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK) }
             } else if LOCK == 16 {
                 call!(sms_slot16, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4 % LOCK, x5 = 5 % LOCK, x6 = 6 % LOCK, x7 = 7 % LOCK,
                     x8 = 8 % LOCK, x9 = 9 % LOCK, x10 = 10 % LOCK, x11 = 11 % LOCK, x12 = 12 % LOCK, x13 = 13 % LOCK, x14 = 14 % LOCK, x15 = 15 % LOCK)
@@ -698,8 +772,8 @@ impl SmsWorker {
             acc: zeroed_slice(1),
             pend: zeroed_slice(1),
             total: zeroed_slice(1),
-            idx: zeroed_slice(LOCK),
-            w: zeroed_slice(6 * LOCK),
+            idx: zeroed_slice(16),
+            w: zeroed_slice(6 * 16),
         }
     }
 }
@@ -822,7 +896,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     let hl = np / 2;
     let span = range.end - range.start;
     assert!(range.start % (np / 2) == 0 && (span == np || span == np / 2), "whole halves of the column");
-    static ZERO64: [B128; 8 * LOCK] = [B128::ZERO; 8 * LOCK];
+    static ZERO64: [B128; 8 * 16] = [B128::ZERO; 8 * 16];
     let kbase = keys.pairs.as_ptr();
     // LOCK=8's FIRST sink broadcasts each digit's bias and overwrites all
     // digit accumulators before use. Only the base stream needs a fill here.
@@ -838,7 +912,11 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
     let mut bias = keys.mur.as_ptr().add(first_chunk * N * DIGITS);
     let acc = ws.acc[0].v.as_mut_ptr() as *mut i32;
     let w = ws.w.as_mut_ptr() as *mut i16;
-    for b in range.clone().step_by(LOCK) {
+    let mut b=range.start;
+    while b<range.end {
+        let local=b%hl;let ic=local%CHUNK_PAIRS;
+        let limit=(FOLD_PAIRS-ic%FOLD_PAIRS).min(CHUNK_PAIRS-ic).min(hl-local).min(range.end-b);
+        let step=if bench_mode()==0 && limit>=16 {16}else{8};
         // The next step's witness words (16 columns x 1 KB, 256 KB apart): the hardware
         // prefetchers only follow some of the sixteen streams, and the table comes from DRAM.
         if INPUT_PREFETCH && b + LOCK < range.end {
@@ -858,7 +936,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         let mut source = |_h: usize, out: *mut crate::simd::transpose_f162::SmsBinaryIndex32| {
             // Prefetch the next pair batch while converting this batch and
             // computing its first prefix. The final batch needs no lookahead.
-            if _h + 1 < LOCK {
+            if _h + 1 < step {
                 for l in 0..g {
                     let p = cols16[l].wrapping_add(8).cast::<i8>();
                     _mm_prefetch::<_MM_HINT_T0>(p);
@@ -873,12 +951,12 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         // The FIRST sink overwrites the auxiliary accumulators from that image.
         let first = (b - b / hl * hl) % CHUNK_PAIRS == 0;
         // Fold every64 pairs within a chunk, and at every chunk/half end.
-        let fold_now = {let local=b+LOCK-(b/hl)*hl;let in_chunk=(b-(b/hl)*hl)%CHUNK_PAIRS+LOCK;in_chunk%FOLD_PAIRS==0||local%CHUNK_PAIRS==0||local==hl};
+        let fold_now = {let local=b+step-(b/hl)*hl;let in_chunk=(b-(b/hl)*hl)%CHUNK_PAIRS+step;in_chunk%FOLD_PAIRS==0||local%CHUNK_PAIRS==0||local==hl};
         let mode = bench_mode();
         if mode == 2 || mode == 4 {
             for h in 0..LOCK { source(h, idx.add(h)); }
         }
-        if mode == 4 { continue; }
+        if mode == 4 { b+=step; continue; }
         if mode == 1 {
             struct Nop;
             impl vb::SliceSink<LOCK> for Nop { unsafe fn rows(&mut self, _: usize, w: [*const i16; LOCK], _: usize, _: usize) { core::hint::black_box(w); } }
@@ -886,6 +964,19 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         } else if mode == 2 {
             let mut sk = Sink::<false> { k, acc, b: bias };
             for kk in 0..24 { vb::SliceSink::<LOCK>::rows(&mut sk, kk, core::array::from_fn(|h| w.add(32 * 27 * h) as *const i16), 0, 27); }
+        } else if step==16 {
+            if first && fold_now {
+                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,true>{k,acc,b:bias},&mut source);
+            }
+            else if first {
+                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,true>{k,acc,b:bias},&mut source);
+            }
+            else if fold_now {
+                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,false>{k,acc,b:bias},&mut source);
+            }
+            else if true {
+                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,false>{k,acc,b:bias},&mut source);
+            }
         } else if first && fold_now {
             vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true, true> { k, acc, b: bias }, &mut source);
         } else if first {
@@ -895,9 +986,9 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         } else {
             vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false> { k, acc, b: bias }, &mut source);
         }
-        if (b + LOCK) % PP == 0 { sync(b + LOCK); }
+        sync(b + step);
         // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
-        let (e, cph) = (b + LOCK, chunks_per_half(np));
+        let (e, cph) = (b + step, chunks_per_half(np));
         let (eh, local) = ((e - 1) / hl, e - (e - 1) / hl * hl);
         if (local % CHUNK_PAIRS == 0 || local == hl) && mode != 3 {
             let chunk = eh * cph + (local - 1) / CHUNK_PAIRS;
@@ -912,6 +1003,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
             }
             if !repair_flags.is_empty(){apply_repair_flags(&mut repair_flags,keys,cols,chunk,&mut ws.total[0]);}
         }
+        b+=step;
     }
     match out {
         RowsOut::Full => write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, RowsMode::Full),
@@ -1421,5 +1513,33 @@ pub(crate) fn certify_relocated_pairs(pairs:&[u32]){assert_eq!(pairs.len()%LOCK,
  #[test]#[should_panic(expected="public key exceeds relocated 8-pair step range")]
  fn rejects_insufficient_public_step_margin(){
   certify_relocated_pairs(&[4860u32|(4860u32<<16);LOCK]);
+ }
+}
+#[cfg(test)]mod wide16_guards{
+ use super::*;
+ #[repr(C,align(64))]#[derive(Clone,Copy)]struct Z([i32;16]);
+ fn rng(s:&mut u64)->u64{*s^=*s<<13;*s^=*s>>7;*s^=*s<<17;*s}
+ unsafe fn check<const RED:bool,const FIRST:bool>(){
+  let mut state=0x648972132176u64;let r=(65536i64%9721)as i64;let r=if r>9721/2{r-9721}else{r};
+  for case in 0..8{
+   let w:Vec<Z>=(0..27*16+2).map(|_|{let a:[i16;32]=core::array::from_fn(|i|match case{0=>0,1=>31296,2=>-31296,3=>i16::MAX,4=>i16::MIN,5=>if i%2==0{i16::MIN}else{i16::MAX},6=>0x5555,_=>rng(&mut state)as i16});Z(core::mem::transmute(a))}).collect();
+   let keys:Vec<u32>=(0..2*N*STREAMS*LOCK).map(|_|match case{0=>0,1=>4860u32|((-4860i16 as u16 as u32)<<16),2=>(-4860i16 as u16 as u32)|(4860u32<<16),3=>0x7fff7fff,4=>0x80008000,5=>0x80007fff,6=>0xffff0001,_=>rng(&mut state)as u32}).collect();let bias:Vec<i32>=(0..N*DIGITS).map(|_|match case{3=>i32::MAX,4=>i32::MIN,_=>rng(&mut state)as i32}).collect();
+   for blk in[0usize,7,23]{for(r0,r1)in[(0usize,27usize),(1,27),(0,26),(3,25),(13,14),(4,4),(26,27)]{
+    let init:Vec<Z>=(0..N*STREAMS+2).map(|_|Z(core::array::from_fn(|_|match case{3=>i32::MAX,4=>i32::MIN,_=>rng(&mut state)as i32}))).collect();let mut changed=init.clone();let mut scalar=init.clone();
+    super::wide_sink_rows::<RED,FIRST>(keys.as_ptr(),changed.as_mut_ptr().add(1).cast(),bias.as_ptr(),blk,w.as_ptr().add(1).cast(),r0,r1);
+    for i in r0..r1{let j=27*blk+i;for s in 0..7{for lane in 0..16{let initial=if FIRST&&s>0{bias[j*6+s-1]}else{init[1+j*7+s].0[lane]};let mut sum=initial as i64;for h in 0..16{let a=w[1+h*27+i].0[lane]as u32;let k=keys[(h/8)*LOCK_WORDS+j*7*8+s*8+h%8];let x0=a as u16 as i16 as i64;let x1=(a>>16)as u16 as i16 as i64;let k0=k as u16 as i16 as i64;let k1=(k>>16)as u16 as i16 as i64;sum+=x0*k0+x1*k1;}let value=sum as i32;scalar[1+j*7+s].0[lane]=if RED{let z=(value as u32)^0x8000;let lo=z as u16 as i16 as i64;let hi=(z>>16)as u16 as i16 as i64;(lo+r*hi)as i32}else{value};}}}
+    let bad_new=changed.iter().zip(&scalar).position(|(a,b)|a.0!=b.0);assert!(bad_new.is_none(),"new/scalar red={RED} first={FIRST} case={case} blk={blk} rows={r0}..{r1} at={bad_new:?}");
+   }}
+  }
+ }
+ #[test]fn wide16_matches_independent_wrapping_reference(){unsafe{check::<false,false>();check::<false,true>();check::<true,false>();check::<true,true>();}}
+}
+
+#[cfg(test)]mod wide16_schedule_guards{
+ use super::*;
+ #[test]fn scheduling_preserves_original_fold_and_chunk_boundaries(){
+  for half in (8usize..=2048).step_by(8){for start in[0usize,half]{let end=start+half;let mut b=start;let mut boundaries=Vec::new();let mut chunks=Vec::new();while b<end{let local=b%half;let ic=local%CHUNK_PAIRS;let limit=(FOLD_PAIRS-ic%FOLD_PAIRS).min(CHUNK_PAIRS-ic).min(half-local).min(end-b);let step=if limit>=16{16}else{8};assert!(step<=limit);assert!(step<=PAIR_LEAD);let e=b+step;let local=e-start;let ic=(b-start)%CHUNK_PAIRS+step;if ic%FOLD_PAIRS==0||local%CHUNK_PAIRS==0||local==half{boundaries.push(e);}if local%CHUNK_PAIRS==0||local==half{chunks.push(e);}b=e;}
+  let old:Vec<_>=(start..end).step_by(8).map(|b|b+8).filter(|&e|{let local=e-start;let ic=(e-8-start)%CHUNK_PAIRS+8;ic%FOLD_PAIRS==0||local%CHUNK_PAIRS==0||local==half}).collect();assert_eq!(boundaries,old);assert_eq!(chunks,(start..end).step_by(8).map(|b|b+8).filter(|&e|(e-start)%CHUNK_PAIRS==0||e==end).collect::<Vec<_>>());
+  }}
  }
 }

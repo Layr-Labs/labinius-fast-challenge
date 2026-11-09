@@ -1273,6 +1273,7 @@ impl RowScratch {
 /// not null) are prefetched during each block's products, which are long enough to cover the
 /// memory latency: the words then arrive while the GFNI port is busy instead of after it.
 #[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
 unsafe fn partials_row(
     acc: &mut [RawAcc], words: *const B128, stride: usize, eq: *const B128, groups: usize,
     scratch: &mut RowScratch, next_row: *const B128,
@@ -1297,7 +1298,15 @@ unsafe fn partials_row(
         }
         let next = if q + 1 < blocks { w.add(stride) } else { next_row };
         for bank in 0..16/K {
-            let mut a:[[__m512i;K];2]=core::array::from_fn(|h|core::array::from_fn(|k|acc_q[h][bank*K+k]));
+            let base = bank * K;
+            let mut a0 = [
+                acc_q[0][base], acc_q[0][base + 1], acc_q[0][base + 2], acc_q[0][base + 3],
+                acc_q[0][base + 4], acc_q[0][base + 5], acc_q[0][base + 6], acc_q[0][base + 7],
+            ];
+            let mut a1 = [
+                acc_q[1][base], acc_q[1][base + 1], acc_q[1][base + 2], acc_q[1][base + 3],
+                acc_q[1][base + 4], acc_q[1][base + 5], acc_q[1][base + 6], acc_q[1][base + 7],
+            ];
             let mut g=0;
             while g<groups {
                 if !next.is_null() {
@@ -1310,14 +1319,18 @@ unsafe fn partials_row(
                     }
                 }
                 let x0=*xs.add(g);let x1=*xs.add(g+1);
-                let m0=aps.add(g)as*const i64;let m1=aps.add(g+1)as*const i64;
+                let m0=(aps.add(g)as*const i64).add(base);
+                let m1=(aps.add(g+1)as*const i64).add(base);
                 for k in 0..K {
-                    let b0=_mm512_set1_epi64(*m0.add(bank*K+k));let b1=_mm512_set1_epi64(*m1.add(bank*K+k));
-                    for h in 0..2 {a[h][k]=xor3(a[h][k],affine(x0[h],b0),affine(x1[h],b1));}
+                    let b0=_mm512_set1_epi64(*m0.add(k));
+                    let b1=_mm512_set1_epi64(*m1.add(k));
+                    a0[k]=xor3(a0[k],affine(x0[0],b0),affine(x1[0],b1));
+                    a1[k]=xor3(a1[k],affine(x0[1],b0),affine(x1[1],b1));
                 }
                 g+=2;
             }
-            for h in 0..2 {acc_q[h][bank*K..bank*K+K].copy_from_slice(&a[h]);}
+            acc_q[0][base..base+K].copy_from_slice(&a0);
+            acc_q[1][base..base+K].copy_from_slice(&a1);
         }
     }
 }
@@ -1696,7 +1709,8 @@ unsafe fn map_xe(xe: &[__m512i; 16], m: &[[u64; 16]; 24], out: &mut [[__m512i; 8
 
 /// The map `m` ([`eq_matrices`]) applied to the 64 words at `eq`, word-sliced: `out[l][g]` is
 /// limb `l` of words `8 g .. 8 g + 8` — the tile of [`poly_from_eq`], kept in registers.
-#[inline(always)]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,vpclmulqdq,gfni")]
 unsafe fn map_tile(eq: *const B128, m: &[[u64; 16]; 24], out: &mut [[__m512i; 8]; 3]) {
     let mut xe = [_mm512_setzero_si512(); 16];
     transpose_tile(eq as *const u8, &mut xe);
@@ -1704,7 +1718,8 @@ unsafe fn map_tile(eq: *const B128, m: &[[u64; 16]; 24], out: &mut [[__m512i; 8]
 }
 
 /// [`map_tile`] for two maps of the same 64 words, transposing them once.
-#[inline(always)]
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,vpclmulqdq,gfni")]
 unsafe fn map_tile2(
     eq: *const B128,
     m: &[[u64; 16]; 24],
@@ -1791,6 +1806,8 @@ impl EqSrc {
 
 /// The message of a round over `j` in `range`, `half` the round's half: `e0 = sum L(eq[j])
 /// p[j]`, `einf = sum L'(eq[j]) (p[j] + p[j + half])`.
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,vpclmulqdq,gfni")]
 unsafe fn message_range(
     eq: EqSrc,
     src: Src,
@@ -1803,6 +1820,8 @@ unsafe fn message_range(
     let mut acci = [_mm512_setzero_si512(); 12];
     let mut av = [[_mm512_setzero_si512(); 8]; 3];
     let mut apv = [[_mm512_setzero_si512(); 8]; 3];
+    let mut p0_tile = [[_mm512_setzero_si512(); 3]; 8];
+    let mut p01_tile = [[_mm512_setzero_si512(); 3]; 8];
     let mut buf = EqTile([B128::ZERO; TILE]);
     for j0 in range.step_by(TILE) {
         map_tile2(eq.tile(j0, &mut buf), ml, mlp, &mut av, &mut apv);
@@ -1810,9 +1829,11 @@ unsafe fn message_range(
             let j = j0 + 8 * g;
             let p0 = load_p(src, j);
             let p1 = load_p(src, j + half);
-            super::f162::mac_soa8(&mut acc0, [av[0][g], av[1][g], av[2][g]], p0);
-            super::f162::mac_soa8(&mut acci, [apv[0][g], apv[1][g], apv[2][g]], xor3p(p0, p1));
+            p0_tile[g] = p0;
+            p01_tile[g] = xor3p(p0, p1);
         }
+        super::f162::mac_tile8(&mut acc0, &av, &p0_tile);
+        super::f162::mac_tile8(&mut acci, &apv, &p01_tile);
     }
     [horiz8(acc0), horiz8(acci)]
 }
@@ -1966,6 +1987,8 @@ fn round_ranges(n: usize, threads: usize) -> Vec<core::ops::Range<usize>> {
 /// One fused step over `j` in `range` (a sub-range of `0 .. hh`): the fold of round `k`,
 /// `p_{k+1}[i] = p_k[i] + r (p_k[i] + p_k[i + half])` for `i = j` and `i = j + hh`, written to
 /// `dst`, and the message of round `k + 1` (half `hh`) over the elements just written.
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,vpclmulqdq,gfni")]
 unsafe fn fold_message_range(
     eq: EqSrc,
     src: Src,
@@ -1982,6 +2005,8 @@ unsafe fn fold_message_range(
     let mut acci = [_mm512_setzero_si512(); 12];
     let mut av = [[_mm512_setzero_si512(); 8]; 3];
     let mut apv = [[_mm512_setzero_si512(); 8]; 3];
+    let mut q0_tile = [[_mm512_setzero_si512(); 3]; 8];
+    let mut q01_tile = [[_mm512_setzero_si512(); 3]; 8];
     let mut buf = EqTile([B128::ZERO; TILE]);
     let stream = hh >= STREAM_FROM;
     for j0 in range.step_by(TILE) {
@@ -2009,9 +2034,11 @@ unsafe fn fold_message_range(
                 store_p(dst, j, q0);
                 store_p(dst, j + hh, q1);
             }
-            super::f162::mac_soa8(&mut acc0, [av[0][g], av[1][g], av[2][g]], q0);
-            super::f162::mac_soa8(&mut acci, [apv[0][g], apv[1][g], apv[2][g]], xor3p(q0, q1));
+            q0_tile[g] = q0;
+            q01_tile[g] = xor3p(q0, q1);
         }
+        super::f162::mac_tile8(&mut acc0, &av, &q0_tile);
+        super::f162::mac_tile8(&mut acci, &apv, &q01_tile);
     }
     if stream {
         _mm_sfence();

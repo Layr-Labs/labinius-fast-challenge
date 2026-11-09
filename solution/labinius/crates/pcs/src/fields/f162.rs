@@ -41,10 +41,39 @@ unsafe fn prods_soa8(a: [__m512i; 3], b: [__m512i; 3]) -> [__m512i; 12] {
 
 #[inline(always)]
 pub unsafe fn mac_soa8(acc: &mut [__m512i; 12], a: [__m512i; 3], b: [__m512i; 3]) {
-    let p = prods_soa8(a, b);
-    for i in 0..12 {
-        acc[i] = _mm512_xor_si512(acc[i], p[i]);
+    let sa01 = _mm512_xor_si512(a[0], a[1]);
+    let sb01 = _mm512_xor_si512(b[0], b[1]);
+    acc[0] = _mm512_xor_si512(acc[0], _mm512_clmulepi64_epi128::<0x00>(a[0], b[0]));
+    acc[1] = _mm512_xor_si512(acc[1], _mm512_clmulepi64_epi128::<0x11>(a[0], b[0]));
+    acc[2] = _mm512_xor_si512(acc[2], _mm512_clmulepi64_epi128::<0x00>(a[1], b[1]));
+    acc[3] = _mm512_xor_si512(acc[3], _mm512_clmulepi64_epi128::<0x11>(a[1], b[1]));
+    acc[6] = _mm512_xor_si512(acc[6], _mm512_clmulepi64_epi128::<0x00>(sa01, sb01));
+    acc[7] = _mm512_xor_si512(acc[7], _mm512_clmulepi64_epi128::<0x11>(sa01, sb01));
+
+    let sa02 = _mm512_xor_si512(a[0], a[2]);
+    let sb02 = _mm512_xor_si512(b[0], b[2]);
+    let sa12 = _mm512_xor_si512(a[1], a[2]);
+    let sb12 = _mm512_xor_si512(b[1], b[2]);
+    acc[4] = _mm512_xor_si512(acc[4], _mm512_clmulepi64_epi128::<0x00>(a[2], b[2]));
+    acc[5] = _mm512_xor_si512(acc[5], _mm512_clmulepi64_epi128::<0x11>(a[2], b[2]));
+    acc[8] = _mm512_xor_si512(acc[8], _mm512_clmulepi64_epi128::<0x00>(sa02, sb02));
+    acc[9] = _mm512_xor_si512(acc[9], _mm512_clmulepi64_epi128::<0x11>(sa02, sb02));
+    acc[10] = _mm512_xor_si512(acc[10], _mm512_clmulepi64_epi128::<0x00>(sa12, sb12));
+    acc[11] = _mm512_xor_si512(acc[11], _mm512_clmulepi64_epi128::<0x11>(sa12, sb12));
+}
+
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,vpclmulqdq,gfni")]
+pub unsafe fn mac_tile8(
+    acc: &mut [__m512i; 12],
+    av: &[[__m512i; 8]; 3],
+    pv: &[[__m512i; 3]; 8],
+) {
+    let mut a = *acc;
+    for g in 0..8 {
+        mac_soa8(&mut a, [av[0][g], av[1][g], av[2][g]], pv[g]);
     }
+    *acc = a;
 }
 
 #[inline(always)]

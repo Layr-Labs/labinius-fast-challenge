@@ -403,6 +403,12 @@ impl Table {
                 )
             };
             if ptr as isize != -1 && !ptr.is_null() && (ptr as usize) % 16 == 0 {
+                // Every pass over the table installs one page-table entry per 4 KiB, 65,536 of
+                // them, and the measured cost of that is ~10 ms of the run (~152 ns each). Ask
+                // for 2 MiB pages so the same range needs 128 entries: the advice must be given
+                // before the first fault, which is the population below. Kernels without
+                // read-only file THP ignore it and nothing changes.
+                unsafe { sys::madvise(ptr, Self::BYTES, sys::MADV_HUGEPAGE) };
                 return Table::Mapped {
                     ptr: ptr as *const B128,
                     bytes: Self::BYTES,
@@ -435,6 +441,7 @@ impl Table {
 /// kernel has it (older kernels refuse it, harmlessly), one read per page otherwise (the
 /// fault-around maps a run of pages per fault). A read-only touch, so it runs on another thread
 /// while the key is built.
+#[allow(dead_code)]
 fn populate_words(words: &[B128], keys: &[u8], threads: usize) {
     let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
     let kruns = labinius::par::ranges(keys.len(), threads, 4096);
@@ -1644,7 +1651,11 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     } else {
         &[]
     };
-    populate_words(values, image, workers);
+    // The table's pages come in with the commitment's own reads of them. Pre-faulting
+    // them here (`MADV_POPULATE_READ`) made the prover touch all 268 MB a second time
+    // before doing any work, which measured as ~10 ms of the run and bought the
+    // commitment ~0.5 ms back: the fault-around it takes instead maps a run of pages
+    // per fault. The key image is small and is left to the commit for the same reason.
     let matrix_time = clock.elapsed();
     // The hybrid modulus commits against the embedded arranged keys when the build host made
     // them; otherwise the key (and the tail key) come from their images or are built.

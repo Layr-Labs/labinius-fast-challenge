@@ -1,3 +1,4 @@
+// Official draw E1: promoted record tree plus early witness-table release.
 //! Packed-binary PCS opening, including the GHASH-to-F162 field switch.
 //!
 //! The default integer modulus is9721*55*2^16. One witness NTT supplies
@@ -1891,14 +1892,11 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         )))
     });
     let fold_time = clock.elapsed();
-    // The file-backed table is no longer read. The command writes the proof and exits
-    // immediately, so leave its mapping to process exit. Retain early release for callers
-    // requesting proof parts without an Output.
+    // The file-backed table is no longer read. Drop its page-table entries on every core now,
+    // so process exit does not have to walk them on one CPU inside the timed window.
     #[cfg(target_os = "linux")]
-    if output.is_none() {
-        if let Table::Mapped { .. } = table {
-            release_words(values, image, workers);
-        }
+    if let Table::Mapped { .. } = table {
+        release_words(values, image, workers);
     }
     std::mem::forget(table);
     let proof = ProofParts {

@@ -434,7 +434,7 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-const PREFETCH_SLOTS: usize = 56;
+const PREFETCH_SLOTS: usize = 37;
 
 // Quarter-scaled witnesses and reciprocal public keys preserve every product.
 // The64-pair window retains the baseline's statistical accumulation strategy;
@@ -763,7 +763,7 @@ struct SmsWorker {
     acc: Box<[SAcc]>,
     pend: Box<[Batch32]>,
     total: Box<[Total]>,
-    idx: Box<[crate::simd::transpose_f162::SmsR3PairIndex32]>,
+    idx: Box<[crate::simd::transpose_f162::SmsBinaryIndex32]>,
     w: Box<[Blk27]>,
 }
 impl SmsWorker {
@@ -933,7 +933,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         });
         // The producer requests each h once, in order. Partial groups use
         // enough zero words for all LOCK pointer advances.
-        let mut source = |_h: usize, out: *mut crate::simd::transpose_f162::SmsR3PairIndex32| {
+        let mut source = |_h: usize, out: *mut crate::simd::transpose_f162::SmsBinaryIndex32| {
             // Prefetch the next pair batch while converting this batch and
             // computing its first prefix. The final batch needs no lookahead.
             if _h + 1 < step {
@@ -943,7 +943,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
                     _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64));
                 }
             }
-            crate::simd::transpose_f162::slice_b128_cols16_r3pair_into(&cols16, &mut *out);
+            crate::simd::transpose_f162::slice_b128_cols16_sms_into(&cols16, &mut *out);
             for p in &mut cols16 { *p = p.add(8); }
         };
         let k = kbase.add((b / LOCK) * LOCK_WORDS);
@@ -960,31 +960,31 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         if mode == 1 {
             struct Nop;
             impl vb::SliceSink<LOCK> for Nop { unsafe fn rows(&mut self, _: usize, w: [*const i16; LOCK], _: usize, _: usize) { core::hint::black_box(w); } }
-            vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Nop, &mut source);
+            vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Nop, &mut source);
         } else if mode == 2 {
             let mut sk = Sink::<false> { k, acc, b: bias };
             for kk in 0..24 { vb::SliceSink::<LOCK>::rows(&mut sk, kk, core::array::from_fn(|h| w.add(32 * 27 * h) as *const i16), 0, 27); }
         } else if step==16 {
             if first && fold_now {
-                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,true>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,true>{k,acc,b:bias},&mut source);
             }
             else if first {
-                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,true>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,true>{k,acc,b:bias},&mut source);
             }
             else if fold_now {
-                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,false>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,false>{k,acc,b:bias},&mut source);
             }
             else if true {
-                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,false>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,false>{k,acc,b:bias},&mut source);
             }
         } else if first && fold_now {
-            vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true, true> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true, true> { k, acc, b: bias }, &mut source);
         } else if first {
-            vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false, true> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false, true> { k, acc, b: bias }, &mut source);
         } else if fold_now {
-            vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true> { k, acc, b: bias }, &mut source);
         } else {
-            vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false> { k, acc, b: bias }, &mut source);
         }
         sync(b + step);
         // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.
@@ -1043,7 +1043,6 @@ const PAIR_LEAD: usize = 2 * PP;
 /// groups it ran; and the number of sibling pairs that gave up their coupling.
 pub static WORKER_END_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
 pub static WORKER_GROUPS: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
-pub static WORKER_START_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
 pub static DECOUPLED_PAIRS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// When (microseconds into the commitment, shifted by 4) and by which waiting worker (low 4 bits)
 /// each pair decoupled.
@@ -1057,8 +1056,7 @@ pub fn worker_report(workers: usize) -> String {
     let groups: Vec<String> = (0..w).map(|i| WORKER_GROUPS[i].load(Relaxed).to_string()).collect();
     let nd = (DECOUPLED_PAIRS.load(Relaxed) as usize).min(16);
     let at: Vec<String> = (0..nd).map(|i| { let v = DECOUPLED_AT[i].load(Relaxed); format!("{}@{}", v & 15, v >> 4) }).collect();
-    let starts: Vec<String> = (0..w).map(|i| WORKER_START_US[i].load(Relaxed).to_string()).collect();
-    format!(" sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={} sms_start_us={}", ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"), starts.join("/"))
+    format!(" sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={}", ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"))
 }
 
 /// The commitment on sibling pairs: hyperthreads `2k`, `2k + 1` (placed on core `k`) take
@@ -1084,27 +1082,8 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
     let done: Vec<Progress> = (0..2 * pairs).map(|_| Progress(AtomicUsize::new(0))).collect();
     let coupled: Vec<AtomicBool> = (0..pairs).map(|_| AtomicBool::new(true)).collect();
     let t0 = std::time::Instant::now();
-    let taken: Vec<AtomicBool> = (0..2 * pairs).map(|_| AtomicBool::new(false)).collect();
-    let started = AtomicUsize::new(0);
-    crate::par::pool().run(2 * pairs, |task| {
-        // Slots by the CPU each runner finds itself on, so that pinning moves nothing; a runner
-        // whose CPU's slot is taken takes one left over.
-        let worker = placement.map_or(task, |p| p.claim(&taken));
-        if worker < 16 {
-            WORKER_START_US[worker].store(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
-        }
+    crate::par::pool().run(2 * pairs, |worker| {
         let _guard = placement.and_then(|p| p.pin(worker));
-        started.fetch_add(1, Ordering::AcqRel);
-        // The scheduler stacks two runners on one CPU while another CPU sits idle and moves one
-        // over only at a later tick, so the stacked one would start 1-6 ms late and its sibling
-        // would spend SIBLING_WAIT on it. Yielding hands it this CPU for its claim, and its pin
-        // moves it to the CPU of the slot left over.
-        for _ in 0..4 {
-            if placement.is_none() || started.load(Ordering::Acquire) == 2 * pairs {
-                break;
-            }
-            std::thread::yield_now();
-        }
         let pair = worker / 2;
         let mine = &done[worker].0;
         let other = &done[worker ^ 1].0;

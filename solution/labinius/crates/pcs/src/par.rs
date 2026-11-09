@@ -482,7 +482,6 @@ pub struct AffinityGuard { old:[usize;16] }
 unsafe extern "C" {
     fn sched_getaffinity(pid:i32,size:usize,mask:*mut usize)->i32;
     fn sched_setaffinity(pid:i32,size:usize,mask:*const usize)->i32;
-    fn sched_getcpu()->i32;
 }
 /// The first allowed logical CPU of each physical core, from `/proc/cpuinfo`: read once (the
 /// kernel samples every CPU's frequency to print it), by [`warm_topology`] off the critical
@@ -558,19 +557,6 @@ impl CorePlacement {
         if tasks==0 || cpus.len()<tasks {return None;}
         Some(Self{cpus})
     }
-    /// A slot of this placement for a task that starts now: the one for the CPU the task runs
-    /// on if that is still free (pinning it then moves nothing), else the first free one. Each
-    /// of `taken.len()` tasks claims exactly one, so one is always free.
-    pub fn claim(&self,taken:&[std::sync::atomic::AtomicBool])->usize {
-        use std::sync::atomic::Ordering::AcqRel;
-        let cpu=unsafe {sched_getcpu()};
-        if cpu>=0 {
-            if let Some(i)=self.cpus.iter().position(|&c|c==cpu as usize) {
-                if i<taken.len() && !taken[i].swap(true,AcqRel) {return i;}
-            }
-        }
-        (0..taken.len()).find(|&i|!taken[i].swap(true,AcqRel)).expect("one slot per task")
-    }
     pub fn pin(&self,worker:usize)->Option<AffinityGuard> {
         let cpu=*self.cpus.get(worker)?;
         let mut old=[0usize;16];
@@ -592,7 +578,6 @@ impl CorePlacement {
     pub fn for_workers(_:usize)->Option<Self>{None}
     pub fn for_logical(_:usize)->Option<Self>{None}
     pub fn for_sibling_pairs(_:usize)->Option<Self>{None}
-    pub fn claim(&self,taken:&[std::sync::atomic::AtomicBool])->usize {(0..taken.len()).find(|&i|!taken[i].swap(true,std::sync::atomic::Ordering::AcqRel)).expect("one slot per task")}
     pub fn pin(&self,_:usize)->Option<()>{None}
 }
 

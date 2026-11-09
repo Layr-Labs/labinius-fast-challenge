@@ -1445,14 +1445,17 @@ mod leap_bench {
         for case in 0..50 {
             let raw: Vec<u8> = (0..N * 4).map(|_| crate::ntt::tests::xorshift(&mut st) as u8).collect();
             let mut idx = Box::new([unsafe { vdupq_n_u8(0) }; N / 4]);
-            // half the cases with in-range table indices only, half with arbitrary bytes
+            // `u16` indices below 256 (the packed form holds a byte); half the cases with
+            // in-range table indices only, half with arbitrary bytes (out of range: zero)
             for (i, v) in idx.iter_mut().enumerate() {
-                *v = unsafe { vld1q_u8(raw.as_ptr().add(16 * i)) };
-                if case % 2 == 0 { *v = unsafe { vandq_u8(*v, vdupq_n_u8(31)) }; }
+                let mut w = unsafe { vld1_u8(raw.as_ptr().add(8 * i)) };
+                if case % 2 == 0 { w = unsafe { vand_u8(w, vdup_n_u8(31)) }; }
+                *v = unsafe { vreinterpretq_u8_u16(vmovl_u8(w)) };
             }
+            let packed = crate::ntt::neon::tests::pack(&idx);
             let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             let mut b = a.clone();
-            unsafe { pass_lut::<PB>(&idx, &mut a, kern); pass_lut_asm(&idx, &mut b, kern); }
+            unsafe { pass_lut::<PB>(&idx, &mut a, kern); pass_lut_asm(&packed, &mut b, kern); }
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
             assert_eq!(x, y);

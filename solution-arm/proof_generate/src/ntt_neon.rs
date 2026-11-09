@@ -377,12 +377,15 @@ unsafe fn nibbles(m: &[int16x8_t; BITS], out: &mut [uint8x16_t; GROUPS]) {
     }
 }
 
-/// `v` through an empty asm statement, so that LLVM keeps the zip that made it and stores it
-/// with a plain `str` instead of fusing the zip pair into an `st2`.
-#[inline(always)]
-fn no_st2(mut v: uint8x16_t) -> uint8x16_t {
-    unsafe { core::arch::asm!("/* {0:v} */", inout(vreg) v, options(pure, nomem, nostack, preserves_flags)) };
-    v
+/// Byte offset of slot `s < GROUPS` in the packed index buffer that [`indices`] writes and
+/// `pass_lut_asm` reads: eight bytes per slot, lane `c` = column `c`'s nibble, which the
+/// consumer's SVE `ld1b {z.h}` zero-extends into the `u16` index [`nibbles`] computes (the
+/// former zip with zero). Slot `s = 4 (16 G + q) + K` sits in the 16-byte vector
+/// `2 ((4 G + q % 4) 4 + K) + (q / 4) % 2`, half `q / 8`: one plain store per nibble vector.
+pub const fn packed_slot(s: usize) -> usize {
+    let (k, t) = (s % 4, s / 4);
+    let (g, q) = (t / 16, t % 16);
+    16 * (2 * ((4 * g + q % 4) * 4 + k) + (q / 4) % 2) + 8 * (q / 8)
 }
 
 /// Exchange alternating groups of `D` bits between two bit planes. After the two
@@ -420,27 +423,14 @@ unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 
     let (c, d) = index_swap::<1>(c, d, 0x55);
     let (a, c) = index_swap::<2>(a, c, 0x33);
     let (b, d) = index_swap::<2>(b, d, 0x33);
-    macro_rules! put {
-        ($q:expr, $z:expr) => {
-            if 4 * (16 * G + $q) + K < GROUPS {
-                *idx.get_unchecked_mut(4 * (16 * G + $q) + K) = $z;
-            }
-        };
-    }
     macro_rules! emit {
         ($v:expr, $r:literal) => {{
             let v = $v;
-            // `u16` nibbles for SVE2's halfword `tbl` ([`look`]): widened by a zip with zero
-            let lo = vandq_u8(v, vdupq_n_u8(0x0f));
-            let hi = vshrq_n_u8::<4>(v);
-            let z = vdupq_n_u8(0);
-            // Each zip through [`no_st2`]: LLVM otherwise fuses a zip pair and its two stores
-            // into one `st2`, about 3 cycles on Neoverse V2 against 4 zips a cycle and 2 plain
-            // stores a cycle (measured on Axion).
-            put!($r, no_st2(vzip1q_u8(lo, z)));
-            put!($r + 4, no_st2(vzip1q_u8(hi, z)));
-            put!($r + 8, no_st2(vzip2q_u8(lo, z)));
-            put!($r + 12, no_st2(vzip2q_u8(hi, z)));
+            // The byte nibbles of slots `q = r, r + 8` (low nibbles) and `r + 4, r + 12` (high),
+            // stored packed ([`packed_slot`]); the consumer zero-extends them on load.
+            let at = 2 * ((G * 4 + $r) * 4 + K);
+            *idx.get_unchecked_mut(at) = vandq_u8(v, vdupq_n_u8(0x0f));
+            *idx.get_unchecked_mut(at + 1) = vshrq_n_u8::<4>(v);
         }};
     }
     emit!(a, 0);
@@ -450,8 +440,9 @@ unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 
 }
 
 /// The table indices of one element of eight columns. Coefficient `4 q + k`
-/// is bit `q` of word `k`; each result lane holds the `u16` pattern `p` for the
-/// four-bit pattern at `j + 162 t`, with coefficients above 511 zero.
+/// is bit `q` of word `k`; each slot's lane holds the byte pattern `p` for the
+/// four-bit pattern at `j + 162 t`, with coefficients above 511 zero, packed by
+/// [`packed_slot`] (the `u16` patterns of [`nibbles`] after zero extension).
 #[inline(always)]
 unsafe fn indices_pair<const P: usize>(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
     let mut bytes = [[vdupq_n_u8(0); 9]; 2];
@@ -1534,6 +1525,20 @@ mod tests {
         pass_lut::<1>(idx, x, kern);
     }
 
+    /// `u16` slot indices ([`nibbles`]' format; high bytes must be zero) in the packed byte
+    /// layout of [`packed_slot`].
+    pub(crate) fn pack(idx: &[uint8x16_t; GROUPS]) -> Box<[uint8x16_t; GROUPS]> {
+        let src: &[[u16; 8]; GROUPS] = unsafe { &*(idx as *const _ as *const [[u16; 8]; GROUPS]) };
+        let mut out = [0u8; 16 * GROUPS];
+        for (s, v) in src.iter().enumerate() {
+            for (c, &x) in v.iter().enumerate() {
+                assert!(x < 256, "slot {s} lane {c}: {x} does not fit a byte");
+                out[packed_slot(s) + c] = x as u8;
+            }
+        }
+        Box::new(unsafe { core::mem::transmute(out) })
+    }
+
     #[no_mangle]
     #[inline(never)]
     unsafe fn mca_indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
@@ -2004,11 +2009,23 @@ mod tests {
                 nibbles(&m, &mut want);
                 mca_indices(&ptrs, &mut got);
             }
+            let want = pack(&want);
+            let (got, want): ([u8; 16 * GROUPS], [u8; 16 * GROUPS]) = unsafe { (core::mem::transmute(got), core::mem::transmute(*want)) };
             for j in 0..GROUPS {
-                let got: [u8; 16] = unsafe { core::mem::transmute(got[j]) };
-                let want: [u8; 16] = unsafe { core::mem::transmute(want[j]) };
-                assert_eq!(got, want, "case {case} group {j}");
+                let at = packed_slot(j);
+                assert_eq!(got[at..at + 8], want[at..at + 8], "case {case} group {j}");
             }
+        }
+    }
+
+    /// The packed slots are disjoint eight-byte runs inside the buffer.
+    #[test]
+    fn packed_slots_are_disjoint() {
+        let mut seen = [false; 2 * GROUPS];
+        for s in 0..GROUPS {
+            let at = packed_slot(s);
+            assert!(at % 8 == 0 && at + 8 <= 16 * GROUPS);
+            assert!(!core::mem::replace(&mut seen[at / 8], true), "slot {s}");
         }
     }
 

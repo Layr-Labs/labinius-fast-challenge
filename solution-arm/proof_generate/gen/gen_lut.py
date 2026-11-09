@@ -1,8 +1,23 @@
 """pass_lut::<1> (levels 0-3 of the 9721 binary transform from the nibble tables) as scheduled asm.
-Tables of node n live in v16-v27 (pairs for tbl), k in v15; the scheduler gets v0-v14 and v28-v31."""
+Tables of node n live in v16-v27 (pairs for tbl), k in v15; the scheduler gets v0-v14 and v28-v31.
+Indices come packed (ntt_neon.rs packed_slot) and are zero-extended by ld1b; p7 = ptrue.h."""
 import os
 from sched import Ins, schedule, allocate
 RESERVED = tuple(range(15, 28))
+def packed_slot(s):
+    # ntt_neon.rs packed_slot: byte offset of slot s in the packed index buffer
+    k, t = s % 4, s // 4
+    g, q = t // 16, t % 16
+    return 16 * (2 * ((4 * g + q % 4) * 4 + k) + (q // 4) % 2) + 8 * (q // 8)
+BASES = set()
+def ld1b(s):
+    # 8 bytes zero-extended to 8 u16 lanes; base m = ix + 64 + 128 m, imm in 8-byte units (-8..7)
+    off = packed_slot(s)
+    m = off // 128
+    imm = (off - 128 * m - 64) // 8
+    assert -8 <= imm <= 7
+    BASES.add(m)
+    return f'ld1b LBz{{d0}}.hRB, p7/z, [IB{m}X, #{imm}, mul vl]'
 def build_node(n, steps):
     ins = []; cnt = [0]
     def v(nm):
@@ -22,7 +37,7 @@ def build_node(n, steps):
         look = []
         for t, o in enumerate(offs):
             ix, val = v('ix'), v('lk')
-            ins.append(Ins('L', [ix], [], f'ldr q{{d0}}, [IPTR, #{16*o}]'))
+            ins.append(Ins('L', [ix], [], ld1b(o)))
             ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.h, z{17+2*t}.hRB, z{{s0}}.h'))
             look.append(val)
         x0, y0, x1, y1, x2, y2 = look
@@ -41,8 +56,12 @@ def build_node(n, steps):
         for x in ins[start:]: x.g = g
         g += 1
     return ins
+def base_names(a):
+    for m in range(12):
+        a = a.replace(f'IB{m}X', f'{{i{m}}}')
+    return a
 def emit(per=27, K=8, B=17):
-    out = ['"ldr q15, [{kp}]"']
+    out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"']
     for n in range(4):
         for t in range(6):
             out.append(f'"ldp q{16+2*t}, q{17+2*t}, [{{lut}}, #{n*192 + 32*t}]"')
@@ -50,5 +69,5 @@ def emit(per=27, K=8, B=17):
             ins = build_node(n, list(range(c, min(27, c + per))))
             seq, _ = schedule(ins, skew=K, budget=B, cap=18)
             asm, _ = allocate(seq, {'k': 15}, set(), reserved=RESERVED)
-            out += [f'"{a.replace("XPTR", "{x}").replace("IPTR", "{ix}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
+            out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
     return ',\n        '.join(out)

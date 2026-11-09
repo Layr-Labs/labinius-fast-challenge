@@ -1329,6 +1329,8 @@ fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
 /// microseconds from the fold's dispatch to the end of its last task, and the tasks it ran.
 pub static FOLD_END_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
 pub static FOLD_TASKS: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// Team fold diagnostics: per worker, TSC kilo-cycles in wait / slice / accumulate / write.
+pub static FOLD_PHASE_KC: [[std::sync::atomic::AtomicU32; 4]; 16] = [const { [const { std::sync::atomic::AtomicU32::new(0) }; 4] }; 16];
 
 /// The diagnostics above as ` fold_end_us=a/b/.. fold_tasks=a/b/..`.
 pub fn fold_report(workers: usize) -> String {
@@ -1336,7 +1338,8 @@ pub fn fold_report(workers: usize) -> String {
     let w = workers.min(16);
     let ends: Vec<String> = (0..w).map(|i| FOLD_END_US[i].load(Relaxed).to_string()).collect();
     let tasks: Vec<String> = (0..w).map(|i| FOLD_TASKS[i].load(Relaxed).to_string()).collect();
-    format!(" fold_end_us={} fold_tasks={}", ends.join("/"), tasks.join("/"))
+    let ph: Vec<String> = (0..w).map(|i| (0..4).map(|k| FOLD_PHASE_KC[i][k].load(Relaxed).to_string()).collect::<Vec<_>>().join(":")).collect();
+    format!(" fold_end_us={} fold_tasks={} fold_phase_kc={}", ends.join("/"), tasks.join("/"), ph.join("/"))
 }
 
 pub fn fold_witness_bitsliced(
@@ -1572,26 +1575,9 @@ mod bitsliced {
     #[repr(C, align(64))]
     struct Aligned<T>(T);
 
-    const fn swap_index(mask: usize, value: usize) -> [u8; 64] {
-        let mut out = [0; 64];
-        let mut p = 0;
-        while p < 64 {
-            out[p] = (64 * ((p & mask != 0) as usize) + (p & !mask) + value) as u8;
-            p += 1;
-        }
-        out
-    }
-
-    static SWAPS: Aligned<[[[u8; 64]; 2]; 4]> = Aligned([
-        [swap_index(8, 0), swap_index(8, 8)],
-        [swap_index(4, 0), swap_index(4, 4)],
-        [swap_index(2, 0), swap_index(2, 2)],
-        [swap_index(1, 0), swap_index(1, 1)],
-    ]);
-
-    /// Exactly bitmat's byte transpose, specialized to four fixed rounds. Both the vector-slot
-    /// bit and the byte-position bit exchanged in round r are 3-r. Constant pair indices let
-    /// the compiler keep all sixteen vectors in registers instead of indexing a stack array.
+    /// Exactly bitmat's byte transpose, specialized to four fixed rounds: round r exchanges
+    /// the vector-slot bit 3-r with the byte-position bit 3-r. Constant pair indices let the
+    /// compiler keep all sixteen vectors in registers instead of indexing a stack array.
     #[inline(always)]
     unsafe fn transpose_tile(
         src: *const B128,
@@ -1603,29 +1589,55 @@ mod bitsliced {
         let mut z: [__m512i; 16] = core::array::from_fn(|i| {
             _mm512_loadu_si512((src as *const u8).add(64 * i) as *const __m512i)
         });
-        macro_rules! pair {
-            ($a:literal, $b:literal, $i0:ident, $i1:ident) => {{
-                let (a, b) = (z[$a], z[$b]);
-                z[$a] = _mm512_permutex2var_epi8(a, $i0, b);
-                z[$b] = _mm512_permutex2var_epi8(a, $i1, b);
-            }};
+        {
+            // The same four exchanges without byte permutes: exchanging byte-position bit
+            // 3 / 2 / 1 / 0 with the slot bit is a qword unpack, then a shift by 32 / 16 / 8
+            // bits plus a blend of the odd dwords / words / bytes (shifts on port 0, blends on
+            // ports 0 or 5, where the two-source byte permute costs several port-5 cycles).
+            macro_rules! unpack {
+                ($a:literal, $b:literal) => {{
+                    let (a, b) = (z[$a], z[$b]);
+                    z[$a] = _mm512_unpacklo_epi64(a, b);
+                    z[$b] = _mm512_unpackhi_epi64(a, b);
+                }};
+            }
+            macro_rules! shift {
+                ($a:literal, $b:literal, $sl:ident, $sr:ident, $blend:ident, $k:expr, $n:literal) => {{
+                    let (a, b) = (z[$a], z[$b]);
+                    z[$a] = $blend($k, a, $sl::<$n>(b));
+                    z[$b] = $blend($k, $sr::<$n>(a), b);
+                }};
+            }
+            unpack!(0, 8); unpack!(1, 9); unpack!(2, 10); unpack!(3, 11);
+            unpack!(4, 12); unpack!(5, 13); unpack!(6, 14); unpack!(7, 15);
+            let k = 0xAAAAu16;
+            shift!(0, 4, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(1, 5, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(2, 6, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(3, 7, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(8, 12, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(9, 13, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(10, 14, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(11, 15, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            let k = 0xAAAA_AAAAu32;
+            shift!(0, 2, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(1, 3, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(4, 6, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(5, 7, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(8, 10, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(9, 11, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(12, 14, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(13, 15, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            let k = 0xAAAA_AAAA_AAAA_AAAAu64;
+            shift!(0, 1, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(2, 3, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(4, 5, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(6, 7, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(8, 9, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(10, 11, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(12, 13, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(14, 15, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
         }
-        let i0 = _mm512_load_si512(SWAPS.0[0][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[0][1].as_ptr() as *const __m512i);
-        pair!(0, 8, i0, i1); pair!(1, 9, i0, i1); pair!(2, 10, i0, i1); pair!(3, 11, i0, i1);
-        pair!(4, 12, i0, i1); pair!(5, 13, i0, i1); pair!(6, 14, i0, i1); pair!(7, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[1][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[1][1].as_ptr() as *const __m512i);
-        pair!(0, 4, i0, i1); pair!(1, 5, i0, i1); pair!(2, 6, i0, i1); pair!(3, 7, i0, i1);
-        pair!(8, 12, i0, i1); pair!(9, 13, i0, i1); pair!(10, 14, i0, i1); pair!(11, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[2][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[2][1].as_ptr() as *const __m512i);
-        pair!(0, 2, i0, i1); pair!(1, 3, i0, i1); pair!(4, 6, i0, i1); pair!(5, 7, i0, i1);
-        pair!(8, 10, i0, i1); pair!(9, 11, i0, i1); pair!(12, 14, i0, i1); pair!(13, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[3][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[3][1].as_ptr() as *const __m512i);
-        pair!(0, 1, i0, i1); pair!(2, 3, i0, i1); pair!(4, 5, i0, i1); pair!(6, 7, i0, i1);
-        pair!(8, 9, i0, i1); pair!(10, 11, i0, i1); pair!(12, 13, i0, i1); pair!(14, 15, i0, i1);
         for i in 0..16 {
             let v = _mm512_permutexvar_epi8(
                 perm,
@@ -1659,6 +1671,9 @@ mod bitsliced {
         a
     });
 
+    /// Whether [`slice`] folds [`PERM`] into the first round of its qword transpose: one
+    /// two-source byte permute per pair of rows instead of a byte permute per row plus a qword
+    /// unpack, 128 fewer shuffle-port operations per 8 KB column-block (about 1/8 of slicing).
     /// Lane l corresponds to this source word. GFNI reverses the eight matrix rows; the byte
     /// transpose uses bitmat's public word permutation. No permutation is needed in the hot loop;
     /// [`write_block`] relies on its shape (lane `64 g + 16 k + r` is word `64 g + 4 (r ^ 7) + k`).
@@ -2127,8 +2142,9 @@ mod bitsliced {
         acc: *const __m512i,
         bias: &[i32; SLOTS],
         output: usize,
+        slots: core::ops::Range<usize>,
     ) {
-        if !WIRE {
+        if !WIRE && slots.start == 0 {
             let output = output as *mut RingElement;
             for e in 0..LANES / 4 {
                 core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
@@ -2141,7 +2157,7 @@ mod bitsliced {
         let idx1 = _mm512_load_si512(INTERLEAVE.0[1].as_ptr() as *const __m512i);
         #[cfg(test)]
         let mut overflow = 0u32;
-        for s0 in (0..OUT_SLOTS).step_by(8) {
+        for s0 in slots.step_by(8) {
             let n = (OUT_SLOTS - s0).min(8);
             let mask = ((1u32 << n) - 1) as __mmask8;
             let mut s_lo = [[zero; 8]; 8];
@@ -2259,8 +2275,6 @@ mod bitsliced {
         let mut ran = 0u32;
         #[cfg(test)]
         let mut times = [std::time::Duration::ZERO; 3];
-        #[cfg(not(test))]
-        let _ = worker;
         let zero = _mm512_setzero_si512();
         // Zero everywhere the columns do not write: the guards and the padding pair.
         let mut planes: Vec<__m512i> = Vec::with_capacity(GUARD + GROUP * STRIDE);
@@ -2271,6 +2285,7 @@ mod bitsliced {
         }
         let mut acc: Vec<__m512i> = Vec::with_capacity(2 * PAIRS * BITS);
         let mut counts = if FUSED { Vec::new() } else { uninit_counts() };
+        let mut kc = [0u64; 4];
         loop {
             let task = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if task >= tasks {
@@ -2284,6 +2299,7 @@ mod bitsliced {
             let range = cuts[part]..cuts[part + 1];
             for gi in range.clone() {
                 let group = &groups[gi];
+                let t0 = core::arch::x86_64::_rdtsc();
                 #[cfg(test)]
                 let start = profile.then(std::time::Instant::now);
                 for j in 0..group.columns {
@@ -2299,6 +2315,7 @@ mod bitsliced {
                     };
                     slice(src, planes.as_mut_ptr().add(GUARD + j * STRIDE), next_src);
                 }
+                let t1 = core::arch::x86_64::_rdtsc();
                 #[cfg(test)]
                 if let Some(start) = start { times[0] += start.elapsed(); }
                 #[cfg(test)]
@@ -2311,6 +2328,9 @@ mod bitsliced {
                         acc.as_mut_ptr().add(2 * q * BITS),
                     );
                 }
+                let t2 = core::arch::x86_64::_rdtsc();
+                kc[1] += t1 - t0;
+                kc[2] += t2 - t1;
                 #[cfg(test)]
                 if let Some(start) = start { times[1] += start.elapsed(); }
             }
@@ -2323,7 +2343,7 @@ mod bitsliced {
                 } else {
                     out_addr + element * core::mem::size_of::<RingElement>()
                 };
-                write_acc::<WIRE>(acc.as_ptr(), bias, output);
+                write_acc::<WIRE>(acc.as_ptr(), bias, output, 0..OUT_SLOTS);
                 #[cfg(test)]
                 if let Some(start) = start { times[2] += start.elapsed(); }
                 continue;
@@ -2357,6 +2377,9 @@ mod bitsliced {
             #[cfg(test)]
             if let Some(start) = start { times[2] += start.elapsed(); }
         }
+        if worker < 16 {
+            for i in 0..4 { super::FOLD_PHASE_KC[worker][i].store((kc[i] / 1000) as u32, std::sync::atomic::Ordering::Relaxed); }
+        }
         #[cfg(test)]
         if profile {
             eprintln!("bitfold worker={} slice_us={} add_us={} output_us={}",
@@ -2364,6 +2387,160 @@ mod bitsliced {
         }
         ran
     }
+
+    /// One physical core's two hyperthreads working one block together ("a team").
+    ///
+    /// The idea, independent of the instruction set: a group step has a streaming part (slice:
+    /// read 8 KB per column of the table from DRAM and transpose it into bit planes) and a
+    /// compute part (accumulate: about a hundred reads of L2-resident planes per table byte).
+    /// When the two hyperthreads of a core run their own blocks, one is usually slicing while
+    /// the other accumulates, and the table stream and the second plane set compete with the
+    /// accumulation for the core's L2 (measured on the old box: accumulation 23.8 ms with the
+    /// table stream, 17.8 ms without). A team shares one plane buffer and one counter set and
+    /// moves through the phases together: both slice half the group's columns, then both
+    /// accumulate half the slot pairs, then the next group. The core's L2 holds one plane set
+    /// instead of two, and no table stream runs while the core accumulates.
+    ///
+    /// The phases of a team are handed out as tickets, two halves per phase: a thread claims
+    /// the next half, waits until every half of the previous phase is done, and runs it. A
+    /// thread only ever waits for a half that a running thread has claimed, so a team whose
+    /// second thread never arrives (a narrow pool, an inline dispatch) is one thread taking
+    /// every half in turn, never a deadlock.
+    #[repr(C, align(128))]
+    struct Team {
+        hand: std::sync::atomic::AtomicU64,
+        _pad0: [u8; 120],
+        done: std::sync::atomic::AtomicU64,
+        _pad1: [u8; 120],
+        /// `round << 32 | task` of the latest round, published by its first ticket.
+        round_task: std::sync::atomic::AtomicU64,
+        planes: usize,
+        acc: usize,
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+    unsafe fn run_team<const GROUP: usize, const WIRE: bool>(
+        worker: usize,
+        team: &Team,
+        words: &[B128],
+        column_words: usize,
+        groups: &[Group],
+        bias: &[i32; SLOTS],
+        pair_split: usize,
+        tasks: usize,
+        next: &std::sync::atomic::AtomicUsize,
+        out_addr: usize,
+    ) -> u32 {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        let zero = _mm512_setzero_si512();
+        let planes = team.planes as *mut __m512i;
+        let acc = team.acc as *mut __m512i;
+        let phases = 2 * groups.len() + 1;
+        // The write's two halves: whole 8-slot rows, about half the output each.
+        let slot_split = (OUT_SLOTS / 2).next_multiple_of(8);
+        let mut ran = 0u32;
+        let mut kc = [0u64; 4];
+        let report = |kc: &[u64; 4]| if worker < 16 {
+            for i in 0..4 { super::FOLD_PHASE_KC[worker][i].store((kc[i] / 1000) as u32, Relaxed); }
+        };
+        loop {
+            let u = team.hand.fetch_add(1, Relaxed) as usize;
+            let (k, h) = (u / 2, u % 2);
+            let (round, p) = (k / phases, k % phases);
+            let w0 = core::arch::x86_64::_rdtsc();
+            while (team.done.load(Acquire) as usize) < 2 * k {
+                core::hint::spin_loop();
+            }
+            let task = if p == 0 && h == 0 {
+                let t = next.fetch_add(1, Relaxed);
+                team.round_task.store(((round as u64) << 32) | t as u64, Release);
+                t
+            } else {
+                loop {
+                    let v = team.round_task.load(Acquire);
+                    if (v >> 32) as usize == round { break (v & 0xffff_ffff) as usize; }
+                    core::hint::spin_loop();
+                }
+            };
+            if task >= tasks {
+                report(&kc);
+                return ran;
+            }
+            ran += 1;
+            let w1 = core::arch::x86_64::_rdtsc();
+            kc[0] += w1 - w0;
+            let kind = if p == 2 * groups.len() { 3 } else { 1 + p % 2 };
+            let block = tasks - 1 - task;
+            let pairs = if h == 0 { 0..pair_split } else { pair_split..PAIRS };
+            if p < 2 * groups.len() {
+                let gi = p / 2;
+                let group = &groups[gi];
+                if p % 2 == 0 {
+                    if gi == 0 {
+                        for i in 2 * BITS * pairs.start..2 * BITS * pairs.end {
+                            _mm512_store_si512(acc.add(i), zero);
+                        }
+                    }
+                    let half = group.columns / 2;
+                    let cols = if h == 0 { 0..half } else { half..group.columns };
+                    for j in cols.clone() {
+                        let src = words.as_ptr().add((group.first + j) * column_words + block * LANES);
+                        let next_src = if j + 1 < cols.end {
+                            src.add(column_words)
+                        } else if gi + 1 < groups.len() {
+                            let g2 = &groups[gi + 1];
+                            let j2 = if h == 0 { 0 } else { g2.columns / 2 };
+                            words.as_ptr().add((g2.first + j2) * column_words + block * LANES)
+                        } else {
+                            src
+                        };
+                        slice(src, planes.add(GUARD + j * STRIDE), next_src);
+                    }
+                } else {
+                    for q in pairs {
+                        accumulate_pair(
+                            planes,
+                            &group.terms[group.offsets[q]..group.mid[q]],
+                            &group.terms[group.mid[q]..group.offsets[q + 1]],
+                            acc.add(2 * q * BITS),
+                        );
+                    }
+                }
+            } else {
+                let element = block * (LANES / 4);
+                let output = if WIRE {
+                    out_addr + element * crate::params::N * core::mem::size_of::<i32>()
+                } else {
+                    out_addr + element * core::mem::size_of::<RingElement>()
+                };
+                let slots = if h == 0 { 0..slot_split } else { slot_split..OUT_SLOTS };
+                write_acc::<WIRE>(acc, bias, output, slots);
+            }
+            kc[kind] += core::arch::x86_64::_rdtsc() - w1;
+            team.done.fetch_add(1, Release);
+        }
+    }
+
+    /// The slot pair splitting the groups' schedule entries (plus a fixed cost per pair call)
+    /// into two halves of about equal work.
+    fn pair_split(groups: &[Group]) -> usize {
+        const PER_CALL: usize = 24;
+        let cost = |q: usize| -> usize {
+            groups.iter().map(|g| g.offsets[q + 1] - g.offsets[q] + PER_CALL).sum()
+        };
+        let total: usize = (0..PAIRS).map(cost).sum();
+        let mut at = 0;
+        for q in 0..PAIRS {
+            at += cost(q);
+            if 2 * at >= total {
+                return q + 1;
+            }
+        }
+        PAIRS
+    }
+
+    /// Whether the fold runs as teams of hyperthread siblings (see [`Team`]).
+    const TEAMS: bool = option_env!("LABINIUS_FOLD_TEAMS").is_none();
 
     pub(super) fn fold_words(
         words: &[B128],
@@ -2426,6 +2603,46 @@ mod bitsliced {
             out.as_mut_ptr() as usize
         };
         let t0 = std::time::Instant::now();
+        let paired = if TEAMS && FUSED && workers >= 4 && workers % 2 == 0 && tasks >= workers / 2 {
+            crate::par::CorePlacement::for_sibling_pairs(workers)
+        } else {
+            None
+        };
+        if let Some(placement) = paired {
+            let teams = workers / 2;
+            let plane_len = (GUARD + GROUP * STRIDE).next_multiple_of(2);
+            let acc_len = 2 * PAIRS * BITS;
+            let mut planes: Vec<__m512i> = vec![unsafe { _mm512_setzero_si512() }; teams * plane_len];
+            let mut accs: Vec<__m512i> = Vec::with_capacity(teams * acc_len);
+            let team: Vec<Team> = (0..teams)
+                .map(|t| Team {
+                    hand: std::sync::atomic::AtomicU64::new(0),
+                    _pad0: [0; 120],
+                    done: std::sync::atomic::AtomicU64::new(0),
+                    _pad1: [0; 120],
+                    round_task: std::sync::atomic::AtomicU64::new(u64::MAX),
+                    planes: unsafe { planes.as_mut_ptr().add(t * plane_len) } as usize,
+                    acc: unsafe { accs.as_mut_ptr().add(t * acc_len) } as usize,
+                })
+                .collect();
+            let split = pair_split(&groups);
+            let (groups, bias, next, team, placement) = (&groups, &bias, &next, &team, &placement);
+            crate::par::pool().run(workers, |worker| unsafe {
+                let _guard = placement.pin(worker);
+                let ran = run_team::<GROUP, WIRE>(
+                    worker, &team[worker / 2], words, column_words, groups, bias, split, tasks, next, out_addr,
+                );
+                if worker < 16 {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    super::FOLD_END_US[worker].store(t0.elapsed().as_micros() as u32, Relaxed);
+                    super::FOLD_TASKS[worker].store(ran, Relaxed);
+                }
+            });
+            drop(planes);
+            drop(accs);
+            if !WIRE { unsafe { out.set_len(len) }; }
+            return out;
+        }
         let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
         crate::par::pool().run(workers.clamp(1, tasks), |worker| unsafe {
             let ran = run_worker::<GROUP, FUSED, WIRE>(
@@ -2462,8 +2679,8 @@ mod bitsliced {
       for fixture in 0..12{
        for slot in 0..SLOTS {let counts:[u16;LANES]=core::array::from_fn(|lane|{state^=state<<13;state^=state>>7;state^=state<<17;match fixture{0=>0,1=>32767,2=>16384,3=>if (lane+slot)&1==0{0}else{32767},_=>(state&32767)as u16}});
         for bit in 0..BITS {let bits:[u64;8]=core::array::from_fn(|word|{let mut v=0;for b in 0..64{v|=(((counts[64*word+b]>>bit)&1)as u64)<<b;}v});acc[slot*BITS+bit]=core::mem::transmute(bits);}}
-       let mut old:Vec<RingElement>=Vec::with_capacity(LANES/4);write_acc::<false>(acc.as_ptr(),&bias,old.as_mut_ptr() as usize);old.set_len(LANES/4);
-       let mut got=vec![0x1a2b3c4di32;(LANES/4)*N+64];write_acc::<true>(acc.as_ptr(),&bias,got.as_mut_ptr().add(32) as usize);
+       let mut old:Vec<RingElement>=Vec::with_capacity(LANES/4);write_acc::<false>(acc.as_ptr(),&bias,old.as_mut_ptr() as usize,0..OUT_SLOTS);old.set_len(LANES/4);
+       let mut got=vec![0x1a2b3c4di32;(LANES/4)*N+64];write_acc::<true>(acc.as_ptr(),&bias,got.as_mut_ptr().add(32) as usize,0..OUT_SLOTS);
        assert!(got[..32].iter().chain(got[32+LANES/4*N..].iter()).all(|&x|x==0x1a2b3c4d));
        for (i,e)in old.iter().enumerate(){for j in 0..N{assert_eq!(got[32+i*N+j],e.v[j]as i32,"fixture={fixture} e={i} j={j}");}}
       }
@@ -2717,6 +2934,25 @@ mod bitsliced {
                 }).collect();
                 let words: Vec<_> = (0..cs.len() * LANES).map(|i| B128(if i % 7 == 0 { 0 } else { u128::MAX })).collect();
                 assert_eq!(fold_words(&words, &cs, LANES, 2), scalar(&words, &cs, LANES));
+            }
+        }
+
+        /// Teams of hyperthread siblings (eight workers on a 4-core, 2-thread machine) against
+        /// two independent workers, with a short last group (odd column halves).
+        #[test]
+        fn teams_match_independent_workers() {
+            let columns = 2 * COL_GROUP + 7;
+            let blocks = 9;
+            let words = table(columns * blocks * LANES);
+            let cs = challenges(columns);
+            let one = fold_words(&words, &cs, blocks * LANES, 2);
+            for workers in [8, 6, 4] {
+                assert!(fold_words(&words, &cs, blocks * LANES, workers) == one, "workers {workers}");
+            }
+            let mut wire = vec![0i32; blocks * 128 * crate::params::N];
+            fold_words_into(&words, &cs, blocks * LANES, 8, &mut wire);
+            for (i, e) in one.iter().enumerate() {
+                for j in 0..crate::params::N { assert_eq!(wire[i * crate::params::N + j], e.v[j] as i32); }
             }
         }
 

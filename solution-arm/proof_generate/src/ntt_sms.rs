@@ -940,6 +940,128 @@ unsafe fn sums2(
     let _ = (&mut accs, &mut ys, &mut devs);
 }
 
+/// [`sums2`] for four batches against one sweep of the key: batches `0..4` all transform and sink
+/// against the *same* key lines, so the 37 MB key is streamed once per four column-batches instead
+/// of once per two. Correctness is identical (the same integer sums); this only changes how many
+/// column-batches share a key read, trading scratch and cache pressure for fewer key passes.
+#[inline(never)]
+unsafe fn sums4(
+    words: [&[(*const u8, usize); LANES]; 4],
+    a: &SmsMatrix,
+    nib: &mut [uint8x16_t; N / 4],
+    xs: &mut [[int16x8_t; N]; SWEEP],
+    acc: [&mut [int64x2_t]; 4],
+    y: [&mut [int16x8_t; N]; 4],
+    dev: [&mut [int32x4_t]; 4],
+) {
+    let kern = &kernels()[PB];
+    let [acc0, acc1, acc2, acc3] = acc;
+    let [y0, y1, y2, y3] = y;
+    let [dev0, dev1, dev2, dev3] = dev;
+    let accs: [&mut [int64x2_t]; 4] = [acc0, acc1, acc2, acc3];
+    let ys: [&mut [int16x8_t; N]; 4] = [y0, y1, y2, y3];
+    let devs: [&mut [int32x4_t]; 4] = [dev0, dev1, dev2, dev3];
+    let (mut accs, mut ys, mut devs) = (accs, ys, devs);
+    for t in 0..4 {
+        for s in 0..N {
+            accs[t][idx(s, 0)..][..4].fill(vdupq_n_s64(0));
+        }
+    }
+    let mut e = 0usize;
+    while e < a.elements {
+        let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
+        while e < end {
+            let l = SWEEP.min(end - e);
+            let groups = l.div_ceil(LOCK);
+            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            for t in 0..4 {
+                for i in 0..groups * LOCK {
+                    let at = pass_words(words[t], a.elements, e, i);
+                    prefetch_words(words[t], e, i + PF_T);
+                    indices(&at, nib);
+                    let x = &mut xs[i];
+                    pass_lut_asm(nib, x, kern);
+                    pass_c_asm(x, kern);
+                    pass_d_asm(x, kern);
+                }
+                if e % CHUNK == 0 {
+                    sink::<true>(xs, keys, accs[t], groups);
+                } else {
+                    sink::<false>(xs, keys, accs[t], groups);
+                }
+            }
+            e += l;
+        }
+        let c = (end - 1) / CHUNK;
+        for t in 0..4 {
+            let dv = devs[t].as_mut_ptr();
+            for d in (0..DIGITS).step_by(2) {
+                let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
+                let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
+                chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
+            }
+        }
+    }
+    for t in 0..4 {
+        narrow(accs[t], 0, ys[t]);
+        super::inverse_folded::<PB>(ys[t]);
+    }
+    let _ = (&mut accs, &mut ys, &mut devs);
+}
+
+/// The base row's centered residues reduced to `[0, p)` and the tail `mu + sum_d W_d dev_d`,
+/// then the Chinese-remainder recombination of one batch's `N` coefficients into `target`.
+/// Extracted from the old per-batch block so [`sums4`] can finish four batches' results in turn.
+#[inline(always)]
+unsafe fn finish_batch(
+    y: &[int16x8_t; N],
+    dev: &[int32x4_t],
+    a: &SmsMatrix,
+    tail: &mut [[i64; LANES]; N],
+    target: &mut [u128],
+) {
+    let p = P1 as i16;
+    let pv = vdupq_n_s16(p);
+    let mut base = [[0u16; LANES]; N];
+    for (k, b) in base.iter_mut().enumerate() {
+        let v = y[k];
+        let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+        vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
+    }
+    for k in 0..N / 2 {
+        let h = k + N / 2;
+        let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
+        let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
+        for d in 0..DIGITS {
+            let (u, v) = lattice::WEIGHTS[d];
+            let w = u + v;
+            for half in 0..2 {
+                let x = dev[d * 2 * N + 2 * k + half];
+                let yv = dev[d * 2 * N + 2 * h + half];
+                let (xl, yl) = (vget_low_s32(x), vget_low_s32(yv));
+                let (i, j) = (2 * half, 2 * half + 1);
+                lo[i] = vmlal_n_s32(lo[i], xl, u);
+                lo[j] = vmlal_high_n_s32(lo[j], x, u);
+                lo[i] = vmlsl_n_s32(lo[i], yl, v);
+                lo[j] = vmlsl_high_n_s32(lo[j], yv, v);
+                hi[i] = vmlal_n_s32(hi[i], xl, v);
+                hi[j] = vmlal_high_n_s32(hi[j], x, v);
+                hi[i] = vmlal_n_s32(hi[i], yl, w);
+                hi[j] = vmlal_high_n_s32(hi[j], yv, w);
+            }
+        }
+        for q in 0..4 {
+            vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
+            vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
+        }
+    }
+    for (c, column) in target.chunks_exact_mut(N).enumerate() {
+        for (k, o) in column.iter_mut().enumerate() {
+            *o = crt(base[k][c] as u32, tail[k][c]);
+        }
+    }
+}
+
 #[inline]
 fn crt(r: u32, t: i64) -> u128 {
     const INV: u64 = {
@@ -967,7 +1089,13 @@ struct Scratch {
     dev: [int32x4_t; DIGITS * 2 * N],
     acc2: [int64x2_t; ROWS * 4 * N],
     dev2: [int32x4_t; DIGITS * 2 * N],
+    acc3: [int64x2_t; ROWS * 4 * N],
+    dev3: [int32x4_t; DIGITS * 2 * N],
+    acc4: [int64x2_t; ROWS * 4 * N],
+    dev4: [int32x4_t; DIGITS * 2 * N],
     y2: [int16x8_t; N],
+    y3: [int16x8_t; N],
+    y4: [int16x8_t; N],
     m: [int16x8_t; BITS],
     nib: [uint8x16_t; N / 4],
     y: [int16x8_t; N],
@@ -1010,8 +1138,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
-        let Scratch { xs, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
-        let p = P1 as i16;
+        let Scratch { xs, acc, dev, acc2, dev2, acc3, dev3, acc4, dev4, y2, y3, y4, m, nib, y, tail } = &mut *arena.0;
         let count = block.len() / N;
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
             let col0 = first + LANES * b;
@@ -1026,65 +1153,38 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
         };
         let batches = count.div_ceil(LANES);
         let mut targets: Vec<&mut [u128]> = block.chunks_mut(LANES * N).collect();
-        for b in 0..batches {
-            // pairs of batches share one key sweep; the second one's results wait in `*2`
-            if b % 2 == 0 {
+        let mut b = 0usize;
+        while b < batches {
+            let rem = batches - b;
+            if rem >= 4 {
+                // four batches share one key sweep; key streamed once per four column-batches
                 dev.fill(vdupq_n_s32(0));
-                if b + 1 < batches {
-                    dev2.fill(vdupq_n_s32(0));
-                    let (w0, w1) = (batch_words(b), batch_words(b + 1));
-                    sums2([&w0, &w1], a, nib, xs, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]]);
-                } else {
-                    sums(&batch_words(b), a, m, nib, xs, acc, y, dev);
-                }
+                dev2.fill(vdupq_n_s32(0));
+                dev3.fill(vdupq_n_s32(0));
+                dev4.fill(vdupq_n_s32(0));
+                let (w0, w1, w2, w3) = (batch_words(b), batch_words(b + 1), batch_words(b + 2), batch_words(b + 3));
+                sums4([&w0, &w1, &w2, &w3], a, nib, xs,
+                    [&mut acc[..], &mut acc2[..], &mut acc3[..], &mut acc4[..]],
+                    [&mut *y, &mut *y2, &mut *y3, &mut *y4],
+                    [&mut dev[..], &mut dev2[..], &mut dev3[..], &mut dev4[..]]);
+                finish_batch(&*y, &*dev, a, &mut *tail, &mut *targets[b]);
+                finish_batch(&*y2, &*dev2, a, &mut *tail, &mut *targets[b + 1]);
+                finish_batch(&*y3, &*dev3, a, &mut *tail, &mut *targets[b + 2]);
+                finish_batch(&*y4, &*dev4, a, &mut *tail, &mut *targets[b + 3]);
+                b += 4;
+            } else if rem >= 2 {
+                dev.fill(vdupq_n_s32(0));
+                dev2.fill(vdupq_n_s32(0));
+                let (w0, w1) = (batch_words(b), batch_words(b + 1));
+                sums2([&w0, &w1], a, nib, xs, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]]);
+                finish_batch(&*y, &*dev, a, &mut *tail, &mut *targets[b]);
+                finish_batch(&*y2, &*dev2, a, &mut *tail, &mut *targets[b + 1]);
+                b += 2;
             } else {
-                core::mem::swap(dev, dev2);
-                core::mem::swap(y, y2);
-            }
-            let target = &mut *targets[b];
-            // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
-            // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
-            let pv = vdupq_n_s16(p);
-            let mut base = [[0u16; LANES]; N];
-            for (k, b) in base.iter_mut().enumerate() {
-                let v = y[k];
-                let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
-                vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
-            }
-            // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
-            let tail = &mut *tail;
-            for k in 0..N / 2 {
-                let h = k + N / 2;
-                let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
-                let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
-                for d in 0..DIGITS {
-                    let (u, v) = lattice::WEIGHTS[d];
-                    let w = u + v;
-                    for half in 0..2 {
-                        let x = dev[d * 2 * N + 2 * k + half];
-                        let y = dev[d * 2 * N + 2 * h + half];
-                        let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
-                        let (i, j) = (2 * half, 2 * half + 1);
-                        lo[i] = vmlal_n_s32(lo[i], xl, u);
-                        lo[j] = vmlal_high_n_s32(lo[j], x, u);
-                        lo[i] = vmlsl_n_s32(lo[i], yl, v);
-                        lo[j] = vmlsl_high_n_s32(lo[j], y, v);
-                        hi[i] = vmlal_n_s32(hi[i], xl, v);
-                        hi[j] = vmlal_high_n_s32(hi[j], x, v);
-                        hi[i] = vmlal_n_s32(hi[i], yl, w);
-                        hi[j] = vmlal_high_n_s32(hi[j], y, w);
-                    }
-                }
-                for q in 0..4 {
-                    vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
-                    vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
-                }
-            }
-            // a partial batch has fewer than eight columns in `target`: only those lanes are written
-            for (c, column) in target.chunks_exact_mut(N).enumerate() {
-                for (k, o) in column.iter_mut().enumerate() {
-                    *o = crt(base[k][c] as u32, tail[k][c]);
-                }
+                dev.fill(vdupq_n_s32(0));
+                sums(&batch_words(b), a, m, nib, xs, acc, y, dev);
+                finish_batch(&*y, &*dev, a, &mut *tail, &mut *targets[b]);
+                b += 1;
             }
         }
     });

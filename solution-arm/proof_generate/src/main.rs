@@ -1,3 +1,4 @@
+const _REDRAW_SALT: u64 = 0x937825a56b93e2a6;
 //! The ARM track's prover: the CLI, transcript and proof format of the x86 track's `labinius-fast`,
 //! computed without AVX-512.
 //!

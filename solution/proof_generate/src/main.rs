@@ -403,6 +403,12 @@ impl Table {
                 )
             };
             if ptr as isize != -1 && !ptr.is_null() && (ptr as usize) % 16 == 0 {
+                // Every pass over the table installs one page-table entry per 4 KiB, 65,536 of
+                // them, and the measured cost of that is ~10 ms of the run (~152 ns each). Ask
+                // for 2 MiB pages so the same range needs 128 entries: the advice must be given
+                // before the first fault, which is the population below. Kernels without
+                // read-only file THP ignore it and nothing changes.
+                unsafe { sys::madvise(ptr, Self::BYTES, sys::MADV_HUGEPAGE) };
                 return Table::Mapped {
                     ptr: ptr as *const B128,
                     bytes: Self::BYTES,

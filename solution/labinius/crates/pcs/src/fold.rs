@@ -1572,26 +1572,9 @@ mod bitsliced {
     #[repr(C, align(64))]
     struct Aligned<T>(T);
 
-    const fn swap_index(mask: usize, value: usize) -> [u8; 64] {
-        let mut out = [0; 64];
-        let mut p = 0;
-        while p < 64 {
-            out[p] = (64 * ((p & mask != 0) as usize) + (p & !mask) + value) as u8;
-            p += 1;
-        }
-        out
-    }
-
-    static SWAPS: Aligned<[[[u8; 64]; 2]; 4]> = Aligned([
-        [swap_index(8, 0), swap_index(8, 8)],
-        [swap_index(4, 0), swap_index(4, 4)],
-        [swap_index(2, 0), swap_index(2, 2)],
-        [swap_index(1, 0), swap_index(1, 1)],
-    ]);
-
-    /// Exactly bitmat's byte transpose, specialized to four fixed rounds. Both the vector-slot
-    /// bit and the byte-position bit exchanged in round r are 3-r. Constant pair indices let
-    /// the compiler keep all sixteen vectors in registers instead of indexing a stack array.
+    /// Exactly bitmat's byte transpose, specialized to four fixed rounds: round r exchanges
+    /// the vector-slot bit 3-r with the byte-position bit 3-r. Constant pair indices let the
+    /// compiler keep all sixteen vectors in registers instead of indexing a stack array.
     #[inline(always)]
     unsafe fn transpose_tile(
         src: *const B128,
@@ -1603,29 +1586,55 @@ mod bitsliced {
         let mut z: [__m512i; 16] = core::array::from_fn(|i| {
             _mm512_loadu_si512((src as *const u8).add(64 * i) as *const __m512i)
         });
-        macro_rules! pair {
-            ($a:literal, $b:literal, $i0:ident, $i1:ident) => {{
-                let (a, b) = (z[$a], z[$b]);
-                z[$a] = _mm512_permutex2var_epi8(a, $i0, b);
-                z[$b] = _mm512_permutex2var_epi8(a, $i1, b);
-            }};
+        {
+            // The same four exchanges without byte permutes: exchanging byte-position bit
+            // 3 / 2 / 1 / 0 with the slot bit is a qword unpack, then a shift by 32 / 16 / 8
+            // bits plus a blend of the odd dwords / words / bytes (shifts on port 0, blends on
+            // ports 0 or 5, where the two-source byte permute costs several port-5 cycles).
+            macro_rules! unpack {
+                ($a:literal, $b:literal) => {{
+                    let (a, b) = (z[$a], z[$b]);
+                    z[$a] = _mm512_unpacklo_epi64(a, b);
+                    z[$b] = _mm512_unpackhi_epi64(a, b);
+                }};
+            }
+            macro_rules! shift {
+                ($a:literal, $b:literal, $sl:ident, $sr:ident, $blend:ident, $k:expr, $n:literal) => {{
+                    let (a, b) = (z[$a], z[$b]);
+                    z[$a] = $blend($k, a, $sl::<$n>(b));
+                    z[$b] = $blend($k, $sr::<$n>(a), b);
+                }};
+            }
+            unpack!(0, 8); unpack!(1, 9); unpack!(2, 10); unpack!(3, 11);
+            unpack!(4, 12); unpack!(5, 13); unpack!(6, 14); unpack!(7, 15);
+            let k = 0xAAAAu16;
+            shift!(0, 4, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(1, 5, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(2, 6, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(3, 7, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(8, 12, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(9, 13, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(10, 14, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            shift!(11, 15, _mm512_slli_epi64, _mm512_srli_epi64, _mm512_mask_blend_epi32, k, 32);
+            let k = 0xAAAA_AAAAu32;
+            shift!(0, 2, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(1, 3, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(4, 6, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(5, 7, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(8, 10, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(9, 11, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(12, 14, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            shift!(13, 15, _mm512_slli_epi32, _mm512_srli_epi32, _mm512_mask_blend_epi16, k, 16);
+            let k = 0xAAAA_AAAA_AAAA_AAAAu64;
+            shift!(0, 1, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(2, 3, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(4, 5, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(6, 7, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(8, 9, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(10, 11, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(12, 13, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
+            shift!(14, 15, _mm512_slli_epi16, _mm512_srli_epi16, _mm512_mask_blend_epi8, k, 8);
         }
-        let i0 = _mm512_load_si512(SWAPS.0[0][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[0][1].as_ptr() as *const __m512i);
-        pair!(0, 8, i0, i1); pair!(1, 9, i0, i1); pair!(2, 10, i0, i1); pair!(3, 11, i0, i1);
-        pair!(4, 12, i0, i1); pair!(5, 13, i0, i1); pair!(6, 14, i0, i1); pair!(7, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[1][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[1][1].as_ptr() as *const __m512i);
-        pair!(0, 4, i0, i1); pair!(1, 5, i0, i1); pair!(2, 6, i0, i1); pair!(3, 7, i0, i1);
-        pair!(8, 12, i0, i1); pair!(9, 13, i0, i1); pair!(10, 14, i0, i1); pair!(11, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[2][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[2][1].as_ptr() as *const __m512i);
-        pair!(0, 2, i0, i1); pair!(1, 3, i0, i1); pair!(4, 6, i0, i1); pair!(5, 7, i0, i1);
-        pair!(8, 10, i0, i1); pair!(9, 11, i0, i1); pair!(12, 14, i0, i1); pair!(13, 15, i0, i1);
-        let i0 = _mm512_load_si512(SWAPS.0[3][0].as_ptr() as *const __m512i);
-        let i1 = _mm512_load_si512(SWAPS.0[3][1].as_ptr() as *const __m512i);
-        pair!(0, 1, i0, i1); pair!(2, 3, i0, i1); pair!(4, 5, i0, i1); pair!(6, 7, i0, i1);
-        pair!(8, 9, i0, i1); pair!(10, 11, i0, i1); pair!(12, 13, i0, i1); pair!(14, 15, i0, i1);
         for i in 0..16 {
             let v = _mm512_permutexvar_epi8(
                 perm,
@@ -1659,6 +1668,9 @@ mod bitsliced {
         a
     });
 
+    /// Whether [`slice`] folds [`PERM`] into the first round of its qword transpose: one
+    /// two-source byte permute per pair of rows instead of a byte permute per row plus a qword
+    /// unpack, 128 fewer shuffle-port operations per 8 KB column-block (about 1/8 of slicing).
     /// Lane l corresponds to this source word. GFNI reverses the eight matrix rows; the byte
     /// transpose uses bitmat's public word permutation. No permutation is needed in the hot loop;
     /// [`write_block`] relies on its shape (lane `64 g + 16 k + r` is word `64 g + 4 (r ^ 7) + k`).

@@ -12,6 +12,13 @@ let vx=(old.0[band][tx][x]as u16|((old.0[band][tx][16+x]as u16)<<8))as i16;
 let vy=(old.0[band][ty][y]as u16|((old.0[band][ty][16+y]as u16)<<8))as i16;
 out[band][k][rr][0][n]=vx+vy;out[band][k][rr][1][n]=if rr==0{vy-vx}else{vx-vy};n+=1;}rr+=1;}k+=1;}band+=1;}SmsJointPairLut(out)}
 static SMS_JOINT_PAIR_LUT:SmsJointPairLut=sms_joint_pair_lut();
+// The same words split into low and high byte tables: a byte permute writes the low
+// byte everywhere and a masked byte permute writes the high byte of every word.
+#[repr(C,align(64))]struct SmsJointPairBytes([[[[[[u8;64];2];2];2];4];3]);
+const fn sms_joint_pair_bytes()->SmsJointPairBytes{let w=sms_joint_pair_lut();let mut out=[[[[[[0u8;64];2];2];2];4];3];let mut band=0;
+while band<3{let mut k=0;while k<4{let mut rr=0;while rr<2{let mut ab=0;while ab<2{let mut n=0;while n<64{let v=w.0[band][k][rr][ab][n] as u16;
+out[band][k][rr][ab][0][n]=v as u8;out[band][k][rr][ab][1][n]=(v>>8)as u8;n+=1;}ab+=1;}rr+=1;}k+=1;}band+=1;}SmsJointPairBytes(out)}
+static SMS_JOINT_PAIR_BYTES:SmsJointPairBytes=sms_joint_pair_bytes();
 #[repr(C,align(64))]struct SmsJointR0Lut([[[[u8;64];2];4];3]);
 const fn sms_joint_r0_lut()->SmsJointR0Lut{let old=sms_band_lut();let mut out=[[[[0u8;64];2];4];3];let mut band=0;while band<3{let mut k=0;while k<4{let mut i=0;while i<64{
 out[band][k][0][i]=old.0[band][12*k][(i&15)+16*((i>>4)&1)];
@@ -56,10 +63,11 @@ pub(crate) unsafe fn ntt_bin_batch32_sms_source<
             let lut=SMS_JOINT_R0_LUT.0.get_unchecked(band).get_unchecked(k).as_ptr()as *const u8;
             let l=|r:usize,ab:usize|_mm512_load_si512(lut.add(64*(r*2+ab))as *const __m512i);
             let(l000,l001)=(l(0,0),l(0,1));
-            let pair_band = SMS_JOINT_PAIR_LUT.0.get_unchecked(band).get_unchecked(k);
-            let pair=|r:usize,s:usize,h:usize|_mm512_load_si512(pair_band[r][s].as_ptr().add(32*h).cast());
+            let pair_band = SMS_JOINT_PAIR_BYTES.0.get_unchecked(band).get_unchecked(k);
+            let pair=|r:usize,s:usize,h:usize|_mm512_load_si512(pair_band[r][s][h].as_ptr().cast());
             let (a10,a11,b10,b11)=(pair(0,0,0),pair(0,0,1),pair(0,1,0),pair(0,1,1));
             let (a20,a21,b20,b21)=(pair(1,0,0),pair(1,0,1),pair(1,1,0),pair(1,1,1));
+            let lk=|lo:__m512i,n:__m512i,hi:__m512i|_mm512_mask_permutexvar_epi8(_mm512_permutexvar_epi8(n,lo),0xaaaa_aaaa_aaaa_aaaa,n,hi);
 
             if band == 0 {
                 for h in 0..core::hint::black_box(H) {
@@ -69,8 +77,8 @@ pub(crate) unsafe fn ntt_bin_batch32_sms_source<
                         let nx=ldb(ip,i);let ny=_mm512_srli_epi16::<4>(nx);let n1=ldb(ip,i+27);let n2=ldb(ip,i+54);
                         let x=_mm512_permutexvar_epi8(nx,l000);let y=_mm512_permutexvar_epi8(ny,l001);
                         let a0=_mm512_add_epi16(x,y);let b0=_mm512_sub_epi16(x,y);
-                        let a1=_mm512_permutex2var_epi16(a10,n1,a11);let b1=_mm512_permutex2var_epi16(b10,n1,b11);
-                        let a2=_mm512_permutex2var_epi16(a20,n2,a21);let b2=_mm512_permutex2var_epi16(b20,n2,b21);
+                        let a1=lk(a10,n1,a11);let b1=lk(b10,n1,b11);
+                        let a2=lk(a20,n2,a21);let b2=lk(b20,n2,b21);
 
                         let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
                         let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
@@ -91,8 +99,8 @@ pub(crate) unsafe fn ntt_bin_batch32_sms_source<
                         let nx=ldb(ip,i);let ny=_mm512_srli_epi16::<4>(nx);let n1=ldb(ip,i+27);let n2=ldb(ip,i+54);
                         let x=_mm512_permutexvar_epi8(nx,l000);let y=_mm512_permutexvar_epi8(ny,l001);
                         let a0=_mm512_add_epi16(x,y);let b0=_mm512_sub_epi16(x,y);
-                        let a1=_mm512_permutex2var_epi16(a10,n1,a11);let b1=_mm512_permutex2var_epi16(b10,n1,b11);
-                        let a2=_mm512_permutex2var_epi16(a20,n2,a21);let b2=_mm512_permutex2var_epi16(b20,n2,b21);
+                        let a1=lk(a10,n1,a11);let b1=lk(b10,n1,b11);
+                        let a2=lk(a20,n2,a21);let b2=lk(b20,n2,b21);
 
                         let (mut u0, u1, u2) = r3_folded(&c, a0, a1, a2);
                         let (mut v0, v1, v2) = r3_folded(&c, b0, b1, b2);

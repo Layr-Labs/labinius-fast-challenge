@@ -44,94 +44,74 @@ pub(crate) unsafe fn ntt_bin_batch32_sms_source<
         om: bc(&t.om[0]),
         omp: bc(&t.om[1]),
     };
-    let ips: [*const u8; H] = core::array::from_fn(|h| {
-        core::ptr::addr_of!((*idx.add(h)).rows).cast::<u8>()
-    });
+    let mut bv = bc(&t.bv);
     // Prefix blocks use the callback buffer's block-major layout. A leaf loads
     // all 27 input vectors before storing any output, so its pointers may alias.
-    let bps: [*mut i16; H] = core::array::from_fn(|h| wbuf.add(32 * 27 * h));
     let buf = |kk: usize| -> [*mut i16; H] { core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk % 6) + h))) };
     let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
 
     for k in 0..4 {
         if FUSED&&k==0{for h in 0..core::hint::black_box(H){fill(h,idx.add(h));}}
         for band in 0..core::hint::black_box(3usize){
-            let lut=SMS_JOINT_R0_LUT.0[band][k].as_ptr()as *const u8;
+            let lut=SMS_JOINT_R0_LUT.0.get_unchecked(band).get_unchecked(k).as_ptr()as *const u8;
             let l=|r:usize,ab:usize|_mm512_load_si512(lut.add(64*(r*2+ab))as *const __m512i);
             let(l000,l001)=(l(0,0),l(0,1));
-            let pair=|r:usize,s:usize,h:usize|_mm512_load_si512(SMS_JOINT_PAIR_LUT.0[band][k][r][s].as_ptr().add(32*h).cast());
+            let pair_band = SMS_JOINT_PAIR_LUT.0.get_unchecked(band).get_unchecked(k);
+            let pair=|r:usize,s:usize,h:usize|_mm512_load_si512(pair_band[r][s].as_ptr().add(32*h).cast());
             let (a10,a11,b10,b11)=(pair(0,0,0),pair(0,0,1),pair(0,1,0),pair(0,1,1));
             let (a20,a21,b20,b21)=(pair(1,0,0),pair(1,0,1),pair(1,1,0),pair(1,1,1));
 
-            match band{
-0=>{for h in 0..core::hint::black_box(H){let(ip,bp)=(ips[h],bps[h]);
-                for i in 9*band..9*band+9 {
-                    let nx=ldb(ip,i);let ny=_mm512_srli_epi16::<4>(nx);let n1=ldb(ip,i+27);let n2=ldb(ip,i+54);
-                    let x=_mm512_permutexvar_epi8(nx,l000);let y=_mm512_permutexvar_epi8(ny,l001);
-                    let a0=_mm512_add_epi16(x,y);let b0=_mm512_sub_epi16(x,y);
-                    let a1=_mm512_permutex2var_epi16(a10,n1,a11);let b1=_mm512_permutex2var_epi16(b10,n1,b11);
-                    let a2=_mm512_permutex2var_epi16(a20,n2,a21);let b2=_mm512_permutex2var_epi16(b20,n2,b21);
+            if band == 0 {
+                for h in 0..core::hint::black_box(H) {
+                    let ip = core::ptr::addr_of!((*idx.add(h)).rows).cast::<u8>();
+                    let bp = wbuf.add(32 * 27 * h);
+                    for i in 0..9 {
+                        let nx=ldb(ip,i);let ny=_mm512_srli_epi16::<4>(nx);let n1=ldb(ip,i+27);let n2=ldb(ip,i+54);
+                        let x=_mm512_permutexvar_epi8(nx,l000);let y=_mm512_permutexvar_epi8(ny,l001);
+                        let a0=_mm512_add_epi16(x,y);let b0=_mm512_sub_epi16(x,y);
+                        let a1=_mm512_permutex2var_epi16(a10,n1,a11);let b1=_mm512_permutex2var_epi16(b10,n1,b11);
+                        let a2=_mm512_permutex2var_epi16(a20,n2,a21);let b2=_mm512_permutex2var_epi16(b20,n2,b21);
 
-                    let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
-                    let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
-                    st(bp, i, u0);
-                    st(bp, i + 27 * H, u1);
-                    st(bp, i + 54 * H, u2);
-                    st(bp, i + 81 * H, v2);
-                    st(bp, i + 108 * H, v0);
-                    st(bp, i + 135 * H, v1);
+                        let (u0, u1, u2) = r3_folded(&c, a0, a1, a2);
+                        let (v0, v1, v2) = r3_folded(&c, b0, b1, b2);
+                        st(bp, i, u0);
+                        st(bp, i + 27 * H, u1);
+                        st(bp, i + 54 * H, u2);
+                        st(bp, i + 81 * H, v2);
+                        st(bp, i + 108 * H, v0);
+                        st(bp, i + 135 * H, v1);
+                    }
                 }
-}},
-1=>{for h in 0..core::hint::black_box(H){let(ip,bp)=(ips[h],bps[h]);
-                for i in 9*band..9*band+9 {
-                    let nx=ldb(ip,i);let ny=_mm512_srli_epi16::<4>(nx);let n1=ldb(ip,i+27);let n2=ldb(ip,i+54);
-                    let x=_mm512_permutexvar_epi8(nx,l000);let y=_mm512_permutexvar_epi8(ny,l001);
-                    let a0=_mm512_add_epi16(x,y);let b0=_mm512_sub_epi16(x,y);
-                    let a1=_mm512_permutex2var_epi16(a10,n1,a11);let b1=_mm512_permutex2var_epi16(b10,n1,b11);
-                    let a2=_mm512_permutex2var_epi16(a20,n2,a21);let b2=_mm512_permutex2var_epi16(b20,n2,b21);
+            } else {
+                core::arch::asm!("/* {0} */", inout(zmm_reg) bv, options(pure, nomem, nostack, preserves_flags));
+                for h in 0..core::hint::black_box(H) {
+                    let ip = core::ptr::addr_of!((*idx.add(h)).rows).cast::<u8>();
+                    let bp = wbuf.add(32 * 27 * h);
+                    for i in 9*band..9*band+9 {
+                        let nx=ldb(ip,i);let ny=_mm512_srli_epi16::<4>(nx);let n1=ldb(ip,i+27);let n2=ldb(ip,i+54);
+                        let x=_mm512_permutexvar_epi8(nx,l000);let y=_mm512_permutexvar_epi8(ny,l001);
+                        let a0=_mm512_add_epi16(x,y);let b0=_mm512_sub_epi16(x,y);
+                        let a1=_mm512_permutex2var_epi16(a10,n1,a11);let b1=_mm512_permutex2var_epi16(b10,n1,b11);
+                        let a2=_mm512_permutex2var_epi16(a20,n2,a21);let b2=_mm512_permutex2var_epi16(b20,n2,b21);
 
-                    let (mut u0, u1, u2) = r3_folded(&c, a0, a1, a2);
-                    let (mut v0, v1, v2) = r3_folded(&c, b0, b1, b2);
-                    let reciprocal=bc(&t.bv);
-                    u0=_mm512_sub_epi16(u0,_mm512_mullo_epi16(_mm512_mulhrs_epi16(u0,reciprocal),c.q));
-                    v0=_mm512_sub_epi16(v0,_mm512_mullo_epi16(_mm512_mulhrs_epi16(v0,reciprocal),c.q));
-                    st(bp, i, u0);
-                    st(bp, i + 27 * H, u1);
-                    st(bp, i + 54 * H, u2);
-                    st(bp, i + 81 * H, v2);
-                    st(bp, i + 108 * H, v0);
-                    st(bp, i + 135 * H, v1);
+                        let (mut u0, u1, u2) = r3_folded(&c, a0, a1, a2);
+                        let (mut v0, v1, v2) = r3_folded(&c, b0, b1, b2);
+                        u0=_mm512_sub_epi16(u0,_mm512_mullo_epi16(_mm512_mulhrs_epi16(u0,bv),c.q));
+                        v0=_mm512_sub_epi16(v0,_mm512_mullo_epi16(_mm512_mulhrs_epi16(v0,bv),c.q));
+                        st(bp, i, u0);
+                        st(bp, i + 27 * H, u1);
+                        st(bp, i + 54 * H, u2);
+                        st(bp, i + 81 * H, v2);
+                        st(bp, i + 108 * H, v0);
+                        st(bp, i + 135 * H, v1);
+                    }
                 }
-}},
-2=>{for h in 0..core::hint::black_box(H){let(ip,bp)=(ips[h],bps[h]);
-                for i in 9*band..9*band+9 {
-                    let nx=ldb(ip,i);let ny=_mm512_srli_epi16::<4>(nx);let n1=ldb(ip,i+27);let n2=ldb(ip,i+54);
-                    let x=_mm512_permutexvar_epi8(nx,l000);let y=_mm512_permutexvar_epi8(ny,l001);
-                    let a0=_mm512_add_epi16(x,y);let b0=_mm512_sub_epi16(x,y);
-                    let a1=_mm512_permutex2var_epi16(a10,n1,a11);let b1=_mm512_permutex2var_epi16(b10,n1,b11);
-                    let a2=_mm512_permutex2var_epi16(a20,n2,a21);let b2=_mm512_permutex2var_epi16(b20,n2,b21);
-
-                    let (mut u0, u1, u2) = r3_folded(&c, a0, a1, a2);
-                    let (mut v0, v1, v2) = r3_folded(&c, b0, b1, b2);
-                    let reciprocal=bc(&t.bv);
-                    u0=_mm512_sub_epi16(u0,_mm512_mullo_epi16(_mm512_mulhrs_epi16(u0,reciprocal),c.q));
-                    v0=_mm512_sub_epi16(v0,_mm512_mullo_epi16(_mm512_mulhrs_epi16(v0,reciprocal),c.q));
-                    st(bp, i, u0);
-                    st(bp, i + 27 * H, u1);
-                    st(bp, i + 54 * H, u2);
-                    st(bp, i + 81 * H, v2);
-                    st(bp, i + 108 * H, v0);
-                    st(bp, i + 135 * H, v1);
-                }
-}},
-_=>unreachable!(),}
-
+            }
         }
         let cv = t.cv.as_ptr() as *const i16;
         let tail_blocks = core::hint::black_box(6usize);
         for j in 0..tail_blocks {
             let kk = 6 * k + j;
-            let os = buf(kk);
             let (t4, t5, t6) = if Q == 9721 {
                 (SMS_BAND_T4.0.as_ptr().add(4 * kk).cast::<u32>(),
                 SMS_TWIDDLES.t5.as_ptr().add(12 * kk).cast::<u32>(),
@@ -142,8 +122,8 @@ _=>unreachable!(),}
                 t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
                 ) };
             for h in 0..core::hint::black_box(H) {
-                let bpj = os[h];
-                if Q==9721 {if SPARSE512 {if j==0{tail27_sms_band0_leaf(bpj,os[h],t4,t5,t6,cv);}else if j==4{tail27_sms_band4_leaf(bpj,os[h],t4,t5,t6,cv);}else{tail27_scaled_leaf(bpj,os[h],t4,t5,t6,cv);}}else{tail27_relocated_leaf(bpj,os[h],t4,t5,t6,cv);}} else {tail27_out_of_line::<Q>(bpj, os[h], t4, t5, t6, cv);}
+                let bpj = wbuf.add(32 * 27 * (H * j + h));
+                if Q==9721 {if SPARSE512 {if j==0{tail27_sms_band0_leaf(bpj,bpj,t4,t5,t6,cv);}else if j==4{tail27_sms_band4_leaf(bpj,bpj,t4,t5,t6,cv);}else{tail27_scaled_leaf(bpj,bpj,t4,t5,t6,cv);}}else{tail27_relocated_leaf(bpj,bpj,t4,t5,t6,cv);}} else {tail27_out_of_line::<Q>(bpj, bpj, t4, t5, t6, cv);}
             }
         }
         for j in 0..6 {

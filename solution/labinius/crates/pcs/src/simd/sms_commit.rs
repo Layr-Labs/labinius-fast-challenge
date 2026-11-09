@@ -488,23 +488,25 @@ unsafe fn sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *m
 impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
     #[inline(always)]
     unsafe fn rows_inline(&self, blk: usize, w0: *const i16, r0: usize, r1: usize) {
+        let j0 = 27 * blk + r0;
+        let mut k = self.k.add(j0 * STREAMS * LOCK);
+        let mut a = self.acc.add(j0 * STREAMS * 16);
+        let mut b = self.b.add(j0 * DIGITS);
+        let f_scale = _mm512_load_si512(FOLD.0.as_ptr() as *const __m512i);
+        let f_sign = _mm512_load_si512(FOLD.0.as_ptr().add(16) as *const __m512i);
         for i in r0..r1 {
-            let j = 27 * blk + i;
             let x: [__m512i; LOCK] = core::array::from_fn(|h| _mm512_load_si512((w0.add(32 * 27 * h) as *const __m512i).add(i)));
-            let k = self.k.add(j * STREAMS * LOCK);
-            let a = self.acc.add(j * STREAMS * 16);
             if PREFETCH_SLOTS > 0 {
-                let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
-                let hi = lo + STREAMS * LOCK * 4;
-                let mut p = (lo + 63) & !63;
-                while p < hi {
-                    _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
-                    p += 64;
-                }
+                let pf = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as *const i8;
+                _mm_prefetch::<_MM_HINT_T0>(pf);
+                _mm_prefetch::<_MM_HINT_T0>(pf.wrapping_add(64));
+                _mm_prefetch::<_MM_HINT_T0>(pf.wrapping_add(128));
+                _mm_prefetch::<_MM_HINT_T0>(pf.wrapping_add(192));
             }
             macro_rules! call {
                 ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
-                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                    core::arch::asm!(concat!($m!($mode), "/* {f} {fs} {fx} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                        fs = in(zmm_reg) f_scale, fx = in(zmm_reg) f_sign,
                         $($xn = in(zmm_reg) x[$xi],)*
                         out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
                         out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
@@ -512,8 +514,9 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             }
             macro_rules! call_first {
                 ($m:ident, $mode:ident, $($xn:ident = $xi:expr),*) => {
-                    core::arch::asm!(concat!($m!($mode), "/* {f} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
-                        b = in(reg) self.b.add(j * DIGITS),
+                    core::arch::asm!(concat!($m!($mode), "/* {f} {fs} {fx} */"), a = in(reg) a, k = in(reg) k, f = in(reg) FOLD.0.as_ptr(),
+                        fs = in(zmm_reg) f_scale, fx = in(zmm_reg) f_sign,
+                        b = in(reg) b,
                         $($xn = in(zmm_reg) x[$xi],)*
                         out("zmm20") _, out("zmm21") _, out("zmm22") _, out("zmm23") _, out("zmm24") _, out("zmm25") _,
                         out("zmm26") _, out("zmm27") _, out("zmm28") _, out("zmm29") _, out("k1") _, options(nostack, preserves_flags))
@@ -530,6 +533,11 @@ impl<const RED: bool, const FIRST: bool> Sink<RED, FIRST> {
             } else {
                 if RED { call!(sms_slot4, reduce, x0 = 0, x1 = 1, x2 = 2, x3 = 3) }
                 else { call!(sms_slot4, plain, x0 = 0, x1 = 1, x2 = 2, x3 = 3) }
+            }
+            k = k.add(STREAMS * LOCK);
+            a = a.add(STREAMS * 16);
+            if FIRST {
+                b = b.add(DIGITS);
             }
         }
     }

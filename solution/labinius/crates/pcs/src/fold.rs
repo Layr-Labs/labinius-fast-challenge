@@ -1593,7 +1593,13 @@ mod bitsliced {
     /// bit and the byte-position bit exchanged in round r are 3-r. Constant pair indices let
     /// the compiler keep all sixteen vectors in registers instead of indexing a stack array.
     #[inline(always)]
-    unsafe fn transpose_tile(src: *const B128, dst: *mut __m512i) {
+    unsafe fn transpose_tile(
+        src: *const B128,
+        tiles_ptr: *mut __m512i,
+        t: usize,
+        perm: __m512i,
+        ident: __m512i,
+    ) {
         let mut z: [__m512i; 16] = core::array::from_fn(|i| {
             _mm512_loadu_si512((src as *const u8).add(64 * i) as *const __m512i)
         });
@@ -1621,7 +1627,11 @@ mod bitsliced {
         pair!(0, 1, i0, i1); pair!(2, 3, i0, i1); pair!(4, 5, i0, i1); pair!(6, 7, i0, i1);
         pair!(8, 9, i0, i1); pair!(10, 11, i0, i1); pair!(12, 13, i0, i1); pair!(14, 15, i0, i1);
         for i in 0..16 {
-            _mm512_store_si512(dst.add(i), z[i]);
+            let v = _mm512_permutexvar_epi8(
+                perm,
+                _mm512_gf2p8affine_epi64_epi8::<0>(ident, z[i]),
+            );
+            _mm512_store_si512(tiles_ptr.add(8 * i + t), v);
         }
     }
 
@@ -1665,23 +1675,18 @@ mod bitsliced {
     /// prefetchers only start on after the first misses, and the table comes from DRAM.
     #[inline(always)]
     unsafe fn slice(words: *const B128, out: *mut __m512i, next: *const B128) {
-        let mut tiles = core::mem::MaybeUninit::<[[__m512i; 16]; 8]>::uninit();
+        let mut tiles = core::mem::MaybeUninit::<[[__m512i; 8]; 16]>::uninit();
         let tiles_ptr = tiles.as_mut_ptr() as *mut __m512i;
+        let perm = _mm512_load_si512(PERM.0.as_ptr() as *const __m512i);
+        let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
         for t in 0..8 {
             for i in 0..16 {
                 _mm_prefetch::<{ _MM_HINT_T0 }>((next as *const i8).add(1024 * t + 64 * i));
             }
-            transpose_tile(words.add(64 * t), tiles_ptr.add(16 * t));
+            transpose_tile(words.add(64 * t), tiles_ptr, t, perm, ident);
         }
-        let perm = _mm512_load_si512(PERM.0.as_ptr() as *const __m512i);
-        let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
         for b in 0..16 {
-            let rows = core::array::from_fn(|t| {
-                _mm512_permutexvar_epi8(
-                    perm,
-                    _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_load_si512(tiles_ptr.add(16 * t + b))),
-                )
-            });
+            let rows = core::array::from_fn(|t| _mm512_load_si512(tiles_ptr.add(8 * b + t)));
             let planes = transpose8x8_q(rows);
             for p in 0..8 {
                 _mm512_store_si512(out.add(8 * b + p), planes[p]);
@@ -2116,6 +2121,7 @@ mod bitsliced {
     }
 
     // Direct full-accumulator output from PR162; valid only for the one-part path.
+    #[inline(never)]
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
     unsafe fn write_acc<const WIRE: bool>(
         acc: *const __m512i,
@@ -2133,6 +2139,7 @@ mod bitsliced {
         let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
         let idx0 = _mm512_load_si512(INTERLEAVE.0[0].as_ptr() as *const __m512i);
         let idx1 = _mm512_load_si512(INTERLEAVE.0[1].as_ptr() as *const __m512i);
+        #[cfg(test)]
         let mut overflow = 0u32;
         for s0 in (0..OUT_SLOTS).step_by(8) {
             let n = (OUT_SLOTS - s0).min(8);
@@ -2156,53 +2163,43 @@ mod bitsliced {
                 }));
             }
             for g in 0..LANES / 64 {
-                macro_rules! row {
-                    ($ds:literal) => {{
-                        let s = (s0 + $ds).min(OUT_SLOTS - 1);
-                        let below = s < 81;
-                        let t = if below { 162 + s } else { s + 81 };
-                        let bs = _mm512_set1_epi16(*bias.get_unchecked(s) as i16);
-                        let bt = _mm512_set1_epi16(*bias.get_unchecked(t) as i16);
-                        let sl = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, s_lo[$ds][g]));
-                        let sh = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, s_hi[$ds][g]));
-                        let tl = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, t_lo[$ds][g]));
-                        let th = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, t_hi[$ds][g]));
-                        let cs0 = _mm512_unpacklo_epi8(sl, sh);
-                        let cs1 = _mm512_unpackhi_epi8(sl, sh);
-                        let ct0 = _mm512_unpacklo_epi8(tl, th);
-                        let ct1 = _mm512_unpackhi_epi8(tl, th);
+                let mut r0_buf = [zero; 8];
+                let mut r1_buf = [zero; 8];
+                for ds in 0..8 {
+                    let s = (s0 + ds).min(OUT_SLOTS - 1);
+                    let below = s < 81;
+                    let t = if below { 162 + s } else { s + 81 };
+                    let bs = _mm512_set1_epi16(*bias.get_unchecked(s) as i16);
+                    let bt = _mm512_set1_epi16(*bias.get_unchecked(t) as i16);
+                    let sl = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, s_lo[ds][g]));
+                    let sh = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, s_hi[ds][g]));
+                    let tl = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, t_lo[ds][g]));
+                    let th = _mm512_gf2p8affine_epi64_epi8::<0>(ident, _mm512_permutexvar_epi8(perm, t_hi[ds][g]));
+                    let cs0 = _mm512_unpacklo_epi8(sl, sh);
+                    let cs1 = _mm512_unpackhi_epi8(sl, sh);
+                    let ct0 = _mm512_unpacklo_epi8(tl, th);
+                    let ct1 = _mm512_unpackhi_epi8(tl, th);
 
-                        let x0 = _mm512_sub_epi16(cs0, bs);
-                        let y0 = if below { _mm512_sub_epi16(bt, ct0) } else { _mm512_sub_epi16(ct0, bt) };
-                        let v0 = _mm512_add_epi16(x0, y0);
+                    let x0 = _mm512_sub_epi16(cs0, bs);
+                    let y0 = if below { _mm512_sub_epi16(bt, ct0) } else { _mm512_sub_epi16(ct0, bt) };
+                    let v0 = _mm512_add_epi16(x0, y0);
+                    #[cfg(test)]
+                    {
                         overflow |= _mm512_cmpneq_epi16_mask(v0, _mm512_adds_epi16(x0, y0));
+                    }
 
-                        let x1 = _mm512_sub_epi16(cs1, bs);
-                        let y1 = if below { _mm512_sub_epi16(bt, ct1) } else { _mm512_sub_epi16(ct1, bt) };
-                        let v1 = _mm512_add_epi16(x1, y1);
+                    let x1 = _mm512_sub_epi16(cs1, bs);
+                    let y1 = if below { _mm512_sub_epi16(bt, ct1) } else { _mm512_sub_epi16(ct1, bt) };
+                    let v1 = _mm512_add_epi16(x1, y1);
+                    #[cfg(test)]
+                    {
                         overflow |= _mm512_cmpneq_epi16_mask(v1, _mm512_adds_epi16(x1, y1));
+                    }
 
-                        (
-                            _mm512_permutex2var_epi16(v0, idx0, v1),
-                            _mm512_permutex2var_epi16(v0, idx1, v1),
-                        )
-                    }};
+                    r0_buf[ds] = _mm512_permutex2var_epi16(v0, idx0, v1);
+                    r1_buf[ds] = _mm512_permutex2var_epi16(v0, idx1, v1);
                 }
-                let (r0_0, r1_0) = row!(0);
-                let (r0_1, r1_1) = row!(1);
-                let (r0_2, r1_2) = row!(2);
-                let (r0_3, r1_3) = row!(3);
-                let (r0_4, r1_4) = row!(4);
-                let (r0_5, r1_5) = row!(5);
-                let (r0_6, r1_6) = row!(6);
-                let (r0_7, r1_7) = row!(7);
-                for (h, rows) in [
-                    [r0_0, r0_1, r0_2, r0_3, r0_4, r0_5, r0_6, r0_7],
-                    [r1_0, r1_1, r1_2, r1_3, r1_4, r1_5, r1_6, r1_7],
-                ]
-                .into_iter()
-                .enumerate()
-                {
+                for (h, rows) in [r0_buf, r1_buf].into_iter().enumerate() {
                     let t = transpose8x8_q(rows);
                     for j in 0..8 {
                         let e = 16 * g + 8 * h + 7 - j;
@@ -2232,6 +2229,7 @@ mod bitsliced {
                 }
             }
         }
+        #[cfg(test)]
         assert!(overflow == 0, "integer fold overflow");
     }
 

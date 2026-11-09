@@ -483,9 +483,8 @@ unsafe extern "C" {
     fn sched_getaffinity(pid:i32,size:usize,mask:*mut usize)->i32;
     fn sched_setaffinity(pid:i32,size:usize,mask:*const usize)->i32;
 }
-/// The first allowed logical CPU of each physical core, from `/proc/cpuinfo`: read once (the
-/// kernel samples every CPU's frequency to print it), by [`warm_topology`] off the critical
-/// path when the caller arranges it.
+/// The first allowed logical CPU of each physical core ([`read_core_cpus`]): read once, by
+/// [`warm_topology`] off the critical path when the caller arranges it.
 #[cfg(target_os="linux")]
 fn physical_cores()->Option<&'static [usize]> {
     static FIRST:std::sync::OnceLock<Option<Vec<usize>>>=std::sync::OnceLock::new();
@@ -505,6 +504,45 @@ pub fn warm_topology() {
 }
 #[cfg(target_os="linux")]
 fn read_core_cpus()->Option<Vec<Vec<usize>>> {
+    #[cfg(target_arch="x86_64")]
+    if let Some(cores)=read_core_cpus_cpuid() {return Some(cores);}
+    read_core_cpus_proc()
+}
+/// The same grouping from CPUID leaf 0xB on each allowed CPU: the x2APIC ID without its SMT
+/// bits names the physical core (package included), as the kernel's own `core id` does.
+/// Reading `/proc/cpuinfo` makes 5.x kernels sample every CPU's clock, a ~10-20 ms sleep
+/// that the commitment's placement otherwise waits on. Cores and their CPUs stay in
+/// ascending CPU order, the order `/proc/cpuinfo` lists them in.
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+fn read_core_cpus_cpuid()->Option<Vec<Vec<usize>>> {
+    use core::arch::x86_64::{__cpuid,__cpuid_count};
+    if unsafe {__cpuid(0)}.eax<0xb {return None;}
+    let mut allowed=[0usize;16];
+    if unsafe {sched_getaffinity(0,std::mem::size_of_val(&allowed),allowed.as_mut_ptr())} !=0 {return None;}
+    let bits=usize::BITS as usize;
+    let cpus:Vec<usize>=(0..allowed.len()*bits).filter(|&c| allowed[c/bits]&(1usize<<(c%bits))!=0).collect();
+    let mut keys=Vec::with_capacity(cpus.len());
+    for &cpu in &cpus {
+        let mut one=[0usize;16];
+        one[cpu/bits]=1usize<<(cpu%bits);
+        if unsafe {sched_setaffinity(0,std::mem::size_of_val(&one),one.as_ptr())} !=0 {break;}
+        let l=unsafe {__cpuid_count(0xb,0)};
+        if l.ebx&0xffff==0 {break;}
+        keys.push(l.edx>>(l.eax&0x1f));
+    }
+    unsafe {sched_setaffinity(0,std::mem::size_of_val(&allowed),allowed.as_ptr());}
+    if keys.len()!=cpus.len() {return None;}
+    let mut cores:Vec<(u32,Vec<usize>)>=Vec::new();
+    for (&cpu,&key) in cpus.iter().zip(&keys) {
+        match cores.iter_mut().find(|c|c.0==key) {
+            Some(c)=>c.1.push(cpu),
+            None=>cores.push((key,vec![cpu])),
+        }
+    }
+    Some(cores.into_iter().map(|c|c.1).collect())
+}
+#[cfg(target_os="linux")]
+fn read_core_cpus_proc()->Option<Vec<Vec<usize>>> {
         let mut allowed=[0usize;16];
         if unsafe {sched_getaffinity(0,std::mem::size_of_val(&allowed),allowed.as_mut_ptr())} !=0 {return None;}
         let info=std::fs::read_to_string("/proc/cpuinfo").ok()?;
@@ -584,6 +622,12 @@ impl CorePlacement {
 #[cfg(all(test,target_os="linux"))]
 mod affinity_tests {
     use super::*;
+    #[cfg(target_arch="x86_64")]
+    #[test]
+    fn cpuid_topology_matches_proc_cpuinfo() {
+        let (Some(a),Some(b))=(read_core_cpus_cpuid(),read_core_cpus_proc()) else {return};
+        assert_eq!(a,b);
+    }
     #[test]
     fn temporary_affinity_restores_the_original_mask() {
         let mut original=[0usize;16];

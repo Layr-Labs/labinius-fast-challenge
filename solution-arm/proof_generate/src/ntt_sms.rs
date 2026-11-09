@@ -1406,7 +1406,18 @@ mod leap_bench {
             unsafe { pass_d::<PB, false>(&mut a, kern, &[], &mut []); pass_d_asm(&mut b, kern); }
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
-            assert_eq!(x, y);
+            congruent_within(x, y);
+        }
+    }
+
+    /// The generated passes reduce with [`Kernel::r13`] lookups where the Rust passes use
+    /// [`reduce_round13`]: the same values modulo `p`, and the generated ones within the
+    /// Rust pass's output bound (the lookup's own bound is the smaller).
+    fn congruent_within(x: &[[i16; 8]], y: &[[i16; 8]]) {
+        let bound = crate::ntt::lut_transform_bound(P1, crate::ntt::SCHEDULES[PB]) as i64;
+        for (u, v) in x.iter().flatten().zip(y.iter().flatten()) {
+            assert_eq!((*u as i64 - *v as i64).rem_euclid(P1 as i64), 0);
+            assert!((*v as i64).abs() <= bound, "{v} above {bound}");
         }
     }
 
@@ -1437,13 +1448,15 @@ mod leap_bench {
         let mut st = 13u64;
         for _ in 0..50 {
             let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
-            let raw: Vec<i16> = (0..N * 8).map(|_| crate::ntt::tests::xorshift(&mut st) as i16).collect();
+            // inputs within the table front's output bound (levels 0 to 3)
+            let bound = crate::ntt::lut_level3_bound(P1, crate::ntt::SCHEDULES[PB]) as u64;
+            let raw: Vec<i16> = (0..N * 8).map(|_| ((crate::ntt::tests::xorshift(&mut st) % (2 * bound + 1)) as i64 - bound as i64) as i16).collect();
             for (i, v) in a.iter_mut().enumerate() { *v = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) }; }
             let mut b = a.clone();
             unsafe { pass_c::<4>(&mut a, kern); pass_c_asm(&mut b, kern); }
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
-            assert_eq!(x, y);
+            congruent_within(x, y);
         }
     }
 

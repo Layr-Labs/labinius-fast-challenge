@@ -19,9 +19,12 @@ def build(nodes):
     def A(op, a, b):
         d = v(op); ins.append(Ins('A', [d], [a, b], f'{op} v{{d0}}.8h, v{{s0}}.8h, v{{s1}}.8h')); return d
     def red13(a):
-        sh, r = v('sh'), v('red')
-        ins.append(Ins('S', [sh], [a], 'srshr v{d0}.8h, v{s0}.8h, #13'))
-        ins.append(Ins('M', [r], [a, sh, 'k'], 'mls v{d0}.8h, v{s1}.8h, v{s2}.h[0]', tie=0))
+        # x - r13[x >> 13]: the multiple of p nearest the middle of x's 8192-wide bucket, from
+        # a table lookup on any vector pipe instead of an mls on the two multiply pipes
+        sh, m, r = v('sh'), v('m'), v('red')
+        ins.append(Ins('S', [sh], [a], 'ushr v{d0}.8h, v{s0}.8h, #13'))
+        ins.append(Ins('A', [m], [sh, 'TAB13'], 'tbl z{d0}.h, {{{{z{s1}.h}}}}, z{s0}.h'))
+        ins.append(Ins('A', [r], [a, m], 'sub v{d0}.8h, v{s0}.8h, v{s1}.8h'))
         return r
     def bfly(a, b, c, t, o):
         b1 = mulc(b, t, o, o + 1); c1 = mulc(c, t, o + 2, o + 3)
@@ -58,11 +61,11 @@ def build(nodes):
             g += 1
     return ins, low
 def emit(per=2, K=8, B=27):
-    out = ['"ldr q15, [{kp}]",']
+    out = ['"ldr q15, [{kp}]",', '"ldr q14, [{rt}]",']
     for c in range(0, 24, per):
         ins, low = build(list(range(c, c + per)))
-        seq, cyc = schedule(ins, skew=K, budget=B)
-        asm, live = allocate(seq, {'k': 15}, low)
+        seq, cyc = schedule(ins, skew=K, budget=B, cap=30)
+        asm, live = allocate(seq, {'k': 15, 'TAB13': 14}, low)
         out += [f'"{a.replace("XPTR", "{x}").replace("CPTR", "{c}")}",' for a in asm]
     return '\n'.join(out)
 if __name__ == '__main__':

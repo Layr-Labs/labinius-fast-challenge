@@ -54,6 +54,13 @@ pub struct Kernel {
     /// `[1, tau, z_0, z_0 tau, z_0^2, z_0^2 tau]`. The other child's twiddles
     /// are `(1 + eps) z_0` and `eps z_0^2`, so its butterfly shares these lookups.
     lut: [[[i16; 16]; 6]; 4],
+    /// The multiplication-free form of [`reduce_round13`] in the generated passes: entry `t` is the
+    /// multiple of `p` nearest the middle of the `i16` bucket whose top three bits are `t`
+    /// (`x >> 13` as unsigned), so `x - r13[x >> 13]` is congruent to `x` with
+    /// `|x - r13[x >> 13]| <= 4096 + p / 2`, below [`reduce_round13`]'s `4096 + 4 (p - 8192)`
+    /// for 9721; a lookup (SVE `tbl`, any vector pipe) instead of `mls` on the two multiply
+    /// pipes. Only prime 9721's is used (the others' would not fit `i16`, and wrap).
+    pub r13: [i16; 8],
 }
 
 fn twiddle(p: u32, w: u64) -> [i16; 2] {
@@ -136,6 +143,11 @@ impl Kernel {
             d,
             v32: ((1u64 << 32) / p as u64).div_ceil(2) as i32,
             lut,
+            r13: core::array::from_fn(|t| {
+                let floor = if t < 4 { t as i64 } else { t as i64 - 8 };
+                let middle = 8192 * floor + 4096;
+                (((2 * middle + p as i64).div_euclid(2 * p as i64)) * p as i64) as i16
+            }),
         }
     }
 }

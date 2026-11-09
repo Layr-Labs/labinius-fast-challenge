@@ -400,8 +400,10 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
     }
 }
 
-/// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 16;
+/// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators. Twelve
+/// (four sweeps per chunk) keeps the sweep buffer at 1.0 MB instead of 1.33 MB, so it and the
+/// sweep's key tiles share the 2 MB L2 of Neoverse V2 better; measured faster than 16 on Axion.
+const SINK: usize = 12;
 /// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);

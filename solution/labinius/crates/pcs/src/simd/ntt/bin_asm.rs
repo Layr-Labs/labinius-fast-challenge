@@ -1555,3 +1555,5 @@ include!("sms_tail.rs");
 include!("source_batched.rs");
 
 include!("source_sms_joint.rs");
+
+include!("source_sms_r3pair.rs");

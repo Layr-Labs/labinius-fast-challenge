@@ -782,7 +782,34 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
 
 #[path = "ntt_neon_asm.rs"]
 mod asm;
-pub use asm::{pass_c_asm, pass_d_asm, pass_lut_asm};
+pub use asm::{pass_c_asm, pass_d_asm, pass_d_limbs_asm, pass_lut_asm};
+
+/// [`pass_d`] whose outputs go out as `SMMLA` operands instead of back into `x`: slot `s` to
+/// `out + s stride` as the eight lanes' low bytes, then their rounded high bytes, `v = lo + 256 hi`
+/// with `hi = (v + 128) >> 8` and `lo` the low byte read as signed (exact while `|v| < 32640`).
+#[inline(always)]
+unsafe fn pass_d_limbs<const S: usize>(x: &[int16x8_t; N], kern: &Kernel, out: *mut int8x16_t, stride: usize) {
+    let s: Schedule = schedule(S);
+    let k = vld1q_s16(kern.k.as_ptr());
+    #[inline(always)]
+    unsafe fn compute(x: &[int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, q: usize) -> [int16x8_t; 6] {
+        let t = vld1q_s16(kern.d[q].as_ptr());
+        let mut v: [int16x8_t; 6] = core::array::from_fn(|i| load(x, 6 * q + i));
+        reduce_inputs(&mut v, s.before[6], s.cheap, &[0, 3], k);
+        let (y0, y1, y2) = r3!(s, 0, 1, 2, 3, v[0], v[1], v[2], t, k);
+        let (y3, y4, y5) = r3!(s, 4, 5, 6, 7, v[3], v[4], v[5], t, k);
+        [y0, y1, y2, y3, y4, y5]
+    }
+    for q in (0..N / 6).step_by(3) {
+        let ys = [compute(x, s, kern, k, q), compute(x, s, kern, k, q + 1), compute(x, s, kern, k, q + 2)];
+        for (d, y) in ys.iter().enumerate() {
+            let base = 6 * (q + d);
+            for (i, &v) in y.iter().enumerate() {
+                *out.add((base + i) * stride) = vrshrn_high_n_s16::<8>(vmovn_s16(v), v);
+            }
+        }
+    }
+}
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].

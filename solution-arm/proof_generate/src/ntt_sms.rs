@@ -57,15 +57,16 @@ const TERMS: i64 = 836;
 // every chunk digit sum and its mean fit in i32 with room: |S| <= CHUNK * TERMS * 32
 const _: () = assert!((CHUNK as i64) * TERMS * (lattice::MAX_DIGIT_ABS as i64) * 4 < i32::MAX as i64);
 
-/// The SMS matrix: in the transform domain, slot `j` of row `r` of element `m` is
-/// `data[(((m / 8) N + j) ROWS + r) 8 + m % 8]`, centered residues, so that one vector holds the
-/// eight elements of a tile, each residue negated because the forward kernel transforms `-s` and
+/// The SMS matrix: in the transform domain, slot `j` of row `r` of element `m` is the centered
+/// residue split into the byte limbs of [`key_limbs`], at the 16-byte unit [`key_at`]`(m / 8, j, r)`
+/// of `data` (low byte at `m % 8`, high byte at `8 + m % 8`), so that one `SMMLA` operand holds the
+/// eight elements of an octet, each residue negated because the forward kernel transforms `-s` and
 /// multiplied by [`KEY_SCALE`] `= 324^-1` so that the inverses need no `1 / r`; per chunk and digit
 /// the centered residue
 /// of the mean modulo 9721; and the weighted sum of all means modulo `M`.
 pub struct SmsMatrix {
     pub elements: usize,
-    pub data: std::borrow::Cow<'static, [i16]>,
+    pub data: std::borrow::Cow<'static, [i8]>,
     /// `mean_residues[(c DIGITS + d) N + coefficient]`.
     pub mean_residues: std::borrow::Cow<'static, [i16]>,
     /// `sum_{d, c} W_d mean_{d,c} mod M`, by coefficient.
@@ -148,7 +149,7 @@ impl SmsMatrix {
     pub fn from_images(data: &'static [u8], means: &'static [u8], mu: &'static [u8], meta: &'static [u8], digits: &'static [u8], mean_int: &'static [u8], threshold: &'static [u8], elements: usize) -> Option<SmsMatrix> {
         let chunks = elements.div_ceil(CHUNK);
         let data = key_copy(data).unwrap_or(data);
-        let data = view::<i16>(data, ROWS * elements.div_ceil(LOCK) * LOCK * N)?;
+        let data = view::<i8>(data, key_len(elements))?;
         let mean_residues = view::<i16>(means, chunks * DIGITS * N)?;
         let mu = view::<u32>(mu, N)?;
         let digits = view::<i8>(digits, elements * DIGITS * N)?;
@@ -171,7 +172,7 @@ impl SmsMatrix {
         let mut meta = self.margin.to_le_bytes().to_vec();
         meta.extend_from_slice(&self.column_failure.to_le_bytes());
         [
-            self.data.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            self.data.iter().map(|&v| v as u8).collect(),
             self.mean_residues.iter().flat_map(|v| v.to_le_bytes()).collect(),
             self.mu.iter().flat_map(|v| v.to_le_bytes()).collect(),
             meta,
@@ -315,10 +316,10 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
         })
         .collect();
     let mu = mu.into_iter().map(|v| v.rem_euclid(TAIL as i64) as u32).collect();
-    // the transformed rows, eight elements per vector
-    let mut data = vec![0i16; elements.div_ceil(LOCK) * N * ROWS * LOCK];
+    // the transformed rows, eight elements per vector, then as SMMLA limbs per sweep
+    let mut tiles = vec![0i16; elements.div_ceil(LOCK) * N * ROWS * LOCK];
     let raw = &raw;
-    for_blocks(&mut data, N * ROWS * LOCK, 1, workers, |first, block| {
+    for_blocks(&mut tiles, N * ROWS * LOCK, 1, workers, |first, block| {
         let mut lanes = vec![[0i16; 8]; N];
         let lanes: &mut [[i16; 8]; N] = (&mut lanes[..]).try_into().unwrap();
         for (g, batch) in block.chunks_exact_mut(N * ROWS * LOCK).enumerate() {
@@ -339,6 +340,23 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
             }
         }
     });
+    let mut data = vec![0i8; key_len(elements)];
+    let tiles = &tiles;
+    for_blocks(&mut data, N * OCT * ROWS * 16, 1, workers, |first, block| {
+        for (w, sweep) in block.chunks_exact_mut(N * OCT * ROWS * 16).enumerate() {
+            let g0 = (first + w) * OCT;
+            for o in 0..OCT.min(elements.div_ceil(LOCK) - g0) {
+                let g = g0 + o;
+                for j in 0..N {
+                    for r in 0..ROWS {
+                        let k: &[i16; LOCK] = tiles[((g * N + j) * ROWS + r) * LOCK..][..LOCK].try_into().unwrap();
+                        let at = (key_at(g, j, r) - key_at(g0, 0, 0)) * 16;
+                        sweep[at..at + 16].copy_from_slice(&key_limbs(k));
+                    }
+                }
+            }
+        }
+    });
     use std::borrow::Cow::Owned;
     SmsMatrix { elements, data: Owned(data), mean_residues: Owned(mean_residues), mu: Owned(mu), digits: Owned(digits), mean_int: Owned(mean_int), threshold: Owned(threshold), margin, column_failure }
 }
@@ -351,304 +369,440 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
 const KEY_SCALE: i64 = crate::ntt::pow_mod(super::FOLD as u64, P1 as u64 - 2, P1 as u64) as i64;
 const _: () = assert!(KEY_SCALE * super::FOLD as i64 % P1 as i64 == 1 && KEY_SCALE == 9691);
 
-/// Elements per vector of the key image, and of a tile of the slot-wise products.
+/// Elements per lane vector of a transform and per key octet: eight elements of one column.
 const LOCK: usize = 8;
-/// Elements transformed per pass over the accumulators: two tiles, so that each accumulator is
-/// read and written once per two tiles.
-const PASS: usize = 2 * LOCK;
-const _: () = assert!(CHUNK % PASS == 0);
+/// Element octets per sweep of [`sink`] over the accumulators.
+const OCT: usize = 16;
+/// Elements transformed per sweep: each accumulator is read and written once per sweep.
+const SWEEP: usize = OCT * LOCK;
+const _: () = assert!(CHUNK % SWEEP == 0);
 
-/// The accumulators of slot `s`, row `r`: `acc[idx..idx + 4]`, two columns per `i64` pair.
+/// The accumulators of slot `s`, row `r`, column `c`: `acc[idx(s, r) + c]`, the four `i32` limb
+/// sums `(lo lo, lo hi, hi lo, hi hi)` of `SMMLA` (transform limbs times key limbs).
 #[inline(always)]
 const fn idx(s: usize, r: usize) -> usize {
-    (s * ROWS + r) * 4
+    (s * ROWS + r) * LANES
 }
 
-/// `acc[q] += ` the four-term dot product per `i64` lane of `a[q]` with the low half of `key`, and
-/// of `b[q]` with the high half: SVE's indexed halfword `sdot`, eight products an instruction.
-/// With SVE the sums go through [`slot_sink`]; this is the reference for its operand order.
-#[cfg(target_feature = "sve")]
-#[allow(dead_code)]
-#[inline(always)]
-unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: int16x8_t) {
-    let (mut s0, mut s1, mut s2, mut s3) = (*acc, *acc.add(1), *acc.add(2), *acc.add(3));
-    core::arch::asm!(
-        "sdot z0.d, z4.h, z12.h[0]", "sdot z1.d, z5.h, z12.h[0]",
-        "sdot z2.d, z6.h, z12.h[0]", "sdot z3.d, z7.h, z12.h[0]",
-        "sdot z0.d, z8.h, z12.h[1]", "sdot z1.d, z9.h, z12.h[1]",
-        "sdot z2.d, z10.h, z12.h[1]", "sdot z3.d, z11.h, z12.h[1]",
-        inout("v0") s0, inout("v1") s1, inout("v2") s2, inout("v3") s3,
-        in("v4") a[0], in("v5") a[1], in("v6") a[2], in("v7") a[3],
-        in("v8") b[0], in("v9") b[1], in("v10") b[2], in("v11") b[3],
-        in("v12") key,
-        options(pure, nomem, nostack, preserves_flags)
-    );
-    (*acc, *acc.add(1), *acc.add(2), *acc.add(3)) = (s0, s1, s2, s3);
-}
-
-/// The same sums without SVE, for development on other AArch64 hosts.
-#[cfg(not(target_feature = "sve"))]
-#[inline(always)]
-unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: int16x8_t) {
-    let (k0, k1) = (vget_low_s16(key), vget_high_s16(key));
-    for q in 0..4 {
-        let pair = |v: int16x8_t, k: int16x4_t| {
-            let (lo, hi) = (vmull_s16(vget_low_s16(v), k), vmull_s16(vget_high_s16(v), k));
-            vcombine_s64(vdup_n_s64(vaddlvq_s32(lo)), vdup_n_s64(vaddlvq_s32(hi)))
-        };
-        *acc.add(q) = vaddq_s64(vaddq_s64(*acc.add(q), pair(a[q], k0)), pair(b[q], k1));
+/// One octet's eight key entries (centered residues) as an `SMMLA` operand: the low bytes, then
+/// the rounded high bytes, `k = lo + 256 hi` with `|hi| <= 19`.
+fn key_limbs(k: &[i16; LOCK]) -> [i8; 16] {
+    let mut out = [0i8; 16];
+    for (e, &v) in k.iter().enumerate() {
+        let hi = (v as i32 + 128) >> 8;
+        out[e] = (v as i32 - 256 * hi) as i8;
+        out[LOCK + e] = hi as i8;
     }
+    out
 }
 
-/// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 16;
-/// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
-const SWEEP: usize = SINK * LOCK;
-const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
+/// Offset in `i8x16` units of key octet `g` (elements `8 g..8 g + 8`), slot `s`, row `r`: sweeps
+/// of [`OCT`] octets, slot-major within a sweep, so that one slot's keys of a sweep are one
+/// contiguous run.
+#[inline(always)]
+const fn key_at(g: usize, s: usize, r: usize) -> usize {
+    (((g / OCT) * N + s) * OCT + g % OCT) * ROWS + r
+}
 
-/// [`slot_sink`]'s body; `$rows13` and `$rows46` start rows 1-3 (v20-v31) and rows 4-6
-/// (v16-v27): loaded from `acc`, or zeroed for a chunk's first sweep ([`slot_sink_fresh`]).
-#[cfg(target_feature = "sve")]
-macro_rules! slot_sink_body {
-    ($acc:expr, $z:expr, $k:expr, $groups:expr, [$($rows13:literal),*], [$($rows46:literal),*]) => {
-        core::arch::asm!(
-        "ldp q16, q17, [{a}, #0]",
-        "ldp q18, q19, [{a}, #32]",
-        $($rows13,)*
-        "mov {zp}, {z}",
-        "mov {kp}, {k}",
-        "mov {n}, {g}",
+/// Bytes of the key image of `elements` elements: whole sweeps, zero past the last element.
+pub const fn key_len(elements: usize) -> usize {
+    elements.div_ceil(SWEEP) * N * OCT * ROWS * 16
+}
+
+
+/// The transform buffer of a sweep: slot `s`, column `c`, octet `o` at `s XSTRIDE + c OCT + o`, the
+/// transform's byte limbs ([`super::pass_d_limbs`]): the octets of one column run on, so that four
+/// consecutive transforms of a column fill each other's cache lines.
+const XS_LEN: usize = N * XSTRIDE;
+/// Vectors between slots of the transform buffer: one 64-byte line more than the slot's data, so
+/// that the 648 lines a transform writes do not alias to a few L1 sets (a 2 KiB stride maps them
+/// to 8 of the 256).
+const XSTRIDE: usize = OCT * LANES + 4;
+// the generated level 6 (`gen/emit.py`, `pass_d_limbs`) writes slots 2112 bytes apart
+const _: () = assert!(XSTRIDE * 16 == 2112);
+
+/// `acc +=` every slot's products of the sweep's first `groups` octets of transforms `xs` with
+/// the sweep's keys `keys` (its first octet's [`key_at`]): `SMMLA`, all seven rows of three, three
+/// and two columns at a time, the sums register-resident over the octets, so that each transform
+/// vector is read once. With `FRESH` (a chunk's first sweep) the digit rows' sums are overwritten
+/// instead of added to, so the chunk end needs no zeroing pass; the base row always accumulates.
+/// An octet past the column's end has zero keys.
+#[inline(never)]
+unsafe fn sink<const FRESH: bool>(xs: *const int8x16_t, keys: *const int8x16_t, acc: &mut [int32x4_t], groups: usize) {
+    debug_assert!(acc.len() == ROWS * LANES * N && (1..=OCT).contains(&groups));
+    const _: () = assert!(ROWS == 7 && LANES == 8);
+    for s in 0..N {
+        let base = acc.as_mut_ptr().add(idx(s, 0));
+        let xb = xs.add(s * XSTRIDE);
+        let k0 = keys.add(s * OCT * ROWS);
+        for c0 in [0usize, 3] {
+            let (a, x, k) = (base.add(c0), xb.add(c0 * OCT), k0);
+            if FRESH {
+                core::arch::asm!(
+        "ldr q0, [{a}, #0]",
+        "ldr q1, [{a}, #16]",
+        "ldr q2, [{a}, #32]",
+        "movi v3.16b, #0",
+        "movi v4.16b, #0",
+        "movi v5.16b, #0",
+        "movi v6.16b, #0",
+        "movi v7.16b, #0",
+        "movi v8.16b, #0",
+        "movi v9.16b, #0",
+        "movi v10.16b, #0",
+        "movi v11.16b, #0",
+        "movi v12.16b, #0",
+        "movi v13.16b, #0",
+        "movi v14.16b, #0",
+        "movi v15.16b, #0",
+        "movi v16.16b, #0",
+        "movi v17.16b, #0",
+        "movi v18.16b, #0",
+        "movi v19.16b, #0",
+        "movi v20.16b, #0",
         "2:",
-        "ldp q0, q1, [{kp}]",
-        "ldp q2, q3, [{kp}, #32]",
-        "ldr q4, [{zp}]",
-        "ldr q5, [{zp}, #{xs1}]",
-        "ldr q6, [{zp}, #{xs2}]",
-        "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
-        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
-        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
-        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
-        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
-        "ldr q4, [{zp}]",
-        "ldr q5, [{zp}, #{xs1}]",
-        "ldr q6, [{zp}, #{xs2}]",
-        "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
-        "add {kp}, {kp}, {ks}",
-        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
-        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        "ldr q22, [{x}, #{c1}]",
+        "ldr q23, [{x}, #{c2}]",
+        "ldr q21, [{x}], #16",
+        "ld1 {{v24.16b, v25.16b, v26.16b, v27.16b}}, [{k}], #64",
+        "ld1 {{v28.16b, v29.16b, v30.16b}}, [{k}], #48",
+        "smmla v0.4s, v21.16b, v24.16b",
+        "smmla v1.4s, v22.16b, v24.16b",
+        "smmla v2.4s, v23.16b, v24.16b",
+        "smmla v3.4s, v21.16b, v25.16b",
+        "smmla v4.4s, v22.16b, v25.16b",
+        "smmla v5.4s, v23.16b, v25.16b",
+        "smmla v6.4s, v21.16b, v26.16b",
+        "smmla v7.4s, v22.16b, v26.16b",
+        "smmla v8.4s, v23.16b, v26.16b",
+        "smmla v9.4s, v21.16b, v27.16b",
+        "smmla v10.4s, v22.16b, v27.16b",
+        "smmla v11.4s, v23.16b, v27.16b",
+        "smmla v12.4s, v21.16b, v28.16b",
+        "smmla v13.4s, v22.16b, v28.16b",
+        "smmla v14.4s, v23.16b, v28.16b",
+        "smmla v15.4s, v21.16b, v29.16b",
+        "smmla v16.4s, v22.16b, v29.16b",
+        "smmla v17.4s, v23.16b, v29.16b",
+        "smmla v18.4s, v21.16b, v30.16b",
+        "smmla v19.4s, v22.16b, v30.16b",
+        "smmla v20.4s, v23.16b, v30.16b",
         "subs {n}, {n}, #1",
         "b.ne 2b",
-        "stp q16, q17, [{a}, #0]",
-        "stp q18, q19, [{a}, #32]",
-        "stp q20, q21, [{a}, #64]",
-        "stp q22, q23, [{a}, #96]",
-        "stp q24, q25, [{a}, #128]",
-        "stp q26, q27, [{a}, #160]",
-        "stp q28, q29, [{a}, #192]",
-        "stp q30, q31, [{a}, #224]",
-        $($rows46,)*
-        "mov {zp}, {z}",
-        "mov {kp}, {k}",
-        "mov {n}, {g}",
-        "3:",
-        "ldp q0, q1, [{kp}, #64]",
-        "ldr q2, [{kp}, #96]",
-        "ldr q4, [{zp}]",
-        "ldr q5, [{zp}, #{xs1}]",
-        "ldr q6, [{zp}, #{xs2}]",
-        "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
-        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
-        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
-        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
-        "ldr q4, [{zp}]",
-        "ldr q5, [{zp}, #{xs1}]",
-        "ldr q6, [{zp}, #{xs2}]",
-        "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
-        "add {kp}, {kp}, {ks}",
-        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
-        "subs {n}, {n}, #1",
-        "b.ne 3b",
-        "stp q16, q17, [{a}, #256]",
-        "stp q18, q19, [{a}, #288]",
-        "stp q20, q21, [{a}, #320]",
-        "stp q22, q23, [{a}, #352]",
-        "stp q24, q25, [{a}, #384]",
-        "stp q26, q27, [{a}, #416]",
-            a = in(reg) $acc,
-            z = in(reg) $z,
-            k = in(reg) $k,
-            g = in(reg) $groups,
-            xs4 = in(reg) 4 * XS,
-            ks = in(reg) KS,
-            xs1 = const XS,
-            xs2 = const 2 * XS,
-            xs3 = const 3 * XS,
-            zp = out(reg) _,
-            kp = out(reg) _,
-            n = out(reg) _,
-            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
-            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
-            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
-            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
-            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+        "str q0, [{a}, #0]",
+        "str q1, [{a}, #16]",
+        "str q2, [{a}, #32]",
+        "str q3, [{a}, #128]",
+        "str q4, [{a}, #144]",
+        "str q5, [{a}, #160]",
+        "str q6, [{a}, #256]",
+        "str q7, [{a}, #272]",
+        "str q8, [{a}, #288]",
+        "str q9, [{a}, #384]",
+        "str q10, [{a}, #400]",
+        "str q11, [{a}, #416]",
+        "str q12, [{a}, #512]",
+        "str q13, [{a}, #528]",
+        "str q14, [{a}, #544]",
+        "str q15, [{a}, #640]",
+        "str q16, [{a}, #656]",
+        "str q17, [{a}, #672]",
+        "str q18, [{a}, #768]",
+        "str q19, [{a}, #784]",
+        "str q20, [{a}, #800]",
+            a = in(reg) a,
+            x = inout(reg) x => _,
+            k = inout(reg) k => _,
+            n = inout(reg) groups => _,
+            c1 = const OCT * 16,
+            c2 = const 2 * OCT * 16,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _, out("v6") _, out("v7") _, out("v8") _, out("v9") _, out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v14") _, out("v15") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _, out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _, out("v30") _,
             options(nostack)
-        )
-    };
-}
-
-/// The register-resident sink for one slot (from 4381e86b's `sve::slot_sink`, after arm-big's
-/// `slot_chunk`): `acc(s, r) +=` the slot's products summed over `groups` key tiles (eight
-/// elements each) of transforms starting at `z` (transform stride `XS`, the [`pass_words`] lane
-/// order), keys starting at `k` (tile stride `KS`). Rows 0-3, then rows 4-6, keep their sums in
-/// v16-v31 across all the tiles: one load and one store per sum per sweep. The key halves are
-/// `sdot`'s indexed operand exactly as in [`dot`]: transforms `0..4` of a tile with key elements
-/// `0..4` (`[0]`), transforms `4..8` with `4..8` (`[1]`). `groups >= 1`.
-#[cfg(target_feature = "sve")]
-#[inline(never)]
-unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
-    const XS: usize = N * 16;
-    const KS: usize = N * ROWS * LOCK * 2;
-    debug_assert!((1..=SINK).contains(&groups));
-    slot_sink_body!(acc, z, k, groups, ["ldp q20, q21, [{a}, #64]", "ldp q22, q23, [{a}, #96]", "ldp q24, q25, [{a}, #128]", "ldp q26, q27, [{a}, #160]", "ldp q28, q29, [{a}, #192]", "ldp q30, q31, [{a}, #224]"], ["ldp q16, q17, [{a}, #256]", "ldp q18, q19, [{a}, #288]", "ldp q20, q21, [{a}, #320]", "ldp q22, q23, [{a}, #352]", "ldp q24, q25, [{a}, #384]", "ldp q26, q27, [{a}, #416]"]);
-}
-
-/// [`slot_sink`] for a chunk's first sweep: the digit rows' sums (rows 1-6) start from zero instead
-/// of being loaded, and are stored as usual, so the chunk end needs no zeroing pass; the base
-/// row (row 0) accumulates as in [`slot_sink`].
-#[cfg(target_feature = "sve")]
-#[inline(never)]
-unsafe fn slot_sink_fresh(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
-    const XS: usize = N * 16;
-    const KS: usize = N * ROWS * LOCK * 2;
-    debug_assert!((1..=SINK).contains(&groups));
-    slot_sink_body!(acc, z, k, groups, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
-}
-
-/// `acc +=` the products of the first `groups` tiles of `xs` (transforms `8 g..8 g + 8` of tile
-/// `g`) with the key tiles at `keys` (`N ROWS LOCK` entries apart), every slot and row; the sums of
-/// [`dot`] per tile, in another order. A tile past the column's end has zero keys. With `FRESH` (a
-/// chunk's first sweep) the digit rows' sums are overwritten instead of added to, so the chunk end
-/// needs no zeroing pass; the base row always accumulates.
-#[inline(never)]
-unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
-    debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
-    let accp = acc.as_mut_ptr();
-    #[cfg(target_feature = "sve")]
-    {
-        let z = xs.as_ptr() as *const int16x8_t;
-        for s in 0..N {
-            if FRESH {
-                slot_sink_fresh(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+        );
             } else {
-                slot_sink(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+                core::arch::asm!(
+        "ldr q0, [{a}, #0]",
+        "ldr q1, [{a}, #16]",
+        "ldr q2, [{a}, #32]",
+        "ldr q3, [{a}, #128]",
+        "ldr q4, [{a}, #144]",
+        "ldr q5, [{a}, #160]",
+        "ldr q6, [{a}, #256]",
+        "ldr q7, [{a}, #272]",
+        "ldr q8, [{a}, #288]",
+        "ldr q9, [{a}, #384]",
+        "ldr q10, [{a}, #400]",
+        "ldr q11, [{a}, #416]",
+        "ldr q12, [{a}, #512]",
+        "ldr q13, [{a}, #528]",
+        "ldr q14, [{a}, #544]",
+        "ldr q15, [{a}, #640]",
+        "ldr q16, [{a}, #656]",
+        "ldr q17, [{a}, #672]",
+        "ldr q18, [{a}, #768]",
+        "ldr q19, [{a}, #784]",
+        "ldr q20, [{a}, #800]",
+        "2:",
+        "ldr q22, [{x}, #{c1}]",
+        "ldr q23, [{x}, #{c2}]",
+        "ldr q21, [{x}], #16",
+        "ld1 {{v24.16b, v25.16b, v26.16b, v27.16b}}, [{k}], #64",
+        "ld1 {{v28.16b, v29.16b, v30.16b}}, [{k}], #48",
+        "smmla v0.4s, v21.16b, v24.16b",
+        "smmla v1.4s, v22.16b, v24.16b",
+        "smmla v2.4s, v23.16b, v24.16b",
+        "smmla v3.4s, v21.16b, v25.16b",
+        "smmla v4.4s, v22.16b, v25.16b",
+        "smmla v5.4s, v23.16b, v25.16b",
+        "smmla v6.4s, v21.16b, v26.16b",
+        "smmla v7.4s, v22.16b, v26.16b",
+        "smmla v8.4s, v23.16b, v26.16b",
+        "smmla v9.4s, v21.16b, v27.16b",
+        "smmla v10.4s, v22.16b, v27.16b",
+        "smmla v11.4s, v23.16b, v27.16b",
+        "smmla v12.4s, v21.16b, v28.16b",
+        "smmla v13.4s, v22.16b, v28.16b",
+        "smmla v14.4s, v23.16b, v28.16b",
+        "smmla v15.4s, v21.16b, v29.16b",
+        "smmla v16.4s, v22.16b, v29.16b",
+        "smmla v17.4s, v23.16b, v29.16b",
+        "smmla v18.4s, v21.16b, v30.16b",
+        "smmla v19.4s, v22.16b, v30.16b",
+        "smmla v20.4s, v23.16b, v30.16b",
+        "subs {n}, {n}, #1",
+        "b.ne 2b",
+        "str q0, [{a}, #0]",
+        "str q1, [{a}, #16]",
+        "str q2, [{a}, #32]",
+        "str q3, [{a}, #128]",
+        "str q4, [{a}, #144]",
+        "str q5, [{a}, #160]",
+        "str q6, [{a}, #256]",
+        "str q7, [{a}, #272]",
+        "str q8, [{a}, #288]",
+        "str q9, [{a}, #384]",
+        "str q10, [{a}, #400]",
+        "str q11, [{a}, #416]",
+        "str q12, [{a}, #512]",
+        "str q13, [{a}, #528]",
+        "str q14, [{a}, #544]",
+        "str q15, [{a}, #640]",
+        "str q16, [{a}, #656]",
+        "str q17, [{a}, #672]",
+        "str q18, [{a}, #768]",
+        "str q19, [{a}, #784]",
+        "str q20, [{a}, #800]",
+            a = in(reg) a,
+            x = inout(reg) x => _,
+            k = inout(reg) k => _,
+            n = inout(reg) groups => _,
+            c1 = const OCT * 16,
+            c2 = const 2 * OCT * 16,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _, out("v6") _, out("v7") _, out("v8") _, out("v9") _, out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v14") _, out("v15") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _, out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _, out("v30") _,
+            options(nostack)
+        );
             }
         }
-    }
-    #[cfg(not(target_feature = "sve"))]
-    for g in 0..groups {
-        let tile = keys.add(g * N * ROWS * LOCK);
-        for s in 0..N {
-            let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *xs[LOCK * g + i].get_unchecked(s));
-            let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
-            for r in 0..ROWS {
-                if FRESH && g == 0 && r > 0 {
-                    for q in 0..4 {
-                        *accp.add(idx(s, r) + q) = vdupq_n_s64(0);
-                    }
-                }
-                dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
-            }
+        let (a, x, k) = (base.add(6), xb.add(6 * OCT), k0);
+        if FRESH {
+            core::arch::asm!(
+        "ldr q0, [{a}, #0]",
+        "ldr q1, [{a}, #16]",
+        "movi v2.16b, #0",
+        "movi v3.16b, #0",
+        "movi v4.16b, #0",
+        "movi v5.16b, #0",
+        "movi v6.16b, #0",
+        "movi v7.16b, #0",
+        "movi v8.16b, #0",
+        "movi v9.16b, #0",
+        "movi v10.16b, #0",
+        "movi v11.16b, #0",
+        "movi v12.16b, #0",
+        "movi v13.16b, #0",
+        "2:",
+        "ldr q22, [{x}, #{c1}]",
+        "ldr q21, [{x}], #16",
+        "ld1 {{v24.16b, v25.16b, v26.16b, v27.16b}}, [{k}], #64",
+        "ld1 {{v28.16b, v29.16b, v30.16b}}, [{k}], #48",
+        "smmla v0.4s, v21.16b, v24.16b",
+        "smmla v1.4s, v22.16b, v24.16b",
+        "smmla v2.4s, v21.16b, v25.16b",
+        "smmla v3.4s, v22.16b, v25.16b",
+        "smmla v4.4s, v21.16b, v26.16b",
+        "smmla v5.4s, v22.16b, v26.16b",
+        "smmla v6.4s, v21.16b, v27.16b",
+        "smmla v7.4s, v22.16b, v27.16b",
+        "smmla v8.4s, v21.16b, v28.16b",
+        "smmla v9.4s, v22.16b, v28.16b",
+        "smmla v10.4s, v21.16b, v29.16b",
+        "smmla v11.4s, v22.16b, v29.16b",
+        "smmla v12.4s, v21.16b, v30.16b",
+        "smmla v13.4s, v22.16b, v30.16b",
+        "subs {n}, {n}, #1",
+        "b.ne 2b",
+        "str q0, [{a}, #0]",
+        "str q1, [{a}, #16]",
+        "str q2, [{a}, #128]",
+        "str q3, [{a}, #144]",
+        "str q4, [{a}, #256]",
+        "str q5, [{a}, #272]",
+        "str q6, [{a}, #384]",
+        "str q7, [{a}, #400]",
+        "str q8, [{a}, #512]",
+        "str q9, [{a}, #528]",
+        "str q10, [{a}, #640]",
+        "str q11, [{a}, #656]",
+        "str q12, [{a}, #768]",
+        "str q13, [{a}, #784]",
+            a = in(reg) a,
+            x = inout(reg) x => _,
+            k = inout(reg) k => _,
+            n = inout(reg) groups => _,
+            c1 = const OCT * 16,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _, out("v6") _, out("v7") _, out("v8") _, out("v9") _, out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v21") _, out("v22") _, out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _, out("v30") _,
+            options(nostack)
+        );
+        } else {
+            core::arch::asm!(
+        "ldr q0, [{a}, #0]",
+        "ldr q1, [{a}, #16]",
+        "ldr q2, [{a}, #128]",
+        "ldr q3, [{a}, #144]",
+        "ldr q4, [{a}, #256]",
+        "ldr q5, [{a}, #272]",
+        "ldr q6, [{a}, #384]",
+        "ldr q7, [{a}, #400]",
+        "ldr q8, [{a}, #512]",
+        "ldr q9, [{a}, #528]",
+        "ldr q10, [{a}, #640]",
+        "ldr q11, [{a}, #656]",
+        "ldr q12, [{a}, #768]",
+        "ldr q13, [{a}, #784]",
+        "2:",
+        "ldr q22, [{x}, #{c1}]",
+        "ldr q21, [{x}], #16",
+        "ld1 {{v24.16b, v25.16b, v26.16b, v27.16b}}, [{k}], #64",
+        "ld1 {{v28.16b, v29.16b, v30.16b}}, [{k}], #48",
+        "smmla v0.4s, v21.16b, v24.16b",
+        "smmla v1.4s, v22.16b, v24.16b",
+        "smmla v2.4s, v21.16b, v25.16b",
+        "smmla v3.4s, v22.16b, v25.16b",
+        "smmla v4.4s, v21.16b, v26.16b",
+        "smmla v5.4s, v22.16b, v26.16b",
+        "smmla v6.4s, v21.16b, v27.16b",
+        "smmla v7.4s, v22.16b, v27.16b",
+        "smmla v8.4s, v21.16b, v28.16b",
+        "smmla v9.4s, v22.16b, v28.16b",
+        "smmla v10.4s, v21.16b, v29.16b",
+        "smmla v11.4s, v22.16b, v29.16b",
+        "smmla v12.4s, v21.16b, v30.16b",
+        "smmla v13.4s, v22.16b, v30.16b",
+        "subs {n}, {n}, #1",
+        "b.ne 2b",
+        "str q0, [{a}, #0]",
+        "str q1, [{a}, #16]",
+        "str q2, [{a}, #128]",
+        "str q3, [{a}, #144]",
+        "str q4, [{a}, #256]",
+        "str q5, [{a}, #272]",
+        "str q6, [{a}, #384]",
+        "str q7, [{a}, #400]",
+        "str q8, [{a}, #512]",
+        "str q9, [{a}, #528]",
+        "str q10, [{a}, #640]",
+        "str q11, [{a}, #656]",
+        "str q12, [{a}, #768]",
+        "str q13, [{a}, #784]",
+            a = in(reg) a,
+            x = inout(reg) x => _,
+            k = inout(reg) k => _,
+            n = inout(reg) groups => _,
+            c1 = const OCT * 16,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _, out("v6") _, out("v7") _, out("v8") _, out("v9") _, out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v21") _, out("v22") _, out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _, out("v30") _,
+            options(nostack)
+        );
         }
     }
 }
 
-/// The eight witness pointers of transform `t` of a pass starting at element `e`, in dot-product
-/// lane order: lane `4 l + k` of transform `4 h + q` is column `2 q + l` of element `e + 4 h + k`.
-/// Each lane is an independent transform, so a 64-bit lane then holds one column's four elements
-/// and `sdot` reads it directly, with no transpose. Elements past the column read as zero.
+/// The eight witness pointers of the transform of octet `o` (elements `e + 8 o..e + 8 o + 8`) of
+/// column `c`: lane `k` is element `e + 8 o + k`. Elements past the column read as zero.
 #[inline(always)]
-unsafe fn pass_words(words: &[(*const u8, usize); LANES], elements: usize, e: usize, t: usize) -> [*const u8; LANES] {
-    let (h, q) = (t / 4, t % 4);
-    core::array::from_fn(|lane| {
-        let (l, k) = (lane / 4, lane % 4);
-        let element = e + 4 * h + k;
-        let (w, stride) = words[2 * q + l];
+unsafe fn octet_words(words: &[(*const u8, usize); LANES], elements: usize, e: usize, c: usize) -> [*const u8; LANES] {
+    let (w, stride) = words[c];
+    core::array::from_fn(|k| {
+        let element = e + k;
         if element < elements { w.add(element * stride) } else { ZERO_WORDS.as_ptr() as *const u8 }
     })
 }
 
-/// The centered residue of a sum below `2^41` in magnitude. Binary64 holds such a sum exactly and
-/// its quotient by 9721 to far better than half a unit, so the rounded quotient is off by at most
-/// one half step: `|result| <= 4861`.
-#[inline(always)]
-unsafe fn narrow_sum(v: int64x2_t) -> int32x2_t {
-    const _: () = assert!(P1 == 9721);
-    let q = vcvtnq_s64_f64(vmulq_n_f64(vcvtq_f64_s64(v), 1.0 / P1 as f64));
-    vmovn_s64(vsubq_s64(v, vmull_n_s32(vmovn_s64(q), P1 as i32)))
-}
-
-/// Row `r`'s sums as residues, one `i16` vector per slot, lane = column.
-#[inline(always)]
-unsafe fn narrow(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
-    for (s, o) in out.iter_mut().enumerate() {
-        let at = idx(s, r);
-        let lo = vcombine_s32(narrow_sum(acc[at]), narrow_sum(acc[at + 1]));
-        let hi = vcombine_s32(narrow_sum(acc[at + 2]), narrow_sum(acc[at + 3]));
-        *o = vcombine_s16(vmovn_s32(lo), vmovn_s32(hi));
-    }
-}
-
-/// The largest product of a key slot (a centered residue) and a transform slot.
-const PRODUCT: u64 = (P1 as u64 - 1) / 2 * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64;
 /// `2^16 mod p`, centered.
 const C16: i32 = centered(1 << 16, P1) as i32;
 /// `round(2^31 / p)`.
 const V31: i32 = ((1u64 << 32) / P1 as u64).div_ceil(2) as i32;
-// a chunk's digit sums `v` (|v| <= CHUNK PRODUCT): `(v >> 16) C16 + (v mod 2^16)` fits i32
-const _: () = assert!(((CHUNK as u64 * PRODUCT >> 16) + 1) * C16.unsigned_abs() as u64 + 65535 < i32::MAX as u64);
+/// The transform's outputs, `|v| <= ` this: the limbs are exact below 32640.
+const XBOUND: u32 = crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]);
+const _: () = assert!(XBOUND < 32640);
+/// Limb bounds: a low byte, the transform's and the key's high bytes.
+const LO: i64 = 128;
+const XHI: i64 = (XBOUND as i64 + 128) >> 8;
+const KHI: i64 = ((P1 as i64 - 1) / 2 + 128) >> 8;
+// a chunk's limb sums: `lo lo + 256 hi lo` and `lo hi + 256 hi hi` fit i32
+const _: () = assert!((CHUNK as i64) * (LO * LO + 256 * XHI * LO) < i32::MAX as i64);
+const _: () = assert!((CHUNK as i64) * (LO * KHI + 256 * XHI * KHI) < i32::MAX as i64);
 
-/// [`narrow`] for a chunk's digit rows, in integers: `v = h 2^16 + l`, `l = v mod 2^16`, so
-/// `v = h (2^16 mod p) + l (mod p)` within `i32`, then a 32-bit Barrett reduction to
-/// `|r| <= 0.65 p` (the inverse takes `|x| <= p`). After the k6 chunk end (dadon line).
+/// `a - round(a / p) p` with the quotient from `sqrdmulh` by `round(2^31 / p)`, off from `a / p`
+/// by at most `1/2 + |a| 0.85 / 2^31`: `|result| <= 0.51 p` for `|a| <= 2^25`, `1.14 p` for any
+/// `i32` lane within `1.62e9`.
 #[inline(always)]
-unsafe fn narrow_digits(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
+unsafe fn reduce32(a: int32x4_t) -> int32x4_t {
+    vmlsq_n_s32(a, vqrdmulhq_n_s32(a, V31), P1 as i32)
+}
+
+/// One slot's eight columns of a chunk's digit row `r` as residues, `|r| <= 0.51 p`: per column
+/// `S = (lo lo + 256 hi lo) + 256 (lo hi + 256 hi hi)`, each part within `i32` over a chunk.
+#[inline(always)]
+unsafe fn narrow_digit(acc: &[int32x4_t], s: usize, r: usize) -> int16x8_t {
+    let at = idx(s, r);
+    let quad = |c: usize| -> int32x4_t {
+        let v = |i: usize| vreinterpretq_s64_s32(*acc.get_unchecked(at + c + i));
+        // (lo lo, lo hi) and (hi lo, hi hi) of two columns, then A and B of each
+        let t = |i: usize| -> int32x4_t {
+            let (l, h) = (vzip1q_s64(v(i), v(i + 1)), vzip2q_s64(v(i), v(i + 1)));
+            vaddq_s32(vreinterpretq_s32_s64(l), vshlq_n_s32::<8>(vreinterpretq_s32_s64(h)))
+        };
+        let (t01, t23) = (t(0), t(2));
+        let (a, b) = (vuzp1q_s32(t01, t23), vuzp2q_s32(t01, t23));
+        reduce32(vaddq_s32(reduce32(a), vshlq_n_s32::<8>(reduce32(b))))
+    };
+    vmovn_high_s32(vmovn_s32(quad(0)), quad(4))
+}
+
+/// The base row's eight columns of slot `s` as residues over a whole column: each limb lane
+/// reduced first (lanes reach `4096 * 128 * 128`), then `l0 + 256 (l1 + l2) + C16 l3`.
+#[inline(always)]
+unsafe fn narrow_base(acc: &[int32x4_t], s: usize) -> int16x8_t {
+    let w = vld1q_s32([1, 256, 256, C16].as_ptr());
+    let at = idx(s, 0);
+    let m = |c: usize| vmulq_s32(reduce32(*acc.get_unchecked(at + c)), w);
+    let quad = |c: usize| reduce32(vpaddq_s32(vpaddq_s32(m(c), m(c + 1)), vpaddq_s32(m(c + 2), m(c + 3))));
+    vmovn_high_s32(vmovn_s32(quad(0)), quad(4))
+}
+
+/// Row 0's sums as residues, one `i16` vector per slot, lane = column.
+#[inline(always)]
+unsafe fn narrow(acc: &[int32x4_t], out: &mut [int16x8_t; N]) {
     for (s, o) in out.iter_mut().enumerate() {
-        *o = narrow_digit(acc, s, r);
+        *o = narrow_base(acc, s);
     }
 }
-
-/// Slot `s` of [`narrow_digits`].
-#[inline(always)]
-unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
-    let c = vdupq_n_s32(C16);
-    let low = vdupq_n_s32(0xFFFF);
-    let half = |a: int64x2_t, b: int64x2_t| -> int32x4_t {
-        let h = vshrn_high_n_s64::<16>(vshrn_n_s64::<16>(a), b);
-        let l = vandq_s32(vmovn_high_s64(vmovn_s64(a), b), low);
-        let t = vmlaq_s32(l, h, c);
-        vmlsq_n_s32(t, vqrdmulhq_n_s32(t, V31), P1 as i32)
-    };
-    let at = idx(s, r);
-    let lo = half(*acc.get_unchecked(at), *acc.get_unchecked(at + 1));
-    let hi = half(*acc.get_unchecked(at + 2), *acc.get_unchecked(at + 3));
-    vmovn_high_s32(vmovn_s32(lo), hi)
-}
-
 /// One digit row's chunk end in one go: the sums narrowed in [`super::inverse_lazy_io`]'s first
 /// pass, and the deviations `S - mean` (centered) summed into `dev` (the row's `2 N` lanes) in its
 /// last pass, instead of three passes over the slots.
 #[inline(always)]
 #[cfg_attr(not(test), allow(dead_code))]
-unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_t], y: &mut [int16x8_t; N]) {
+unsafe fn chunk_row(acc: &[int32x4_t], r: usize, mr: &[i16], dev: &mut [int32x4_t], y: &mut [int16x8_t; N]) {
     let p = P1 as i16;
     let dv = dev.as_mut_ptr();
     super::inverse_lazy_io(y, |s| narrow_digit(acc, s, r), |s, x| {
@@ -659,7 +813,7 @@ unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_
 }
 
 #[inline(always)]
-unsafe fn chunk_row2(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
+unsafe fn chunk_row2(acc: &[int32x4_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
     let p = P1 as i16;
     let thr = [vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r - 1]), vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r])];
     super::inverse_lazy_io2(y, |h, s| narrow_digit(acc, s, r + h), |h, s, x| {
@@ -789,41 +943,46 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
     vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
 }
 
-/// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
-/// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients.
+/// The batch's pass: each chunk's digit sums inverted to canonical coefficients and summed as
+/// deviations into `dev`; on return `y` holds the base row's coefficients. `x` is the transform's
+/// working buffer, `xs` a sweep's transforms as `SMMLA` limbs ([`XS_LEN`]), `y2` a second inverse
+/// buffer.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn sums(
     words: &[(*const u8, usize); LANES],
     a: &SmsMatrix,
-    m: &mut [int16x8_t; BITS],
     nib: &mut [uint8x16_t; N / 4],
-    xs: &mut [[int16x8_t; N]; SWEEP],
-    acc: &mut [int64x2_t],
+    x: &mut [int16x8_t; N],
+    xs: *mut int8x16_t,
+    acc: &mut [int32x4_t],
     y: &mut [int16x8_t; N],
+    y2: &mut [int16x8_t; N],
     dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
     for s in 0..N {
-        acc[idx(s, 0)..][..4].fill(vdupq_n_s64(0));
+        acc[idx(s, 0)..][..LANES].fill(vdupq_n_s32(0));
     }
     let mut e = 0usize;
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
         while e < end {
-            // Up to eight tiles per sweep, never across a chunk end (chunks are whole tiles). A short
-            // tile only occurs at the end of the column, where the missing elements read zero
-            // words and their key lanes are zero, so those lanes contribute nothing.
+            // Up to OCT octets per sweep, never across a chunk end (chunks are whole sweeps). A
+            // short octet only occurs at the end of the column, where the missing elements read
+            // zero words and their key lanes are zero, so those lanes contribute nothing.
             let l = SWEEP.min(end - e);
             let groups = l.div_ceil(LOCK);
-            for i in 0..groups * LOCK {
-                let at = pass_words(words, a.elements, e, i);
-                indices(&at, nib);
-                let x = &mut xs[i];
-                pass_lut_asm(nib, x, kern);
-                pass_c_asm(x, kern);
-                pass_d_asm(x, kern);
+            for c in 0..LANES {
+                for o in 0..groups {
+                    let at = octet_words(words, a.elements, e + LOCK * o, c);
+                    indices(&at, nib);
+                    pass_lut_asm(nib, x, kern);
+                    pass_c_asm(x, kern);
+                    pass_d_limbs_asm(x, kern, xs.add(c * OCT + o));
+                }
             }
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            let keys = (a.data.as_ptr() as *const int8x16_t).add(key_at(e / LOCK, 0, 0));
             // the chunk's first sweep starts the digit rows' sums afresh
             if e % CHUNK == 0 {
                 sink::<true>(xs, keys, acc, groups);
@@ -838,78 +997,11 @@ unsafe fn sums(
         for d in (0..DIGITS).step_by(2) {
             let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
             let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
-            chunk_row2(acc, 1 + d, mr, rows, [&mut *y, &mut xs[0]], &Repair { words, a, c });
+            chunk_row2(acc, 1 + d, mr, rows, [&mut *y, &mut *y2], &Repair { words, a, c });
         }
     }
-    narrow(acc, 0, y);
+    narrow(acc, y);
     super::inverse_folded::<PB>(y);
-}
-
-/// [`sums`] for two batches against one sweep of the key (after IvanLudvig's submission
-/// ce686fcc): per sweep, batch A's transforms into `xs` and their sink, then batch B's into the
-/// same `xs` and their sink against the same key lines, which are then still cached.
-#[inline(never)]
-unsafe fn sums2(
-    words: [&[(*const u8, usize); LANES]; 2],
-    a: &SmsMatrix,
-    nib: &mut [uint8x16_t; N / 4],
-    xs: &mut [[int16x8_t; N]; SWEEP],
-    acc: [&mut [int64x2_t]; 2],
-    y: [&mut [int16x8_t; N]; 2],
-    dev: [&mut [int32x4_t]; 2],
-) {
-    let kern = &kernels()[PB];
-    let [acc0, acc1] = acc;
-    let [y0, y1] = y;
-    let [dev0, dev1] = dev;
-    let accs: [&mut [int64x2_t]; 2] = [acc0, acc1];
-    let ys: [&mut [int16x8_t; N]; 2] = [y0, y1];
-    let devs: [&mut [int32x4_t]; 2] = [dev0, dev1];
-    let (mut accs, mut ys, mut devs) = (accs, ys, devs);
-    for t in 0..2 {
-        for s in 0..N {
-            accs[t][idx(s, 0)..][..4].fill(vdupq_n_s64(0));
-        }
-    }
-    let mut e = 0usize;
-    while e < a.elements {
-        let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
-        while e < end {
-            let l = SWEEP.min(end - e);
-            let groups = l.div_ceil(LOCK);
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-            for t in 0..2 {
-                for i in 0..groups * LOCK {
-                    let at = pass_words(words[t], a.elements, e, i);
-                    indices(&at, nib);
-                    let x = &mut xs[i];
-                    pass_lut_asm(nib, x, kern);
-                    pass_c_asm(x, kern);
-                    pass_d_asm(x, kern);
-                }
-                if e % CHUNK == 0 {
-                    sink::<true>(xs, keys, accs[t], groups);
-                } else {
-                    sink::<false>(xs, keys, accs[t], groups);
-                }
-            }
-            e += l;
-        }
-        let c = (end - 1) / CHUNK;
-        for t in 0..2 {
-            let dv = devs[t].as_mut_ptr();
-            for d in (0..DIGITS).step_by(2) {
-                let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
-                let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
-                chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
-            }
-        }
-    }
-    for t in 0..2 {
-        narrow(accs[t], 0, ys[t]);
-        super::inverse_folded::<PB>(ys[t]);
-    }
-    let _ = (&mut accs, &mut ys, &mut devs);
 }
 
 #[inline]
@@ -934,13 +1026,11 @@ fn crt(r: u32, t: i64) -> u128 {
 
 #[repr(C)]
 struct Scratch {
-    xs: [[int16x8_t; N]; SWEEP],
-    acc: [int64x2_t; ROWS * 4 * N],
-    dev: [int32x4_t; DIGITS * 2 * N],
-    acc2: [int64x2_t; ROWS * 4 * N],
-    dev2: [int32x4_t; DIGITS * 2 * N],
+    xs: [int8x16_t; XS_LEN],
+    acc: [int32x4_t; ROWS * LANES * N],
+    x: [int16x8_t; N],
     y2: [int16x8_t; N],
-    m: [int16x8_t; BITS],
+    dev: [int32x4_t; DIGITS * 2 * N],
     nib: [uint8x16_t; N / 4],
     y: [int16x8_t; N],
     tail: [[i64; LANES]; N],
@@ -982,38 +1072,21 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let mut out = vec![0u128; columns * N];
     for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
-        let Scratch { xs, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
+        let Scratch { xs, acc, x, y2, dev, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / N;
-        let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
+        for (b, target) in block.chunks_mut(LANES * N).enumerate() {
             let col0 = first + LANES * b;
             let here = (count - LANES * b).min(LANES);
-            core::array::from_fn(|c| {
+            let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
                 if c < here {
                     (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
                 } else {
                     (ZERO_WORDS.as_ptr() as *const u8, 0)
                 }
-            })
-        };
-        let batches = count.div_ceil(LANES);
-        let mut targets: Vec<&mut [u128]> = block.chunks_mut(LANES * N).collect();
-        for b in 0..batches {
-            // pairs of batches share one key sweep; the second one's results wait in `*2`
-            if b % 2 == 0 {
-                dev.fill(vdupq_n_s32(0));
-                if b + 1 < batches {
-                    dev2.fill(vdupq_n_s32(0));
-                    let (w0, w1) = (batch_words(b), batch_words(b + 1));
-                    sums2([&w0, &w1], a, nib, xs, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]]);
-                } else {
-                    sums(&batch_words(b), a, m, nib, xs, acc, y, dev);
-                }
-            } else {
-                core::mem::swap(dev, dev2);
-                core::mem::swap(y, y2);
-            }
-            let target = &mut *targets[b];
+            });
+            dev.fill(vdupq_n_s32(0));
+            sums(&words, a, nib, x, xs.as_mut_ptr(), acc, y, y2, dev);
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
             let pv = vdupq_n_s16(p);
@@ -1064,137 +1137,124 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
 }
 
 #[cfg(test)]
-mod chunk_bench {
-    use super::*;
-
-    /// One digit row's chunk end, the record's three passes against [`chunk_row`]: `cargo test
-    /// --release chunk_end_timing -- --ignored --nocapture` (on the board's core).
-    #[test]
-    #[ignore]
-    fn chunk_end_timing() {
-        let mut st = 7u64;
-        let bound = 1i64 << 34;
-        let acc: Vec<int64x2_t> = (0..ROWS * 4 * N).map(|_| unsafe { vcombine_s64(vdup_n_s64((crate::ntt::tests::xorshift(&mut st) % (2 * bound as u64)) as i64 - bound), vdup_n_s64((crate::ntt::tests::xorshift(&mut st) % (2 * bound as u64)) as i64 - bound)) }).collect();
-        let mr: Vec<i16> = (0..N).map(|i| (i as i16 * 37) % 4860).collect();
-        let mut dev = vec![unsafe { vdupq_n_s32(0) }; 2 * N];
-        let mut dev2 = dev.clone();
-        let mut y = Box::new([unsafe { vdupq_n_s16(0) }; N]);
-        // same deviations both ways
-        unsafe {
-            narrow_digits(&acc, 1, &mut y);
-            super::super::inverse_folded::<PB>(&mut y);
-            for s in 0..N {
-                let v = canonical(vsubq_s16(y[s], vdupq_n_s16(mr[s])), P1 as i16);
-                dev[2 * s] = vaddw_s16(dev[2 * s], vget_low_s16(v));
-                dev[2 * s + 1] = vaddw_high_s16(dev[2 * s + 1], v);
-            }
-            chunk_row(&acc, 1, &mr, &mut dev2, &mut y);
-        }
-        let a: &[[i32; 4]] = unsafe { core::slice::from_raw_parts(dev.as_ptr() as *const [i32; 4], dev.len()) };
-        let b: &[[i32; 4]] = unsafe { core::slice::from_raw_parts(dev2.as_ptr() as *const [i32; 4], dev2.len()) };
-        assert_eq!(a, b, "the fused chunk end gives the same deviations");
-        let reps = 20000;
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                unsafe {
-                    narrow_digits(&acc, 1, &mut y);
-                    super::super::inverse_folded::<PB>(&mut y);
-                    for s in 0..N {
-                        let v = canonical(vsubq_s16(y[s], vdupq_n_s16(mr[s])), P1 as i16);
-                        dev[2 * s] = vaddw_s16(dev[2 * s], vget_low_s16(v));
-                        dev[2 * s + 1] = vaddw_high_s16(dev[2 * s + 1], v);
-                    }
-                }
-                core::hint::black_box(&mut dev);
-            }
-            let old = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                unsafe { chunk_row(&acc, 1, &mr, &mut dev2, &mut y) };
-                core::hint::black_box(&mut dev2);
-            }
-            let new = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                unsafe { super::super::inverse_folded::<PB>(&mut y) };
-                core::hint::black_box(&mut *y);
-            }
-            let f = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                unsafe { super::super::inverse_lazy(&mut y); for v in y.iter_mut() { *v = vandq_s16(*v, vdupq_n_s16(0x0fff)); } };
-                core::hint::black_box(&mut *y);
-            }
-            let l = t.elapsed().as_nanos() as f64 / reps as f64;
-            println!("chunk-end row: record {old:.0} ns, fused {new:.0} ns ({:+.1}%); inverse_folded {f:.0} ns, inverse_lazy {l:.0} ns", 100.0 * (new / old - 1.0));
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
-    /// [`narrow_digits`] is congruent to the sum and within `p`, on the extremes of a chunk's sums
-    /// (`+-CHUNK PRODUCT`), small and boundary values, and random values in range.
+    /// [`narrow_digit`] (a chunk's limb sums) and [`narrow_base`] (a column's) are congruent to
+    /// `l0 + 256 (l1 + l2) + 65536 l3` and within `0.51 p` (the inverses take `p`), at the extremes of their bounds and
+    /// on random values in range.
     #[test]
-    fn digit_narrowing_is_exact() {
-        let bound = (CHUNK as u64 * PRODUCT) as i64;
+    fn limb_narrowing_is_exact() {
         let mut state = 5u64;
-        let edge = [bound, -bound, bound - 1, -bound + 1, 0, 1, -1, 65535, -65536, 65536, 4860, -4861];
-        let mut want = vec![0i64; ROWS * 8 * N];
-        for (i, w) in want.iter_mut().enumerate() {
-            *w = if i < edge.len() { edge[i] } else { (crate::ntt::tests::xorshift(&mut state) % (2 * bound as u64 + 1)) as i64 - bound };
-        }
-        let mut acc = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
-        unsafe {
-            core::ptr::copy_nonoverlapping(want.as_ptr() as *const int64x2_t, acc.as_mut_ptr(), acc.len());
-            for r in 0..ROWS {
-                let mut out = [vdupq_n_s16(0); N];
-                narrow_digits(&acc, r, &mut out);
-                for s in 0..N {
-                    let o: [i16; 8] = core::mem::transmute(out[s]);
-                    for c in 0..8 {
-                        let v = want[2 * idx(s, r) + c];
-                        assert_eq!((o[c] as i64 - v).rem_euclid(P1 as i64), 0, "{v}");
-                        assert!((o[c] as i64).abs() <= P1 as i64);
+        let mut next = move || crate::ntt::tests::xorshift(&mut state);
+        for base in [false, true] {
+            let n = if base { 4096 } else { CHUNK as i64 };
+            let bound = [n * LO * LO, n * LO * KHI, n * XHI * LO, n * XHI * KHI];
+            let mut acc = vec![unsafe { vdupq_n_s32(0) }; ROWS * LANES * N];
+            let mut want = vec![[0i32; 4]; ROWS * LANES * N];
+            for (i, w) in want.iter_mut().enumerate() {
+                for (l, v) in w.iter_mut().enumerate() {
+                    let b = bound[l];
+                    *v = match i % 5 {
+                        0 => b as i32,
+                        1 => -b as i32,
+                        _ => ((next() % (2 * b as u64 + 1)) as i64 - b) as i32,
+                    };
+                }
+                acc[i] = unsafe { vld1q_s32(w.as_ptr()) };
+            }
+            for s in 0..N {
+                for r in if base { 0..1 } else { 1..ROWS } {
+                    let o: [i16; 8] = unsafe { core::mem::transmute(if base { narrow_base(&acc, s) } else { narrow_digit(&acc, s, r) }) };
+                    for c in 0..LANES {
+                        let l = want[idx(s, r) + c].map(|v| v as i64);
+                        let v = l[0] + 256 * (l[1] + l[2]) + 65536 * l[3];
+                        assert_eq!((o[c] as i64 - v).rem_euclid(P1 as i64), 0, "{l:?}");
+                        assert!((o[c] as i64).abs() * 100 <= 51 * P1 as i64);
                     }
                 }
             }
         }
     }
 
-    /// A fresh sweep ([`sink`]`::<true>`) over accumulators holding garbage in the digit rows equals
-    /// an accumulating sweep over the same accumulators with those rows zeroed, bit for bit, and the
-    /// base row accumulates in both: one to four tiles, random keys and transforms.
+    /// [`sink`] against the limb sums computed lane by lane, every octet count, fresh and
+    /// accumulating, random limbs over all of `i8` and garbage in the accumulators.
     #[test]
-    fn fresh_sweep_overwrites_the_digit_rows() {
-        use core::arch::aarch64::*;
+    fn sink_matches_the_limb_sums() {
         let mut state = 23u64;
         let mut next = move || crate::ntt::tests::xorshift(&mut state);
-        let mut xs = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
-        for groups in 1..=SINK {
-            let keys: Vec<i16> = (0..groups * N * ROWS * LOCK).map(|_| ((next() % 9721) as i64 - 4860) as i16).collect();
-            for x in xs.iter_mut().flatten() {
-                let v: [i16; 8] = core::array::from_fn(|_| next() as i16);
-                *x = unsafe { vld1q_s16(v.as_ptr()) };
+        let mut xs = vec![unsafe { vdupq_n_s8(0) }; XS_LEN];
+        let mut keys = vec![unsafe { vdupq_n_s8(0) }; N * OCT * ROWS];
+        let bytes = |v: &int8x16_t| -> [i8; 16] { unsafe { core::mem::transmute(*v) } };
+        for groups in 1..=OCT {
+            for v in xs.iter_mut().chain(keys.iter_mut()) {
+                let b: [i8; 16] = core::array::from_fn(|_| next() as i8);
+                *v = unsafe { vld1q_s8(b.as_ptr()) };
             }
-            let garbage: Vec<i64> = (0..ROWS * 8 * N).map(|_| (next() >> 24) as i64 - (1 << 39)).collect();
-            let mut fresh = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
-            unsafe { core::ptr::copy_nonoverlapping(garbage.as_ptr() as *const int64x2_t, fresh.as_mut_ptr(), fresh.len()) };
-            let mut zeroed = fresh.clone();
-            for s in 0..N {
-                for r in 1..ROWS {
-                    zeroed[idx(s, r)..idx(s, r) + 4].fill(unsafe { vdupq_n_s64(0) });
+            for fresh in [false, true] {
+                let start: Vec<[i32; 4]> = (0..ROWS * LANES * N).map(|_| core::array::from_fn(|_| (next() >> 40) as i32)).collect();
+                let mut acc: Vec<int32x4_t> = start.iter().map(|w| unsafe { vld1q_s32(w.as_ptr()) }).collect();
+                unsafe {
+                    if fresh {
+                        sink::<true>(xs.as_ptr(), keys.as_ptr(), &mut acc, groups);
+                    } else {
+                        sink::<false>(xs.as_ptr(), keys.as_ptr(), &mut acc, groups);
+                    }
+                }
+                for s in 0..N {
+                    for r in 0..ROWS {
+                        for c in 0..LANES {
+                            let mut want = if fresh && r > 0 { [0i32; 4] } else { start[idx(s, r) + c] };
+                            for o in 0..groups {
+                                let x = bytes(&xs[s * XSTRIDE + c * OCT + o]);
+                                let k = bytes(&keys[(s * OCT + o) * ROWS + r]);
+                                for i in 0..2 {
+                                    for j in 0..2 {
+                                        let d: i32 = (0..8).map(|q| x[8 * i + q] as i32 * k[8 * j + q] as i32).sum();
+                                        want[2 * i + j] = want[2 * i + j].wrapping_add(d);
+                                    }
+                                }
+                            }
+                            let got: [i32; 4] = unsafe { core::mem::transmute(acc[idx(s, r) + c]) };
+                            assert_eq!(got, want, "groups {groups} fresh {fresh} slot {s} row {r} column {c}");
+                        }
+                    }
                 }
             }
-            unsafe {
-                sink::<true>(&xs, keys.as_ptr(), &mut fresh, groups);
-                sink::<false>(&xs, keys.as_ptr(), &mut zeroed, groups);
+        }
+    }
+
+    /// The limbs reassemble their value: [`key_limbs`] over every centered residue, and
+    /// [`super::super::pass_d_limbs`] against [`super::super::pass_d`] on random transforms.
+    #[test]
+    fn limbs_reassemble() {
+        let h = (P1 as i16 - 1) / 2;
+        for v in -h..=h {
+            let b = key_limbs(&[v; LOCK]);
+            assert!(b[LOCK].unsigned_abs() as i64 <= KHI);
+            assert_eq!(b[0] as i32 + 256 * b[LOCK] as i32, v as i32);
+        }
+        let mut state = 41u64;
+        let kern = &kernels()[PB];
+        for _ in 0..20 {
+            let mut x = [unsafe { vdupq_n_s16(0) }; N];
+            for v in x.iter_mut() {
+                let l: [i16; 8] = core::array::from_fn(|_| ((crate::ntt::tests::xorshift(&mut state) % (2 * h as u64 + 1)) as i64 - h as i64) as i16);
+                *v = unsafe { vld1q_s16(l.as_ptr()) };
             }
-            let words = |v: &[int64x2_t]| -> Vec<[i64; 2]> { v.iter().map(|&x| unsafe { core::mem::transmute(x) }).collect() };
-            assert!(words(&fresh) == words(&zeroed), "{groups} tiles");
+            let mut out = vec![unsafe { vdupq_n_s8(0) }; 2 * N];
+            let mut y = x;
+            unsafe {
+                super::super::pass_d_limbs::<PB>(&x, kern, out.as_mut_ptr(), 2);
+                super::super::pass_d::<PB, false>(&mut y, kern, &[], &mut []);
+            }
+            for s in 0..N {
+                let b: [i8; 16] = unsafe { core::mem::transmute(out[2 * s]) };
+                let w: [i16; 8] = unsafe { core::mem::transmute(y[s]) };
+                for e in 0..8 {
+                    assert_eq!(b[e] as i32 + 256 * b[8 + e] as i32, w[e] as i32, "slot {s} lane {e}");
+                }
+            }
         }
     }
 
@@ -1214,61 +1274,6 @@ mod tests {
             }
             for k in 0..N {
                 assert_eq!(acc[k].rem_euclid(TAIL as i64) as u128, c[k] % TAIL as u128, "element {index} coefficient {k}");
-            }
-        }
-    }
-
-    /// The folded path (key times [`KEY_SCALE`], [`super::super::inverse_folded`]) against the
-    /// unscaled one ([`super::super::inverse`], the path before the fold), bit for bit, on every
-    /// row of one chunk: random key vectors (centered residues, and the extremes `+-(p - 1) / 2`),
-    /// random transforms over all of `i16`, [`CHUNK`]` / `[`SWEEP`] full sweeps through [`sink`] and
-    /// a last one of one to three tiles (on SVE hosts, [`slot_sink`]'s `sdot`), then [`narrow`] and
-    /// the inverse.
-    #[test]
-    fn folded_key_matches_unscaled_path() {
-        use core::arch::aarch64::*;
-        let h = (P1 as i64 - 1) / 2;
-        let mut state = 17u64;
-        let mut next = move || crate::ntt::tests::xorshift(&mut state);
-        let lanes = |v: &[int16x8_t; N]| -> Vec<[i16; 8]> { v.iter().map(|&x| unsafe { core::mem::transmute(x) }).collect() };
-        let mut xs = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
-        for case in 0..3 {
-            let mut old_acc = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
-            let mut new_acc = old_acc.clone();
-            for sweep in 0..=CHUNK / SWEEP {
-                let groups = if sweep < CHUNK / SWEEP { SINK } else { 1 + case };
-                let old: Vec<i16> = (0..groups * N * ROWS * LOCK)
-                    .map(|_| match case {
-                        1 => if next() & 1 == 0 { h as i16 } else { -h as i16 },
-                        _ => ((next() % (2 * h as u64 + 1)) as i64 - h) as i16,
-                    })
-                    .collect();
-                let new: Vec<i16> = old.iter().map(|&k| centered(k as i64 * KEY_SCALE, P1)).collect();
-                for x in xs.iter_mut().flatten() {
-                    let v: [i16; 8] = core::array::from_fn(|_| match case {
-                        2 => if next() & 1 == 0 { i16::MAX } else { i16::MIN },
-                        _ => next() as i16,
-                    });
-                    *x = unsafe { vld1q_s16(v.as_ptr()) };
-                }
-                unsafe {
-                    sink::<false>(&xs, old.as_ptr(), &mut old_acc, groups);
-                    sink::<false>(&xs, new.as_ptr(), &mut new_acc, groups);
-                }
-            }
-            let mut y = Box::new([unsafe { vdupq_n_s16(0) }; N]);
-            for r in 0..ROWS {
-                unsafe {
-                    narrow(&old_acc, r, &mut y);
-                    super::super::inverse::<PB>(&mut y);
-                }
-                let want = lanes(&y);
-                unsafe {
-                    narrow(&new_acc, r, &mut y);
-                    super::super::inverse_folded::<PB>(&mut y);
-                }
-                assert!(lanes(&y) == want, "case {case} row {r}");
-                assert!(want.iter().flatten().all(|&v| v as i64 >= -h && v as i64 <= h));
             }
         }
     }
@@ -1389,24 +1394,99 @@ mod timing {
 }
 
 #[cfg(test)]
-mod leap_bench {
+mod store_timing {
+    use super::*;
+
+    /// One sweep's 128 transforms with their outputs stored three ways: in place (the SDOT
+    /// layout), as limbs into the sweep buffer (the SMMLA layout), and as limbs contiguously.
+    /// `cargo test --release store_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn store_timing() {
+        let kern = &kernels()[PB];
+        let mut state = 9u64;
+        let words: Vec<u128> = (0..4 * 4096 * 8).map(|_| (crate::ntt::tests::xorshift(&mut state) as u128) << 64 | crate::ntt::tests::xorshift(&mut state) as u128).collect();
+        let cols: [(*const u8, usize); LANES] = core::array::from_fn(|c| (words[c * 4 * 4096..].as_ptr() as *const u8, 64));
+        let mut nib = Box::new([unsafe { vdupq_n_u8(0) }; N / 4]);
+        let mut x = Box::new([unsafe { vdupq_n_s16(0) }; N]);
+        let mut old = vec![[unsafe { vdupq_n_s16(0) }; N]; SWEEP];
+        let mut xs = vec![unsafe { vdupq_n_s8(0) }; XS_LEN];
+        let reps = 200;
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            for rep in 0..reps {
+                let e = (rep % 32) * SWEEP;
+                for i in 0..SWEEP {
+                    unsafe {
+                        let at = octet_words(&cols, 4096, e + LOCK * (i % OCT), i / OCT);
+                        indices(&at, &mut nib);
+                        let y = &mut old[i];
+                        pass_lut::<PB>(&nib, y, kern);
+                        pass_c::<4>(y, kern);
+                        pass_d::<PB, false>(y, kern, &[], &mut []);
+                    }
+                }
+            }
+            let a = t.elapsed().as_nanos() as f64 / (reps * SWEEP) as f64;
+            let t = std::time::Instant::now();
+            for rep in 0..reps {
+                let e = (rep % 32) * SWEEP;
+                for c in 0..LANES {
+                    for o in 0..OCT {
+                        unsafe {
+                            let at = octet_words(&cols, 4096, e + LOCK * o, c);
+                            indices(&at, &mut nib);
+                            pass_lut::<PB>(&nib, &mut x, kern);
+                            pass_c::<4>(&mut x, kern);
+                            super::super::pass_d_limbs::<PB>(&x, kern, xs.as_mut_ptr().add(c * OCT + o), XSTRIDE);
+                        }
+                    }
+                }
+            }
+            let b = t.elapsed().as_nanos() as f64 / (reps * SWEEP) as f64;
+            let t = std::time::Instant::now();
+            for rep in 0..reps {
+                let e = (rep % 32) * SWEEP;
+                for c in 0..LANES {
+                    for o in 0..OCT {
+                        unsafe {
+                            let at = octet_words(&cols, 4096, e + LOCK * o, c);
+                            indices(&at, &mut nib);
+                            pass_lut::<PB>(&nib, &mut x, kern);
+                            pass_c::<4>(&mut x, kern);
+                            super::super::pass_d_limbs::<PB>(&x, kern, xs.as_mut_ptr().add((c * OCT + o) * N), 1);
+                        }
+                    }
+                }
+            }
+            let d = t.elapsed().as_nanos() as f64 / (reps * SWEEP) as f64;
+            println!("round {round}: in place {a:.0} ns, limbs to sweep buffer {b:.0} ns, limbs contiguous {d:.0} ns per transform");
+        }
+    }
+}
+
+#[cfg(test)]
+mod asm_tests {
     use super::*;
 
     #[test]
-    fn pass_d_asm_matches() {
+    fn pass_d_limbs_asm_matches() {
         let kern = &kernels()[PB];
-        let mut st = 11u64;
-        for _ in 0..50 {
-            // inputs within pass_c's output bound for 9721 (values up to the lut transform bound)
-            let bound = crate::ntt::lut_transform_bound(P1, crate::ntt::SCHEDULES[PB]) as u64;
-            let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
-            let raw: Vec<i16> = (0..N * 8).map(|_| ((crate::ntt::tests::xorshift(&mut st) % (2 * bound + 1)) as i64 - bound as i64) as i16).collect();
-            for (i, v) in a.iter_mut().enumerate() { *v = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) }; }
-            let mut b = a.clone();
-            unsafe { pass_d::<PB, false>(&mut a, kern, &[], &mut []); pass_d_asm(&mut b, kern); }
-            let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
-            let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
-            assert_eq!(x, y);
+        let mut st = 29u64;
+        for _ in 0..30 {
+            let mut x: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            let raw: Vec<i16> = (0..N * 8).map(|_| crate::ntt::tests::xorshift(&mut st) as i16).collect();
+            for (i, v) in x.iter_mut().enumerate() { *v = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) }; }
+            let mut a = vec![unsafe { vdupq_n_s8(0) }; N * XSTRIDE];
+            let mut b = vec![unsafe { vdupq_n_s8(1) }; N * XSTRIDE];
+            unsafe {
+                super::super::pass_d_limbs::<PB>(&x, kern, a.as_mut_ptr().add(5), XSTRIDE);
+                pass_d_limbs_asm(&x, kern, b.as_mut_ptr().add(5));
+            }
+            for s in 0..N {
+                let (u, w): ([u8; 16], [u8; 16]) = unsafe { (core::mem::transmute(a[5 + s * XSTRIDE]), core::mem::transmute(b[5 + s * XSTRIDE])) };
+                assert_eq!(u, w, "slot {s}");
+            }
         }
     }
 
@@ -1448,48 +1528,56 @@ mod leap_bench {
     }
 
     #[test]
-    #[ignore]
-    fn transform_timing() {
+    fn pass_d_asm_matches() {
         let kern = &kernels()[PB];
-        let mut st = 7u64;
-        let mut nib = Box::new([unsafe { vdupq_n_u8(0) }; N / 4]);
-        let raw: Vec<u8> = (0..N * 4).map(|_| crate::ntt::tests::xorshift(&mut st) as u8).collect();
-        for (i, v) in nib.iter_mut().enumerate() { *v = unsafe { vld1q_u8(raw.as_ptr().add(16 * i)) }; for _ in 0..0 {} }
-        for v in nib.iter_mut() { *v = unsafe { vandq_u8(*v, vdupq_n_u8(15)) }; }
-        let mut xs: Box<[[int16x8_t; N]; SWEEP]> = unsafe { Box::new(core::mem::zeroed()) };
-        let words_buf: Vec<u8> = (0..LANES * 64 * 4096).map(|_| crate::ntt::tests::xorshift(&mut st) as u8).collect();
-        let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| (unsafe { words_buf.as_ptr().add(c * 64 * 4096) }, 64));
-        let reps = 4096;
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            for _ in 0..reps { unsafe { let x = &mut xs[0]; pass_lut::<PB>(&nib, x, kern); pass_c::<4>(x, kern); pass_d::<PB, false>(x, kern, &[], &mut []); } core::hint::black_box(&mut *xs); }
-            let l1 = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for r in 0..reps { unsafe { let x = &mut xs[r % SWEEP]; pass_lut::<PB>(&nib, x, kern); pass_c::<4>(x, kern); pass_d::<PB, false>(x, kern, &[], &mut []); } core::hint::black_box(&mut *xs); }
-            let l2 = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for r in 0..reps { unsafe { let at = pass_words(&words, 4096 * 8, (r / 8 % 512) * 8, r % 8); indices(&at, &mut nib); } core::hint::black_box(&mut *nib); }
-            let ix = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps { unsafe { pass_lut::<PB>(&nib, &mut xs[0], kern); } core::hint::black_box(&mut *xs); }
-            let lut = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps { unsafe { pass_c::<4>(&mut xs[0], kern); } core::hint::black_box(&mut *xs); }
-            let pc = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps { unsafe { pass_d::<PB, false>(&mut xs[0], kern, &[], &mut []); } core::hint::black_box(&mut *xs); }
-            let pd = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps { unsafe { pass_d_asm(&mut xs[0], kern); } core::hint::black_box(&mut *xs); }
-            let pda = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps { unsafe { pass_c_asm(&mut xs[0], kern); } core::hint::black_box(&mut *xs); }
-            let pca = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for _ in 0..reps { unsafe { pass_lut_asm(&nib, &mut xs[0], kern); } core::hint::black_box(&mut *xs); }
-            let la = t.elapsed().as_nanos() as f64 / reps as f64;
-            println!("pass_d_asm {pda:.0} ns vs pass_d {pd:.0} ns; pass_c_asm {pca:.0} ns vs pass_c {pc:.0} ns; pass_lut_asm {la:.0} vs {lut:.0} ns");
-            println!("per transform (648 vectors): L1 {l1:.0} ns ({:.2} cyc/vec), cycling xs {l2:.0} ns; indices {ix:.0}, lut {lut:.0}, pass_c {pc:.0}, pass_d {pd:.0} ns", l1 * 2.99 / N as f64);
+        let mut st = 11u64;
+        for _ in 0..50 {
+            // inputs within pass_c's output bound for 9721 (values up to the lut transform bound)
+            let bound = crate::ntt::lut_transform_bound(P1, crate::ntt::SCHEDULES[PB]) as u64;
+            let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            let raw: Vec<i16> = (0..N * 8).map(|_| ((crate::ntt::tests::xorshift(&mut st) % (2 * bound + 1)) as i64 - bound as i64) as i16).collect();
+            for (i, v) in a.iter_mut().enumerate() { *v = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) }; }
+            let mut b = a.clone();
+            unsafe { pass_d::<PB, false>(&mut a, kern, &[], &mut []); pass_d_asm(&mut b, kern); }
+            let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
+            let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
+            assert_eq!(x, y);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sink_timing {
+    use super::*;
+
+    /// One sweep of [`sink`] per call, keys streamed from a full 37 MB image or repeated from one
+    /// sweep's 1.2 MB, on one thread and on eight at once. `cargo test --release sink_timing --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sink_timing() {
+        let sweeps = 32;
+        let keys: Vec<i8> = (0..sweeps * N * OCT * ROWS * 16).map(|i| (i * 7 % 251) as i8).collect();
+        for threads in [1usize, 8] {
+            for streamed in [true, false] {
+                let keys = &keys;
+                let per = std::thread::scope(|sc| {
+                    let hs: Vec<_> = (0..threads).map(|_| sc.spawn(move || {
+                        let xs = vec![unsafe { vdupq_n_s8(3) }; XS_LEN];
+                        let mut acc = vec![unsafe { vdupq_n_s32(0) }; ROWS * LANES * N];
+                        let t = std::time::Instant::now();
+                        let reps = 96;
+                        for rep in 0..reps {
+                            let w = if streamed { rep % sweeps } else { 0 };
+                            let k = unsafe { (keys.as_ptr() as *const int8x16_t).add(w * N * OCT * ROWS) };
+                            unsafe { sink::<false>(xs.as_ptr(), k, &mut acc, OCT) };
+                        }
+                        t.elapsed().as_nanos() as f64 / reps as f64 / 1000.0
+                    })).collect();
+                    hs.into_iter().map(|h| h.join().unwrap()).sum::<f64>() / threads as f64
+                });
+                println!("threads {threads} keys {}: {per:.1} us per sweep", if streamed { "streamed 37 MB" } else { "one sweep, cached" });
+            }
         }
     }
 }

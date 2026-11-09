@@ -1,7 +1,7 @@
 """pass_d (level 6, prime 9721 schedule: FIRST13 inputs 0 and 3, no reduction of d) for U groups of six."""
 import sys
 from sched import Ins, schedule, allocate
-def build(U):
+def build(U, limbs=None):
     ins = []; low = set(); cnt = [0]
     def v(n):
         cnt[0] += 1; return f'{n}{cnt[0]}'
@@ -34,8 +34,17 @@ def build(U):
         t = v('t'); low.add(t)
         ins.append(Ins('L', [t], [], f'ldr q{{d0}}, [TPTR, #{16*g}]'))
         ys = bfly(red13(vin[0]), vin[1], vin[2], t, 0) + bfly(red13(vin[3]), vin[4], vin[5], t, 4)
-        for p in range(3):
-            ins.append(Ins('T', [], [ys[2*p], ys[2*p+1]], f'stp q{{s0}}, q{{s1}}, [XPTR, #{96*g+32*p}]'))
+        if limbs is None:
+            for p in range(3):
+                ins.append(Ins('T', [], [ys[2*p], ys[2*p+1]], f'stp q{{s0}}, q{{s1}}, [XPTR, #{96*g+32*p}]'))
+        else:
+            # SMMLA limbs: the low bytes, then the rounded high bytes, slot s at OPTR + s * limbs
+            for i, y in enumerate(ys):
+                lo = v('lb')
+                ins.append(Ins('A', [lo], [y], 'xtn v{d0}.8b, v{s0}.8h'))
+                hb = v('hb')
+                ins.append(Ins('S', [hb], [lo, y], 'rshrn2 v{d0}.16b, v{s1}.8h, #8', tie=0))
+                ins.append(Ins('T', [], [hb], f'str q{{s0}}, [OPTR, #{limbs*(6*g+i)}]'))
         for x in ins[start:]:
             x.g = g
     return ins, low

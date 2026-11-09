@@ -1,4 +1,4 @@
-// Official draw F2: record prefetch-37 tree, early release, proof and key page advice.
+// Official draw H7: INPUT_PREFETCH enabled, distinct archive for resampling.
 //! Packed-binary PCS opening, including the GHASH-to-F162 field switch.
 //!
 //! The default integer modulus is9721*55*2^16. One witness NTT supplies
@@ -2627,4 +2627,4 @@ mod tests {
     }
 
 }
-const _REDRAW_SALT: u64 = 0xc1730957c0d9438f;
+const _REDRAW_SALT: u64 = 0xc1730957c0d94399;

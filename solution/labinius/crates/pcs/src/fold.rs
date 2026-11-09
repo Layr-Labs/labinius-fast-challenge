@@ -1355,6 +1355,15 @@ pub fn fold_witness_bitsliced(
     bitsliced::fold_words(words, challenges, 128 * bpc, workers)
 }
 
+/// Allocate and free the fold's medium-sized buffers (the schedule of every column group, and
+/// every worker's planes and counters) so that the allocator's free lists hold faulted memory
+/// of their size classes when the fold runs: the fold otherwise carves fresh huge-page chunks
+/// and faults them inside its timed window (about 0.2 ms of its plan on gx86b). Meant for idle
+/// worker time before the fold; a no-op for correctness.
+pub fn prewarm(columns: usize, workers: usize) {
+    bitsliced::prewarm(columns, workers);
+}
+
 /// Compute the exact integer fold directly as little-endian `i32` coefficients.
 /// Returns `false` without changing `dst` when the general streaming path is required.
 /// Each worker owns complete, disjoint blocks of the destination until it returns.
@@ -1419,6 +1428,45 @@ mod bitsliced {
     const PAD_PER_GROUP: usize = 2;
     // The offsets use x86's scale-8 addressing directly, avoiding a shift per input.
     const _: () = assert!((GUARD + COL_GROUP * STRIDE) * 8 <= u16::MAX as usize);
+
+    /// Entries a group's schedule may hold at most: a term's run of 128 slots meets at most 65
+    /// slot pairs (its wrap is part of the same 128), plus the padding of both signs of every
+    /// pair. Allocating every group's schedule at this capacity puts them all in one size class
+    /// of the prover's allocator, where [`prewarm`] leaves faulted blocks.
+    fn terms_capacity(columns: usize, weight: usize) -> usize {
+        columns * weight * 65 + PAD_PER_GROUP * PAIRS + PF_AHEAD
+    }
+
+    pub(super) fn prewarm(columns: usize, workers: usize) {
+        let groups = columns.div_ceil(COL_GROUP);
+        let cap = terms_capacity(COL_GROUP, crate::challenge::DEFAULT_WEIGHT);
+        let mut terms: Vec<Vec<u16>> = Vec::with_capacity(groups);
+        for _ in 0..groups {
+            let mut v: Vec<u16> = Vec::with_capacity(cap);
+            touch(v.as_mut_ptr() as *mut u8, cap * 2);
+            terms.push(v);
+        }
+        let mut vectors: Vec<Vec<__m512i>> = Vec::with_capacity(2 * workers);
+        for _ in 0..workers {
+            for n in [GUARD + COL_GROUP * STRIDE, 2 * PAIRS * BITS] {
+                let mut v: Vec<__m512i> = Vec::with_capacity(n);
+                touch(v.as_mut_ptr() as *mut u8, n * 64);
+                vectors.push(v);
+            }
+        }
+        drop(terms);
+        drop(vectors);
+    }
+
+    /// Fault every page of a fresh block in (a byte per 4 KB; the allocator's huge-page chunks
+    /// are faulted as a whole, this covers 4 KB-page fallbacks).
+    fn touch(p: *mut u8, bytes: usize) {
+        let mut at = 0;
+        while at < bytes {
+            unsafe { core::ptr::write_volatile(p.add(at), 0) };
+            at += 4096;
+        }
+    }
 
     /// Whether the counters cannot overflow: a slot's counter adds at most one entry per
     /// challenge term and the padding of every group.
@@ -1487,7 +1535,10 @@ mod bitsliced {
         // even alignment); presetting that slot to 0 avoids zeroing the whole schedule vector.
         let total_terms = group.offsets[PAIRS];
         // [`PF_AHEAD`] trailing zero offsets: the accumulation's look-ahead reads them.
-        group.terms = Vec::with_capacity(total_terms + PF_AHEAD);
+        // The capacity is the class [`prewarm`] stocked when the group's weights allow it.
+        let weight = cs.iter().map(|c| c.weight).max().unwrap_or(0);
+        let cap = (total_terms + PF_AHEAD).max(terms_capacity(GROUP, weight.max(crate::challenge::DEFAULT_WEIGHT)));
+        group.terms = Vec::with_capacity(cap);
         core::ptr::write_bytes(group.terms.as_mut_ptr().add(total_terms), 0, PF_AHEAD);
         unsafe {
             let terms_ptr = group.terms.as_mut_ptr();

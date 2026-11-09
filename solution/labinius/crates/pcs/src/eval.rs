@@ -342,7 +342,7 @@ unsafe fn dot_words(a: &Poly, from: usize, b: *const F162Word, n: usize) -> F162
 
 /// [`dot_words`] on two columns of `n` `B128` words at once: the word-sliced `eq` table (`a`,
 /// 384 KB at `n = 2^14`) is loaded from L2 once per pair of columns while both witness streams
-/// are prefetched 1 KB ahead.
+/// are prefetched [`ROW_LEAD`] blocks (512 bytes) ahead.
 ///
 /// # Safety
 unsafe fn dot_words2(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162Word, n: usize) -> [F162; 2] {
@@ -354,7 +354,7 @@ unsafe fn dot_words2(a: &Poly, from: usize, b0: *const F162Word, b1: *const F162
     let blocks = n / 8;
     let last = blocks.saturating_sub(1);
     for t in 0..blocks {
-        let at = 8 * (t + 8).min(last);
+        let at = 8 * (t + ROW_LEAD).min(last);
         let ahead0 = b0.wrapping_add(at) as *const i8;
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0);
         core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ahead0.wrapping_add(64));
@@ -478,6 +478,9 @@ pub fn row_evaluate_words(words: &[F162Word], p0: &[F162], workers: usize) -> Ve
     }
     out
 }
+
+/// Blocks of eight words [`dot_words2`] prefetches its two witness streams ahead.
+const ROW_LEAD: usize = 4;
 
 const TAIL_PARTS: usize = 4;
 

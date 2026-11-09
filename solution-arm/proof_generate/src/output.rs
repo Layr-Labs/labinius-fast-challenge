@@ -222,6 +222,11 @@ impl Output {
         if layout == self.state.layout {
             if let Some(map) = self.state.mapped() {
                 unsafe { encode_into(p, layout, map.addr as *mut u8); }
+                // The proof file is complete and its bytes are in the page cache: drop the
+                // mapping's page-table entries so process exit does not walk them. A shared
+                // write mapping only loses PTEs, not file data; the bytes are unchanged.
+                #[cfg(target_os = "linux")]
+                unsafe { sys::madvise(map.addr as *mut u8, layout.len(), 4) };
                 return;
             }
         }

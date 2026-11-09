@@ -171,6 +171,27 @@ impl Drop for Table {
     }
 }
 
+impl Table {
+    /// MADV_DONTNEED over a mapped witness table after its last read phase: with the
+    /// pool still warm the kernel drops the 256 MiB mapping's page-table entries in
+    /// parallel, so process exit does not walk them single-threaded on the way out.
+    /// The mapping is read-only MAP_PRIVATE: the file backing is untouched, the file
+    /// bytes and every proof byte are unchanged, and a later fault would just refault.
+    /// An owned table keeps its memory (DONTNEED would zero it, and it is private).
+    pub fn release_pages(&self) {
+        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        if let Self::Mapped { ptr, len } = self {
+            let addr = *ptr as usize;
+            labinius::par::map_blocks_scoped(*len, threads(), (2 << 20) / 16, |_, s, e| {
+                if s < e {
+                    // MADV_DONTNEED, the same advice the load path gives in parallel.
+                    unsafe { table_sys::madvise((addr + 16 * s) as *mut u8, 16 * (e - s), 4) };
+                }
+            });
+        }
+    }
+}
+
 fn read_table(path: &str) -> Table {
     load_table(path, 1 << LOG_PACKED)
 }
@@ -940,6 +961,9 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
+    // The fold's pass was the mapped table's last read: drop its page-table entries in
+    // parallel here so process exit does not walk them. Proof bytes are unchanged.
+    values.release_pages();
     output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));

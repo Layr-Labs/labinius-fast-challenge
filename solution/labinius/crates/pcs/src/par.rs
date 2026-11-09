@@ -483,7 +483,23 @@ unsafe extern "C" {
     fn sched_getaffinity(pid:i32,size:usize,mask:*mut usize)->i32;
     fn sched_setaffinity(pid:i32,size:usize,mask:*const usize)->i32;
     fn sched_getcpu()->i32;
+    fn syscall(number:i64, ...)->i64;
 }
+/// The calling thread's kernel id (0 where there is none). The raw system call: glibc's own
+/// `gettid` wrapper needs glibc 2.30.
+#[cfg(target_os="linux")]
+pub fn thread_id()->i32 {
+    #[cfg(target_arch="x86_64")]
+    const SYS_GETTID:i64=186;
+    #[cfg(target_arch="aarch64")]
+    const SYS_GETTID:i64=178;
+    #[cfg(not(any(target_arch="x86_64",target_arch="aarch64")))]
+    return 0;
+    #[cfg(any(target_arch="x86_64",target_arch="aarch64"))]
+    unsafe {syscall(SYS_GETTID) as i32}
+}
+#[cfg(not(target_os="linux"))]
+pub fn thread_id()->i32 {0}
 /// The first allowed logical CPU of each physical core, from `/proc/cpuinfo`: read once (the
 /// kernel samples every CPU's frequency to print it), by [`warm_topology`] off the critical
 /// path when the caller arranges it.
@@ -580,6 +596,16 @@ impl CorePlacement {
         if unsafe {sched_setaffinity(0,std::mem::size_of_val(&chosen),chosen.as_ptr())} !=0 {return None;}
         Some(AffinityGuard{old})
     }
+    /// Let thread `tid`, pinned to `worker`'s CPU, run on every CPU of this placement but that
+    /// one: for a runner whose CPU another process has taken.
+    pub fn release(&self,tid:i32,worker:usize)->bool {
+        let mut mask=[0usize;16];
+        let bits=usize::BITS as usize;
+        for (i,&c) in self.cpus.iter().enumerate() {
+            if i!=worker && c<mask.len()*bits {mask[c/bits]|=1usize<<(c%bits);}
+        }
+        tid>0 && mask.iter().any(|&m|m!=0) && unsafe {sched_setaffinity(tid,std::mem::size_of_val(&mask),mask.as_ptr())}==0
+    }
 }
 #[cfg(target_os="linux")]
 impl Drop for AffinityGuard {
@@ -594,6 +620,7 @@ impl CorePlacement {
     pub fn for_sibling_pairs(_:usize)->Option<Self>{None}
     pub fn claim(&self,taken:&[std::sync::atomic::AtomicBool])->usize {(0..taken.len()).find(|&i|!taken[i].swap(true,std::sync::atomic::Ordering::AcqRel)).expect("one slot per task")}
     pub fn pin(&self,_:usize)->Option<()>{None}
+    pub fn release(&self,_:i32,_:usize)->bool{false}
 }
 
 #[cfg(all(test,target_os="linux"))]

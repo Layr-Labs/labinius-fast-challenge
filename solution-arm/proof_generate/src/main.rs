@@ -846,7 +846,9 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
             coords.push(r);
             switch.fold(r);
         }
-        return (partials, rounds, coords, switch.final_eval());
+        let eval = switch.final_eval();
+        std::mem::forget(switch);
+        return (partials, rounds, coords, eval);
     }
     let mut ws = cf::Workspace::new(LOG_PACKED, 1);
     let partials = ws.partial_evals(0, values, hi);
@@ -872,11 +874,24 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
     (partials, rounds, coords, opened)
 }
 
+fn commit_packed(values: &[B128], modulus: u128, mut buf: Vec<u8>) -> Vec<u8> {
+    #[cfg(target_arch = "aarch64")]
+    if modulus == ntt::neon::sms::MODULUS {
+        use ntt::neon::sms;
+        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
+            .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+        sms::commit_into(values, &matrix, threads(), &mut buf);
+        return buf;
+    }
+    let coefficients = commit(values, modulus);
+    let commitment = output::pack_commitment(&coefficients, modulus, buf);
+    std::mem::forget(coefficients);
+    commitment
+}
+
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
-    let coefficients = commit(values, modulus);
-    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
-    std::mem::forget(coefficients);
+    let commitment = commit_packed(values, modulus, output.commitment_buffer());
     labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
@@ -1002,7 +1017,7 @@ mod tests {
     #[test]
     fn sms_commit_matches_reference() {
         // the embedded images are the runtime matrix, byte for byte
-        {
+        if !SMS_DATA.0.is_empty() {
             use ntt::neon::sms;
             let built = sms::matrix(RING_ELEMENTS, 8);
             let embedded = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
@@ -1015,10 +1030,14 @@ mod tests {
         let values: Vec<B128> = (0..9).flat_map(|s| column(100 + s)).collect();
         let matrix = rq::ajtai_matrix(q, RING_ELEMENTS);
         let want = commit_reference(&values, &matrix, q);
+        let want_packed = output::pack_commitment(&want, q, vec![0u8; want.len() * 5]);
         let a = sms::matrix(RING_ELEMENTS, 8);
         eprintln!("sms margin {}", a.margin);
         for workers in [1, 3] {
             assert!(sms::commit(&values, &a, workers) == want, "workers {workers}");
+            let mut packed = vec![0u8; want.len() * 5];
+            sms::commit_into(&values, &a, workers, &mut packed);
+            assert!(packed == want_packed, "commit_into workers {workers}");
         }
         // a short last chunk and a short last lockstep group, partial batches; the last sweep of
         // the column with one to four tiles (whole and short), a column of one short tile, and a
@@ -1027,8 +1046,12 @@ mod tests {
             let values: Vec<B128> = (0..cols).flat_map(|s| column(200 + s as u64)).take(cols * 4 * elements).collect();
             let matrix = rq::ajtai_matrix(q, elements);
             let want = commit_reference(&values, &matrix, q);
+            let want_packed = output::pack_commitment(&want, q, vec![0u8; want.len() * 5]);
             let a = sms::matrix(elements, 3);
             assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
+            let mut packed = vec![0u8; want.len() * 5];
+            sms::commit_into(&values, &a, 3, &mut packed);
+            assert!(packed == want_packed, "commit_into {elements} elements");
         }
     }
     #[test]

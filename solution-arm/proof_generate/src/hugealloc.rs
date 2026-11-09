@@ -39,7 +39,34 @@ mod imp {
         (size + HUGE - 1) & !(HUGE - 1)
     }
 
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static LOCK: AtomicBool = AtomicBool::new(false);
+    static mut FREE: [(usize, usize); 16] = [(0, 0); 16];
+
+    #[inline]
+    unsafe fn take_recycled(size: usize) -> *mut u8 {
+        let need = span(size);
+        while LOCK.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        let mut out = core::ptr::null_mut();
+        for i in 0..16 {
+            let (addr, rem) = FREE[i];
+            if rem >= need {
+                out = addr as *mut u8;
+                FREE[i] = (addr + need, rem - need);
+                break;
+            }
+        }
+        LOCK.store(false, Ordering::Release);
+        out
+    }
+
     pub unsafe fn map(size: usize) -> *mut u8 {
+        let recycled = take_recycled(size);
+        if !recycled.is_null() {
+            return recycled;
+        }
         let len = span(size);
         let raw = mmap(core::ptr::null_mut(), len + HUGE, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, -1, 0);
         if raw as isize == -1 {
@@ -59,8 +86,47 @@ mod imp {
         aligned as *mut u8
     }
 
+    pub unsafe fn map_zeroed(size: usize) -> *mut u8 {
+        let recycled = take_recycled(size);
+        if !recycled.is_null() {
+            core::ptr::write_bytes(recycled, 0, size);
+            return recycled;
+        }
+        map(size)
+    }
+
     pub unsafe fn unmap(ptr: *mut u8, size: usize) {
-        munmap(ptr, span(size));
+        let len = span(size);
+        let p = ptr as usize;
+        while LOCK.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        let mut stored = false;
+        for i in 0..16 {
+            let (addr, rem) = FREE[i];
+            if rem > 0 && addr + rem == p {
+                FREE[i] = (addr, rem + len);
+                stored = true;
+                break;
+            } else if rem > 0 && p + len == addr {
+                FREE[i] = (p, rem + len);
+                stored = true;
+                break;
+            }
+        }
+        if !stored {
+            for i in 0..16 {
+                if FREE[i].1 == 0 {
+                    FREE[i] = (p, len);
+                    stored = true;
+                    break;
+                }
+            }
+        }
+        LOCK.store(false, Ordering::Release);
+        if !stored {
+            munmap(ptr, len);
+        }
     }
 }
 
@@ -78,7 +144,7 @@ unsafe impl GlobalAlloc for Allocator {
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if imp::is_big(&layout) {
-            imp::map(layout.size())
+            imp::map_zeroed(layout.size())
         } else {
             System.alloc_zeroed(layout)
         }

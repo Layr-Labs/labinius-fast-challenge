@@ -5,7 +5,7 @@ use crate::par;
 
 const PACK: usize = 128;
 const PREFIX: usize = 6;
-const PLANE_RESERVE: usize = 4 << 20;
+const PLANE_RESERVE: usize = 2 << 20;
 
 fn inverse(x: B128) -> B128 {
     assert_ne!(x, B128::ZERO);

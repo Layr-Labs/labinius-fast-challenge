@@ -409,7 +409,12 @@ unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 
         vdupq_n_u8(0)
     };
     let (a, b) = index_swap::<1>(a, b, 0x55);
-    let (c, d) = index_swap::<1>(c, d, 0x55);
+    let (c, d) = if G == 0 {
+        index_swap::<1>(c, d, 0x55)
+    } else {
+        let m55 = vdupq_n_u8(0x55);
+        (vandq_u8(c, m55), vandq_u8(vshrq_n_u8::<1>(c), m55))
+    };
     let (a, c) = index_swap::<2>(a, c, 0x33);
     let (b, d) = index_swap::<2>(b, d, 0x33);
     macro_rules! put {
@@ -429,8 +434,12 @@ unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 
             let hi_odd = vorrq_u8(hi, vdupq_n_u8(1));
             put!($r, vzip1q_u8(lo, lo_odd));
             put!($r + 4, vzip1q_u8(hi, hi_odd));
-            put!($r + 8, vzip2q_u8(lo, lo_odd));
-            put!($r + 12, vzip2q_u8(hi, hi_odd));
+            if 4 * (16 * G + $r + 8) + K < GROUPS {
+                put!($r + 8, vzip2q_u8(lo, lo_odd));
+            }
+            if 4 * (16 * G + $r + 12) + K < GROUPS {
+                put!($r + 12, vzip2q_u8(hi, hi_odd));
+            }
         }};
     }
     emit!(a, 0);
@@ -792,6 +801,147 @@ pub unsafe fn transform<const P: usize>(m: &[int16x8_t; BITS], x: &mut [int16x8_
     pass_d::<P, false>(x, kern, &[], &mut []);
 }
 
+/// Levels 4, 5, and 6 fused for prime 9721 (`S == 4` table-front schedule): per level-3 node
+/// (27 slots), levels 4 and 5 feed level 6 directly without writing `v1` and `v2` (`j = 1, 2`)
+/// back to `x` and reloading all 648 slots in a separate `pass_d`.
+#[inline(never)]
+pub unsafe fn pass_cd(x: &mut [int16x8_t; N], kern: &Kernel) {
+    let s: Schedule = schedule(1);
+    let k = vld1q_s16(kern.k.as_ptr());
+    #[inline(always)]
+    unsafe fn lvl4<const R4: bool, const SKIP: u8>(
+        x: &[int16x8_t; N],
+        s: Schedule,
+        t0: int16x8_t,
+        k: int16x8_t,
+        at: usize,
+    ) -> [int16x8_t; 9] {
+        let mut v: [int16x8_t; 9] = core::array::from_fn(|i| load(x, at + 3 * i));
+        if R4 {
+            reduce_inputs(&mut v, s.before[4], s.cheap, &[0, 1, 2], k);
+        }
+        for i in 0..3 {
+            let (a, b, c) = r3!(s, 0, 1, 2, 3, v[i], v[i + 3], v[i + 6], t0, k);
+            (v[i], v[i + 3], v[i + 6]) = (a, b, c);
+        }
+        for g in 0..3 {
+            if SKIP >> g & 1 == 0 {
+                v[3 * g] = reduce_round13(v[3 * g], k);
+            }
+        }
+        v
+    }
+    #[inline(always)]
+    unsafe fn group6<const EVEN: bool>(
+        x: &mut [int16x8_t; N],
+        s: Schedule,
+        a: (int16x8_t, int16x8_t, int16x8_t),
+        b: (int16x8_t, int16x8_t, int16x8_t),
+        c: (int16x8_t, int16x8_t, int16x8_t),
+        d0: int16x8_t,
+        d1: int16x8_t,
+        k: int16x8_t,
+        at: usize,
+    ) {
+        let ((y0, y1, y2), (y3, y4, y5), (y6, y7, y8)) = if EVEN {
+            (
+                r3!(s, 0, 1, 2, 3, a.0, b.0, c.0, d0, k),
+                r3!(s, 4, 5, 6, 7, a.1, b.1, c.1, d0, k),
+                r3!(s, 0, 1, 2, 3, a.2, b.2, c.2, d1, k),
+            )
+        } else {
+            (
+                r3!(s, 4, 5, 6, 7, a.0, b.0, c.0, d0, k),
+                r3!(s, 0, 1, 2, 3, a.1, b.1, c.1, d1, k),
+                r3!(s, 4, 5, 6, 7, a.2, b.2, c.2, d1, k),
+            )
+        };
+        store(x, at, y0);
+        store(x, at + 1, y1);
+        store(x, at + 2, y2);
+        store(x, at + 3, y3);
+        store(x, at + 4, y4);
+        store(x, at + 5, y5);
+        store(x, at + 6, y6);
+        store(x, at + 7, y7);
+        store(x, at + 8, y8);
+    }
+    #[inline(always)]
+    unsafe fn node<const N_IDX: usize, const R4: bool, const SKIP: u8>(
+        x: &mut [int16x8_t; N],
+        s: Schedule,
+        kern: &Kernel,
+        k: int16x8_t,
+    ) {
+        let t0 = vld1q_s16(kern.c[N_IDX].as_ptr());
+        let t1 = vld1q_s16(kern.c[N_IDX].as_ptr().add(8));
+        let base = 27 * N_IDX;
+        let v0 = lvl4::<R4, SKIP>(x, s, t0, k, base);
+        let a0 = r3!(s, 4, 5, 6, 7, v0[0], v0[1], v0[2], t0, k);
+        store(x, base, reduce_round13(a0.0, k));
+        store(x, base + 3, reduce_round13(a0.1, k));
+        store(x, base + 6, reduce_round13(a0.2, k));
+        let a1 = r3!(s, 0, 1, 2, 3, v0[3], v0[4], v0[5], t1, k);
+        store(x, base + 9, reduce_round13(a1.0, k));
+        store(x, base + 12, reduce_round13(a1.1, k));
+        store(x, base + 15, reduce_round13(a1.2, k));
+        let a2 = r3!(s, 4, 5, 6, 7, v0[6], v0[7], v0[8], t1, k);
+        store(x, base + 18, reduce_round13(a2.0, k));
+        store(x, base + 21, reduce_round13(a2.1, k));
+        store(x, base + 24, reduce_round13(a2.2, k));
+
+        let v1 = lvl4::<R4, SKIP>(x, s, t0, k, base + 1);
+        let b0 = r3!(s, 4, 5, 6, 7, v1[0], v1[1], v1[2], t0, k);
+        let b1 = r3!(s, 0, 1, 2, 3, v1[3], v1[4], v1[5], t1, k);
+        let b2 = r3!(s, 4, 5, 6, 7, v1[6], v1[7], v1[8], t1, k);
+        store(x, base + 19, b2.0);
+        store(x, base + 22, b2.1);
+        store(x, base + 25, b2.2);
+
+        let v2 = lvl4::<R4, SKIP>(x, s, t0, k, base + 2);
+        let c0 = r3!(s, 4, 5, 6, 7, v2[0], v2[1], v2[2], t0, k);
+        let a0 = (load(x, base), load(x, base + 3), load(x, base + 6));
+        let q0 = (9 * N_IDX) / 2;
+        let d0 = vld1q_s16(kern.d[q0].as_ptr());
+        let d1 = vld1q_s16(kern.d[q0 + 1].as_ptr());
+        if N_IDX % 2 == 0 {
+            group6::<true>(x, s, a0, b0, c0, d0, d1, k, base);
+        } else {
+            group6::<false>(x, s, a0, b0, c0, d0, d1, k, base);
+        }
+
+        let c1 = r3!(s, 0, 1, 2, 3, v2[3], v2[4], v2[5], t1, k);
+        let a1 = (load(x, base + 9), load(x, base + 12), load(x, base + 15));
+        let q1 = (9 * N_IDX + 3) / 2;
+        let d2 = vld1q_s16(kern.d[q1].as_ptr());
+        let d3 = vld1q_s16(kern.d[q1 + 1].as_ptr());
+        if N_IDX % 2 == 0 {
+            group6::<false>(x, s, a1, b1, c1, d2, d3, k, base + 9);
+        } else {
+            group6::<true>(x, s, a1, b1, c1, d2, d3, k, base + 9);
+        }
+
+        let c2 = r3!(s, 4, 5, 6, 7, v2[6], v2[7], v2[8], t1, k);
+        let a2 = (load(x, base + 18), load(x, base + 21), load(x, base + 24));
+        let b2 = (load(x, base + 19), load(x, base + 22), load(x, base + 25));
+        let q2 = (9 * N_IDX + 6) / 2;
+        let d4 = vld1q_s16(kern.d[q2].as_ptr());
+        let d5 = vld1q_s16(kern.d[q2 + 1].as_ptr());
+        if N_IDX % 2 == 0 {
+            group6::<true>(x, s, a2, b2, c2, d4, d5, k, base + 18);
+        } else {
+            group6::<false>(x, s, a2, b2, c2, d4, d5, k, base + 18);
+        }
+    }
+    macro_rules! nodes {
+        ($($n:literal),*) => {
+            const { assert!([$($n),*].len() == 24) };
+            $(node::<$n, { lut_node_kind($n).0 }, { lut_node_kind($n).1 }>(x, s, kern, k);)*
+        };
+    }
+    nodes!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
+}
+
 /// [`transform`] through the nibble tables: [`nibbles`] and [`pass_lut`] in place of [`pass_a`]
 /// and [`pass_b`], values within [`super::lut_transform_bound`].
 #[inline(never)]
@@ -800,8 +950,12 @@ pub unsafe fn transform_lut<const P: usize>(m: &[int16x8_t; BITS], idx: &mut [ui
     let kern = &kernels()[P];
     nibbles(m, idx);
     pass_lut::<P>(idx, x, kern);
-    if P == 1 { pass_c::<4>(x, kern); } else { pass_c::<P>(x, kern); }
-    pass_d::<P, false>(x, kern, &[], &mut []);
+    if P == 1 {
+        pass_cd(x, kern);
+    } else {
+        pass_c::<P>(x, kern);
+        pass_d::<P, false>(x, kern, &[], &mut []);
+    }
 }
 
 /// Levels 0 and 1 of a general transform: Barrett products, every value reduced in between

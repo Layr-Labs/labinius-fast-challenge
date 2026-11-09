@@ -2427,7 +2427,14 @@ mod bitsliced {
         };
         let t0 = std::time::Instant::now();
         let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
+        // One runner per physical core, pinned: two hyperthreads share the core's load ports
+        // and L2, and each one's table stream and planes evict the other's.
+        let cores = crate::par::physical_core_count().filter(|&c| c > 0 && c < workers);
+        let workers = cores.unwrap_or(workers);
+        let placement = cores.and_then(crate::par::CorePlacement::for_workers);
+        let placement = &placement;
         crate::par::pool().run(workers.clamp(1, tasks), |worker| unsafe {
+            let _pin = placement.as_ref().and_then(|p| p.pin(worker));
             let ran = run_worker::<GROUP, FUSED, WIRE>(
                 worker,
                 words,

@@ -498,6 +498,13 @@ fn core_cpus()->Option<&'static [Vec<usize>]> {
     static CORES:std::sync::OnceLock<Option<Vec<Vec<usize>>>>=std::sync::OnceLock::new();
     CORES.get_or_init(read_core_cpus).as_deref()
 }
+/// Allowed physical cores, when the topology is readable.
+pub fn physical_core_count() -> Option<usize> {
+    #[cfg(target_os="linux")]
+    { physical_cores().map(|c| c.len()) }
+    #[cfg(not(target_os="linux"))]
+    { None }
+}
 /// Read the CPU topology [`CorePlacement::for_workers`] needs now.
 pub fn warm_topology() {
     #[cfg(target_os="linux")]

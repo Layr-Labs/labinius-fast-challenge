@@ -162,6 +162,23 @@ impl std::ops::Deref for Table {
     }
 }
 
+impl Table {
+    /// Drop the mapping's page-table entries on every worker (`MADV_DONTNEED`, 2 MiB parts): the
+    /// mapping is read-only, so the page cache keeps the pages. Otherwise the exit tears down all
+    /// of them, one per 4 KiB page on a 4 KiB-page kernel, on one core inside the measured time.
+    fn release(&self) {
+        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        if let Self::Mapped { ptr, len } = self {
+            let base = *ptr as usize;
+            labinius::par::map_blocks_scoped(*len, threads(), (2 << 20) / 16, |_, s, e| {
+                if s < e {
+                    unsafe { table_sys::madvise((base + 16 * s) as *mut u8, 16 * (e - s), 4) };
+                }
+            });
+        }
+    }
+}
+
 impl Drop for Table {
     fn drop(&mut self) {
         #[cfg(all(target_os = "linux", target_endian = "little"))]
@@ -191,11 +208,13 @@ fn load_table(path: &str, n: usize) -> Table {
             labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
                 if s < e {
                     let addr = (base + 16 * s) as *mut u8;
-                    // Linux 5.14+: install the page-cache pages in parallel. Older kernels
-                    // simply fault on access. MADV_HUGEPAGE is a best-effort hint for the file.
+                    // MADV_HUGEPAGE is a best-effort hint for the file. The pages are not
+                    // installed up front (MADV_POPULATE_READ): with 4 KiB page-cache folios that
+                    // costs ~10 ms of one-entry-per-page work before the commitment starts, while
+                    // the commitment's own first reads fault them in a fault-around batch at a
+                    // time, on the worker that needs them.
                     unsafe {
                         table_sys::madvise(addr, 16 * (e - s), 14);
-                        table_sys::madvise(addr, 16 * (e - s), 22);
                     }
                 }
             });
@@ -941,6 +960,7 @@ fn main() {
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
     output.write(&proof);
+    values.release();
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
     // The proof file is complete. Let process teardown release the large allocations and

@@ -1013,24 +1013,12 @@ static SMS_MUR:Aligned64<[u8;SMS_MUR_LEN]>=Aligned64(*include_bytes!(concat!(env
 const SMS_MU_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")).len();
 static SMS_MU:Aligned64<[u8;SMS_MU_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-mu.bin")));
 
-// Repair digits remain a separate read-only image: only rare boundary
-// coefficients read it. It contains public matrix data, never instance data.
-const SMS_DIGITS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-digits.bin")).len();
-static SMS_DIGITS:Aligned64<[u8;SMS_DIGITS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-digits.bin")));
-const SMS_MEANS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-means.bin")).len();
-static SMS_MEANS:Aligned64<[u8;SMS_MEANS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-means.bin")));
-const SMS_LIMITS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-limits.bin")).len();
-static SMS_LIMITS:Aligned64<[u8;SMS_LIMITS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-limits.bin")));
-
 /// The embedded single-transform keys, read in place, if the build host made them for this
 /// shape.
 fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     use labinius::simd::commit::sms;
     let words = (RING_ELEMENTS / (2 * sms::LOCK)) * sms::LOCK_WORDS;
-    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 4 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N
-        || SMS_DIGITS_LEN != sms::DIGITS * RING_ELEMENTS * N
-        || SMS_MEANS_LEN != 4 * sms::mur_len(RING_ELEMENTS)
-        || SMS_LIMITS_LEN != 2 * sms::DIGITS * sms::chunk_count(RING_ELEMENTS) {
+    if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 4 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N {
         return None;
     }
     unsafe {
@@ -1039,11 +1027,6 @@ fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
             mur: std::slice::from_raw_parts(SMS_MUR.0.as_ptr() as *const i32, sms::mur_len(RING_ELEMENTS)),
             mu: std::slice::from_raw_parts(SMS_MU.0.as_ptr() as *const u32, N),
             elements: RING_ELEMENTS,
-            repair: Some(sms::RepairKeys {
-                digits: std::slice::from_raw_parts(SMS_DIGITS.0.as_ptr().cast::<i8>(), SMS_DIGITS_LEN),
-                means: std::slice::from_raw_parts(SMS_MEANS.0.as_ptr().cast::<i32>(), SMS_MEANS_LEN / 4),
-                limits: std::slice::from_raw_parts(SMS_LIMITS.0.as_ptr().cast::<i16>(), SMS_LIMITS_LEN / 2),
-            }),
         })
     }
 }
@@ -1159,42 +1142,6 @@ const HYBRID_GROUP: usize = 16;
 
 /// What [`prove`] produces: the proof's fields, the folded witness still as ring elements (its
 /// wire form is written straight into the proof file).
-enum FoldedData {
-    Owned(FoldedWitness),
-    /// All coefficient bytes have already been computed in this owned mapping.
-    Encoded(std::sync::Arc<OutputState>),
-}
-
-impl FoldedData {
-    fn len(&self) -> usize {
-        match self {
-            Self::Owned(v) => v.elements().len(),
-            Self::Encoded(state) => {
-                assert_eq!(state.layout.folded_bytes % (FOLDED_BYTES * N), 0);
-                state.layout.folded_bytes / (FOLDED_BYTES * N)
-            }
-        }
-    }
-
-    fn encoded(&self) -> Option<&[u8]> {
-        match self {
-            Self::Owned(_) => None,
-            Self::Encoded(state) => {
-                let mapped = state.map.get().and_then(Option::as_ref).expect("the encoded fold owns its mapping");
-                // Only constructed after the synchronous fold has initialized every byte.
-                Some(unsafe { core::slice::from_raw_parts((mapped.addr + state.layout.folded_at()) as *const u8, state.layout.folded_bytes) })
-            }
-        }
-    }
-
-    fn into_bytes(self) -> Vec<u8> {
-        match &self {
-            Self::Owned(v) => pack_folded(v),
-            Self::Encoded(_) => self.encoded().unwrap().to_vec(),
-        }
-    }
-}
-
 struct ProofParts {
     modulus: u128,
     commitment: Vec<u8>,
@@ -1202,7 +1149,7 @@ struct ProofParts {
     rounds: Vec<[[u64; 3]; 2]>,
     opened: [u64; 3],
     row: Vec<u8>,
-    folded: FoldedData,
+    folded: FoldedWitness,
 }
 
 impl ProofParts {
@@ -1210,7 +1157,7 @@ impl ProofParts {
         Proof {
             version: 1,
             modulus: self.modulus,
-            folded: self.folded.into_bytes(),
+            folded: pack_folded(&self.folded),
             commitment: self.commitment,
             partials: self.partials,
             rounds: self.rounds,
@@ -1249,7 +1196,7 @@ impl ProofLayout {
         ProofLayout {
             commitment_bytes: parts.commitment.len(),
             row_bytes: parts.row.len(),
-            folded_bytes: FOLDED_BYTES * N * parts.folded.len(),
+            folded_bytes: FOLDED_BYTES * N * parts.folded.elements().len(),
             partials: parts.partials.len(),
             rounds: parts.rounds.len(),
         }
@@ -1315,20 +1262,17 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
     debug_assert_eq!(middle.len(), layout.middle());
     put(&mut at, &middle);
     debug_assert_eq!(at, layout.folded_at());
-    let elements = match &parts.folded {
-        FoldedData::Owned(v) => Some(v.elements()),
-        FoldedData::Encoded(_) => None,
-    };
-    if let Some(elements) = elements {
-        assert!(elements.iter().all(|e| e.representation == Representation::Coefficients), "a fold is in coefficient form");
-    }
-    let encoded = parts.folded.encoded();
-    if let Some(bytes) = encoded { assert_eq!(bytes.len(), layout.folded_bytes); }
-    let already_written = encoded.is_some_and(|bytes| bytes.as_ptr() == out.add(layout.folded_at()));
+    let elements = parts.folded.elements();
+    assert!(
+        elements
+            .iter()
+            .all(|e| e.representation == Representation::Coefficients),
+        "a fold is in coefficient form"
+    );
     // A few commitment slices and many folded runs, taken dynamically.
     let ctasks = 4;
     let cruns = labinius::par::ranges(parts.commitment.len(), ctasks, 4096);
-    let fruns = if already_written { Vec::new() } else { labinius::par::ranges(parts.folded.len(), 4 * threads(), 1) };
+    let fruns = labinius::par::ranges(elements.len(), 4 * threads(), 1);
     let (addr, folded_at) = (out as usize, layout.folded_at());
     #[cfg(target_arch = "x86_64")]
     let avx512 = std::arch::is_x86_feature_detected!("avx512f");
@@ -1345,13 +1289,6 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
         }
         let r = fruns[i - cruns.len()].clone();
         let mut dst = out.add(folded_at + FOLDED_BYTES * N * r.start);
-        if let Some(bytes) = encoded {
-            let start = FOLDED_BYTES * N * r.start;
-            let len = FOLDED_BYTES * N * r.len();
-            core::ptr::copy_nonoverlapping(bytes.as_ptr().add(start), dst, len);
-            return;
-        }
-        let elements = elements.expect("a fold has either coefficients or encoded bytes");
         #[cfg(target_arch = "x86_64")]
         if avx512 {
             for e in &elements[r] {
@@ -1561,27 +1498,6 @@ impl Output {
         let _ = self.populate.set(job);
     }
 
-    /// Compute the final witness directly in its wire region when the exact integer
-    /// kernel supports this shape. The retained Arc also supports an ordinary codec fallback.
-    fn folded_into(&self, values: &[B128], challenges: &[ShortChallenge], workers: usize) -> Option<FoldedData> {
-        let layout = self.state.layout;
-        if layout.folded_bytes != FOLDED_BYTES * N * RING_ELEMENTS {
-            return None;
-        }
-        labinius::par::pool().quiesce(self.job);
-        if let Some(job) = self.populate.get() { labinius::par::pool().quiesce(job); }
-        let mapped = self.state.mapped()?;
-        let addr = mapped.addr.checked_add(layout.folded_at())?;
-        if addr % core::mem::align_of::<i32>() != 0 { return None; }
-        // No Rust references to this region exist, and the idle population work has
-        // stopped. The fold joins all workers before this exclusive borrow ends.
-        let dst = unsafe { core::slice::from_raw_parts_mut(addr as *mut i32, layout.folded_bytes / FOLDED_BYTES) };
-        if !labinius::fold::fold_witness_bitsliced_into(values, COLUMNS, challenges, COLUMN_LEN / 128, workers, dst) {
-            return None;
-        }
-        Some(FoldedData::Encoded(self.state.clone()))
-    }
-
     /// Write the proof: encoded into the mapping when it has the expected layout, else through
     /// the codec into a freshly truncated file.
     fn write(self, parts: ProofParts) {
@@ -1597,7 +1513,6 @@ impl Output {
                 return;
             }
         }
-        let proof = parts.into_proof();
         #[cfg(target_os = "linux")]
         if let Some(Some(m)) = self.state.map.get() {
             unsafe { sys::munmap(m.addr as *mut _, self.state.layout.len()) };
@@ -1606,7 +1521,7 @@ impl Output {
         let file = std::fs::File::create(&self.state.path).expect("create proof file");
         let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
         codec()
-            .serialize_into(&mut out, &proof)
+            .serialize_into(&mut out, &parts.into_proof())
             .expect("write proof");
         out.flush().expect("flush proof");
     }
@@ -1826,10 +1741,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
             let (addr, _) = p.region();
             (0..bound).step_by(POPULATE_CHUNK).map(move |o| (addr + o, POPULATE_CHUNK.min(bound - o)))
         });
-        let at = image.as_ptr() as usize;
-        let (lo, hi) = ((at + 4095) & !4095, (at + image.len()) & !4095);
-        let release = (lo..hi.max(lo)).step_by(POPULATE_CHUNK).map(|o| (o, POPULATE_CHUNK.min(hi - o)));
-        output.populate(first.collect(), release.collect());
+        output.populate(first.collect(), Vec::new());
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);
@@ -1874,20 +1786,16 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     let row_time = clock.elapsed();
     let challenges = folding_challenges(&mut t, &row);
     let challenge_time = clock.elapsed();
-    let folded = output.and_then(|o| o.folded_into(values, &challenges, workers)).unwrap_or_else(|| {
-        FoldedData::Owned(FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
-            values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
-        )))
-    });
+    let folded = FoldedWitness::of(labinius::fold::fold_witness_bitsliced(
+        values, COLUMNS, &challenges, COLUMN_LEN / 128, primes[0], workers,
+    ));
     let fold_time = clock.elapsed();
-    // The file-backed table is no longer read. The command writes the proof and exits
-    // immediately, so leave its mapping to process exit. Retain early release for callers
-    // requesting proof parts without an Output.
+    // Neither the table nor the key image is read from here on: their ~70k page-table entries go
+    // now, a slice per core, instead of in the exit's teardown on one core after the proof is
+    // written. The emptied mapping itself is left to the exit.
     #[cfg(target_os = "linux")]
-    if output.is_none() {
-        if let Table::Mapped { .. } = table {
-            release_words(values, image, workers);
-        }
+    if let Table::Mapped { .. } = table {
+        release_words(values, if output.is_some() { &[] } else { image }, workers);
     }
     std::mem::forget(table);
     let proof = ProofParts {
@@ -2219,7 +2127,7 @@ mod tests {
                 rounds: (0..24).map(|_| [[next(), next(), next()], [next(), next(), next()]]).collect(),
                 opened: [next(), next(), next()],
                 row: (0..row_bytes).map(|_| next() as u8).collect(),
-                folded: FoldedData::Owned(FoldedWitness::of(
+                folded: FoldedWitness::of(
                     (0..elements)
                         .map(|_| {
                             let mut e = labinius::RingElement648::zero(Representation::Coefficients);
@@ -2229,7 +2137,7 @@ mod tests {
                             e
                         })
                         .collect(),
-                )),
+                ),
             };
             let layout = ProofLayout::of_parts(&parts);
             let mut out = vec![0xA5u8; layout.len()];
@@ -2237,36 +2145,6 @@ mod tests {
             assert_eq!(out, codec().serialize(&parts.into_proof()).unwrap());
         }
         assert_eq!(ProofLayout::of_instance(MODULUS).len(), 13_958_612, "the default proof's length");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn encoded_fold_is_the_codec_encoding_and_can_copy() {
-        let elements = (0..19).map(|e| {
-            let mut v = labinius::RingElement648::zero(Representation::Coefficients);
-            for (j,c) in v.v.iter_mut().enumerate() { *c = ((e * 139 + j * 17) % 65536) as i16; }
-            v
-        }).collect();
-        let folded = FoldedWitness::of(elements);
-        let bytes = pack_folded(&folded);
-        let mut parts = ProofParts { modulus: MODULUS, commitment: vec![3;97], partials:vec![17;3], rounds:vec![[[1,2,3],[4,5,6]];2], opened:[7,8,9], row:vec![11;41], folded:FoldedData::Owned(folded) };
-        let layout = ProofLayout::of_parts(&parts);
-        let mut expected = vec![0u8;layout.len()];
-        unsafe { encode_into(&parts,&layout,expected.as_mut_ptr()); }
-        let addr = unsafe { sys::mmap(core::ptr::null_mut(),layout.len(),sys::PROT_READ|sys::PROT_WRITE,sys::MAP_PRIVATE|sys::MAP_ANONYMOUS,-1,0) };
-        assert!(addr as isize != -1 && !addr.is_null());
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(),(addr as *mut u8).add(layout.folded_at()),bytes.len()); }
-        let state = std::sync::Arc::new(OutputState { path:String::new(),layout,map:std::sync::OnceLock::new(),populate_failed:std::sync::atomic::AtomicBool::new(false) });
-        assert!(state.map.set(Some(Mapped { _file:std::fs::File::open("/dev/null").unwrap(),addr:addr as usize })).is_ok());
-        parts.folded=FoldedData::Encoded(state.clone());
-        let mut copied=vec![0xA5u8;layout.len()];
-        unsafe { encode_into(&parts,&layout,copied.as_mut_ptr()); }
-        assert_eq!(copied,expected);
-        unsafe { encode_into(&parts,&layout,addr as *mut u8); }
-        assert_eq!(unsafe{core::slice::from_raw_parts(addr as *const u8,layout.len())},&expected[..]);
-        assert_eq!(codec().serialize(&parts.into_proof()).unwrap(),expected);
-        drop(state);
-        unsafe { assert_eq!(sys::munmap(addr,layout.len()),0); }
     }
 
     /// The vectorised hybrid lift is the scalar one, word for word.

@@ -40,8 +40,6 @@ pub mod limb;
 pub mod par;
 pub mod params;
 pub mod recursion;
-/// Exact ambiguity recovery for the single-transform commitment.
-pub mod repair176_runtime;
 pub mod ring;
 pub mod rng;
 pub mod scalar;

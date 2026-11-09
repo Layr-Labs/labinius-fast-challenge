@@ -14,7 +14,7 @@
 //!
 //! The SMS commitment ([`sms`]) runs levels 0 to 2 and the level-3 twiddles as lookups instead
 //! ([`nibbles`], [`pass_lut`]): per level-1 node, 16-entry `i16` tables indexed by the nibble of
-//! the coefficients `j + 162 g`, one SVE2 halfword `tbl` per lookup and two lookups per level-3 input,
+//! the coefficients `j + 162 g`, one `vqtbl2q_u8` per lookup and two lookups per level-3 input,
 //! within [`super::lut_transform_bound`] (the library's x86 `bin_asm` does the same).
 use super::{for_blocks, primes, schedule, Matrix, Schedule, ALL, FIRST, FIRST13, N, PRIMES, ROW, SCHEDULES};
 use core::arch::aarch64::*;
@@ -358,13 +358,13 @@ unsafe fn pass_a(m: &[int16x8_t; BITS], x: &mut [int16x8_t; N], kern: &Kernel) {
 /// Coefficient groups of the nibble tables: group `j < 162` is the coefficients `j + 162 g`.
 const GROUPS: usize = N / 4;
 
-/// `out[j]`, lane `c`: column `c`'s nibble `v` at group `j` as a `u16` (bit `g` set where
-/// coefficient `j + 162 g` is; coefficients from 512 on are zero), the SVE2 halfword `tbl`
-/// index of entry `v` of a 16-entry `i16` table ([`look`]).
+/// `out[j]`, lane `c`: the byte pair `(2 v, 2 v + 1)` of column `c`'s nibble `v` at group `j`
+/// (bit `g` set where coefficient `j + 162 g` is; coefficients from 512 on are zero), the
+/// `vqtbl2q_u8` index of entry `v` of a 16-entry `i16` table.
 #[inline(always)]
 unsafe fn nibbles(m: &[int16x8_t; BITS], out: &mut [uint8x16_t; GROUPS]) {
-    let (lo, c0) = (vdupq_n_u16(0), vdupq_n_u16(1));
-    let (c1, c2, c3) = (vdupq_n_u16(2), vdupq_n_u16(4), vdupq_n_u16(8));
+    let (lo, c0) = (vdupq_n_u16(0x0100), vdupq_n_u16(0x0302));
+    let (c1, c2, c3) = (vdupq_n_u16(0x0404), vdupq_n_u16(0x0808), vdupq_n_u16(0x1010));
     let mask = |i: usize| vreinterpretq_u16_s16(*m.get_unchecked(i));
     for j in 0..GROUPS {
         let mut r = vbslq_u16(mask(j), c0, lo);
@@ -375,14 +375,6 @@ unsafe fn nibbles(m: &[int16x8_t; BITS], out: &mut [uint8x16_t; GROUPS]) {
         }
         *out.get_unchecked_mut(j) = vreinterpretq_u8_u16(r);
     }
-}
-
-/// `v` through an empty asm statement, so that LLVM keeps the zip that made it and stores it
-/// with a plain `str` instead of fusing the zip pair into an `st2`.
-#[inline(always)]
-fn no_st2(mut v: uint8x16_t) -> uint8x16_t {
-    unsafe { core::arch::asm!("/* {0:v} */", inout(vreg) v, options(pure, nomem, nostack, preserves_flags)) };
-    v
 }
 
 /// Exchange alternating groups of `D` bits between two bit planes. After the two
@@ -430,17 +422,15 @@ unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 
     macro_rules! emit {
         ($v:expr, $r:literal) => {{
             let v = $v;
-            // `u16` nibbles for SVE2's halfword `tbl` ([`look`]): widened by a zip with zero
-            let lo = vandq_u8(v, vdupq_n_u8(0x0f));
-            let hi = vshrq_n_u8::<4>(v);
-            let z = vdupq_n_u8(0);
-            // Each zip through [`no_st2`]: LLVM otherwise fuses a zip pair and its two stores
-            // into one `st2`, about 3 cycles on Neoverse V2 against 4 zips a cycle and 2 plain
-            // stores a cycle (measured on Axion).
-            put!($r, no_st2(vzip1q_u8(lo, z)));
-            put!($r + 4, no_st2(vzip1q_u8(hi, z)));
-            put!($r + 8, no_st2(vzip2q_u8(lo, z)));
-            put!($r + 12, no_st2(vzip2q_u8(hi, z)));
+            let lo = vandq_u8(vshlq_n_u8::<1>(v), vdupq_n_u8(0x1e));
+            let hi = vandq_u8(vshrq_n_u8::<3>(v), vdupq_n_u8(0x1e));
+            // Set the second byte before duplication: one OR serves both halves.
+            let lo_odd = vorrq_u8(lo, vdupq_n_u8(1));
+            let hi_odd = vorrq_u8(hi, vdupq_n_u8(1));
+            put!($r, vzip1q_u8(lo, lo_odd));
+            put!($r + 4, vzip1q_u8(hi, hi_odd));
+            put!($r + 8, vzip2q_u8(lo, lo_odd));
+            put!($r + 12, vzip2q_u8(hi, hi_odd));
         }};
     }
     emit!(a, 0);
@@ -450,7 +440,7 @@ unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 
 }
 
 /// The table indices of one element of eight columns. Coefficient `4 q + k`
-/// is bit `q` of word `k`; each result lane holds the `u16` pattern `p` for the
+/// is bit `q` of word `k`; each result lane holds `(2 p, 2 p + 1)` for the
 /// four-bit pattern at `j + 162 t`, with coefficients above 511 zero.
 #[inline(always)]
 unsafe fn indices_pair<const P: usize>(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
@@ -501,7 +491,7 @@ unsafe fn indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
     indices_pair::<1>(words, idx);
 }
 
-/// The 16-entry `i16` table `t` as the two registers SVE2's two-register `tbl` reads.
+/// The 16-entry `i16` table `t` as the two registers `vqtbl2q_u8` reads.
 #[inline(always)]
 unsafe fn table(t: &[i16; 16]) -> uint8x16x2_t {
     vld1q_u8_x2(t.as_ptr() as *const u8)
@@ -510,15 +500,7 @@ unsafe fn table(t: &[i16; 16]) -> uint8x16x2_t {
 /// Entry `v` of table `t` in every lane, `v` from the lane's index pair in `i`.
 #[inline(always)]
 unsafe fn look(t: uint8x16x2_t, i: uint8x16_t) -> int16x8_t {
-    // SVE2 two-register halfword `tbl` (Neoverse V2: the same throughput as NEON's byte
-    // `tbl`, measured on Axion): `u16` indices, so the nibbles need no byte-pair expansion.
-    let r: uint8x16_t;
-    core::arch::asm!(
-        "tbl z19.h, {{z16.h, z17.h}}, z18.h",
-        in("v16") t.0, in("v17") t.1, in("v18") i, lateout("v19") r,
-        options(pure, nomem, nostack, preserves_flags)
-    );
-    vreinterpretq_s16_u8(r)
+    vreinterpretq_s16_u8(vqtbl2q_u8(t, i))
 }
 
 /// The second child's radix-3 butterfly from the shared lookups. If `b` and

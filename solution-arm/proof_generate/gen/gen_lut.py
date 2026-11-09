@@ -23,7 +23,7 @@ def build_node(n, steps):
         for t, o in enumerate(offs):
             ix, val = v('ix'), v('lk')
             ins.append(Ins('L', [ix], [], f'ldr q{{d0}}, [IPTR, #{16*o}]'))
-            ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.h, z{17+2*t}.hRB, z{{s0}}.h'))
+            ins.append(Ins('A', [val], [ix], f'tbl v{{d0}}.16b, LBv{16+2*t}.16b, v{17+2*t}.16bRB, v{{s0}}.16b'))
             look.append(val)
         x0, y0, x1, y1, x2, y2 = look
         a0, b0 = A('add', x0, y0), A('sub', x0, y0)

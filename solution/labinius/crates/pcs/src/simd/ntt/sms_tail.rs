@@ -274,17 +274,8 @@ static SMS_BAND_T4:SmsBandT4=SmsBandT4([[-2511i16;32],[-7i16;32],[-2511i16;32],[
 const fn sms_band_lut()->SmsBandLut{let original=build_tables::<9721>();let scales:[[i32;3];4]=[[9626, 7203, 7344], [4010, 1866, 175], [1282, 7826, 1186], [5655, 6885, 3406]];let mut output=[[[0u8;64];48];3];let mut b=0;while b<3{let mut table=0;while table<48{let mut n=0;while n<16{let old=(original.lut[table][n]as u16|((original.lut[table][16+n]as u16)<<8))as i16 as i32;let mut v=old*scales[table/12][b]%9721;if v<0{v+=9721;}if v>4860{v-=9721;}output[b][table][n]=v as u16 as u8;output[b][table][16+n]=((v as u16)>>8)as u8;n+=1;}table+=1;}b+=1;}SmsBandLut(output)}
 static SMS_BAND_LUT:SmsBandLut=sms_band_lut();
 
-#[inline(never)]
-#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn tail27_sms_band0_leaf(
-    bp: *const i16,
-    op: *mut i16,
-    t4: *const u32,
-    t5: *const u32,
-    t6: *const u32,
-    cv: *const i16,
-) {
-    core::arch::asm!(
+macro_rules! tail27_sms_band0 {
+    () => {
         concat!(
 "vmovdqa64 zmm27, [{c}]\n",
 "vmovdqa64 zmm0, [{i}+0]\n",
@@ -437,7 +428,22 @@ bfly!(8,17,26,28),
             level6_mem!(plain "+128", 12, 13, 14, 28),
             bfly!(15, 16, 17, 29, 1344, 1408, 1472),
             bfly!(12, 13, 14, 28, 1536, 1600, 1664),
-),
+)
+    };
+}
+
+#[inline(never)]
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn tail27_sms_band0_leaf(
+    bp: *const i16,
+    op: *mut i16,
+    t4: *const u32,
+    t5: *const u32,
+    t6: *const u32,
+    cv: *const i16,
+) {
+    core::arch::asm!(
+        tail27_sms_band0!(),
         i = in(reg) bp,
         o = in(reg) op,
         
@@ -478,17 +484,8 @@ bfly!(8,17,26,28),
         options(nostack)
     );
 }
-#[inline(never)]
-#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn tail27_sms_band4_leaf(
-    bp: *const i16,
-    op: *mut i16,
-    t4: *const u32,
-    t5: *const u32,
-    t6: *const u32,
-    cv: *const i16,
-) {
-    core::arch::asm!(
+macro_rules! tail27_sms_band4 {
+    () => {
         concat!(
 "vmovdqa64 zmm27, [{c}]\n",
 "vpxord zmm31, zmm31, zmm31\n",
@@ -651,7 +648,22 @@ bfly!(8,17,26,28),
             level6_mem!(plain "+128", 21, 22, 23, 28),
             bfly!(24, 25, 26, 29, 1344, 1408, 1472),
             bfly!(21, 22, 23, 28, 1536, 1600, 1664),
-),
+)
+    };
+}
+
+#[inline(never)]
+#[target_feature(enable="avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
+unsafe fn tail27_sms_band4_leaf(
+    bp: *const i16,
+    op: *mut i16,
+    t4: *const u32,
+    t5: *const u32,
+    t6: *const u32,
+    cv: *const i16,
+) {
+    core::arch::asm!(
+        tail27_sms_band4!(),
         i = in(reg) bp,
         o = in(reg) op,
         

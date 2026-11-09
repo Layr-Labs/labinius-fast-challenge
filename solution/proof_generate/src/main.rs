@@ -1,4 +1,4 @@
-// Official draw F2: record prefetch-37 tree, early release, proof and key page advice.
+// Official draw G1: prefetch-37, SIBLING_WAIT 1000 us variant.
 //! Packed-binary PCS opening, including the GHASH-to-F162 field switch.
 //!
 //! The default integer modulus is9721*55*2^16. One witness NTT supplies

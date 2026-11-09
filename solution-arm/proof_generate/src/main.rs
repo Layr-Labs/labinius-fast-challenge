@@ -919,7 +919,27 @@ impl Timer {
     }
 }
 
+/// Run every thread of this process under `SCHED_IDLE`: on a CPU where another runnable task
+/// appears, that task runs at once instead of waiting for one of the prover's threads to be
+/// preempted. Lowering one's own policy needs no privilege; a refusal changes nothing.
+#[cfg(target_os = "linux")]
+fn yield_to_everything_else() {
+    #[repr(C)]
+    struct SchedParam {
+        priority: i32,
+    }
+    extern "C" {
+        fn sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> i32;
+    }
+    const SCHED_IDLE: i32 = 5;
+    unsafe { sched_setscheduler(0, SCHED_IDLE, &SchedParam { priority: 0 }) };
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
+        yield_to_everything_else();
+    }
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 5 || args.len() == 7,
@@ -940,6 +960,13 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
+    // Release table pages early to reduce teardown time
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    if let Table::Mapped { ptr, len } = &values {
+        let bytes = 16 * *len;
+        let start = (*ptr as usize) & !4095;
+        unsafe { table_sys::madvise(start as *mut u8, bytes + (*ptr as usize - start), 4) };
+    }
     output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));

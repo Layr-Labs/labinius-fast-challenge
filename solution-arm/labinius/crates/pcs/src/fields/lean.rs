@@ -20,22 +20,6 @@ fn inverse(x: B128) -> B128 {
     a
 }
 
-fn inverses(xs: &[B128]) -> Vec<B128> {
-    let mut prefix = Vec::with_capacity(xs.len());
-    let mut product = B128::ONE;
-    for &x in xs {
-        prefix.push(product);
-        product = product * x;
-    }
-    let mut inv = inverse(product);
-    let mut out = vec![B128::ZERO; xs.len()];
-    for i in (0..xs.len()).rev() {
-        out[i] = inv * prefix[i];
-        inv = inv * xs[i];
-    }
-    out
-}
-
 fn scales(ratios: &[B128]) -> Vec<B128> {
     (0..1usize << ratios.len())
         .map(|q| {
@@ -96,8 +80,7 @@ impl Prepared {
             return None;
         }
         let prefix = requested.min(r.len() - 3);
-        let shifted: Vec<B128> = r.iter().map(|&x| B128::ONE + x).collect();
-        let inverses = inverses(&shifted);
+        let inverses: Vec<_> = r.iter().map(|&x| inverse(B128::ONE + x)).collect();
         let ratios = r.iter().zip(&inverses).map(|(&x, &d)| x * d).collect();
         let scale = r[..prefix].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
         let eq = EqFactors::new(&r[prefix..], scale);
@@ -240,11 +223,11 @@ impl<'a> Switch<'a> {
     }
 
     pub fn fold(&mut self, r: F162) {
+        for (l, &lp) in self.l.iter_mut().zip(&self.lp) {
+            *l += r * lp;
+        }
+        self.lt = ByteTables::new(&self.l);
         if self.round + 1 < self.prepared.inverses.len() {
-            for (l, &lp) in self.l.iter_mut().zip(&self.lp) {
-                *l += r * lp;
-            }
-            self.lt = ByteTables::new(&self.l);
             self.lp = compose(&self.lt, self.prepared.inverses[self.round + 1]);
         }
         if self.round < self.prepared.prefix {

@@ -90,12 +90,41 @@ unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
         } else {
             let (s, e) = par::block(elements.len(), ftasks, i - ctasks, 1);
             let mut dst = out.add(layout.folded_at() + 4 * rq::N * s);
-            // The widening loop vectorizes on NEON; the temporary gives it aligned i32 stores.
-            let mut wide = [0i32; rq::N];
-            for element in &elements[s..e] {
-                for (w, &c) in wide.iter_mut().zip(&element.v) { *w = (c as i32).to_le(); }
-                core::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, dst, 4 * rq::N);
-                dst = dst.add(4 * rq::N);
+            // Vectorized widening: process coefficients in chunks of 8 on aarch64
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use core::arch::aarch64::*;
+                for element in &elements[s..e] {
+                    let src = element.v.as_ptr();
+                    let mut offset = 0;
+                    // Process 8 i16 -> 8 i32 at a time
+                    while offset + 8 <= rq::N {
+                        let v = vld1q_s16(src.add(offset));
+                        let v_lo = vmovl_s16(vget_low_s16(v));
+                        let v_hi = vmovl_s16(vget_high_s16(v));
+                        vst1q_s32(dst.add(offset * 4) as *mut i32, v_lo);
+                        vst1q_s32(dst.add(offset * 4 + 16) as *mut i32, v_hi);
+                        offset += 8;
+                    }
+                    // Handle remaining coefficients with scalar fallback
+                    if offset < rq::N {
+                        let mut wide = [0i32; 8];
+                        for k in 0..(rq::N - offset) {
+                            wide[k] = (*src.add(offset + k) as i32).to_le();
+                        }
+                        core::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, dst.add(offset * 4), 4 * (rq::N - offset));
+                    }
+                    dst = dst.add(4 * rq::N);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut wide = [0i32; rq::N];
+                for element in &elements[s..e] {
+                    for (w, &c) in wide.iter_mut().zip(&element.v) { *w = (c as i32).to_le(); }
+                    core::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, dst, 4 * rq::N);
+                    dst = dst.add(4 * rq::N);
+                }
             }
         }
     });

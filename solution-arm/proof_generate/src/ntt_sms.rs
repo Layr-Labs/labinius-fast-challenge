@@ -685,6 +685,122 @@ unsafe fn sums(
     super::inverse_folded::<PB>(y);
 }
 
+/// The paired scratch of [`commit16`]: the transform tiles as 32-byte coefficient rows (both
+/// column batches interleaved), and per-batch accumulators, deviations, rows and tails.
+#[cfg(target_feature = "sve2")]
+#[repr(C)]
+struct Scratch16 {
+    xsp: [[int16x8x2_t; N]; SWEEP],
+    xsb: [[[int16x8_t; N]; SWEEP]; 2],
+    acc: [[int64x2_t; ROWS * 4 * N]; 2],
+    dev: [[int32x4_t; DIGITS * 2 * N]; 2],
+    nib: [uint8x16_t; GROUPS],
+    y: [[int16x8_t; N]; 2],
+    tail: [[[i64; LANES]; N]; 2],
+}
+
+#[cfg(target_feature = "sve2")]
+const ARENA16: usize = 8 << 20;
+#[cfg(target_feature = "sve2")]
+const _: () = assert!(core::mem::size_of::<Scratch16>() <= 8 << 20, "the paired scratch fits the arena");
+
+#[cfg(target_feature = "sve2")]
+struct Arena16(*mut Scratch16);
+
+#[cfg(target_feature = "sve2")]
+impl Arena16 {
+    fn layout() -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(ARENA16.max(core::mem::size_of::<Scratch16>()), core::mem::align_of::<Scratch16>())
+            .expect("the paired scratch layout")
+    }
+
+    fn new() -> Self {
+        let layout = Self::layout();
+        let p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut Scratch16;
+        if p.is_null() {
+            unsafe { std::alloc::handle_alloc_error(layout) };
+        }
+        Arena16(p)
+    }
+}
+
+#[cfg(target_feature = "sve2")]
+impl Drop for Arena16 {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.0 as *mut u8, Self::layout()) }
+    }
+}
+
+/// [`sums`] over sixteen columns (two batches of eight, transformed per paired vector): the
+/// lookup front end runs per batch in NEON, storing each batch's half of the paired rows, levels
+/// 4-6 run once per tile in SVE over both halves ([`crate::ntt::neon::sve`]), and the sink walks
+/// each batch's halves ([`sink2`]). Element, chunk and lane semantics are [`sums`]'s unchanged.
+#[cfg(target_feature = "sve2")]
+#[inline(never)]
+unsafe fn sums16(
+    words: &[(*const u8, usize); 2 * LANES],
+    a: &SmsMatrix,
+    nib: &mut [uint8x16_t; GROUPS],
+    xsp: &mut [[int16x8x2_t; N]; SWEEP],
+    xsb: &mut [[[int16x8_t; N]; SWEEP]; 2],
+    accs: &mut [[int64x2_t; ROWS * 4 * N]; 2],
+    ys: &mut [[int16x8_t; N]; 2],
+    devs: &mut [[int32x4_t; DIGITS * 2 * N]; 2],
+) {
+    use crate::ntt::neon::sve;
+    let kern = &kernels()[PB];
+    for acc in accs.iter_mut() {
+        acc.fill(vdupq_n_s64(0));
+    }
+    let mut e = 0usize;
+    while e < a.elements {
+        let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
+        while e < end {
+            let l = SWEEP.min(end - e);
+            let groups = l.div_ceil(LOCK);
+            for i in 0..groups * LOCK {
+                for b in 0..2 {
+                    let wb: &[(*const u8, usize); LANES] = words[b * LANES..][..LANES].try_into().unwrap();
+                    let at = pass_words(wb, a.elements, e, i);
+                    indices(&at, nib);
+                    sve::pass_lut2::<PB>(nib, xsp[i].as_mut_ptr() as *mut int16x8_t, b, kern);
+                }
+                let xp = xsp[i].as_mut_ptr() as *mut u16;
+                sve::pass_c_sve::<4>(xp, kern);
+                sve::pass_d_sve::<PB>(xp, kern);
+            }
+            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            // The original sink, per batch, over materialized halves of the paired rows: the
+            // paired sink's row-0 accumulation diverged under qemu and is not yet understood;
+            // the copy costs one pass over the sweep's rows.
+            for b in 0..2 {
+                for i in 0..groups * LOCK {
+                    for s in 0..N {
+                        xsb[b][i][s] = if b == 0 { xsp[i][s].0 } else { xsp[i][s].1 };
+                    }
+                }
+                // the chunk's first sweep starts the digit rows' sums afresh
+                if e % CHUNK == 0 {
+                    sink::<true>(&xsb[b], keys, &mut accs[b], groups);
+                } else {
+                    sink::<false>(&xsb[b], keys, &mut accs[b], groups);
+                }
+            }
+            e += l;
+        }
+        let c = (end - 1) / CHUNK;
+        for b in 0..2 {
+            for d in 0..DIGITS {
+                chunk_row(&accs[b], 1 + d, a.mean_residues(c, d), &mut devs[b][d * 2 * N..][..2 * N], &mut ys[b]);
+            }
+        }
+    }
+    for b in 0..2 {
+        narrow(&accs[b], 0, &mut ys[b]);
+        super::inverse_folded::<PB>(&mut ys[b]);
+    }
+}
+
 #[inline]
 fn crt(r: u32, t: i64) -> u128 {
     const INV: u64 = {
@@ -743,9 +859,91 @@ impl Drop for Arena {
     }
 }
 
+/// [`commit`] over sixteen-column blocks on a VL = 256 host: both batches share one paired
+/// transform pass per level ([`sums16`]); the reconstruction (base row, digit tails, CRT) is
+/// [`commit`]'s, per batch.
+#[cfg(target_feature = "sve2")]
+fn commit16(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
+    let len = 4 * a.elements;
+    assert_eq!(values.len() % len, 0);
+    let columns = values.len() / len;
+    assert!(columns % (2 * LANES) == 0 || columns < 2 * LANES, "paired blocks divide the columns");
+    let mut out = vec![0u128; columns * N];
+    for_blocks(&mut out, N, 2 * LANES, workers, |first, block| unsafe {
+        let arena = Arena16::new();
+        let Scratch16 { xsp, xsb, acc, dev, nib, y, tail } = &mut *arena.0;
+        let p = P1 as i16;
+        let count = block.len() / N;
+        for (b2, target) in block.chunks_mut(2 * LANES * N).enumerate() {
+            let col0 = first + 2 * LANES * b2;
+            let here = (count - 2 * LANES * b2).min(2 * LANES);
+            let words: [(*const u8, usize); 2 * LANES] = core::array::from_fn(|c| {
+                if c < here {
+                    (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
+                } else {
+                    (ZERO_WORDS.as_ptr() as *const u8, 0)
+                }
+            });
+            dev.iter_mut().for_each(|d| d.fill(vdupq_n_s32(0)));
+            sums16(&words, a, nib, xsp, xsb, acc, y, dev);
+            for b in 0..2 {
+                // The base row's centered residues to `[0, p)` lane-wise, eight columns per vector.
+                let pv = vdupq_n_s16(p);
+                let mut base = [[0u16; LANES]; N];
+                for (k, out16) in base.iter_mut().enumerate() {
+                    let v = y[b][k];
+                    let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+                    vst1q_u16(out16.as_mut_ptr(), vreinterpretq_u16_s16(v));
+                }
+                // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
+                let tail_b = &mut tail[b];
+                for k in 0..N / 2 {
+                    let h = k + N / 2;
+                    let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
+                    let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
+                    for d in 0..DIGITS {
+                        let (u, v) = lattice::WEIGHTS[d];
+                        let w = u + v;
+                        for half in 0..2 {
+                            let x = dev[b][d * 2 * N + 2 * k + half];
+                            let yv = dev[b][d * 2 * N + 2 * h + half];
+                            let (xl, yl) = (vget_low_s32(x), vget_low_s32(yv));
+                            let (i, j) = (2 * half, 2 * half + 1);
+                            lo[i] = vmlal_n_s32(lo[i], xl, u);
+                            lo[j] = vmlal_high_n_s32(lo[j], x, u);
+                            lo[i] = vmlsl_n_s32(lo[i], yl, v);
+                            lo[j] = vmlsl_high_n_s32(lo[j], yv, v);
+                            hi[i] = vmlal_n_s32(hi[i], xl, v);
+                            hi[j] = vmlal_high_n_s32(hi[j], x, v);
+                            hi[i] = vmlal_n_s32(hi[i], yl, w);
+                            hi[j] = vmlal_high_n_s32(hi[j], yv, w);
+                        }
+                    }
+                    for q in 0..4 {
+                        vst1q_s64(tail_b[k].as_mut_ptr().add(2 * q), lo[q]);
+                        vst1q_s64(tail_b[h].as_mut_ptr().add(2 * q), hi[q]);
+                    }
+                }
+                // a partial batch has fewer than eight columns in `target`: only those lanes are written
+                let cols_here = here.saturating_sub(LANES * b).min(LANES);
+                for (c, column) in target.chunks_exact_mut(N).skip(LANES * b).take(cols_here).enumerate() {
+                    for (k, o) in column.iter_mut().enumerate() {
+                        *o = crt(base[k][c] as u32, tail_b[k][c]);
+                    }
+                }
+            }
+        }
+    });
+    out
+}
+
 /// The commitment of every column of `values` (columns of `4 a.elements` words) modulo
 /// [`MODULUS`].
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
+    #[cfg(target_feature = "sve2")]
+    if crate::ntt::neon::sve::paired_supported() && std::env::var_os("LABINIUS_NO_PAIRED").is_none() {
+        return commit16(values, a, workers);
+    }
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
@@ -814,6 +1012,169 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
         }
     });
     out
+}
+
+#[cfg(test)]
+mod paired_tests {
+    use super::*;
+
+    /// Deterministic random columns, as the crate's other tests.
+    fn col(seed: u64, n: usize) -> Vec<B128> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                let mut w = 0u128;
+                for _ in 0..2 {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    w = w << 64 | s as u128;
+                }
+                B128(w)
+            })
+            .collect()
+    }
+
+    /// One tile's full transform (lut front + levels 4-6) through the paired SVE kernels
+    /// equals the NEON kernels, both halves. Meaningful on SVE hosts only.
+    #[test]
+    fn paired_tile_transform_matches() {
+        use super::super::{indices, kernels, pass_c, pass_d, pass_lut, N, LANES};
+        let elements = 4;
+        let mut storage: Vec<[u128; 16]> = (0..LANES)
+            .map(|c| {
+                let v = col(7000 + c as u64, 4 * elements);
+                let mut w = [0u128; 16];
+                for (i, x) in v.iter().take(16).enumerate() {
+                    w[i] = x.0;
+                }
+                w
+            })
+            .collect();
+        let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
+            (storage[c].as_ptr() as *const u8, 64)
+        });
+        let kern = &kernels()[1];
+        unsafe {
+            let at = pass_words(&words, elements, 0, 0);
+            let mut nib: [uint8x16_t; N / 4] = std::mem::zeroed();
+            indices(&at, &mut nib);
+            // the NEON reference
+            let mut x1: [int16x8_t; N] = std::mem::zeroed();
+            pass_lut::<1>(&nib, &mut x1, kern);
+            pass_c::<4>(&mut x1, kern);
+            pass_d::<1, false>(&mut x1, kern, &[], &mut []);
+            #[cfg(target_feature = "sve2")]
+            {
+                use crate::ntt::neon::sve;
+                if sve::paired_supported() {
+                    let mut xsp: Box<[int16x8x2_t; N]> = Box::new(std::mem::zeroed());
+                    for half in 0..2 {
+                        sve::pass_lut2::<1>(&nib, xsp.as_mut_ptr() as *mut int16x8_t, half, kern);
+                    }
+                    // stage A: the lut front alone
+                    let mut x1_lut: [int16x8_t; N] = std::mem::zeroed();
+                    let mut nib2: [uint8x16_t; N / 4] = std::mem::zeroed();
+                    indices(&at, &mut nib2);
+                    pass_lut::<1>(&nib2, &mut x1_lut, kern);
+                    for s in 0..N {
+                        let a: &[i16; 8] = unsafe { &*(&xsp[s].0 as *const _ as *const i16).cast() };
+                        let c: &[i16; 8] = unsafe { &*(&xsp[s].1 as *const _ as *const i16).cast() };
+                        let b: &[i16; 8] = unsafe { &*(&x1_lut[s] as *const _ as *const i16).cast() };
+                        for l in 0..8 {
+                            assert_eq!(a[l], b[l], "lut half 0 slot {s} lane {l}");
+                            assert_eq!(c[l], b[l], "lut half 1 slot {s} lane {l}");
+                        }
+                    }
+                    let xp = xsp.as_mut_ptr() as *mut u16;
+                    // stage B: after pass_c
+                    let mut x1_c: [int16x8_t; N] = x1_lut;
+                    pass_c::<4>(&mut x1_c, kern);
+                    sve::pass_c_sve::<4>(xp, kern);
+                    for s in 0..N {
+                        let a: &[i16; 8] = unsafe { &*(&xsp[s].0 as *const _ as *const i16).cast() };
+                        let c: &[i16; 8] = unsafe { &*(&xsp[s].1 as *const _ as *const i16).cast() };
+                        let b: &[i16; 8] = unsafe { &*(&x1_c[s] as *const _ as *const i16).cast() };
+                        for l in 0..8 {
+                            assert_eq!(a[l], b[l], "pass_c half 0 slot {s} lane {l}");
+                            assert_eq!(c[l], b[l], "pass_c half 1 slot {s} lane {l}");
+                        }
+                    }
+                    sve::pass_d_sve::<1>(xp, kern);
+                    {
+                        let a: &[i16; 8] = unsafe { &*(&xsp[216].0 as *const _ as *const i16).cast() };
+                        let b: &[i16; 8] = unsafe { &*(std::ptr::addr_of!(x1[216]) as *const i16).cast() };
+                        eprintln!("pass_d slot 216: got {:?} want {:?}", a, b);
+                        let vv216 = |s: usize| -> [i16; 8] { unsafe { core::mem::transmute(x1_c[s]) } };
+                        eprintln!("q36 inputs: {:?} {:?} {:?}", vv216(216), vv216(217), vv216(218));
+                        let kern36 = &crate::ntt::neon::kernels()[1];
+                        eprintln!("kern.d[36]: {:?}", &kern36.d[36]);
+                        // group 0 of q=0 hand-computed on the (verified) pass_c outputs
+                        let vv = |s: usize| -> [i16; 8] { unsafe { core::mem::transmute(x1_c[s]) } };
+                        eprintln!("inputs v0..v2: {:?} {:?} {:?}", vv(0), vv(1), vv(2));
+                        let kern2 = &crate::ntt::neon::kernels()[1];
+                        eprintln!("kern.d[0]: {:?}", &kern2.d[0]);
+                        let kk = unsafe { vld1q_s16(kern2.k.as_ptr()) };
+                        let dv = unsafe { vld1q_s16(kern2.d[0].as_ptr()) };
+                        let v8x = |s: usize| unsafe { x1_c[s] };
+                        let a0r = unsafe { super::super::reduce_round13(v8x(0), kk) };
+                        let w = unsafe { super::super::radix3::<0,1,2,3,0>(a0r, v8x(1), v8x(2), dv, kk) };
+                        let arr = |v: int16x8_t| -> [i16; 8] { core::mem::transmute(v) };
+                        eprintln!("hand r3#1 y0: {:?}", arr(w.0));
+                        let dv2 = unsafe { vld1q_s16(kern2.d[0].as_ptr().add(4)) };
+                        let w2 = unsafe { super::super::radix3::<4,5,6,7,0>(a0r, v8x(1), v8x(2), dv, kk) };
+                        let w3 = unsafe { super::super::radix3::<0,1,2,3,0>(a0r, v8x(1), v8x(2), dv2, kk) };
+                        eprintln!("hand r3#1 with lanes4-7: {:?}", arr(w2.0));
+                        eprintln!("hand r3#1 with d[4..8] as 0-3: {:?}", arr(w3.0));
+                        let w4 = unsafe { super::super::radix3::<0,1,2,3,0>(v8x(0), v8x(1), v8x(2), dv, kk) };
+                        eprintln!("hand r3#1 unreduced a: {:?}", arr(w4.0));
+                    }
+                    for s in 0..N {
+                        let a: &[i16; 8] = unsafe { &*(&xsp[s].0 as *const _ as *const i16).cast() };
+                        let c: &[i16; 8] = unsafe { &*(&xsp[s].1 as *const _ as *const i16).cast() };
+                        let b: &[i16; 8] = unsafe { &*(std::ptr::addr_of!(x1[s]) as *const i16).cast() };
+                        for l in 0..8 {
+                            assert_eq!(a[l], b[l], "pass_d half 0 slot {s} lane {l}");
+                            assert_eq!(c[l], b[l], "pass_d half 1 slot {s} lane {l}");
+                        }
+                    }
+                }
+            }
+            let _ = elements;
+        }
+    }
+
+    /// The paired SVE path equals the NEON path, on one short chunk of columns (a partial
+    /// chunk end, one fresh sweep) and on a full chunk. Meaningful on SVE hosts; on others
+    /// the dispatch keeps both calls on the NEON path.
+    #[test]
+    fn paired_matches_neon() {
+        for elements in [64usize, 256] {
+            let columns = 16;
+            let values: Vec<B128> = (0..columns)
+                .flat_map(|c| col(1000 + c as u64 + 77 * elements as u64, 4 * elements))
+                .collect();
+            let a = matrix(elements, 1);
+            std::env::set_var("LABINIUS_NO_PAIRED", "1");
+            let want = commit(&values, &a, 1);
+            std::env::remove_var("LABINIUS_NO_PAIRED");
+            let got = commit(&values, &a, 1);
+            unsafe {
+            let want = unsafe {
+                std::env::set_var("LABINIUS_NO_PAIRED", "1");
+                let w = commit(&values, &a, 1);
+                std::env::remove_var("LABINIUS_NO_PAIRED");
+                w
+            };
+            let got = commit(&values, &a, 1);
+            for (c, (x, y)) in want.iter().zip(&got).enumerate() {
+                assert_eq!(x, y, "elements {elements} commitment coefficient {c}");
+            }
+
+            }
+
+        }
+    }
 }
 
 #[cfg(test)]

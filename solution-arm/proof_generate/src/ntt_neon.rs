@@ -1392,6 +1392,8 @@ pub fn commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
 
 #[path = "ntt_hybrid.rs"]
 pub mod hybrid;
+#[path = "ntt_sve.rs"]
+pub mod sve;
 
 #[path = "ntt_sms.rs"]
 pub mod sms;

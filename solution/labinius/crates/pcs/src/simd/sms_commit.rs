@@ -432,7 +432,7 @@ include!("sms_wide16_gen.rs");
 const _: () = assert!(STREAMS == 7 && LOCK == 8);
 
 /// Whether a group step prefetches the next step's witness words into L2.
-const INPUT_PREFETCH: bool = false;
+const INPUT_PREFETCH: bool = true;
 
 const PREFETCH_SLOTS: usize = 37;
 
@@ -919,9 +919,9 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         let step=if bench_mode()==0 && limit>=16 {16}else{8};
         // The next step's witness words (16 columns x 1 KB, 256 KB apart): the hardware
         // prefetchers only follow some of the sixteen streams, and the table comes from DRAM.
-        if INPUT_PREFETCH && b + LOCK < range.end {
+        if INPUT_PREFETCH && b + 2 * LOCK < range.end {
             for l in 0..g {
-                let p = cols[l].as_ptr().add(8 * (b + LOCK)) as *const i8;
+                let p = cols[l].as_ptr().add(8 * (b + 2 * LOCK)) as *const i8;
                 for line in 0..(8 * LOCK * 16) / 64 {
                     _mm_prefetch::<_MM_HINT_T1>(p.add(64 * line));
                 }

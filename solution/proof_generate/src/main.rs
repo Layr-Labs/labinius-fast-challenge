@@ -477,6 +477,23 @@ fn populate_part(addr: usize, bytes: usize) {
     std::hint::black_box(sink);
 }
 
+/// The table and key ranges whose release `encode_into` runs: (words, bytes, keys, bytes).
+static DEFERRED_RELEASE: std::sync::OnceLock<(usize, usize, usize, usize)> = std::sync::OnceLock::new();
+
+/// One of `parts` page-aligned pieces of a deferred release (both ranges cut alike).
+#[cfg(target_os = "linux")]
+fn release_part(part: usize, parts: usize) {
+    let Some(&(w, wb, k, kb)) = DEFERRED_RELEASE.get() else { return };
+    for (addr, bytes) in [(w, wb), (k, kb)] {
+        let (lo, hi) = (addr & !4095, (addr + bytes + 4095) & !4095);
+        let pages = (hi - lo) / 4096;
+        let (a, b) = (lo + 4096 * (pages * part / parts), lo + 4096 * (pages * (part + 1) / parts));
+        if b > a {
+            unsafe { sys::madvise(a as *mut core::ffi::c_void, b - a, sys::MADV_DONTNEED) };
+        }
+    }
+}
+
 /// Drop the words' and the keys' page-table entries (`MADV_DONTNEED`), a slice of each per task.
 /// Both are read-only file mappings: the page cache keeps the pages, and a later read faults the
 /// same bytes back in. Whatever is still mapped at the end is torn down by the exit on one CPU,
@@ -1340,8 +1357,27 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
     let (addr, folded_at) = (out as usize, layout.folded_at());
     #[cfg(target_arch = "x86_64")]
     let avx512 = std::arch::is_x86_feature_detected!("avx512f");
-    labinius::par::pool().run(cruns.len() + fruns.len(), |i| {
+    let rparts = if DEFERRED_RELEASE.get().is_some() { threads() } else { 0 };
+    // The folded runs were written by the fold: their page-table entries go beside the copy.
+    let unmap_folded = rparts > 0 && already_written;
+    labinius::par::pool().run(cruns.len() + fruns.len() + rparts, |i| {
         let out = addr as *mut u8;
+        if i >= cruns.len() + fruns.len() {
+            let part = i - cruns.len() - fruns.len();
+            #[cfg(target_os = "linux")]
+            release_part(part, rparts);
+            #[cfg(target_os = "linux")]
+            if unmap_folded {
+                let lo = (addr + folded_at + 4095) & !4095;
+                let hi = (addr + folded_at + layout.folded_bytes) & !4095;
+                let pages = hi.saturating_sub(lo) / 4096;
+                let (a, b) = (lo + 4096 * (pages * part / rparts), lo + 4096 * (pages * (part + 1) / rparts));
+                if b > a {
+                    unsafe { sys::madvise(a as *mut core::ffi::c_void, b - a, sys::MADV_DONTNEED) };
+                }
+            }
+            return;
+        }
         if i < cruns.len() {
             let r = cruns[i].clone();
             core::ptr::copy_nonoverlapping(
@@ -1601,12 +1637,18 @@ impl Output {
         if layout == self.state.layout {
             if let Some(m) = self.state.mapped() {
                 unsafe { encode_into(&parts, &layout, m.addr as *mut u8) };
-                // The bytes are in the page cache; drop the PTEs so exit need not walk them.
+                // The bytes are in the page cache; drop the PTEs so exit need not walk them
+                // (the folded runs' went during the encoding when it ran a deferred release).
+                let len = if DEFERRED_RELEASE.get().is_some() && parts.folded.encoded().is_some() {
+                    (layout.folded_at() + 4095) & !4095
+                } else {
+                    self.state.layout.len()
+                };
                 #[cfg(target_os = "linux")]
                 unsafe {
                     sys::madvise(
                         m.addr as *mut core::ffi::c_void,
-                        self.state.layout.len(),
+                        len,
                         sys::MADV_DONTNEED,
                     )
                 };
@@ -1916,7 +1958,13 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // so process exit does not have to walk them on one CPU inside the timed window.
     #[cfg(target_os = "linux")]
     if let Table::Mapped { .. } = table {
-        release_words(values, image, workers);
+        // With a mapped proof the release runs beside the proof's encoding (`encode_into`),
+        // whose copy and page-table work leave the cores partly idle.
+        let deferred = output.is_some()
+            && DEFERRED_RELEASE.set((values.as_ptr() as usize, values.len() * 16, image.as_ptr() as usize, image.len())).is_ok();
+        if !deferred {
+            release_words(values, image, workers);
+        }
     }
     std::mem::forget(table);
     let proof = ProofParts {

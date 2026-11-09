@@ -40,7 +40,9 @@ const _: () = {
 pub const CHUNK_PAIRS: usize = 176;
 const FOLD_PAIRS:usize=64;
 fn folds_in_chunk(np:usize,c:usize)->usize{let r=chunk_range(np,c);(r.end-r.start).div_ceil(FOLD_PAIRS)}
-fn folds_in_range(np:usize,r:core::ops::Range<usize>)->usize{let cph=chunks_per_half(np);(r.start/(np/2)*cph..r.end/(np/2)*cph).map(|c|folds_in_chunk(np,c)).sum()}
+fn folds_in_range(np:usize,r:core::ops::Range<usize>)->usize{(chunk_at(np,r.start)..chunk_at(np,r.end)).map(|c|folds_in_chunk(np,c)).sum()}
+/// The index of the chunk that starts at pair batch `b` (a chunk boundary; `np` gives the count).
+fn chunk_at(np:usize,b:usize)->usize{let hl=np/2;b/hl*chunks_per_half(np)+(b%hl).div_ceil(CHUNK_PAIRS)}
 /// Chunks of each half column: [`CHUNK_PAIRS`] pair batches each and a shorter last one, so
 /// that every chunk lies in one half (the commitment's work units are halves).
 pub const fn chunks_per_half(np: usize) -> usize {
@@ -814,22 +816,25 @@ unsafe fn transpose16x16_u32(r: &[__m512i; 16]) -> [__m512i; 16] {
     out
 }
 
-/// What [`write_rows`] writes: a whole column's rows, or one of the two halves of its
-/// ring-element range ([`HALVES`]). The first half to finish leaves its raw partial rows (the
-/// base residue canonical in `[0, 9721)`, the tail reduced without its means); the
-/// second adds its own to them and writes the final rows.
+/// What [`write_rows`] writes: a whole column's rows, or one of the parts of its ring-element
+/// range ([`parts`]). The first part to finish leaves its raw partial rows (the base residue
+/// canonical in `[0, 9721)`, the tail reduced without its means); a middle one adds its own to
+/// them; the last adds its own and the means and writes the final rows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowsMode {
     Full,
     First,
+    Middle,
     Second,
 }
 
 /// The group's two rows per column: the base stream canonical in `[0, 9721)` (NTT domain) and the
 /// tail modulo TAIL_MODULUS (coefficients); all accumulator planes are cleared.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
-unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usize, dst: *mut [u32; N], mode: RowsMode) {
+unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usize, dst: *mut [u32; N], mode: RowsMode, corr: i32) {
+    debug_assert!((0..P as i32).contains(&corr));
     let zero = _mm512_setzero_si512();
+    let corr = _mm512_set1_epi32(corr);
     let mask = _mm512_set1_epi32(TAIL_MODULUS as i32);
     let q = _mm512_set1_epi32(P as i32);
     let pa = acc.v.as_mut_ptr() as *mut __m512i;
@@ -842,13 +847,14 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
             let j = j0 + s;
             let v0 = _mm512_load_si512(pa.add(STREAMS * j));
             _mm512_store_si512(pa.add(STREAMS * j), zero);
-            r0[s] = canon_red16::<P>(v0);
+            let r = _mm512_add_epi32(canon_red16::<P>(v0), corr);
+            r0[s] = _mm512_mask_sub_epi32(r, _mm512_cmp_epi32_mask(r, q, _MM_CMPINT_NLT), r, q);
             let p=total.t[j].as_mut_ptr().cast::<__m512i>();
             let h=total.hi[j].as_mut_ptr().cast::<__m512i>();
             let low=_mm512_load_si512(p);
             let high=reduce_hi55(_mm512_load_si512(h));
             _mm512_store_si512(p,zero);_mm512_store_si512(h,zero);
-            let mu=if mode==RowsMode::First{0}else{keys.mu[j] as i32};
+            let mu=if mode==RowsMode::First||mode==RowsMode::Middle{0}else{keys.mu[j] as i32};
             let value=_mm512_add_epi32(_mm512_or_si512(low,_mm512_slli_epi32::<16>(high)),_mm512_set1_epi32(mu));
             rt[s]=_mm512_mask_sub_epi32(value,_mm512_cmp_epi32_mask(value,mask,_MM_CMPINT_NLT),value,mask);
         }
@@ -858,12 +864,12 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
         for c in 0..gc {
             let (db, dt) = ((dst.add(2 * c) as *mut i32).add(j0), (dst.add(2 * c + 1) as *mut i32).add(j0));
             let (mut b, mut t) = (c0[c], ct[c]);
-            if mode == RowsMode::Second {
+            if mode == RowsMode::Second || mode == RowsMode::Middle {
                 b = _mm512_add_epi32(b, _mm512_maskz_loadu_epi32(m, db));
                 b = _mm512_mask_sub_epi32(b, _mm512_cmp_epi32_mask(b, q, _MM_CMPINT_NLT), b, q);
                 t = _mm512_add_epi32(t, _mm512_maskz_loadu_epi32(m, dt));
             }
-            if mode == RowsMode::Second {
+            if mode == RowsMode::Second || mode == RowsMode::Middle {
                 t = _mm512_mask_sub_epi32(t,_mm512_cmp_epu32_mask(t,mask,_MM_CMPINT_NLT),t,mask);
             }
             _mm512_mask_storeu_epi32(db, m, b);
@@ -873,29 +879,83 @@ unsafe fn write_rows(acc: &mut SAcc, total: &mut Total, keys: &SmsKeys, gc: usiz
     }
 }
 
-/// Parts of a column's ring-element range committed as separate work units by
-/// [`commit_paired`]: the commitment's coarse units otherwise leave cores idle at its end. Each
-/// part is whole digit chunks and one half-column chunk of the last digit.
-const HALVES: usize = 2;
+/// Chunks at the end of the second half that [`parts`] cuts into parts of their own, last first.
+const END_PARTS: &[usize] = &[2];
 
-/// Where a group writes its rows: in full, or as one half of the range under its group's lock
-/// (`state` counts the halves already written).
-enum RowsOut<'a> {
-    Full,
-    Half(&'a std::sync::Mutex<u8>),
+/// How [`commit_paired`] balances the commitment's end (`LABINIUS_END`, for A/B measurements):
+/// 0 halves whose unstarted chunks idle runners take over (default), 1 [`END_PARTS`], 2 halves.
+fn end_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("LABINIUS_END").as_deref() {
+        Ok("parts") => 1,
+        Ok("halves") => 2,
+        _ => 0,
+    })
 }
 
-/// Commits a group of up to 16 columns across all `np` pair batches and writes its `2 g` rows to
-/// `dst`. `sync(b_done)` is called at every [`PP`] boundary so hyperthread siblings can share the
-/// key stream in L2.
+/// A runner's unit as idle runners see it, one word: its group (12 bits), a publication tag (20
+/// bits), the end of the chunk it has started (16) and the end of its range (16). The owner moves
+/// `next` up a chunk at a time, a thief moves `limit` down; both by compare-and-swap.
+fn span_pack(gi: usize, tag: u64, next: usize, limit: usize) -> u64 {
+    (gi as u64) << 52 | (tag & 0xF_FFFF) << 32 | (next as u64) << 16 | limit as u64
+}
+fn span_unpack(s: u64) -> (usize, usize, usize) {
+    ((s >> 52) as usize, (s >> 16 & 0xFFFF) as usize, (s & 0xFFFF) as usize)
+}
+
+/// Units whose unstarted chunks idle runners took over in the last [`commit_paired`].
+pub static STOLEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Runners of the last [`commit_paired`] unpinned at the end because their unit stopped advancing.
+pub static RESCUED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// A unit that has not started a new chunk for this long (a chunk is ~1.2 ms) has lost its CPU.
+const STALL: std::time::Duration = std::time::Duration::from_micros(2500);
+/// Tests only: runner `n - 1` (0: none) sleeps 200 ms early in its first unit, like a runner
+/// whose CPU another task holds.
+#[cfg(test)]
+static TEST_STALL_WORKER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The parts of a column's pair-batch range that [`commit_paired`] commits as separate work
+/// units, handed out in this order for every column group: the first half, then the second half
+/// cut at chunk boundaries into ever smaller parts ([`END_PARTS`]). A runner that finds the
+/// queue empty waits for the others' last units, so the units at the queue's end are small: a
+/// runner that lost CPU time (another process on its CPU) leaves the others less to wait for.
+fn parts(np: usize, end_parts: &[usize]) -> Vec<core::ops::Range<usize>> {
+    let (hl, cph) = (np / 2, chunks_per_half(np));
+    let mut cuts = vec![cph];
+    for &n in end_parts {
+        let at = *cuts.last().unwrap();
+        if at > n {
+            cuts.push(at - n);
+        }
+    }
+    cuts.push(0);
+    cuts.reverse();
+    let at = |c: usize| hl + (c * CHUNK_PAIRS).min(hl);
+    let mut out = vec![0..hl];
+    out.extend(cuts.windows(2).map(|w| at(w[0])..at(w[1])));
+    out
+}
+
+/// Where a group writes its rows: in full, or as one part of the column's range under its group's
+/// lock, which counts the pair batches already written.
+enum RowsOut<'a> {
+    Full,
+    Part(&'a std::sync::Mutex<usize>),
+}
+
+/// Commits a group of up to 16 columns across the pair batches `range` and writes its `2 g` rows
+/// to `dst`. `sync(b_done)` is called at every [`PP`] boundary so hyperthread siblings can share
+/// the key stream in L2. `claim(b)` is called at every chunk boundary `b` inside the range before
+/// that chunk starts: `false` ends the group there (another runner took the rest). Returns the
+/// end reached.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
-unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, range: core::ops::Range<usize>, out: RowsOut, ws: &mut SmsWorker, dst: *mut [u32; N], mut sync: F) {
+unsafe fn group<F: FnMut(usize), C: FnMut(usize) -> bool>(cols: &[&[B128]], keys: &SmsKeys, np: usize, range: core::ops::Range<usize>, out: RowsOut, ws: &mut SmsWorker, dst: *mut [u32; N], mut sync: F, mut claim: C) -> usize {
     let g = cols.len();
     let mut repair_flags=Vec::<RepairFlag>::new();
     assert!(g >= 1 && g <= 16 && (np / 2) % LOCK == 0 && ((np / 2) % CHUNK_PAIRS) % LOCK == 0 && 2 * np == keys.elements);
     let hl = np / 2;
-    let span = range.end - range.start;
-    assert!(range.start % (np / 2) == 0 && (span == np || span == np / 2), "whole halves of the column");
+    let aligned = |b: usize| b == np || (b % hl) % CHUNK_PAIRS == 0;
+    assert!(range == (0..np) || (aligned(range.start) && aligned(range.end) && range.start < range.end && range.start / hl == (range.end - 1) / hl), "whole chunks of one half");
     static ZERO64: [B128; 8 * 16] = [B128::ZERO; 8 * 16];
     let kbase = keys.pairs.as_ptr();
     // LOCK=8's FIRST sink broadcasts each digit's bias and overwrites all
@@ -908,18 +968,19 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         fill_stream(&mut ws.acc[0], s, b);
     }
     // Each auxiliary stream starts at fold_bias - scaled_NTT(mean) for this chunk.
-    let first_chunk = range.start / hl * chunks_per_half(np);
+    let first_chunk = chunk_at(np, range.start);
     let mut bias = keys.mur.as_ptr().add(first_chunk * N * DIGITS);
     let acc = ws.acc[0].v.as_mut_ptr() as *mut i32;
     let w = ws.w.as_mut_ptr() as *mut i16;
     let mut b=range.start;
-    while b<range.end {
+    let mut end=range.end;
+    while b<end {
         let local=b%hl;let ic=local%CHUNK_PAIRS;
-        let limit=(FOLD_PAIRS-ic%FOLD_PAIRS).min(CHUNK_PAIRS-ic).min(hl-local).min(range.end-b);
+        let limit=(FOLD_PAIRS-ic%FOLD_PAIRS).min(CHUNK_PAIRS-ic).min(hl-local).min(end-b);
         let step=if bench_mode()==0 && limit>=16 {16}else{8};
         // The next step's witness words (16 columns x 1 KB, 256 KB apart): the hardware
         // prefetchers only follow some of the sixteen streams, and the table comes from DRAM.
-        if INPUT_PREFETCH && b + LOCK < range.end {
+        if INPUT_PREFETCH && b + LOCK < end {
             for l in 0..g {
                 let p = cols[l].as_ptr().add(8 * (b + LOCK)) as *const i8;
                 for line in 0..(8 * LOCK * 16) / 64 {
@@ -1002,18 +1063,26 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
                 reconstruct_repair(pd,d,chunk,keys,&mut ws.total[0],g,&mut repair_flags);
             }
             if !repair_flags.is_empty(){apply_repair_flags(&mut repair_flags,keys,cols,chunk,&mut ws.total[0]);}
+            if e < end && !claim(e) {
+                end = e;
+            }
         }
         b+=step;
     }
+    // Stream 0 started from the bias of the whole range's folds; a range cut short took fewer.
+    let corr = (P as i32 - fold_bias(folds_in_range(np, end..range.end))) % P as i32;
     match out {
-        RowsOut::Full => write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, RowsMode::Full),
-        RowsOut::Half(state) => {
+        RowsOut::Full => write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, RowsMode::Full, corr),
+        RowsOut::Part(state) => {
             let mut done = state.lock().unwrap();
-            let mode = if *done == 0 { RowsMode::First } else { RowsMode::Second };
-            write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, mode);
-            *done += 1;
+            let len = end - range.start;
+            let mode = if *done == 0 { RowsMode::First } else if *done + len < np { RowsMode::Middle } else { RowsMode::Second };
+            assert!(*done + len <= np && (*done, len) != (0, np));
+            write_rows(&mut ws.acc[0], &mut ws.total[0], keys, g, dst, mode, corr);
+            *done += len;
         }
     }
+    end
 }
 
 /// Benchmark-only phase isolation (`SMS_MODE`): 0 everything, 1 no accumulation, 2 accumulation
@@ -1058,11 +1127,100 @@ pub fn worker_report(workers: usize) -> String {
     let nd = (DECOUPLED_PAIRS.load(Relaxed) as usize).min(16);
     let at: Vec<String> = (0..nd).map(|i| { let v = DECOUPLED_AT[i].load(Relaxed); format!("{}@{}", v & 15, v >> 4) }).collect();
     let starts: Vec<String> = (0..w).map(|i| WORKER_START_US[i].load(Relaxed).to_string()).collect();
-    format!(" sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={} sms_start_us={}", ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"), starts.join("/"))
+    let cpu: Vec<String> = (0..w).map(|i| WORKER_CPU_US[i].load(Relaxed).to_string()).collect();
+    let ivcsw: Vec<String> = (0..w).map(|i| WORKER_IVCSW[i].load(Relaxed).to_string()).collect();
+    let faults: Vec<String> = (0..w).map(|i| WORKER_FAULTS[i].load(Relaxed).to_string()).collect();
+    let wait: Vec<String> = (0..w).map(|i| WORKER_WAIT_US[i].load(Relaxed).to_string()).collect();
+    let vcsw: Vec<String> = (0..w).map(|i| WORKER_VCSW[i].load(Relaxed).to_string()).collect();
+    format!(" sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={} sms_start_us={} sms_cpu_us={} sms_ivcsw={} sms_faults={} sms_wait_us={} sms_vcsw={} sms_stolen={} sms_rescued={}{}", ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"), starts.join("/"), cpu.join("/"), ivcsw.join("/"), faults.join("/"), wait.join("/"), vcsw.join("/"), STOLEN.load(Relaxed), RESCUED.load(Relaxed), SYS_DELTA.lock().map(|s| s.clone()).unwrap_or_default())
+}
+
+/// Per runner of the last [`commit_paired`]: CPU time it got and involuntary context switches
+/// it took during the commitment (a runner whose CPU another process held shows CPU time far
+/// below its wall time).
+pub static WORKER_CPU_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+pub static WORKER_IVCSW: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+
+/// Per runner of the last [`commit_paired`]: page faults it took (minor + major).
+pub static WORKER_FAULTS: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// Per runner of the last [`commit_paired`]: microseconds it was runnable but waiting for its
+/// CPU (`/proc/thread-self/schedstat`: another task held the CPU), and voluntary switches
+/// (blocked: a fault's I/O, a lock).
+pub static WORKER_WAIT_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+pub static WORKER_VCSW: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// System-wide deltas over the last [`commit_paired`], read once before and once after it:
+/// per CPU (first 16) user, nice, system, irq, softirq and steal ticks from `/proc/stat`, and the
+/// [`VM_KEYS`] counters of `/proc/vmstat`. Empty where the files cannot be read.
+static SYS_DELTA: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+const VM_KEYS: [&str; 11] = ["pgscan_kswapd", "pgscan_direct", "pgsteal_kswapd", "compact_stall", "compact_daemon_wake", "thp_fault_alloc", "thp_fault_fallback", "nr_dirty", "nr_writeback", "pgpgout", "pgfault"];
+
+/// The counters [`SYS_DELTA`] reports, now.
+fn sys_snapshot() -> ([[u64; 6]; 16], usize, [u64; 11]) {
+    let mut cpu = [[0u64; 6]; 16];
+    let mut ncpu = 0;
+    if let Ok(s) = std::fs::read_to_string("/proc/stat") {
+        for l in s.lines() {
+            let mut f = l.split_whitespace();
+            let Some(c) = f.next().and_then(|n| n.strip_prefix("cpu")).and_then(|c| c.parse::<usize>().ok()) else { continue };
+            if c < 16 {
+                let v: Vec<u64> = f.take(8).map(|x| x.parse().unwrap_or(0)).collect();
+                if v.len() == 8 {
+                    cpu[c] = [v[0], v[1], v[2], v[5], v[6], v[7]];
+                    ncpu = ncpu.max(c + 1);
+                }
+            }
+        }
+    }
+    let mut vm = [0u64; 11];
+    if let Ok(s) = std::fs::read_to_string("/proc/vmstat") {
+        for l in s.lines() {
+            let mut f = l.split_whitespace();
+            if let (Some(k), Some(v)) = (f.next(), f.next()) {
+                if let Some(i) = VM_KEYS.iter().position(|&x| x == k) {
+                    vm[i] = v.parse().unwrap_or(0);
+                }
+            }
+        }
+    }
+    (cpu, ncpu, vm)
+}
+
+/// ` sms_cpustat=u,n,s,irq,si,st/..` (ticks per CPU) and ` sms_vm=key:delta,..` between two
+/// snapshots (gauges such as nr_dirty as their value after).
+fn sys_delta(a: &([[u64; 6]; 16], usize, [u64; 11]), b: &([[u64; 6]; 16], usize, [u64; 11])) -> String {
+    let cpus: Vec<String> = (0..b.1).map(|c| (0..6).map(|k| b.0[c][k].saturating_sub(a.0[c][k]).to_string()).collect::<Vec<_>>().join(",")).collect();
+    let vm: Vec<String> = VM_KEYS.iter().enumerate().map(|(i, k)| {
+        let v = if k.starts_with("nr_") { b.2[i] as i64 } else { b.2[i] as i64 - a.2[i] as i64 };
+        format!("{k}:{v}")
+    }).collect();
+    format!(" sms_cpustat={} sms_vm={}", cpus.join("/"), vm.join(","))
+}
+
+/// This thread's run-queue wait so far in nanoseconds (0 where unreadable).
+fn thread_wait_ns() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/schedstat").ok().and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse().ok())).unwrap_or(0)
+}
+
+
+/// This thread's (CPU microseconds, involuntary context switches, page faults, voluntary
+/// context switches) so far; zeros off Linux.
+fn thread_usage() -> (u64, u64, u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        // struct rusage on x86-64 Linux: two timevals, then 14 longs; ru_nivcsw is the last.
+        #[repr(C)]
+        struct Rusage { ut: [i64; 2], st: [i64; 2], rest: [i64; 14] }
+        unsafe extern "C" { fn getrusage(who: i32, usage: *mut Rusage) -> i32; }
+        let mut r = Rusage { ut: [0; 2], st: [0; 2], rest: [0; 14] };
+        if unsafe { getrusage(1, &mut r) } == 0 {
+            return ((r.ut[0] + r.st[0]) as u64 * 1_000_000 + (r.ut[1] + r.st[1]) as u64, r.rest[13] as u64, (r.rest[4] + r.rest[5]) as u64, r.rest[12] as u64);
+        }
+    }
+    (0, 0, 0, 0)
 }
 
 /// The commitment on sibling pairs: hyperthreads `2k`, `2k + 1` (placed on core `k`) take
-/// 16-column work units of one ring-element part ([`HALVES`]) each and advance through the key
+/// 16-column work units of one ring-element part ([`parts`]) each and advance through the key
 /// within [`PAIR_LEAD`] pair batches of each other, so both read every key line from their core's
 /// L2. Units are handed out dynamically, part-major: a coupled pair claims two adjacent units
 /// (two column groups, one part, one key range) at a time, the second for the sibling that asks
@@ -1076,13 +1234,29 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
     let g = 16usize;
     let pairs = workers / 2;
     let groups = columns.len().div_ceil(g);
-    let units = groups * HALVES;
-    let locks: Vec<std::sync::Mutex<u8>> = (0..groups).map(|_| std::sync::Mutex::new(0)).collect();
+    let mode = end_mode();
+    let steal = mode == 0;
+    let parts = parts(np, if mode == 1 { END_PARTS } else { &[] });
+    let units = groups * parts.len();
+    assert!(groups < 1 << 12 && np < 1 << 16);
+    let locks: Vec<std::sync::Mutex<usize>> = (0..groups).map(|_| std::sync::Mutex::new(0)).collect();
+    // Per runner: the unit it is running (span_pack; 0: none), and the tags' source.
+    let spans: Vec<std::sync::atomic::AtomicU64> = (0..2 * pairs).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let tags = std::sync::atomic::AtomicU64::new(1);
+    let tids: Vec<std::sync::atomic::AtomicI32> = (0..2 * pairs).map(|_| std::sync::atomic::AtomicI32::new(0)).collect();
+    let moved: Vec<AtomicBool> = (0..2 * pairs).map(|_| AtomicBool::new(false)).collect();
+    // Per runner: it has finished its own claims (a runner starved before its first claim counts
+    // as busy, so that the end watch can unpin it too).
+    let watching: Vec<AtomicBool> = (0..2 * pairs).map(|_| AtomicBool::new(false)).collect();
+    let rescue = steal && std::env::var_os("LABINIUS_NO_RESCUE").is_none();
+    STOLEN.store(0, Ordering::Relaxed);
+    RESCUED.store(0, Ordering::Relaxed);
     let next = AtomicUsize::new(0);
     // Per pair: the unit its last pair claim left for the other sibling.
     let pending: Vec<std::sync::Mutex<Option<usize>>> = (0..pairs).map(|_| std::sync::Mutex::new(None)).collect();
     let done: Vec<Progress> = (0..2 * pairs).map(|_| Progress(AtomicUsize::new(0))).collect();
     let coupled: Vec<AtomicBool> = (0..pairs).map(|_| AtomicBool::new(true)).collect();
+    let sys0 = sys_snapshot();
     let t0 = std::time::Instant::now();
     let taken: Vec<AtomicBool> = (0..2 * pairs).map(|_| AtomicBool::new(false)).collect();
     let started = AtomicUsize::new(0);
@@ -1093,6 +1267,9 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
         if worker < 16 {
             WORKER_START_US[worker].store(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
         }
+        let usage0 = thread_usage();
+        let wait0 = thread_wait_ns();
+        tids[worker].store(crate::par::thread_id(), Ordering::Relaxed);
         let _guard = placement.and_then(|p| p.pin(worker));
         started.fetch_add(1, Ordering::AcqRel);
         // The scheduler stacks two runners on one CPU while another CPU sits idle and moves one
@@ -1113,6 +1290,43 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
         let mut ran = 0u32;
         // Pair batches of finished units: the siblings' common clock while they are coupled.
         let mut progressed = 0usize;
+        // Runs group `gi` over `range`, published in this runner's span so that idle runners can
+        // take its unstarted chunks; returns the end it reached.
+        let run = |gi: usize, range: core::ops::Range<usize>, ws: &mut SmsWorker, sync: &mut dyn FnMut(usize)| -> usize {
+            let lo = gi * g;
+            let n = g.min(columns.len() - lo);
+            let span = &spans[worker];
+            if steal {
+                let first = chunk_range(np, chunk_at(np, range.start)).end;
+                span.store(span_pack(gi, tags.fetch_add(1, Ordering::Relaxed), first, range.end), Ordering::Release);
+            }
+            let end = unsafe {
+                group(&columns[lo..lo + n], keys, np, range.clone(), RowsOut::Part(&locks[gi]), ws, (dst as *mut [u32; N]).add(2 * lo), |b| sync(b), |e| {
+                    // Chunk boundary `e` = the span's next: start the chunk after it unless a
+                    // thief has cut the range there.
+                    if !steal {
+                        return true;
+                    }
+                    let mut s = span.load(Ordering::Acquire);
+                    loop {
+                        let (_, next, limit) = span_unpack(s);
+                        debug_assert_eq!(next, e);
+                        if e >= limit {
+                            return false;
+                        }
+                        let ne = chunk_range(np, chunk_at(np, e)).end;
+                        match span.compare_exchange_weak(s, (s & !0xFFFF_0000) | (ne as u64) << 16, Ordering::AcqRel, Ordering::Acquire) {
+                            Ok(_) => return true,
+                            Err(x) => s = x,
+                        }
+                    }
+                })
+            };
+            if steal {
+                span.store(0, Ordering::Release);
+            }
+            end
+        };
         loop {
             let unit = {
                 let mut left = pending[pair].lock().unwrap();
@@ -1130,48 +1344,128 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
             };
             let Some(u) = unit else { break };
             let (part, gi) = (u / groups, u % groups);
-            let range = part * np / HALVES..(part + 1) * np / HALVES;
-            let lo = gi * g;
-            let n = g.min(columns.len() - lo);
+            let range = parts[part].clone();
             let ws = ws.get_or_insert_with(SmsWorker::new);
             ran += 1;
             let (from, base) = (range.start, progressed);
-            unsafe {
-                let out = if HALVES == 1 { RowsOut::Full } else { RowsOut::Half(&locks[gi]) };
-                group(&columns[lo..lo + n], keys, np, range.clone(), out, ws, (dst as *mut [u32; N]).add(2 * lo), |b_done| {
-                    let d = base + (b_done - from);
-                    mine.store(d, Ordering::Release);
-                    if !coupled.load(Ordering::Relaxed) {
+            let end = run(gi, range.clone(), ws, &mut |b_done| {
+                #[cfg(test)]
+                if TEST_STALL_WORKER.load(Ordering::Relaxed) == worker + 1 && ran == 1 && b_done - from <= 16 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                let d = base + (b_done - from);
+                mine.store(d, Ordering::Release);
+                if !coupled.load(Ordering::Relaxed) {
+                    return;
+                }
+                if other.load(Ordering::Acquire) + PAIR_LEAD >= d {
+                    return;
+                }
+                let start = std::time::Instant::now();
+                let mut spins = 0u32;
+                while other.load(Ordering::Acquire) + PAIR_LEAD < d {
+                    core::hint::spin_loop();
+                    spins += 1;
+                    if spins % 64 == 0 && start.elapsed() > SIBLING_WAIT {
+                        coupled.store(false, Ordering::Relaxed);
+                        let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
+                        if k < 16 {
+                            DECOUPLED_AT[k].store(((t0.elapsed().as_micros() as u32) << 4) | worker as u32, Ordering::Relaxed);
+                        }
                         return;
                     }
-                    if other.load(Ordering::Acquire) + PAIR_LEAD >= d {
-                        return;
+                }
+            });
+            progressed += end - from;
+            mine.store(progressed, Ordering::Release);
+        }
+        // The queue is empty: from here on this runner's sibling does not wait for it. Take the
+        // units other pairs' slower siblings have not started, then the unstarted chunks of the
+        // unit with the most of them (the later half of them, so a runner that lost its CPU keeps
+        // little), until no runner has a chunk left to start.
+        mine.store(usize::MAX / 2, Ordering::Release);
+        watching[worker].store(true, Ordering::Release);
+        // Per runner: its span when this runner last saw it change, and when that was.
+        let mut seen: Vec<(u64, std::time::Instant)> = spans.iter().map(|s| (s.load(Ordering::Relaxed), std::time::Instant::now())).collect();
+        // When this runner last ran out of work (the profile's end, not the end of its watch).
+        let mut out_of_work: Option<u32> = None;
+        while steal {
+            if let Some(u) = pending.iter().find_map(|p| p.lock().unwrap().take()) {
+                let ws = ws.get_or_insert_with(SmsWorker::new);
+                ran += 1;
+                run(u % groups, parts[u / groups].clone(), ws, &mut |_| {});
+                out_of_work = None;
+                continue;
+            }
+            let mut best: Option<(usize, usize, u64)> = None;
+            for (w, sp) in spans.iter().enumerate() {
+                let s = sp.load(Ordering::Acquire);
+                let (_, next, limit) = span_unpack(s);
+                if w != worker && next < limit && best.map_or(true, |(left, _, _)| limit - next > left) {
+                    best = Some((limit - next, w, s));
+                }
+            }
+            let Some((_, w, s)) = best else {
+                out_of_work.get_or_insert_with(|| t0.elapsed().as_micros() as u32);
+                // Nothing left to start. A runner still inside its last chunk whose unit has not
+                // advanced for STALL is not running: another task holds its pinned CPU. Unpin it
+                // so that it moves to a CPU whose runner is done; yield so that it gets one.
+                let mut busy = false;
+                for (w, sp) in spans.iter().enumerate() {
+                    let s = sp.load(Ordering::Acquire);
+                    if w == worker || (s == 0 && watching[w].load(Ordering::Acquire)) {
+                        continue;
                     }
-                    let start = std::time::Instant::now();
-                    let mut spins = 0u32;
-                    while other.load(Ordering::Acquire) + PAIR_LEAD < d {
-                        core::hint::spin_loop();
-                        spins += 1;
-                        if spins % 64 == 0 && start.elapsed() > SIBLING_WAIT {
-                            coupled.store(false, Ordering::Relaxed);
-                            let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
-                            if k < 16 {
-                                DECOUPLED_AT[k].store(((t0.elapsed().as_micros() as u32) << 4) | worker as u32, Ordering::Relaxed);
-                            }
-                            return;
+                    busy = true;
+                    if seen[w].0 != s {
+                        seen[w] = (s, std::time::Instant::now());
+                    } else if rescue && seen[w].1.elapsed() > STALL && !moved[w].load(Ordering::Acquire) {
+                        let tid = tids[w].load(Ordering::Relaxed);
+                        if tid > 0 && !moved[w].swap(true, Ordering::AcqRel) && placement.is_some_and(|p| p.release(tid, w)) {
+                            RESCUED.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                })
+                }
+                if !busy || !rescue {
+                    break;
+                }
+                for _ in 0..64 {
+                    core::hint::spin_loop();
+                }
+                std::thread::yield_now();
+                continue;
             };
-            progressed += range.len();
-            mine.store(progressed, Ordering::Release);
+            let (gi, next, limit) = span_unpack(s);
+            let mut cuts = vec![next];
+            while *cuts.last().unwrap() < limit {
+                cuts.push(chunk_range(np, chunk_at(np, *cuts.last().unwrap())).end);
+            }
+            let k = cuts.len() - 1;
+            let split = cuts[k / 2];
+            if spans[w].compare_exchange(s, (s & !0xFFFF) | split as u64, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                STOLEN.fetch_add(1, Ordering::Relaxed);
+                let ws = ws.get_or_insert_with(SmsWorker::new);
+                ran += 1;
+                run(gi, split..limit, ws, &mut |_| {});
+                out_of_work = None;
+            }
         }
         mine.store(usize::MAX / 2, Ordering::Release);
         if worker < 16 {
-            WORKER_END_US[worker].store(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
+            WORKER_END_US[worker].store(out_of_work.unwrap_or_else(|| t0.elapsed().as_micros() as u32), Ordering::Relaxed);
             WORKER_GROUPS[worker].store(ran, Ordering::Relaxed);
+            let usage = thread_usage();
+            WORKER_CPU_US[worker].store((usage.0 - usage0.0) as u32, Ordering::Relaxed);
+            WORKER_IVCSW[worker].store((usage.1 - usage0.1) as u32, Ordering::Relaxed);
+            WORKER_FAULTS[worker].store((usage.2 - usage0.2) as u32, Ordering::Relaxed);
+            WORKER_VCSW[worker].store((usage.3 - usage0.3) as u32, Ordering::Relaxed);
+            WORKER_WAIT_US[worker].store((thread_wait_ns().saturating_sub(wait0) / 1000) as u32, Ordering::Relaxed);
         }
     });
+    let delta = sys_delta(&sys0, &sys_snapshot());
+    if let Ok(mut s) = SYS_DELTA.lock() {
+        *s = delta;
+    }
 }
 
 /// The commitment's rows: `rows[2c]` is column `c` modulo 9721 in the NTT domain (canonical),
@@ -1209,7 +1503,7 @@ pub fn commit_columns_rows(keys: &SmsKeys, columns: &[&[B128]], workers: usize) 
                 let c0 = gi * g;
                 let gc = g.min(columns.len() - c0);
                 let ws = ws.get_or_insert_with(SmsWorker::new);
-                unsafe { group(&columns[c0..c0 + gc], keys, np, 0..np, RowsOut::Full, ws, (dst as *mut [u32; N]).add(2 * c0), |_| {}) };
+                unsafe { group(&columns[c0..c0 + gc], keys, np, 0..np, RowsOut::Full, ws, (dst as *mut [u32; N]).add(2 * c0), |_| {}, |_| true) };
             }
         });
     }
@@ -1400,10 +1694,26 @@ mod tests {
     }
 
     #[test]
+    fn parts_cover_the_column_in_whole_chunks() {
+        for np in [256usize, 512, 1024, 2048, 4096] {
+            let ps = parts(np, END_PARTS);
+            assert_eq!(ps[0], 0..np / 2);
+            assert!(ps.windows(2).all(|w| w[0].end == w[1].start && w[1].start < w[1].end), "{np}: {ps:?}");
+            assert_eq!(ps.last().unwrap().end, np);
+            let cuts: Vec<usize> = (0..chunk_count(2 * np)).map(|c| chunk_range(np, c).start).collect();
+            assert!(ps.iter().all(|r| cuts.contains(&r.start)), "{np}: {ps:?}");
+            assert_eq!(ps.iter().map(|r| folds_in_range(np, r.clone())).sum::<usize>(), folds_in_range(np, 0..np));
+        }
+        assert_eq!(parts(2048, END_PARTS), vec![0..1024, 1024..1728, 1728..2048]);
+        assert_eq!(parts(2048, &[]), vec![0..1024, 1024..2048]);
+    }
+
+    #[test]
     fn commitment_matches_reference() {
         commitment_matches_reference_at(512, 7.5); // exact chunk boundary
         commitment_matches_reference_at(640, 7.5); // full and short chunks in each half
         commitment_matches_reference_at(1024, 7.5); // multiple full chunks
+        commitment_matches_reference_at(2048, 7.5); // three chunks per half: three parts
     }
 
     fn commitment_matches_reference_at(elements: usize, floor: f64) {
@@ -1427,6 +1737,83 @@ mod tests {
             }
         }
     }
+    /// A group cut short at any chunk boundary, with the rest committed as further parts in any
+    /// order, writes the rows of the uncut group (the stream-0 fold bias is corrected).
+    #[test]
+    fn groups_cut_at_chunk_boundaries_add_up_to_the_whole() {
+        let elements = 2048usize;
+        let np = elements / 2;
+        let mut s = 0xc47a11u64;
+        let a: Vec<u128> = (0..elements * N).map(|_| ((xorshift(&mut s) as u128) << 64 | xorshift(&mut s) as u128) % MODULUS).collect();
+        let data = SmsKeyData::build(&a, elements);
+        let keys = data.keys();
+        let len = 4 * elements;
+        let g = 16usize;
+        let words: Vec<B128> = (0..len * g).map(|_| B128(((xorshift(&mut s) as u128) << 64) | xorshift(&mut s) as u128)).collect();
+        let cols: Vec<&[B128]> = words.chunks_exact(len).collect();
+        let mut ws = SmsWorker::new();
+        let mut want = vec![[0u32; N]; 2 * g];
+        unsafe { group(&cols, &keys, np, 0..np, RowsOut::Full, &mut ws, want.as_mut_ptr(), |_| {}, |_| true) };
+        let bounds: Vec<usize> = (0..chunk_count(elements)).map(|c| chunk_range(np, c).start).chain([np]).collect();
+        let hl = np / 2;
+        for &cut in bounds.iter().filter(|&&b| b != 0 && b != hl && b != np) {
+            let (h0, h1) = if cut < hl { (0..hl, hl..np) } else { (hl..np, 0..hl) };
+            for order in 0..3 {
+                let lock = std::sync::Mutex::new(0usize);
+                let mut got = vec![[0u32; N]; 2 * g];
+                // The cut half: its head (stopped at `cut` by the claim), and its tail.
+                let pieces = [(h0.clone(), cut), (cut..h0.end, np), (h1.clone(), np)];
+                for i in 0..3 {
+                    let (r, stop) = pieces[(i + order) % 3].clone();
+                    let end = unsafe { group(&cols, &keys, np, r.clone(), RowsOut::Part(&lock), &mut ws, got.as_mut_ptr(), |_| {}, |e| e < stop) };
+                    assert_eq!(end, if stop < r.end { stop } else { r.end });
+                }
+                for c in 0..g {
+                    assert!(column_coefficients(&got[2 * c], &got[2 * c + 1]) == column_coefficients(&want[2 * c], &want[2 * c + 1]), "column {c} differs, cut {cut} order {order}");
+                }
+            }
+        }
+    }
+
+    /// A runner stalled inside its first unit has its unstarted chunks taken over by the idle
+    /// runners at the queue's end, and the rows equal those of an unstalled commitment.
+    #[test]
+    fn stalled_runners_chunks_are_taken_over_with_identical_rows() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let elements = 2048usize;
+        let ncols = 80usize;
+        let mut s = 0x57ea1u64;
+        let a: Vec<u128> = (0..elements * N).map(|_| ((xorshift(&mut s) as u128) << 64 | xorshift(&mut s) as u128) % MODULUS).collect();
+        let data = SmsKeyData::build(&a, elements);
+        let len = 4 * elements;
+        let words: Vec<B128> = (0..len * ncols).map(|_| B128(((xorshift(&mut s) as u128) << 64) | xorshift(&mut s) as u128)).collect();
+        let cols: Vec<&[B128]> = words.chunks_exact(len).collect();
+        let keys = data.keys();
+        let want = commit_columns_rows(&keys, &cols, 1);
+        let mut stolen = 0;
+        for stall in [2usize, 5] {
+            // A test running alongside may hold the pool (the commitment then runs inline).
+            for _ in 0..5 {
+                TEST_STALL_WORKER.store(stall, Relaxed);
+                let got = commit_columns_rows(&keys, &cols, 8);
+                TEST_STALL_WORKER.store(0, Relaxed);
+                for c in 0..ncols {
+                    assert!(column_coefficients(&got[2 * c], &got[2 * c + 1]) == column_coefficients(&want[2 * c], &want[2 * c + 1]), "column {c} differs with runner {} stalled", stall - 1);
+                }
+                let n = STOLEN.load(Relaxed);
+                if n > 0 {
+                    stolen += n;
+                    break;
+                }
+            }
+        }
+        if crate::par::CorePlacement::for_sibling_pairs(8).is_some() {
+            assert!(stolen >= 2, "no chunks were taken over");
+        } else {
+            eprintln!("no 4-core x 2-thread placement here: take-over not exercised");
+        }
+    }
+
     #[test]fn rep176_forced_alias_matches_schoolbook(){
       let elements=1024;let mut seed=0x1765a9721u64;let a:Vec<u128>=(0..elements*N).map(|_|((xorshift(&mut seed)as u128)<<64|xorshift(&mut seed)as u128)%MODULUS).collect();let data=SmsKeyData::build(&a,elements);let keys=data.keys();let nc=chunk_count(elements);let range=chunk_range(elements/2,0);let(first,last)=(2*range.start,2*range.end);
       for digit in 0..DIGITS{for sign in[-1i64,1]{let m=[0usize,81,323,324,486,647][digit];let bound=P as i64-data.repair.limits[digit*nc]as i64;assert!(bound>5625+64);let target=sign*(bound-64);let mean=data.repair.means[(digit*nc)*N+m]as i64;let mut actual=-mean;let mut words=vec![B128(0);4*elements];

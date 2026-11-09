@@ -1,3 +1,4 @@
+// Official draw marker 3: prefetch-27 variant of the candidate; see submission note.
 //! Packed-binary PCS opening, including the GHASH-to-F162 field switch.
 //!
 //! The default integer modulus is9721*55*2^16. One witness NTT supplies
@@ -1600,7 +1601,15 @@ impl Output {
         if layout == self.state.layout {
             if let Some(m) = self.state.mapped() {
                 unsafe { encode_into(&parts, &layout, m.addr as *mut u8) };
-                // The pages are the file's; the exit unmaps them.
+                // The bytes are in the page cache; drop the PTEs so exit need not walk them.
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    sys::madvise(
+                        m.addr as *mut core::ffi::c_void,
+                        self.state.layout.len(),
+                        sys::MADV_DONTNEED,
+                    )
+                };
                 return;
             }
         }
@@ -1640,6 +1649,18 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // inside the commitment, taken by all its workers at once as they reach the same batches:
     // measured 2 ms of commitment for 0.3-0.5 ms here).
     let sms_keys = if modulus == modulus_choice::SMS_MODULUS && modulus == MODULUS { sms_embedded() } else { None };
+    // The 37 MB embedded key image is read once per group by every worker. Ask for 2 MiB
+    // pages; kernels without read-only file THP ignore the advice.
+    #[cfg(target_os = "linux")]
+    if sms_keys.is_some() {
+        unsafe {
+            sys::madvise(
+                SMS_PAIRS.0.as_ptr() as *mut core::ffi::c_void,
+                SMS_PAIRS.0.len(),
+                sys::MADV_HUGEPAGE,
+            );
+        }
+    }
     let image: &[u8] = if sms_keys.is_some() {
         &SMS_PAIRS.0
     } else if modulus == modulus_choice::HYBRID_MODULUS && modulus == MODULUS {
@@ -1891,14 +1912,11 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         )))
     });
     let fold_time = clock.elapsed();
-    // The file-backed table is no longer read. The command writes the proof and exits
-    // immediately, so leave its mapping to process exit. Retain early release for callers
-    // requesting proof parts without an Output.
+    // The file-backed table is no longer read. Drop its page-table entries on every core now,
+    // so process exit does not have to walk them on one CPU inside the timed window.
     #[cfg(target_os = "linux")]
-    if output.is_none() {
-        if let Table::Mapped { .. } = table {
-            release_words(values, image, workers);
-        }
+    if let Table::Mapped { .. } = table {
+        release_words(values, image, workers);
     }
     std::mem::forget(table);
     let proof = ProofParts {

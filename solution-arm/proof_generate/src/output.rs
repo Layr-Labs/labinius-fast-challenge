@@ -80,7 +80,7 @@ unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
     let elements = p.folded.elements();
     assert!(elements.iter().all(|e| e.representation == Representation::Coefficients));
     let addr = out as usize;
-    let ctasks = if p.commitment.is_empty() { 0 } else { 4 };
+    let ctasks = if p.commitment.is_empty() { 0 } else { par::threads() };
     let ftasks = if elements.is_empty() { 0 } else { 4 * par::threads() };
     par::pool().run(ctasks + ftasks, |i| {
         let out = addr as *mut u8;

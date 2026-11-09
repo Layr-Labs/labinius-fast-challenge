@@ -58,6 +58,9 @@ image!(SMS_DATA, "sms-data.bin");
 image!(SMS_MEANS, "sms-means.bin");
 image!(SMS_MU, "sms-mu.bin");
 image!(SMS_META, "sms-meta.bin");
+image!(SMS_DIGITS, "sms-digits.bin");
+image!(SMS_MEAN_INT, "sms-mean-int.bin");
+image!(SMS_THRESHOLD, "sms-threshold.bin");
 const MODULUS: u128 = ntt::neon::sms::MODULUS;
 
 /// Coefficients of a witness ring element per table lookup in [`commit`].
@@ -357,7 +360,7 @@ fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
         use ntt::neon::sms;
-        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
+        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
         return sms::commit(values, &matrix, threads());
     }
@@ -1005,9 +1008,10 @@ mod tests {
         {
             use ntt::neon::sms;
             let built = sms::matrix(RING_ELEMENTS, 8);
-            let embedded = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, RING_ELEMENTS)
+            let embedded = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
                 .expect("the build embeds the SMS images");
             assert!(built.data == embedded.data && built.mean_residues == embedded.mean_residues && built.mu == embedded.mu);
+            assert!(built.digits == embedded.digits && built.mean_int == embedded.mean_int && built.threshold == embedded.threshold);
             assert_eq!(built.margin, embedded.margin);
         }
         use ntt::neon::sms;
@@ -1023,12 +1027,27 @@ mod tests {
         // a short last chunk and a short last lockstep group, partial batches; the last sweep of
         // the column with one to four tiles (whole and short), a column of one short tile, and a
         // column whose chunks are all whole sweeps
-        for (elements, cols) in [(301usize, 11usize), (5, 3), (229, 9), (240, 9), (241, 9), (250, 9), (256, 9), (448, 2)] {
+        for (elements, cols) in [(301usize, 11usize), (5, 3), (229, 9), (240, 9), (241, 9), (250, 9), (256, 9), (448, 2), (384, 9), (385, 9), (800, 9)] {
             let values: Vec<B128> = (0..cols).flat_map(|s| column(200 + s as u64)).take(cols * 4 * elements).collect();
             let matrix = rq::ajtai_matrix(q, elements);
             let want = commit_reference(&values, &matrix, q);
             let a = sms::matrix(elements, 3);
             assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
+        }
+    }
+    /// With every repair threshold at zero each chunk deviation is recomputed exactly by
+    /// `sms::repair`, and the commitment still agrees with the schoolbook one.
+    #[test]
+    fn sms_forced_repairs_match_reference() {
+        use ntt::neon::sms;
+        let q = sms::MODULUS;
+        for (elements, cols) in [(800usize, 9usize), (385, 3), (130, 2)] {
+            let values: Vec<B128> = (0..cols).flat_map(|s| column(300 + s as u64)).take(cols * 4 * elements).collect();
+            let matrix = rq::ajtai_matrix(q, elements);
+            let want = commit_reference(&values, &matrix, q);
+            let mut a = sms::matrix(elements, 3);
+            a.threshold = std::borrow::Cow::Owned(vec![0; a.threshold.len()]);
+            assert!(sms::commit(&values, &a, 3) == want, "{elements} elements, every coefficient repaired");
         }
     }
     #[test]

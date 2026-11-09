@@ -1,6 +1,7 @@
 // Packed-binary SMS index only: 32 ring lanes, each with512 Boolean coefficients.
 // Rows0..27 encode x bits0..3, byte selector bit4 and y bits5..7; both
-// byte selectors share one word. Rows27..81 contain six-bit pair indices.
+// byte selectors share one word. Rows27..81 contain six-bit pair indices,
+// repeated in both bytes of the word.
 // All81 rows are written before a producer reads them. The general F162 and
 // full648-bit constructors retain their original representation and paths.
 #[repr(C,align(64))]pub(crate)struct SmsBinaryIndex32{pub(crate)rows:[[u16;32];81]}
@@ -143,12 +144,10 @@ unsafe fn uv_sms_step<const T: usize, const BASE: usize>(
                                     _mm512_gf2p8affine_epi64_epi8::<0>(tagged, matrix),
                                 );
                             } else {
-                                let bytes = if $high {
-                                    _mm512_extracti64x4_epi64::<1>(n)
-                                } else {
-                                    _mm512_castsi512_si256(n)
-                                };
-                                _mm512_store_si512(out.rows[row].as_mut_ptr().cast(), _mm512_cvtepu8_epi16(bytes));
+                                // Both bytes of each word hold the pair index: the producer
+                                // looks it up with a byte permute and a masked byte permute.
+                                let dup = if $high { dup1 } else { dup0 };
+                                _mm512_store_si512(out.rows[row].as_mut_ptr().cast(), _mm512_permutexvar_epi8(dup, n));
                             }
                         }
                     }};
@@ -199,7 +198,7 @@ unsafe fn uv_b128_to_sms_rows(u: *const u64, v: *const u64, out: &mut SmsBinaryI
  }}
  let ptrs=core::array::from_fn(|i|columns[i].as_ptr());let mut old=BinaryIndex32{rows:[[0;64];162]};let mut got=Guard{pre:[0x75319acf1dfe4321;8],value:SmsBinaryIndex32{rows:[[0x3a55;32];81]},post:[0x75319acf1dfe4321;8]};
  slice_b128_cols16_into(&ptrs,&mut old);slice_b128_cols16_sms_into(&ptrs,&mut got.value);
- for i in 0..81{for lane in 0..32{let x=old.rows[i][2*lane]&15;let y=old.rows[i+81][2*lane]&15;let mut n=(x&8)<<3;for b in 0..3{n|=((x>>b)&1)<<(2*b);n|=((y>>b)&1)<<(2*b+1);}if i<27{let low=(x as u16)|((y as u16)<<5);assert_eq!(got.value.rows[i][lane],low|((low|16)<<8),"fixture={fixture} row={i} lane={lane}");}else{assert_eq!(got.value.rows[i][lane],n as u16,"fixture={fixture} row={i} lane={lane}");}}}
+ for i in 0..81{for lane in 0..32{let x=old.rows[i][2*lane]&15;let y=old.rows[i+81][2*lane]&15;let mut n=(x&8)<<3;for b in 0..3{n|=((x>>b)&1)<<(2*b);n|=((y>>b)&1)<<(2*b+1);}if i<27{let low=(x as u16)|((y as u16)<<5);assert_eq!(got.value.rows[i][lane],low|((low|16)<<8),"fixture={fixture} row={i} lane={lane}");}else{assert_eq!(got.value.rows[i][lane],(n as u16)|((n as u16)<<8),"fixture={fixture} row={i} lane={lane}");}}}
 
  assert_eq!(got.pre,[0x75319acf1dfe4321;8]);assert_eq!(got.post,[0x75319acf1dfe4321;8]);
  }

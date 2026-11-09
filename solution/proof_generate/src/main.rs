@@ -1581,11 +1581,18 @@ impl Output {
     ///
     /// `first` are anonymous regions to fault in before the file, one chunk each (writable,
     /// and only ever populated: `MADV_POPULATE_WRITE` leaves what they hold as it is).
-    fn populate(&self, first: Vec<(usize, usize)>, release: Vec<(usize, usize)>) {
+    fn populate(&self, first: Vec<(usize, usize)>, release: Vec<(usize, usize)>, workers: usize) {
         let chunks = self.state.layout.len().div_ceil(POPULATE_CHUNK);
         let worker_state = self.state.clone();
         let (nf, nr) = (first.len(), release.len());
-        let job = labinius::par::pool().idle(nf + nr + chunks, move |i| {
+        // After the switch's pages: the fold's buffers, so that its allocations find faulted
+        // blocks (`labinius::fold::prewarm`); then the proof file.
+        let job = labinius::par::pool().idle(nf + 1 + nr + chunks, move |i| {
+            if i == nf {
+                labinius::fold::prewarm(COLUMNS, workers);
+                return;
+            }
+            let i = if i > nf { i - 1 } else { i };
             if let Some(&(addr, len)) = first.get(i) {
                 #[cfg(target_os = "linux")]
                 unsafe {
@@ -1903,7 +1910,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         let at = image.as_ptr() as usize;
         let (lo, hi) = ((at + 4095) & !4095, (at + image.len()) & !4095);
         let release = (lo..hi.max(lo)).step_by(POPULATE_CHUNK).map(|o| (o, POPULATE_CHUNK.min(hi - o)));
-        output.populate(first.collect(), release.collect());
+        output.populate(first.collect(), release.collect(), workers);
     }
     let mut t = transcript(seed, modulus, &commitment);
     let (lo, hi) = point(&mut t);

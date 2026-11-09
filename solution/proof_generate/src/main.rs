@@ -1,4 +1,4 @@
-// Official draw F2: record prefetch-37 tree, early release, proof and key page advice.
+// Official draw F4: prefetch-38 variant with early release and page advice.
 //! Packed-binary PCS opening, including the GHASH-to-F162 field switch.
 //!
 //! The default integer modulus is9721*55*2^16. One witness NTT supplies

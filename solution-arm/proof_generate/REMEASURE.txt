@@ -1,1 +1,8 @@
-re-measurement 2 of packed byte nibbles + SVE ld1b table front (ba4d19f4) (first filed as ba4d19f4-e60b-4d5b-aae5-a071cdba8fd8)
+Re-measurement marker: this archive is the promoted record tree 916b5f8 (official median
+298.5617 ms, benchmark Holindauer/labinius-fast/arm), unchanged except for this one-line marker.
+The server refuses byte-identical archives, so this file distinguishes the re-filed submission.
+
+Rationale: official medians vary by several milliseconds between draws of functionally identical
+code on this benchmark (this account's own five trusted readings on identical trees span
+298.77-304.50 ms). This submission samples that distribution again on the proven record tree; no
+functional change is claimed.

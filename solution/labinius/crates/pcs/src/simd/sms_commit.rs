@@ -434,7 +434,7 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-const PREFETCH_SLOTS: usize = 37;
+const PREFETCH_SLOTS: usize = 5;
 
 // Quarter-scaled witnesses and reciprocal public keys preserve every product.
 // The64-pair window retains the baseline's statistical accumulation strategy;
@@ -1034,7 +1034,7 @@ fn bench_mode() -> u32 {
 /// A batch counter on a cache line of its own.
 #[repr(align(128))]
 struct Progress(std::sync::atomic::AtomicUsize);
-const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(3000);
+const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(1000);
 /// Maximum lead (in pair batches) between two hyperthread siblings on one physical core.
 const PAIR_LEAD: usize = 2 * PP;
 

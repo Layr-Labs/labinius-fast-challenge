@@ -575,7 +575,8 @@ unsafe fn narrow(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
 }
 
 /// The largest product of a key slot (a centered residue) and a transform slot.
-const PRODUCT: u64 = (P1 as u64 - 1) / 2 * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64;
+const PRODUCT: u64 = (P1 as u64 - 1) / 2 * super::LAZY_BOUND as u64;
+const _: () = assert!(PB == 1, "the lazy table-front tail is prime 9721's");
 /// `2^16 mod p`, centered.
 const C16: i32 = centered(1 << 16, P1) as i32;
 /// `round(2^31 / p)`.
@@ -664,8 +665,7 @@ unsafe fn sums(
                 indices(&at, nib);
                 let x = &mut xs[i];
                 pass_lut::<PB>(nib, x, kern);
-                pass_c::<4>(x, kern);
-                pass_d::<PB, false>(x, kern, &[], &mut []);
+                pass_lazy_tail(x, kern);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             // the chunk's first sweep starts the digit rows' sums afresh
@@ -1138,5 +1138,75 @@ mod timing {
             println!("{out}");
         }
         println!("per element: ajtai {:?} digits {:?} moments {:?} transforms {:?}", ajtai / n as u32, (both - ajtai) / n as u32, mom / n as u32, tr / n as u32);
+    }
+}
+
+#[cfg(test)]
+mod front_bench {
+    use super::*;
+
+    /// The commit's per-transform front (indices, pass_lut, pass_c, pass_d) on one thread:
+    /// `cargo test --release front_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn front_timing() {
+        let mut st = 99u64;
+        let data: Vec<u128> = (0..8 * 4 * 64).map(|_| (crate::ntt::tests::xorshift(&mut st) as u128) << 64 | crate::ntt::tests::xorshift(&mut st) as u128).collect();
+        let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| (data[c * 256..].as_ptr() as *const u8, 64));
+        let kern = &kernels()[PB];
+        let mut nib = Box::new([unsafe { vdupq_n_u8(0) }; N / 4]);
+        let mut xs = vec![[unsafe { vdupq_n_s16(0) }; N]; 16];
+        let reps = 20000usize;
+        let mut best = [f64::INFINITY; 4];
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            for r in 0..reps {
+                let at = unsafe { pass_words(&words, 64, 8 * (r % 7), r % 8) };
+                unsafe { indices(&at, &mut nib) };
+                core::hint::black_box(&mut *nib);
+            }
+            best[0] = best[0].min(t.elapsed().as_nanos() as f64 / reps as f64);
+            let t = std::time::Instant::now();
+            for r in 0..reps {
+                let x = &mut xs[r % 16];
+                unsafe { pass_lut::<PB>(&nib, x, kern) };
+                core::hint::black_box(&mut *x);
+            }
+            best[1] = best[1].min(t.elapsed().as_nanos() as f64 / reps as f64);
+            let t = std::time::Instant::now();
+            for r in 0..reps {
+                let x = &mut xs[r % 16];
+                unsafe { pass_c::<4>(x, kern) };
+                core::hint::black_box(&mut *x);
+            }
+            best[2] = best[2].min(t.elapsed().as_nanos() as f64 / reps as f64);
+            let t = std::time::Instant::now();
+            for r in 0..reps {
+                let x = &mut xs[r % 16];
+                unsafe { pass_d::<PB, false>(x, kern, &[], &mut []) };
+                core::hint::black_box(&mut *x);
+            }
+            best[3] = best[3].min(t.elapsed().as_nanos() as f64 / reps as f64);
+        }
+        println!("front min ns: indices {:.0} lut {:.0} c {:.0} d {:.0} total {:.0}", best[0], best[1], best[2], best[3], best.iter().sum::<f64>());
+        // the tail, earlier schedule (pass_c::<4>, pass_d) against the lazy one, interleaved
+        let (mut old, mut new) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..15 {
+            let t = std::time::Instant::now();
+            for r in 0..reps {
+                let x = &mut xs[r % 16];
+                unsafe { pass_lut::<PB>(&nib, x, kern); pass_c::<4>(x, kern); pass_d::<PB, false>(x, kern, &[], &mut []) };
+                core::hint::black_box(&mut *x);
+            }
+            old = old.min(t.elapsed().as_nanos() as f64 / reps as f64);
+            let t = std::time::Instant::now();
+            for r in 0..reps {
+                let x = &mut xs[r % 16];
+                unsafe { pass_lut::<PB>(&nib, x, kern); pass_lazy_tail(x, kern) };
+                core::hint::black_box(&mut *x);
+            }
+            new = new.min(t.elapsed().as_nanos() as f64 / reps as f64);
+        }
+        println!("lut+tail min ns: earlier {old:.0} lazy {new:.0} ({:+.1}%)", 100.0 * (new / old - 1.0));
     }
 }

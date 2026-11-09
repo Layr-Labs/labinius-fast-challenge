@@ -708,6 +708,171 @@ unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     }
 }
 
+/// The table-front transform's first-input reductions (prime 9721, [`pass_lut`] then
+/// [`pass_c_lazy`] and [`pass_d_lazy`]), per butterfly, from a greedy search over the exact
+/// intervals of the table front (`lazy_lut_intervals` proves every intermediate fits `i16` and the
+/// outputs stay within [`LAZY_BOUND`]): 482 reductions instead of the 549 of [`pass_c::<4>`] and
+/// [`pass_d`]. Per level-4 node `n`, bit `j` of `LAZY4[n]`: level-4 butterfly `j` (slots
+/// `27 n + j + 9 i`) reduces its first input.
+const LAZY4: [u16; 24] = [511, 335, 511, 511, 511, 511, 511, 511, 511, 511, 511, 511, 511, 511, 511, 7, 511, 511, 511, 511, 511, 511, 511, 511];
+/// Per level-4 node `n`, bit `3 g + j` of `LAZY5[n]`: butterfly `j` of level-5 node `3 n + g`
+/// (slots `9 (3 n + g) + j + 3 i`) reduces its first input.
+const LAZY5: [u16; 24] = [455, 463, 511, 511, 511, 217, 71, 71, 455, 463, 205, 463, 451, 511, 127, 79, 127, 511, 383, 511, 463, 383, 455, 15];
+/// Per level-6 node pair `q`, bit `h` of `LAZY6[q]`: node `2 q + h` (slots `3 (2 q + h) + i`)
+/// reduces its first input.
+const LAZY6: [u8; 108] = [3, 3, 3, 3, 3, 0, 1, 2, 0, 3, 0, 0, 3, 0, 2, 3, 0, 0, 3, 2, 1, 3, 1, 2, 2, 0, 0, 1, 2, 3, 0, 2, 3, 3, 1, 0, 0, 3, 3, 3, 3, 3, 2, 3, 1, 0, 0, 0, 0, 2, 2, 0, 0, 0, 1, 2, 3, 1, 3, 1, 2, 0, 1, 1, 3, 2, 1, 2, 2, 0, 2, 1, 3, 3, 3, 1, 2, 3, 2, 1, 0, 3, 3, 1, 1, 0, 2, 2, 1, 0, 1, 0, 2, 3, 3, 3, 0, 0, 1, 0, 3, 3, 2, 1, 0, 1, 2, 3];
+/// The bound on the outputs of the lazily reduced table-front transform: they fit `i16`.
+pub const LAZY_BOUND: u32 = i16::MAX as u32;
+
+/// The one-multiplication reduction of [`FIRST13`].
+#[inline(always)]
+unsafe fn red13(v: int16x8_t, k: int16x8_t) -> int16x8_t {
+    vmlsq_laneq_s16::<0>(v, vrshrq_n_s16::<13>(v), k)
+}
+
+/// [`pass_c::<4>`] with the per-butterfly reductions of [`LAZY4`] and [`LAZY5`].
+#[inline(always)]
+unsafe fn pass_c_lazy(x: &mut [int16x8_t; N], kern: &Kernel) {
+    let s: Schedule = schedule(1);
+    const { assert!(!SCHEDULES[1].reduce_d && !SCHEDULES[1].cheap) };
+    let k = vld1q_s16(kern.k.as_ptr());
+    #[inline(always)]
+    unsafe fn lvl4<const NODE: usize, const J: usize>(x: &[int16x8_t; N], s: Schedule, t0: int16x8_t, k: int16x8_t, at: usize) -> [int16x8_t; 9] {
+        let r4 = const { LAZY4[NODE] };
+        let r5 = const { LAZY5[NODE] };
+        let mut v: [int16x8_t; 9] = core::array::from_fn(|i| load(x, at + 3 * i));
+        for i in 0..3 {
+            if r4 >> (J + 3 * i) & 1 != 0 {
+                v[i] = red13(v[i], k);
+            }
+        }
+        for i in 0..3 {
+            let (a, b, c) = r3!(s, 0, 1, 2, 3, v[i], v[i + 3], v[i + 6], t0, k);
+            (v[i], v[i + 3], v[i + 6]) = (a, b, c);
+        }
+        for g in 0..3 {
+            if r5 >> (3 * g + J) & 1 != 0 {
+                v[3 * g] = red13(v[3 * g], k);
+            }
+        }
+        v
+    }
+    #[inline(always)]
+    unsafe fn lvl5(x: &mut [int16x8_t; N], s: Schedule, v: [int16x8_t; 9], t0: int16x8_t, t1: int16x8_t, k: int16x8_t, at: usize) {
+        let r = [
+            r3!(s, 4, 5, 6, 7, v[0], v[1], v[2], t0, k),
+            r3!(s, 0, 1, 2, 3, v[3], v[4], v[5], t1, k),
+            r3!(s, 4, 5, 6, 7, v[6], v[7], v[8], t1, k),
+        ];
+        for (g, (a, b, c)) in r.into_iter().enumerate() {
+            store(x, at + 9 * g, a);
+            store(x, at + 9 * g + 3, b);
+            store(x, at + 9 * g + 6, c);
+        }
+    }
+    #[inline(always)]
+    unsafe fn node<const NODE: usize>(x: &mut [int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t) {
+        let t0 = vld1q_s16(kern.c[NODE].as_ptr());
+        let t1 = vld1q_s16(kern.c[NODE].as_ptr().add(8));
+        let base = 27 * NODE;
+        let v0 = lvl4::<NODE, 0>(x, s, t0, k, base);
+        let v1 = lvl4::<NODE, 1>(x, s, t0, k, base + 1);
+        lvl5(x, s, v0, t0, t1, k, base);
+        let v2 = lvl4::<NODE, 2>(x, s, t0, k, base + 2);
+        lvl5(x, s, v1, t0, t1, k, base + 1);
+        lvl5(x, s, v2, t0, t1, k, base + 2);
+    }
+    macro_rules! nodes {
+        ($($n:literal),*) => {
+            const { assert!([$($n),*].len() == 24) };
+            $(node::<$n>(x, s, kern, k);)*
+        };
+    }
+    nodes!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
+}
+
+/// The level-6 node pairs `q` by their [`LAZY6`] reductions, so that [`pass_d_lazy`] runs one
+/// compact loop per class (an unrolled pass would push the commitment's hot loop past a 64 KiB
+/// instruction cache). Built at compile time from [`LAZY6`].
+const LAZY6_ORDER: ([u8; 108], [usize; 5]) = {
+    let mut order = [0u8; 108];
+    let mut starts = [0usize; 5];
+    let mut at = 0;
+    let mut class = 0;
+    while class < 4 {
+        starts[class] = at;
+        let mut q = 0;
+        while q < 108 {
+            if LAZY6[q] as usize == class {
+                order[at] = q as u8;
+                at += 1;
+            }
+            q += 1;
+        }
+        class += 1;
+    }
+    starts[4] = at;
+    assert!(at == 108);
+    (order, starts)
+};
+
+/// [`pass_d`] for prime 9721's table front (no `MAC`), with the reductions of [`LAZY6`]: the node
+/// pairs of each reduction class in one loop, three pairs computed before any is stored, as in
+/// [`pass_d`]. Every pair is independent, so the order does not change the result.
+#[inline(always)]
+unsafe fn pass_d_lazy(x: &mut [int16x8_t; N], kern: &Kernel) {
+    let k = vld1q_s16(kern.k.as_ptr());
+    #[inline(always)]
+    unsafe fn compute<const M: u8>(x: &[int16x8_t; N], kern: &Kernel, k: int16x8_t, q: usize) -> [int16x8_t; 6] {
+        let t = vld1q_s16(kern.d.get_unchecked(q).as_ptr());
+        let mut v: [int16x8_t; 6] = core::array::from_fn(|i| load(x, 6 * q + i));
+        if M & 1 != 0 {
+            v[0] = red13(v[0], k);
+        }
+        if M & 2 != 0 {
+            v[3] = red13(v[3], k);
+        }
+        let (y0, y1, y2) = radix3::<0, 1, 2, 3, 0>(v[0], v[1], v[2], t, k);
+        let (y3, y4, y5) = radix3::<4, 5, 6, 7, 0>(v[3], v[4], v[5], t, k);
+        [y0, y1, y2, y3, y4, y5]
+    }
+    #[inline(always)]
+    unsafe fn put(x: &mut [int16x8_t; N], q: usize, y: &[int16x8_t; 6]) {
+        for (i, &v) in y.iter().enumerate() {
+            store(x, 6 * q + i, v);
+        }
+    }
+    #[inline(always)]
+    unsafe fn class<const M: u8>(x: &mut [int16x8_t; N], kern: &Kernel, k: int16x8_t) {
+        let (order, starts) = &LAZY6_ORDER;
+        let list = &order[starts[M as usize]..starts[M as usize + 1]];
+        let mut it = list.chunks_exact(3);
+        for c in &mut it {
+            let (a, b, d) = (c[0] as usize, c[1] as usize, c[2] as usize);
+            let ys = [compute::<M>(x, kern, k, a), compute::<M>(x, kern, k, b), compute::<M>(x, kern, k, d)];
+            put(x, a, &ys[0]);
+            put(x, b, &ys[1]);
+            put(x, d, &ys[2]);
+        }
+        for &q in it.remainder() {
+            let y = compute::<M>(x, kern, k, q as usize);
+            put(x, q as usize, &y);
+        }
+    }
+    class::<0>(x, kern, k);
+    class::<1>(x, kern, k);
+    class::<2>(x, kern, k);
+    class::<3>(x, kern, k);
+}
+
+/// Levels 4 to 6 of prime 9721's table-fed transform, lazily reduced: outputs within
+/// [`LAZY_BOUND`].
+#[inline(always)]
+pub(crate) unsafe fn pass_lazy_tail(x: &mut [int16x8_t; N], kern: &Kernel) {
+    pass_c_lazy(x, kern);
+    pass_d_lazy(x, kern);
+}
+
 /// Node `n`'s reductions in `pass_c::<4>`: whether its level-4 inputs are reduced, and the `g`
 /// whose level-5 first input is not ([`skip_lut5`]) as bits.
 const fn lut_node_kind(n: usize) -> (bool, u8) {
@@ -800,8 +965,12 @@ pub unsafe fn transform_lut<const P: usize>(m: &[int16x8_t; BITS], idx: &mut [ui
     let kern = &kernels()[P];
     nibbles(m, idx);
     pass_lut::<P>(idx, x, kern);
-    if P == 1 { pass_c::<4>(x, kern); } else { pass_c::<P>(x, kern); }
-    pass_d::<P, false>(x, kern, &[], &mut []);
+    if P == 1 {
+        pass_lazy_tail(x, kern);
+    } else {
+        pass_c::<P>(x, kern);
+        pass_d::<P, false>(x, kern, &[], &mut []);
+    }
 }
 
 /// Levels 0 and 1 of a general transform: Barrett products, every value reduced in between
@@ -1468,30 +1637,180 @@ mod tests {
                 }
             }
         }
-        for n in 0..24 {
-            for j in 0..9 {
-                let pos: [usize; 3] = core::array::from_fn(|i| 27 * n + j + 9 * i);
-                let mut v = pos.map(|i| x[i]);
-                if n != 1 && n != 15 { v[0] = red(v[0]); }
-                for (i, a) in pos.into_iter().zip(r3(v, &k.c[n], k)) { x[i] = a; }
+        let front = x;
+        // the earlier schedule (pass_c::<4>, pass_d), then the lazy one (pass_lazy_tail)
+        for lazy in [false, true] {
+            let mut x = front;
+            for n in 0..24 {
+                for j in 0..9 {
+                    let pos: [usize; 3] = core::array::from_fn(|i| 27 * n + j + 9 * i);
+                    let mut v = pos.map(|i| x[i]);
+                    let reduce = if lazy { LAZY4[n] >> j & 1 != 0 } else { n != 1 && n != 15 };
+                    if reduce { v[0] = red(v[0]); }
+                    for (i, a) in pos.into_iter().zip(r3(v, &k.c[n], k)) { x[i] = a; }
+                }
+            }
+            for n in 0..72 {
+                for j in 0..3 {
+                    let pos: [usize; 3] = core::array::from_fn(|i| 9 * n + j + 3 * i);
+                    let mut v = pos.map(|i| x[i]);
+                    let reduce = if lazy { LAZY5[n / 3] >> (3 * (n % 3) + j) & 1 != 0 } else { !skip_lut5(n) };
+                    if reduce { v[0] = red(v[0]); }
+                    let t = if n % 3 == 0 { &k.c[n / 3][4..] } else { &k.c[n / 3][8 + 4 * (n % 3 - 1)..] };
+                    for (i, a) in pos.into_iter().zip(r3(v, t, k)) { x[i] = a; }
+                }
+            }
+            let bound = if lazy { LAZY_BOUND as i32 } else { super::super::lut_transform_bound(9721, SCHEDULES[1]) as i32 };
+            for n in 0..216 {
+                let mut v = core::array::from_fn(|i| x[3 * n + i]);
+                let reduce = if lazy { LAZY6[n / 2] >> (n % 2) & 1 != 0 } else { true };
+                if reduce { v[0] = red(v[0]); }
+                let t = &k.d[n / 2][4 * (n % 2)..];
+                for a in r3(v, t, k) {
+                    assert!(a.0 >= -bound && a.1 <= bound, "final {a:?} bound {bound}");
+                }
             }
         }
-        for n in 0..72 {
-            for j in 0..3 {
-                let pos: [usize; 3] = core::array::from_fn(|i| 9 * n + j + 3 * i);
-                let mut v = pos.map(|i| x[i]);
-                if !skip_lut5(n) { v[0] = red(v[0]); }
-                let t = if n % 3 == 0 { &k.c[n / 3][4..] } else { &k.c[n / 3][8 + 4 * (n % 3 - 1)..] };
-                for (i, a) in pos.into_iter().zip(r3(v, t, k)) { x[i] = a; }
+        let count = |m: u32| m.count_ones() as usize;
+        let lazy = LAZY4.iter().chain(&LAZY5).map(|&m| count(m as u32)).sum::<usize>()
+            + LAZY6.iter().map(|&m| count(m as u32)).sum::<usize>();
+        assert_eq!(lazy, 482);
+    }
+
+    /// Greedy search for the largest set of first-input reductions (levels 4, 5, 6, per
+    /// butterfly) that the exact table-front intervals allow, outputs within `i16`.
+    #[test]
+    #[ignore]
+    fn lazy_greedy_search() {
+        type Range = (i32, i32);
+        fn add(a: Range, b: Range) -> Range { (a.0 + b.0, a.1 + b.1) }
+        fn sub(a: Range, b: Range) -> Range { (a.0 - b.1, a.1 - b.0) }
+        fn fits(a: Range) -> bool { a.0 >= -32768 && a.1 <= 32767 }
+        fn map(a: Range, f: impl Fn(i32) -> i32) -> Range {
+            (a.0..=a.1).map(f).fold((i32::MAX, i32::MIN), |r, v| (r.0.min(v), r.1.max(v)))
+        }
+        fn mul(a: Range, t: &[i16]) -> Range {
+            map(a, |v| v * t[0] as i32 - ((v * t[1] as i32 + 16384) >> 15) * 9721)
+        }
+        fn red(a: Range) -> Range { map(a, |v| v - ((v + 4096) >> 13) * 9721) }
+        fn r3(v: [Range; 3], t: &[i16], k: &Kernel) -> Option<[Range; 3]> {
+            if !v.iter().all(|&a| fits(a)) { return None; }
+            let (a, b, c) = (v[0], mul(v[1], t), mul(v[2], &t[2..]));
+            let s = add(b, c); let d = sub(b, c);
+            if !fits(s) || !fits(d) { return None; }
+            let e = mul(d, &k.k[2..]);
+            let ac = sub(a, c); let ab = sub(a, b);
+            let out = [add(a, s), add(ac, e), sub(ab, e)];
+            if [ac, ab].iter().chain(out.iter()).all(|&x| fits(x)) { Some(out) } else { None }
+        }
+        let k = &kernels()[1];
+        let mut front = [(0, 0); N];
+        for n in 0..4 {
+            for j in 0..27 {
+                let look = |t: usize, pos: usize| {
+                    (0..16).filter(|&pat| (0..4).all(|b| pat >> b & 1 == 0 || pos + 162 * b < BITS))
+                        .map(|pat| k.lut[n][t][pat] as i32)
+                        .fold((i32::MAX, i32::MIN), |r, v| (r.0.min(v), r.1.max(v)))
+                };
+                for h in 0..2 {
+                    let v: [Range; 3] = core::array::from_fn(|r| {
+                        let t = 2 * r;
+                        let a = look(t, j + 27 * r);
+                        let b = look(t + 1, j + 27 * r + 81);
+                        if h == 0 { add(a, b) } else { sub(a, b) }
+                    });
+                    let [a, b, c] = v;
+                    let ys = if h == 0 {
+                        let e = mul(sub(b, c), &k.k[2..]);
+                        [add(a, add(b, c)), add(sub(a, c), e), sub(sub(a, b), e)]
+                    } else {
+                        let e = mul(add(b, c), &k.k[2..]);
+                        [add(add(a, b), e), add(sub(a, b), c), sub(sub(a, c), e)]
+                    };
+                    for (i, a) in ys.into_iter().enumerate() {
+                        front[162 * n + 81 * h + j + 27 * i] = a;
+                    }
+                }
             }
         }
-        let bound = super::super::lut_transform_bound(9721, SCHEDULES[1]) as i32;
-        for n in 0..216 {
-            let mut v = core::array::from_fn(|i| x[3 * n + i]);
-            v[0] = red(v[0]);
-            let t = &k.d[n / 2][4 * (n % 2)..];
-            for a in r3(v, t, k) {
-                assert!(a.0 >= -bound && a.1 <= bound, "final {a:?} bound {bound}");
+        // reduce[0..216]: level 4 butterfly (n, j) = 9 n + j; [216..432]: level 5 (n, j) = 3 n + j;
+        // [432..648]: level 6 node n
+        let eval = |reduce: &[bool]| -> Option<i32> {
+            let mut x = front;
+            for n in 0..24 {
+                for j in 0..9 {
+                    let pos: [usize; 3] = core::array::from_fn(|i| 27 * n + j + 9 * i);
+                    let mut v = pos.map(|i| x[i]);
+                    if reduce[9 * n + j] { v[0] = red(v[0]); }
+                    for (i, a) in pos.into_iter().zip(r3(v, &k.c[n], k)?) { x[i] = a; }
+                }
+            }
+            for n in 0..72 {
+                for j in 0..3 {
+                    let pos: [usize; 3] = core::array::from_fn(|i| 9 * n + j + 3 * i);
+                    let mut v = pos.map(|i| x[i]);
+                    if reduce[216 + 3 * n + j] { v[0] = red(v[0]); }
+                    let t = if n % 3 == 0 { &k.c[n / 3][4..] } else { &k.c[n / 3][8 + 4 * (n % 3 - 1)..] };
+                    for (i, a) in pos.into_iter().zip(r3(v, t, k)?) { x[i] = a; }
+                }
+            }
+            let mut worst = 0;
+            for n in 0..216 {
+                let mut v: [Range; 3] = core::array::from_fn(|i| x[3 * n + i]);
+                if reduce[432 + n] { v[0] = red(v[0]); }
+                let t = &k.d[n / 2][4 * (n % 2)..];
+                for a in r3(v, t, k)? { worst = worst.max(a.0.abs().max(a.1.abs())); }
+            }
+            Some(worst)
+        };
+        // the current schedule
+        let mut cur = vec![true; 648];
+        for n in 0..24 { if n == 1 || n == 15 { for j in 0..9 { cur[9 * n + j] = false; } } }
+        for n in 0..72 { if skip_lut5(n) { for j in 0..3 { cur[216 + 3 * n + j] = false; } } }
+        println!("current: {} reductions, worst {:?}", cur.iter().filter(|&&b| b).count(), eval(&cur));
+        let orders: Vec<(&str, Vec<usize>)> = vec![
+            ("6,5,4", (432..648).chain(216..432).chain(0..216).collect()),
+            ("4,5,6", (0..648).collect()),
+            ("5,6,4", (216..432).chain(432..648).chain(0..216).collect()),
+        ];
+        let mut best: Option<Vec<bool>> = None;
+        let mut st = 12345u64;
+        for trial in 0..40 {
+            let mut order: Vec<usize> = (0..648).collect();
+            // shuffle, biased: level 6 first with probability 1/2
+            for i in (1..order.len()).rev() {
+                st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+                order.swap(i, (st % (i as u64 + 1)) as usize);
+            }
+            if trial % 2 == 0 { order.sort_by_key(|&i| if i >= 432 { 0 } else { 1 }); }
+            let mut r = vec![true; 648];
+            for &i in &order {
+                r[i] = false;
+                if eval(&r).is_none() { r[i] = true; }
+            }
+            let c = r.iter().filter(|&&b| b).count();
+            if best.as_ref().map_or(true, |b| c < b.iter().filter(|&&x| x).count()) {
+                println!("trial {trial}: {c} left");
+                best = Some(r);
+            }
+        }
+        let b = best.unwrap();
+        println!("BEST {} left: {:?}", b.iter().filter(|&&x| x).count(), b.iter().map(|&x| x as u8).collect::<Vec<_>>());
+        for (name, order) in orders {
+            for start_current in [true, false] {
+                let mut r = if start_current { cur.clone() } else { vec![true; 648] };
+                for &i in &order {
+                    if !r[i] { continue; }
+                    r[i] = false;
+                    if eval(&r).is_none() { r[i] = true; }
+                }
+                let lv = |a: usize, b: usize| r[a..b].iter().filter(|&&x| !x).count();
+                println!("order {name} from_current {start_current}: {} reductions left (skipped l4 {} l5 {} l6 {}), worst {:?}",
+                    r.iter().filter(|&&b| b).count(), lv(0, 216), lv(216, 432), lv(432, 648), eval(&r));
+                if name == "6,5,4" && start_current {
+                    let l6: Vec<usize> = (0..216).filter(|&n| !r[432 + n]).collect();
+                    println!("  l6 skips {:?}", l6);
+                }
             }
         }
     }
@@ -1953,7 +2272,7 @@ mod tests {
                         _ => transform_lut::<1>(&m, &mut idx, &mut x),
                     }
                 }
-                let bound = super::super::lut_transform_bound(plan.p, SCHEDULES[i]);
+                let bound = if i == 1 { LAZY_BOUND } else { super::super::lut_transform_bound(plan.p, SCHEDULES[i]) };
                 for c in 0..8 {
                     let b: Vec<B128> = words[c].iter().map(|&w| B128(w)).collect();
                     let mut s = [0u32; N];

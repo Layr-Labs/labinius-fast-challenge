@@ -434,7 +434,7 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-const PREFETCH_SLOTS: usize = 37;
+const PREFETCH_SLOTS: usize = 78;
 
 // Quarter-scaled witnesses and reciprocal public keys preserve every product.
 // The64-pair window retains the baseline's statistical accumulation strategy;
@@ -763,7 +763,7 @@ struct SmsWorker {
     acc: Box<[SAcc]>,
     pend: Box<[Batch32]>,
     total: Box<[Total]>,
-    idx: Box<[crate::simd::transpose_f162::SmsBinaryIndex32]>,
+    idx: Box<[crate::simd::transpose_f162::SmsR3PairIndex32]>,
     w: Box<[Blk27]>,
 }
 impl SmsWorker {
@@ -933,7 +933,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         });
         // The producer requests each h once, in order. Partial groups use
         // enough zero words for all LOCK pointer advances.
-        let mut source = |_h: usize, out: *mut crate::simd::transpose_f162::SmsBinaryIndex32| {
+        let mut source = |_h: usize, out: *mut crate::simd::transpose_f162::SmsR3PairIndex32| {
             // Prefetch the next pair batch while converting this batch and
             // computing its first prefix. The final batch needs no lookahead.
             if _h + 1 < step {
@@ -943,7 +943,7 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
                     _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64));
                 }
             }
-            crate::simd::transpose_f162::slice_b128_cols16_sms_into(&cols16, &mut *out);
+            crate::simd::transpose_f162::slice_b128_cols16_r3pair_into(&cols16, &mut *out);
             for p in &mut cols16 { *p = p.add(8); }
         };
         let k = kbase.add((b / LOCK) * LOCK_WORDS);
@@ -960,31 +960,31 @@ unsafe fn group<F: FnMut(usize)>(cols: &[&[B128]], keys: &SmsKeys, np: usize, ra
         if mode == 1 {
             struct Nop;
             impl vb::SliceSink<LOCK> for Nop { unsafe fn rows(&mut self, _: usize, w: [*const i16; LOCK], _: usize, _: usize) { core::hint::black_box(w); } }
-            vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Nop, &mut source);
+            vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Nop, &mut source);
         } else if mode == 2 {
             let mut sk = Sink::<false> { k, acc, b: bias };
             for kk in 0..24 { vb::SliceSink::<LOCK>::rows(&mut sk, kk, core::array::from_fn(|h| w.add(32 * 27 * h) as *const i16), 0, 27); }
         } else if step==16 {
             if first && fold_now {
-                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,true>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,true>{k,acc,b:bias},&mut source);
             }
             else if first {
-                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,true>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,true>{k,acc,b:bias},&mut source);
             }
             else if fold_now {
-                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,false>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,false>{k,acc,b:bias},&mut source);
             }
             else if true {
-                vb::ntt_bin_batch32_sms_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,false>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,false>{k,acc,b:bias},&mut source);
             }
         } else if first && fold_now {
-            vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true, true> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true, true> { k, acc, b: bias }, &mut source);
         } else if first {
-            vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false, true> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false, true> { k, acc, b: bias }, &mut source);
         } else if fold_now {
-            vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true> { k, acc, b: bias }, &mut source);
         } else {
-            vb::ntt_bin_batch32_sms_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false> { k, acc, b: bias }, &mut source);
+            vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<false> { k, acc, b: bias }, &mut source);
         }
         sync(b + step);
         // Chunk ends: every CHUNK_PAIRS pair batches into a half, and the half's end.

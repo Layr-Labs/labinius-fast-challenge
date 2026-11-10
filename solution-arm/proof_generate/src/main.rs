@@ -876,7 +876,11 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 }
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
-    output.wait_setup();
+    // No join here: the output preparation (proof mapping, `fallocate`, commitment-buffer faults)
+    // is pure page-fault and syscall work, and it now overlaps the commitment instead of
+    // preceding it. Both consumers still wait for it -- `commitment_buffer` before the buffer is
+    // packed into, `write` before the mapping is encoded -- so nothing observes a half-prepared
+    // output.
     let coefficients = commit(values, modulus);
     let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
     std::mem::forget(coefficients);

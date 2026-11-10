@@ -436,7 +436,7 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-const PREFETCH_SLOTS: usize = 59;
+const PREFETCH_SLOTS: usize = 74;
 
 // Quarter-scaled witnesses and reciprocal public keys preserve every product.
 // The64-pair window retains the baseline's statistical accumulation strategy;

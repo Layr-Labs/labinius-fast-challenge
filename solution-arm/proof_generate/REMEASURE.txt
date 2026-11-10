@@ -1,1 +1,1 @@
-re-measurement 2 of packed byte nibbles + SVE ld1b table front (ba4d19f4) (first filed as ba4d19f4-e60b-4d5b-aae5-a071cdba8fd8)
+overnight fresh official reading of the 297.967 ms record tree, kind=const GROUP=28 PAIRS=96, attempt 2 (20261110-220641)

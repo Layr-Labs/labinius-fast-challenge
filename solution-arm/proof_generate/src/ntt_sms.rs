@@ -425,21 +425,20 @@ macro_rules! slot_sink_body {
         "ldr q5, [{zp}, #{xs1}]",
         "ldr q6, [{zp}, #{xs2}]",
         "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
+        "ldr q8, [{zp}, {xs4}]",
+        "ldr q9, [{zp}, {xs5}]",
+        "ldr q10, [{zp}, {xs6}]",
+        "ldr q11, [{zp}, {xs7}]",
         "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
         "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
         "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
         "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
-        "ldr q4, [{zp}]",
-        "ldr q5, [{zp}, #{xs1}]",
-        "ldr q6, [{zp}, #{xs2}]",
-        "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
         "add {kp}, {kp}, {ks}",
-        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
-        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        "sdot z16.d, z8.h, z0.h[1]", "sdot z17.d, z9.h, z0.h[1]", "sdot z18.d, z10.h, z0.h[1]", "sdot z19.d, z11.h, z0.h[1]",
+        "sdot z20.d, z8.h, z1.h[1]", "sdot z21.d, z9.h, z1.h[1]", "sdot z22.d, z10.h, z1.h[1]", "sdot z23.d, z11.h, z1.h[1]",
+        "sdot z24.d, z8.h, z2.h[1]", "sdot z25.d, z9.h, z2.h[1]", "sdot z26.d, z10.h, z2.h[1]", "sdot z27.d, z11.h, z2.h[1]",
+        "sdot z28.d, z8.h, z3.h[1]", "sdot z29.d, z9.h, z3.h[1]", "sdot z30.d, z10.h, z3.h[1]", "sdot z31.d, z11.h, z3.h[1]",
+        "add {zp}, {zp}, {xs8}",
         "subs {n}, {n}, #1",
         "b.ne 2b",
         "stp q16, q17, [{a}, #0]",
@@ -461,19 +460,18 @@ macro_rules! slot_sink_body {
         "ldr q5, [{zp}, #{xs1}]",
         "ldr q6, [{zp}, #{xs2}]",
         "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
+        "ldr q8, [{zp}, {xs4}]",
+        "ldr q9, [{zp}, {xs5}]",
+        "ldr q10, [{zp}, {xs6}]",
+        "ldr q11, [{zp}, {xs7}]",
         "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
         "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
         "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
-        "ldr q4, [{zp}]",
-        "ldr q5, [{zp}, #{xs1}]",
-        "ldr q6, [{zp}, #{xs2}]",
-        "ldr q7, [{zp}, #{xs3}]",
-        "add {zp}, {zp}, {xs4}",
         "add {kp}, {kp}, {ks}",
-        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
-        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
-        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z16.d, z8.h, z0.h[1]", "sdot z17.d, z9.h, z0.h[1]", "sdot z18.d, z10.h, z0.h[1]", "sdot z19.d, z11.h, z0.h[1]",
+        "sdot z20.d, z8.h, z1.h[1]", "sdot z21.d, z9.h, z1.h[1]", "sdot z22.d, z10.h, z1.h[1]", "sdot z23.d, z11.h, z1.h[1]",
+        "sdot z24.d, z8.h, z2.h[1]", "sdot z25.d, z9.h, z2.h[1]", "sdot z26.d, z10.h, z2.h[1]", "sdot z27.d, z11.h, z2.h[1]",
+        "add {zp}, {zp}, {xs8}",
         "subs {n}, {n}, #1",
         "b.ne 3b",
         "stp q16, q17, [{a}, #256]",
@@ -487,6 +485,10 @@ macro_rules! slot_sink_body {
             k = in(reg) $k,
             g = in(reg) $groups,
             xs4 = in(reg) 4 * XS,
+            xs5 = in(reg) 5 * XS,
+            xs6 = in(reg) 6 * XS,
+            xs7 = in(reg) 7 * XS,
+            xs8 = in(reg) 8 * XS,
             ks = in(reg) KS,
             xs1 = const XS,
             xs2 = const 2 * XS,
@@ -496,6 +498,7 @@ macro_rules! slot_sink_body {
             n = out(reg) _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _,
             out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
             out("v16") _, out("v17") _, out("v18") _, out("v19") _,
             out("v20") _, out("v21") _, out("v22") _, out("v23") _,
             out("v24") _, out("v25") _, out("v26") _, out("v27") _,
@@ -815,6 +818,16 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
     vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
 }
 
+/// The SMS nibble pass: the generated SVE2 kernel on Graviton4, the NEON fallback on CPUs
+/// without SVE (Apple Silicon), which read the same packed slots and produce the same values.
+#[inline(always)]
+unsafe fn pass_lut_batch(idx: &[uint8x16_t; super::GROUPS], x: &mut [int16x8_t; N], kern: &Kernel) {
+    #[cfg(target_feature = "sve")]
+    pass_lut_asm(idx, x, kern);
+    #[cfg(not(target_feature = "sve"))]
+    super::pass_lut_neon(idx, x, kern);
+}
+
 /// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
 /// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients.
 #[inline(never)]
@@ -846,7 +859,7 @@ unsafe fn sums(
                 prefetch_words(words, e, i + PF_T);
                 indices(&at, nib);
                 let x = &mut xs[i];
-                pass_lut_asm(nib, x, kern);
+                pass_lut_batch(nib, x, kern);
                 pass_c_asm(x, kern);
                 pass_d_asm(x, kern);
             }
@@ -911,7 +924,7 @@ unsafe fn sums2(
                     prefetch_words(words[t], e, i + PF_T);
                     indices(&at, nib);
                     let x = &mut xs[i];
-                    pass_lut_asm(nib, x, kern);
+                    pass_lut_batch(nib, x, kern);
                     pass_c_asm(x, kern);
                     pass_d_asm(x, kern);
                 }
@@ -1455,7 +1468,7 @@ mod leap_bench {
             let packed = crate::ntt::neon::tests::pack(&idx);
             let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             let mut b = a.clone();
-            unsafe { pass_lut::<PB>(&idx, &mut a, kern); pass_lut_asm(&packed, &mut b, kern); }
+            unsafe { pass_lut::<PB>(&idx, &mut a, kern); pass_lut_batch(&packed, &mut b, kern); }
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
             assert_eq!(x, y);
@@ -1517,7 +1530,7 @@ mod leap_bench {
             for _ in 0..reps { unsafe { pass_c_asm(&mut xs[0], kern); } core::hint::black_box(&mut *xs); }
             let pca = t.elapsed().as_nanos() as f64 / reps as f64;
             let t = std::time::Instant::now();
-            for _ in 0..reps { unsafe { pass_lut_asm(&nib, &mut xs[0], kern); } core::hint::black_box(&mut *xs); }
+            for _ in 0..reps { unsafe { pass_lut_batch(&nib, &mut xs[0], kern); } core::hint::black_box(&mut *xs); }
             let la = t.elapsed().as_nanos() as f64 / reps as f64;
             println!("pass_d_asm {pda:.0} ns vs pass_d {pd:.0} ns; pass_c_asm {pca:.0} ns vs pass_c {pc:.0} ns; pass_lut_asm {la:.0} vs {lut:.0} ns");
             println!("per transform (648 vectors): L1 {l1:.0} ns ({:.2} cyc/vec), cycling xs {l2:.0} ns; indices {ix:.0}, lut {lut:.0}, pass_c {pc:.0}, pass_d {pd:.0} ns", l1 * 2.99 / N as f64);

@@ -1,1 +1,1 @@
-re-measurement 2 of packed byte nibbles + SVE ld1b table front (ba4d19f4) (first filed as ba4d19f4-e60b-4d5b-aae5-a071cdba8fd8)
+re-measurement: switch PAIRS 74 -> 64 (2 KiB row runs), record tree otherwise (deepseek-flash)

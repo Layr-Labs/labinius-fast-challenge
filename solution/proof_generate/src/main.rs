@@ -1585,28 +1585,40 @@ impl Output {
         let chunks = self.state.layout.len().div_ceil(POPULATE_CHUNK);
         let worker_state = self.state.clone();
         let (nf, nr) = (first.len(), release.len());
-        // After the switch's pages: the fold's buffers, so that its allocations find faulted
-        // blocks (`labinius::fold::prewarm`); then the proof file.
-        let job = labinius::par::pool().idle(nf + 1 + nr + chunks, move |i| {
-            if i == nf {
+        // The proof file's pages first, all in ONE chunk: seven workers populating 2 MB pieces
+        // at once spend ~6 ms of CPU on them (~11 ms beside busy siblings: contention on the
+        // inode's locks), one worker in sequence ~3.4 ms; and a static dispatch (the switch's
+        // prefix rounds) runs on fewer runners while workers are inside chunks, which cost
+        // the switch ~0.8 ms per run when the seven pieces landed there. Started in the
+        // transcript's window, the one chunk ends during the partials' dynamic rows, which
+        // absorb a runner's absence (~0.3 ms). Then the switch's pages, the fold's buffers
+        // (`labinius::fold::prewarm`, so that its allocations find faulted blocks), and the
+        // key image's release.
+        let job = labinius::par::pool().idle(1 + nf + 1 + nr, move |i| {
+            if i == 0 {
+                for k in 1..=chunks {
+                    worker_state.chunk(k);
+                }
+                return;
+            }
+            let j = i - 1;
+            if j == nf {
                 labinius::fold::prewarm(COLUMNS, workers);
                 return;
             }
-            let i = if i > nf { i - 1 } else { i };
-            if let Some(&(addr, len)) = first.get(i) {
+            let j = if j > nf { j - 1 } else { j };
+            if let Some(&(addr, len)) = first.get(j) {
                 #[cfg(target_os = "linux")]
                 unsafe {
                     sys::madvise(addr as *mut _, len, sys::MADV_POPULATE_WRITE);
                 }
                 let _ = (addr, len);
-            } else if let Some(&(addr, len)) = release.get(i - nf) {
+            } else if let Some(&(addr, len)) = release.get(j - nf) {
                 #[cfg(target_os = "linux")]
                 unsafe {
                     sys::madvise(addr as *mut _, len, sys::MADV_DONTNEED);
                 }
                 let _ = (addr, len);
-            } else {
-                worker_state.chunk(i - nf - nr + 1);
             }
         });
         let _ = self.populate.set(job);

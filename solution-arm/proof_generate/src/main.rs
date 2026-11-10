@@ -171,6 +171,17 @@ impl Drop for Table {
     }
 }
 
+impl Table {
+    /// The address and byte length of the read-only mapping, when the table is mapped.
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    fn mapped(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Mapped { ptr, len } => Some((*ptr as usize, 16 * *len)),
+            Self::Owned(_) => None,
+        }
+    }
+}
+
 fn read_table(path: &str) -> Table {
     load_table(path, 1 << LOG_PACKED)
 }
@@ -940,7 +951,20 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
+    // Release the 256 MiB read-only table's pages while the proof is encoded into its own
+    // mapping: the encoding never reads the table, so the teardown runs beside it instead of
+    // after the last timed phase. The mapping itself stays until process exit.
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    let releasing = values.mapped().map(|(addr, len)| {
+        std::thread::spawn(move || unsafe {
+            table_sys::madvise(addr as *mut u8, len, 4);
+        })
+    });
     output.write(&proof);
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    if let Some(releasing) = releasing {
+        let _ = releasing.join();
+    }
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
     // The proof file is complete. Let process teardown release the large allocations and

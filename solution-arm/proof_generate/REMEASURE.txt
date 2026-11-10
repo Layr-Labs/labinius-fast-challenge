@@ -1,1 +1,1 @@
-re-measurement 2 of packed byte nibbles + SVE ld1b table front (ba4d19f4) (first filed as ba4d19f4-e60b-4d5b-aae5-a071cdba8fd8)
+﻿Re-measurement marker combo re-file 20261110-100558. This archive is the promoted record tree with fold GROUP=28 and switch PAIRS=96 (two rig-verified constants); everything else unchanged. No algorithm, modulus, transcript or proof-format change.

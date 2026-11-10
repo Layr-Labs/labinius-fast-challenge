@@ -1,1 +1,1 @@
-re-measurement 2 of packed byte nibbles + SVE ld1b table front (ba4d19f4) (first filed as ba4d19f4-e60b-4d5b-aae5-a071cdba8fd8)
+﻿Re-measurement marker automated re-file 20261110-080756. This archive is the proven record tree 916b5f8 (official median 298.5617 ms) unchanged except for this marker file. No algorithm, constant, kernel, allocator, serialization, modulus, or proof-format change. The server refuses byte-identical archives; this marker distinguishes the filing.

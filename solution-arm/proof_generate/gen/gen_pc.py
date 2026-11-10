@@ -57,11 +57,11 @@ def build(nodes):
             for x in ins[start:]: x.g = g
             g += 1
     return ins, low
-def emit(per=2, K=8, B=27):
+def emit(per=2, K=8, B=27, ls=2):
     out = ['"ldr q15, [{kp}]",']
     for c in range(0, 24, per):
         ins, low = build(list(range(c, c + per)))
-        seq, cyc = schedule(ins, skew=K, budget=B)
+        seq, cyc = schedule(ins, skew=K, budget=B, ls=ls)
         asm, live = allocate(seq, {'k': 15}, low)
         out += [f'"{a.replace("XPTR", "{x}").replace("CPTR", "{c}")}",' for a in asm]
     return '\n'.join(out)

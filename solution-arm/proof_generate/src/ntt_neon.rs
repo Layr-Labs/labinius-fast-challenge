@@ -501,15 +501,22 @@ unsafe fn table(t: &[i16; 16]) -> uint8x16x2_t {
 /// Entry `v` of table `t` in every lane, `v` from the lane's index pair in `i`.
 #[inline(always)]
 unsafe fn look(t: uint8x16x2_t, i: uint8x16_t) -> int16x8_t {
-    // SVE2 two-register halfword `tbl` (Neoverse V2: the same throughput as NEON's byte
-    // `tbl`, measured on Axion): `u16` indices, so the nibbles need no byte-pair expansion.
-    let r: uint8x16_t;
-    core::arch::asm!(
-        "tbl z19.h, {{z16.h, z17.h}}, z18.h",
-        in("v16") t.0, in("v17") t.1, in("v18") i, lateout("v19") r,
-        options(pure, nomem, nostack, preserves_flags)
-    );
-    vreinterpretq_s16_u8(r)
+    #[cfg(target_feature = "sve")]
+    {
+        // SVE2 two-register halfword `tbl` (Neoverse V2: the same throughput as NEON's byte
+        // `tbl`, measured on Axion): `u16` indices, so the nibbles need no byte-pair expansion.
+        let r: uint8x16_t;
+        core::arch::asm!(
+            "tbl z19.h, {{z16.h, z17.h}}, z18.h",
+            in("v16") t.0, in("v17") t.1, in("v18") i, lateout("v19") r,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        vreinterpretq_s16_u8(r)
+    }
+    #[cfg(not(target_feature = "sve"))]
+    {
+        look_neon(t, i)
+    }
 }
 
 /// The second child's radix-3 butterfly from the shared lookups. If `b` and
@@ -574,6 +581,84 @@ unsafe fn pass_lut<const S: usize>(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_
             store(x, at + 135, v.2);
         };
         // nine `j` per block, so that the scheduler interleaves their lookups and butterflies
+        for j in (0..27).step_by(9) {
+            step(j);
+            step(j + 1);
+            step(j + 2);
+            step(j + 3);
+            step(j + 4);
+            step(j + 5);
+            step(j + 6);
+            step(j + 7);
+            step(j + 8);
+        }
+    }
+}
+
+/// Eight table indices in the low bytes of `i`: each selects the two bytes of its `i16` table
+/// entry, looked up separately and interleaved back into halfword lanes.
+#[cfg(not(target_feature = "sve"))]
+#[inline(always)]
+unsafe fn look_bytes(t: uint8x16x2_t, i: uint8x16_t) -> int16x8_t {
+    // SVE's `tbl` yields zero for an index past the sixteen-entry table; NEON's byte `tbl`
+    // yields zero past 31, so send out-of-range indices to the zero slots 32 / 33.
+    let in_range = vcltq_u8(i, vdupq_n_u8(16));
+    let twice = vshlq_n_u8::<1>(i);
+    let even = vbslq_u8(in_range, twice, vdupq_n_u8(0x20));
+    let odd = vbslq_u8(in_range, vorrq_u8(twice, vdupq_n_u8(1)), vdupq_n_u8(0x21));
+    let lo = vqtbl2q_u8(t, even);
+    let hi = vqtbl2q_u8(t, odd);
+    vreinterpretq_s16_u8(vzip1q_u8(lo, hi))
+}
+
+/// [`look`] with NEON's byte `tbl`: compact the low bytes of the eight `u16` indices, then
+/// look up their `i16` table entries.
+#[cfg(not(target_feature = "sve"))]
+#[inline(always)]
+unsafe fn look_neon(t: uint8x16x2_t, i: uint8x16_t) -> int16x8_t {
+    look_bytes(t, vuzp1q_u8(i, i))
+}
+
+/// The eight byte nibbles of packed slot `s` in the low half of a vector (the rest is ignored).
+#[cfg(not(target_feature = "sve"))]
+#[inline(always)]
+unsafe fn packed_lut(idx: &[uint8x16_t; GROUPS], s: usize) -> uint8x16_t {
+    let at = packed_slot(s);
+    let v = *idx.get_unchecked(at / 16);
+    if at % 16 == 0 { v } else { vextq_u8::<8>(v, v) }
+}
+
+/// [`pass_lut`]`::<1>` for CPUs without SVE2, reading the same packed slots ([`packed_slot`])
+/// with NEON table lookups. The values match the SVE2 pass; only the lookup instruction differs.
+#[cfg(not(target_feature = "sve"))]
+#[inline(never)]
+pub unsafe fn pass_lut_neon(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_t; N], kern: &Kernel) {
+    let s: Schedule = schedule(1);
+    let k = vld1q_s16(kern.k.as_ptr());
+    for n in 0..4 {
+        let l = &kern.lut[n];
+        let t: [uint8x16x2_t; 6] = core::array::from_fn(|i| table(&l[i]));
+        let base = 162 * n;
+        let mut step = |j: usize| {
+            let (x0, y0) = (look_bytes(t[0], packed_lut(idx, j)), look_bytes(t[1], packed_lut(idx, j + 81)));
+            let (x1, y1) = (look_bytes(t[2], packed_lut(idx, j + 27)), look_bytes(t[3], packed_lut(idx, j + 108)));
+            let (x2, y2) = (look_bytes(t[4], packed_lut(idx, j + 54)), look_bytes(t[5], packed_lut(idx, j + 135)));
+            let (a0, b0) = (vaddq_s16(x0, y0), vsubq_s16(x0, y0));
+            let (a1, b1) = (vaddq_s16(x1, y1), vsubq_s16(x1, y1));
+            let (a2, b2) = (vaddq_s16(x2, y2), vsubq_s16(x2, y2));
+            let (u, v) = match (s.reduce_d, s.cheap) {
+                (false, _) => (radix3_twiddled::<0>(a0, a1, a2, k), radix3_sixth::<0>(b0, b1, b2, k)),
+                (true, false) => (radix3_twiddled::<1>(a0, a1, a2, k), radix3_sixth::<1>(b0, b1, b2, k)),
+                (true, true) => (radix3_twiddled::<2>(a0, a1, a2, k), radix3_sixth::<2>(b0, b1, b2, k)),
+            };
+            let at = base + j;
+            store(x, at, u.0);
+            store(x, at + 27, u.1);
+            store(x, at + 54, u.2);
+            store(x, at + 81, v.0);
+            store(x, at + 108, v.1);
+            store(x, at + 135, v.2);
+        };
         for j in (0..27).step_by(9) {
             step(j);
             step(j + 1);

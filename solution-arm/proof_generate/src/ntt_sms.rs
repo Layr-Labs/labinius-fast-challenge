@@ -815,6 +815,16 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
     vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
 }
 
+/// The SMS nibble pass: the generated SVE2 kernel on Graviton4, the NEON fallback on CPUs
+/// without SVE (Apple Silicon), which read the same packed slots and produce the same values.
+#[inline(always)]
+unsafe fn pass_lut_batch(idx: &[uint8x16_t; super::GROUPS], x: &mut [int16x8_t; N], kern: &Kernel) {
+    #[cfg(target_feature = "sve")]
+    pass_lut_asm(idx, x, kern);
+    #[cfg(not(target_feature = "sve"))]
+    super::pass_lut_neon(idx, x, kern);
+}
+
 /// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
 /// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients.
 #[inline(never)]
@@ -846,7 +856,7 @@ unsafe fn sums(
                 prefetch_words(words, e, i + PF_T);
                 indices(&at, nib);
                 let x = &mut xs[i];
-                pass_lut_asm(nib, x, kern);
+                pass_lut_batch(nib, x, kern);
                 pass_c_asm(x, kern);
                 pass_d_asm(x, kern);
             }
@@ -911,7 +921,7 @@ unsafe fn sums2(
                     prefetch_words(words[t], e, i + PF_T);
                     indices(&at, nib);
                     let x = &mut xs[i];
-                    pass_lut_asm(nib, x, kern);
+                    pass_lut_batch(nib, x, kern);
                     pass_c_asm(x, kern);
                     pass_d_asm(x, kern);
                 }
@@ -1455,7 +1465,7 @@ mod leap_bench {
             let packed = crate::ntt::neon::tests::pack(&idx);
             let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             let mut b = a.clone();
-            unsafe { pass_lut::<PB>(&idx, &mut a, kern); pass_lut_asm(&packed, &mut b, kern); }
+            unsafe { pass_lut::<PB>(&idx, &mut a, kern); pass_lut_batch(&packed, &mut b, kern); }
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
             assert_eq!(x, y);
@@ -1517,7 +1527,7 @@ mod leap_bench {
             for _ in 0..reps { unsafe { pass_c_asm(&mut xs[0], kern); } core::hint::black_box(&mut *xs); }
             let pca = t.elapsed().as_nanos() as f64 / reps as f64;
             let t = std::time::Instant::now();
-            for _ in 0..reps { unsafe { pass_lut_asm(&nib, &mut xs[0], kern); } core::hint::black_box(&mut *xs); }
+            for _ in 0..reps { unsafe { pass_lut_batch(&nib, &mut xs[0], kern); } core::hint::black_box(&mut *xs); }
             let la = t.elapsed().as_nanos() as f64 / reps as f64;
             println!("pass_d_asm {pda:.0} ns vs pass_d {pd:.0} ns; pass_c_asm {pca:.0} ns vs pass_c {pc:.0} ns; pass_lut_asm {la:.0} vs {lut:.0} ns");
             println!("per transform (648 vectors): L1 {l1:.0} ns ({:.2} cyc/vec), cycling xs {l2:.0} ns; indices {ix:.0}, lut {lut:.0}, pass_c {pc:.0}, pass_d {pd:.0} ns", l1 * 2.99 / N as f64);

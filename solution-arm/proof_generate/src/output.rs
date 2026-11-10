@@ -183,14 +183,28 @@ impl Output {
             let state = worker.upgrade();
             if let Some(state) = &state { let _ = state.mapped(); }
             labinius::challenge::warm();
-            for offset in (0..bytes).step_by(4096) {
-                unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
-            }
-            // Fault the whole proof mapping while the table read still runs on the other
-            // cores: the write phase then only has to encode, not populate file pages.
-            if let Some(state) = &state {
-                for i in 0..state.layout.len().div_ceil(CHUNK) { state.populate(i); }
-            }
+            // Fault the commitment buffer and the proof mapping's file pages on several threads.
+            // `wait_setup` makes the commitment wait for exactly this work, it is pure page-fault
+            // and allocation cost with no dependence between the pieces, and every thread owns a
+            // disjoint range, so one thread doing all of it is pure serial latency.
+            const PREP: usize = 8;
+            std::thread::scope(|scope| {
+                for t in 0..PREP {
+                    let state = state.as_deref();
+                    scope.spawn(move || {
+                        let per = bytes.div_ceil(PREP);
+                        let (s, e) = (t * per, ((t + 1) * per).min(bytes));
+                        for offset in (s..e).step_by(4096) {
+                            unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
+                        }
+                        // The write phase then only has to encode, not populate file pages.
+                        if let Some(state) = state {
+                            let chunks = state.layout.len().div_ceil(CHUNK);
+                            for i in (t..chunks).step_by(PREP) { state.populate(i); }
+                        }
+                    });
+                }
+            });
         });
         Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
     }

@@ -504,19 +504,25 @@ pub fn for_blocks<T: Send>(
 ) {
     let groups = out.len() / unit;
     let workers = workers.clamp(1, groups.div_ceil(align).max(1));
-    let edges: Vec<(usize, usize)> = (0..workers)
+    // Four blocks per runner, handed out from the pool's single claim word: a runner that loses
+    // its CPU to another task resumes with the next unclaimed block, instead of every other
+    // runner waiting for its whole share at the join. With one block per runner the slowest
+    // runner alone sets the phase time.
+    let parts = (workers * 4).min(groups.div_ceil(align).max(1));
+    let edges: Vec<(usize, usize)> = (0..parts)
         .map(|t| {
-            let (s, e) = labinius::par::block(groups, workers, t, align);
+            let (s, e) = labinius::par::block(groups, parts, t, align);
             (s * unit, e * unit)
         })
         .collect();
     let blocks = labinius::par::split_mut(out, &edges);
     let f = &f;
-    std::thread::scope(|scope| {
-        for (block, &(s, _)) in blocks.into_iter().zip(&edges) {
-            scope.spawn(move || f(s / unit, block));
-        }
-    });
+    labinius::par::for_each(
+        blocks
+            .into_iter()
+            .zip(edges.iter().map(|&(s, _)| s / unit)),
+        |(block, first)| f(first, block),
+    );
 }
 
 /// The transform of every element of `matrix` (`rq::ajtai_matrix` layout, residues below

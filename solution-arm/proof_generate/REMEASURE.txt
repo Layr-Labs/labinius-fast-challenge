@@ -1,1 +1,1 @@
-re-measurement 2 of packed byte nibbles + SVE ld1b table front (ba4d19f4) (first filed as ba4d19f4-e60b-4d5b-aae5-a071cdba8fd8)
+allways official reading 20261111-223436 attempt 5 kind=const GROUP=30 PAIRS=96 ROW_BATCH=4 SINK=16; the tree differs from promoted source 06bd2a1 only in the constants/one sink constant named here and in this marker

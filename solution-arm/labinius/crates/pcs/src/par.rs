@@ -17,7 +17,7 @@ pub fn threads() -> usize {
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()) + 1)
     })
 }
 

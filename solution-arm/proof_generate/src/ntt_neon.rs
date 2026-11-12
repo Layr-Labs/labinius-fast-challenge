@@ -358,13 +358,20 @@ unsafe fn pass_a(m: &[int16x8_t; BITS], x: &mut [int16x8_t; N], kern: &Kernel) {
 /// Coefficient groups of the nibble tables: group `j < 162` is the coefficients `j + 162 g`.
 const GROUPS: usize = N / 4;
 
-/// `out[j]`, lane `c`: column `c`'s nibble `v` at group `j` as a `u16` (bit `g` set where
-/// coefficient `j + 162 g` is; coefficients from 512 on are zero), the SVE2 halfword `tbl`
-/// index of entry `v` of a 16-entry `i16` table ([`look`]).
+/// `out[j]`, lane `c`: column `c`'s nibble `v` at group `j` (bit `g` set where coefficient
+/// `j + 162 g` is; coefficients from 512 on are zero), the index of entry `v` of a 16-entry
+/// `i16` table ([`look`]): the byte pair `(2 v, 2 v + 1)` for the NEON form, a `u16` for SVE2's
+/// halfword `tbl`.
 #[inline(always)]
 unsafe fn nibbles(m: &[int16x8_t; BITS], out: &mut [uint8x16_t; GROUPS]) {
+    #[cfg(target_feature = "sve")]
     let (lo, c0) = (vdupq_n_u16(0), vdupq_n_u16(1));
+    #[cfg(target_feature = "sve")]
     let (c1, c2, c3) = (vdupq_n_u16(2), vdupq_n_u16(4), vdupq_n_u16(8));
+    #[cfg(not(target_feature = "sve"))]
+    let (lo, c0) = (vdupq_n_u16(0x0100), vdupq_n_u16(0x0302));
+    #[cfg(not(target_feature = "sve"))]
+    let (c1, c2, c3) = (vdupq_n_u16(0x0404), vdupq_n_u16(0x0808), vdupq_n_u16(0x1010));
     let mask = |i: usize| vreinterpretq_u16_s16(*m.get_unchecked(i));
     for j in 0..GROUPS {
         let mut r = vbslq_u16(mask(j), c0, lo);
@@ -501,15 +508,23 @@ unsafe fn table(t: &[i16; 16]) -> uint8x16x2_t {
 /// Entry `v` of table `t` in every lane, `v` from the lane's index pair in `i`.
 #[inline(always)]
 unsafe fn look(t: uint8x16x2_t, i: uint8x16_t) -> int16x8_t {
-    // SVE2 two-register halfword `tbl` (Neoverse V2: the same throughput as NEON's byte
-    // `tbl`, measured on Axion): `u16` indices, so the nibbles need no byte-pair expansion.
-    let r: uint8x16_t;
-    core::arch::asm!(
-        "tbl z19.h, {{z16.h, z17.h}}, z18.h",
-        in("v16") t.0, in("v17") t.1, in("v18") i, lateout("v19") r,
-        options(pure, nomem, nostack, preserves_flags)
-    );
-    vreinterpretq_s16_u8(r)
+    #[cfg(target_feature = "sve")]
+    {
+        // SVE2 two-register halfword `tbl` (Neoverse V2: the same throughput as NEON's byte
+        // `tbl`, measured on Axion): `u16` indices, so the nibbles need no byte-pair expansion.
+        let r: uint8x16_t;
+        core::arch::asm!(
+            "tbl z19.h, {{z16.h, z17.h}}, z18.h",
+            in("v16") t.0, in("v17") t.1, in("v18") i, lateout("v19") r,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+        vreinterpretq_s16_u8(r)
+    }
+    #[cfg(not(target_feature = "sve"))]
+    {
+        // The portable form: `i` carries the `(2 v, 2 v + 1)` byte pair per lane.
+        vreinterpretq_s16_u8(vqtbl2q_u8(t, i))
+    }
 }
 
 /// The second child's radix-3 butterfly from the shared lookups. If `b` and

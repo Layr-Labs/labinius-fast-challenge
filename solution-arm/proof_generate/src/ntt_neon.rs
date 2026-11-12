@@ -635,9 +635,9 @@ unsafe fn pass_b<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
 /// Proven for all admissible nibble patterns by `lazy_lut_intervals` below.
 #[inline(always)]
 const fn skip_lut5(n: usize) -> bool {
-    const NODES: [usize; 27] = [
+    const NODES: [usize; 29] = [
         1, 11, 15, 16, 17, 19, 20, 22, 23, 25, 28, 30, 31, 32,
-        34, 35, 36, 37, 44, 50, 56, 59, 61, 65, 67, 70, 71,
+        34, 35, 36, 37, 44, 50, 53, 56, 59, 61, 64, 65, 67, 70, 71,
     ];
     const MASK: u128 = {
         let mut mask = 0;
@@ -650,15 +650,21 @@ const fn skip_lut5(n: usize) -> bool {
 
 /// Levels 4 and 5: per level-3 node (27 slots) and `j < 3`, the nine slots `j + 3 i`. All three
 /// `j` of a node in one block (arm-big): nine independent butterflies per level.
-/// `S == 4` uses prime 9721's table-front intervals to omit 99 first-input reductions.
+/// `S == 4` uses prime 9721's table-front intervals to omit 108 first-input reductions.
 #[inline(always)]
 unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
     let s: Schedule = schedule(if S == 4 { 1 } else { S });
     let k = vld1q_s16(kern.k.as_ptr());
     #[inline(always)]
-    unsafe fn lvl4<const SS: usize, const R4: bool, const SKIP: u8>(x: &[int16x8_t; N], s: Schedule, t0: int16x8_t, k: int16x8_t, at: usize) -> [int16x8_t; 9] {
+    unsafe fn lvl4<const SS: usize, const R4: u8, const SKIP: u8>(x: &[int16x8_t; N], s: Schedule, t0: int16x8_t, k: int16x8_t, at: usize) -> [int16x8_t; 9] {
         let mut v: [int16x8_t; 9] = core::array::from_fn(|i| load(x, at + 3 * i));
-        if SS != 4 || R4 {
+        if SS == 4 {
+            for i in 0..3 {
+                if R4 >> i & 1 != 0 {
+                    v[i] = vmlsq_laneq_s16::<0>(v[i], vrshrq_n_s16::<13>(v[i]), k);
+                }
+            }
+        } else {
             reduce_inputs(&mut v, s.before[4], s.cheap, &[0, 1, 2], k);
         }
         for i in 0..3 {
@@ -690,7 +696,7 @@ unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
         }
     }
     #[inline(always)]
-    unsafe fn node<const SS: usize, const R4: bool, const SKIP: u8>(x: &mut [int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, n: usize) {
+    unsafe fn node<const SS: usize, const R4: u8, const SKIP: u8>(x: &mut [int16x8_t; N], s: Schedule, kern: &Kernel, k: int16x8_t, n: usize) {
         let t0 = vld1q_s16(kern.c[n].as_ptr());
         let t1 = vld1q_s16(kern.c[n].as_ptr().add(8));
         let base = 27 * n;
@@ -712,14 +718,14 @@ unsafe fn pass_c<const S: usize>(x: &mut [int16x8_t; N], kern: &Kernel) {
         nodes!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23);
     } else {
         for n in 0..24 {
-            node::<S, true, 0>(x, s, kern, k, n);
+            node::<S, 7, 0>(x, s, kern, k, n);
         }
     }
 }
 
-/// Node `n`'s reductions in `pass_c::<4>`: whether its level-4 inputs are reduced, and the `g`
+/// Node `n`'s reductions in `pass_c::<4>`: which level-4 input groups are reduced, and the `g`
 /// whose level-5 first input is not ([`skip_lut5`]) as bits.
-const fn lut_node_kind(n: usize) -> (bool, u8) {
+const fn lut_node_kind(n: usize) -> (u8, u8) {
     let mut skip = 0u8;
     let mut g = 0;
     while g < 3 {
@@ -728,7 +734,7 @@ const fn lut_node_kind(n: usize) -> (bool, u8) {
         }
         g += 1;
     }
-    (n != 1 && n != 15, skip)
+    (if n == 1 || n == 15 { 0 } else if n == 5 { 5 } else { 7 }, skip)
 }
 
 /// `acc[2 s..2 s + 2] -= a_s * y` for the six slots `s = base..base + 6`, `a_s` in lanes 0..6
@@ -791,7 +797,7 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
 
 #[path = "ntt_neon_asm.rs"]
 mod asm;
-pub use asm::{pass_c_asm, pass_d_asm, pass_lut_asm};
+pub use asm::{pass_c_asm, pass_d_asm, pass_lut_asm, pass_lut_sparse_asm};
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].
@@ -1569,11 +1575,6 @@ mod tests {
             let e = mul(sub(b, c), &k.k[2..]);
             [add(a, add(b, c)), add(sub(a, c), e), sub(sub(a, b), e)]
         }
-        fn sixth(v: [Range; 3], k: &Kernel) -> [Range; 3] {
-            let [a, b, c] = v;
-            let e = mul(add(b, c), &k.k[2..]);
-            [add(add(a, b), e), add(sub(a, b), c), sub(sub(a, c), e)]
-        }
         fn r3(v: [Range; 3], t: &[i16], k: &Kernel) -> [Range; 3] {
             bare([v[0], mul(v[1], t), mul(v[2], &t[2..])], k)
         }
@@ -1581,21 +1582,44 @@ mod tests {
         let mut x = [(0, 0); N];
         for n in 0..4 {
             for j in 0..27 {
-                let look = |t: usize, pos: usize| {
+                // Preserve the correlation between b, c and eps*(b +/- c).
+                // The a input has disjoint source bits, so its exact extrema can
+                // be added independently. Enumerate every legal nibble pattern.
+                let look = |t: usize, pos: usize| -> Vec<i32> {
                     (0..16).filter(|&pat| (0..4).all(|b| pat >> b & 1 == 0 || pos + 162 * b < BITS))
-                        .map(|pat| k.lut[n][t][pat] as i32)
-                        .fold((i32::MAX, i32::MIN), |r, v| (r.0.min(v), r.1.max(v)))
+                        .map(|pat| k.lut[n][t][pat] as i32).collect()
                 };
                 for h in 0..2 {
-                    let v = core::array::from_fn(|r| {
-                        let t = 2 * r;
-                        let a = look(t, j + 27 * r);
-                        let b = look(t + 1, j + 27 * r + 81);
-                        if h == 0 { add(a, b) } else { sub(a, b) }
+                    let vals: [Vec<i32>; 3] = core::array::from_fn(|r| {
+                        let a = look(2 * r, j + 27 * r);
+                        let b = look(2 * r + 1, j + 27 * r + 81);
+                        a.iter().flat_map(|&a| b.iter().map(move |&b| {
+                            let v = if h == 0 { a + b } else { a - b };
+                            check((v, v));
+                            v
+                        })).collect()
                     });
-                    let ys = if h == 0 { bare(v, k) } else { sixth(v, k) };
+                    let ar = (*vals[0].iter().min().unwrap(), *vals[0].iter().max().unwrap());
+                    let mut ys = [(i32::MAX, i32::MIN); 3];
+                    for &b in &vals[1] {
+                        for &c in &vals[2] {
+                            let d = if h == 0 { b - c } else { b + c };
+                            check((d, d));
+                            let e = mul((d, d), &k.k[2..]).0;
+                            let out = if h == 0 {
+                                let sum = check((b + c, b + c));
+                                [add(ar, sum), add(sub(ar, (c, c)), (e, e)), sub(sub(ar, (b, b)), (e, e))]
+                            } else {
+                                [add(add(ar, (b, b)), (e, e)), add(sub(ar, (b, b)), (c, c)), sub(sub(ar, (c, c)), (e, e))]
+                            };
+                            for i in 0..3 {
+                                ys[i].0 = ys[i].0.min(out[i].0);
+                                ys[i].1 = ys[i].1.max(out[i].1);
+                            }
+                        }
+                    }
                     for (i, a) in ys.into_iter().enumerate() {
-                        x[162 * n + 81 * h + j + 27 * i] = a;
+                        x[162 * n + 81 * h + j + 27 * i] = check(a);
                     }
                 }
             }
@@ -1604,7 +1628,7 @@ mod tests {
             for j in 0..9 {
                 let pos: [usize; 3] = core::array::from_fn(|i| 27 * n + j + 9 * i);
                 let mut v = pos.map(|i| x[i]);
-                if n != 1 && n != 15 { v[0] = red(v[0]); }
+                if lut_node_kind(n).0 >> (j / 3) & 1 != 0 { v[0] = red(v[0]); }
                 for (i, a) in pos.into_iter().zip(r3(v, &k.c[n], k)) { x[i] = a; }
             }
         }

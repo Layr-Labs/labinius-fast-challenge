@@ -1,11 +1,11 @@
 """pass_c::<4> (levels 4 and 5 after the 9721 LUT front) as straight-line scheduled asm."""
 import sys, os
 from sched import Ins, schedule, allocate
-NODES = [1, 11, 15, 16, 17, 19, 20, 22, 23, 25, 28, 30, 31, 32, 34, 35, 36, 37, 44, 50, 56, 59, 61, 65, 67, 70, 71]
+NODES = [1, 11, 15, 16, 17, 19, 20, 22, 23, 25, 28, 30, 31, 32, 34, 35, 36, 37, 44, 50, 53, 56, 59, 61, 64, 65, 67, 70, 71]
 def skip_lut5(n): return n in NODES
 def kind(n):
     skip = sum(1 << g for g in range(3) if skip_lut5(3 * n + g))
-    return (n != 1 and n != 15, skip)
+    return (0 if n in (1, 15) else 5 if n == 5 else 7, skip)
 def build(nodes):
     ins = []; low = set(); cnt = [0]
     def v(n):
@@ -44,8 +44,8 @@ def build(nodes):
             for i in range(9):
                 d = v('in'); vv.append(d)
                 ins.append(Ins('L', [d], [], f'ldr q{{d0}}, [XPTR, #{16*(at+3*i)}]'))
-            if r4:
-                for i in range(3): vv[i] = red13(vv[i])
+            for i in range(3):
+                if r4 >> i & 1: vv[i] = red13(vv[i])
             for i in range(3):
                 vv[i], vv[i+3], vv[i+6] = bfly(vv[i], vv[i+3], vv[i+6], t0, 0)
             for q in range(3):

@@ -60,14 +60,14 @@ def base_names(a):
     for m in range(12):
         a = a.replace(f'IB{m}X', f'{{i{m}}}')
     return a
-def emit(per=27, K=8, B=17):
+def emit(per=27, K=8, B=17, width=6, ls=2):
     out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"']
     for n in range(4):
         for t in range(6):
             out.append(f'"ldp q{16+2*t}, q{17+2*t}, [{{lut}}, #{n*192 + 32*t}]"')
         for c in range(0, 27, per):
             ins = build_node(n, list(range(c, min(27, c + per))))
-            seq, _ = schedule(ins, skew=K, budget=B, cap=18)
+            seq, _ = schedule(ins, skew=K, budget=B, cap=18, width=width, ls=ls)
             asm, _ = allocate(seq, {'k': 15}, set(), reserved=RESERVED)
             out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
     return ',\n        '.join(out)

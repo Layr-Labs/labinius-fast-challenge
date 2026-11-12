@@ -658,28 +658,32 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
     assert!(o1.len() == len && o2.len() == len && start + len <= stride && len % 2 == 0);
     let wk: Vec<_> = weights.iter().map(|w| kara(w.0.map(|x| vdupq_n_u64(x)))).collect();
     const PAIRS: usize = 74;
+    // Rows swept together. The rows of the key sit `stride` (4 MiB) apart, so they map to the same
+    // L1/L2 sets: a 4-way set holds four rows' lines, not eight. The sum is carry-less, so the
+    // row order is free.
+    const ROW_GROUP: usize = 4;
     let z = vdupq_n_u64(0);
     let mut scratch = vec![[[z; 6]; 2]; PAIRS];
     for first in (0..len).step_by(2 * PAIRS) {
         let pairs = ((len - first) / 2).min(PAIRS);
         let next = first + 2 * PAIRS < len;
-        for (group, ws) in wk.chunks(8).enumerate() {
+        for (group, ws) in wk.chunks(ROW_GROUP).enumerate() {
             // This group's rows of the next chunk into L2.
             for g in 0..ws.len() {
-                let row = words.as_ptr().add((8 * group + g) * stride + start + first) as *const u8;
+                let row = words.as_ptr().add((ROW_GROUP * group + g) * stride + start + first) as *const u8;
                 if next {
                     prefetch_l2(row.wrapping_add(64 * PAIRS), 64 * PAIRS);
                 }
             }
-            // Two pairs (one 64-byte line of each row) per step: the eight rows of a group sit 4 MiB
+            // Two pairs (one 64-byte line of each row) per step: the rows of a group sit 4 MiB
             // apart, so their lines share one L1 set; reading a line once instead of once per pair
-            // halves the L1 refills (a 4-way set cannot hold eight rows' lines between two pairs).
+            // halves the L1 refills, and four rows fit a 4-way set.
             let mut i = 0;
             while i + 2 <= pairs {
                 let mut a = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
                 let mut b = if group == 0 { [[z; 6]; 2] } else { scratch[i + 1] };
                 for (g, w) in ws.iter().enumerate() {
-                    let q = 8 * group + g;
+                    let q = ROW_GROUP * group + g;
                     let row = words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64;
                     mat_step(&mut a, w, vld2q_u64(row));
                     mat_step(&mut b, w, vld2q_u64(row.add(4)));
@@ -691,7 +695,7 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
             if i < pairs {
                 let mut acc = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
                 for (g, w) in ws.iter().enumerate() {
-                    let q = 8 * group + g;
+                    let q = ROW_GROUP * group + g;
                     mat_step(&mut acc, w, vld2q_u64(words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64));
                 }
                 scratch[i] = acc;

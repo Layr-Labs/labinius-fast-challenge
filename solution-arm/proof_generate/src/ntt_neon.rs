@@ -791,7 +791,7 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
 
 #[path = "ntt_neon_asm.rs"]
 mod asm;
-pub use asm::{pass_c_asm, pass_d_asm, pass_lut_asm};
+pub use asm::{pass_c_asm, pass_d_asm, pass_lut_asm, pass_lut_sparse_asm};
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].

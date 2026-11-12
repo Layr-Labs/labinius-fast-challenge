@@ -846,7 +846,7 @@ unsafe fn sums(
                 prefetch_words(words, e, i + PF_T);
                 indices(&at, nib);
                 let x = &mut xs[i];
-                pass_lut_asm(nib, x, kern);
+                pass_lut_sparse_asm(nib, x, kern);
                 pass_c_asm(x, kern);
                 pass_d_asm(x, kern);
             }
@@ -911,7 +911,7 @@ unsafe fn sums2(
                     prefetch_words(words[t], e, i + PF_T);
                     indices(&at, nib);
                     let x = &mut xs[i];
-                    pass_lut_asm(nib, x, kern);
+                    pass_lut_sparse_asm(nib, x, kern);
                     pass_c_asm(x, kern);
                     pass_d_asm(x, kern);
                 }
@@ -1459,6 +1459,32 @@ mod leap_bench {
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
             assert_eq!(x, y);
+        }
+    }
+
+    #[test]
+    fn pass_lut_sparse_asm_matches() {
+        let kern = &kernels()[PB];
+        let mut st = 35u64;
+        for case in 0..100 {
+            let mut idx = Box::new([unsafe { vdupq_n_u8(0) }; N / 4]);
+            for (slot, v) in idx.iter_mut().enumerate() {
+                let mask = if slot < 26 { 15 } else { 7 };
+                let lanes: [u16; 8] = core::array::from_fn(|lane| match case {
+                    0 => 0,
+                    1 => mask,
+                    2..=17 => ((case - 2) as u16) & mask,
+                    _ => (crate::ntt::tests::xorshift(&mut st) as u16 ^ lane as u16) & mask,
+                });
+                *v = unsafe { vreinterpretq_u8_u16(vld1q_u16(lanes.as_ptr())) };
+            }
+            let packed = crate::ntt::neon::tests::pack(&idx);
+            let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            let mut b = a.clone();
+            unsafe { pass_lut_asm(&packed, &mut a, kern); pass_lut_sparse_asm(&packed, &mut b, kern); }
+            let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
+            let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
+            assert_eq!(x, y, "case={case}");
         }
     }
 

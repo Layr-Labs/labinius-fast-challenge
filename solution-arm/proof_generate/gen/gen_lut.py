@@ -18,7 +18,7 @@ def ld1b(s):
     assert -8 <= imm <= 7
     BASES.add(m)
     return f'ld1b LBz{{d0}}.hRB, p7/z, [IB{m}X, #{imm}, mul vl]'
-def build_node(n, steps):
+def build_node(n, steps, sparse=False):
     ins = []; cnt = [0]
     def v(nm):
         cnt[0] += 1; return f'{nm}{cnt[0]}'
@@ -38,7 +38,10 @@ def build_node(n, steps):
         for t, o in enumerate(offs):
             ix, val = v('ix'), v('lk')
             ins.append(Ins('L', [ix], [], ld1b(o)))
-            ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.h, z{17+2*t}.hRB, z{{s0}}.h'))
+            # For slots >=27, coefficient slot+486 is outside the 512-bit input.
+            # These five lookup tables therefore need only their low eight entries.
+            table = f'LBz{17+t}.hRB' if sparse and t else f'LBz{16+2*t}.h, z{17+2*t}.hRB'
+            ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, {table}, z{{s0}}.h'))
             look.append(val)
         x0, y0, x1, y1, x2, y2 = look
         a0, b0 = A('add', x0, y0), A('sub', x0, y0)
@@ -60,14 +63,17 @@ def base_names(a):
     for m in range(12):
         a = a.replace(f'IB{m}X', f'{{i{m}}}')
     return a
-def emit(per=27, K=8, B=17):
+def emit(per=27, K=8, B=17, sparse=False):
     out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"']
     for n in range(4):
         for t in range(6):
-            out.append(f'"ldp q{16+2*t}, q{17+2*t}, [{{lut}}, #{n*192 + 32*t}]"')
+            if sparse and t:
+                out.append(f'"ldr q{17+t}, [{{lut}}, #{n*192 + 32*t}]"')
+            else:
+                out.append(f'"ldp q{16+2*t}, q{17+2*t}, [{{lut}}, #{n*192 + 32*t}]"')
         for c in range(0, 27, per):
-            ins = build_node(n, list(range(c, min(27, c + per))))
-            seq, _ = schedule(ins, skew=K, budget=B, cap=18)
-            asm, _ = allocate(seq, {'k': 15}, set(), reserved=RESERVED)
+            ins = build_node(n, list(range(c, min(27, c + per))), sparse)
+            seq, _ = schedule(ins, skew=K, budget=B, cap=24 if sparse else 18)
+            asm, _ = allocate(seq, {'k': 15}, set(), reserved=tuple(range(15, 23)) if sparse else RESERVED)
             out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
     return ',\n        '.join(out)

@@ -807,12 +807,10 @@ pub unsafe fn repair(col: (*const u8, usize), a: &SmsMatrix, c: usize, d: usize,
 /// `x` in `[-(p-1)/2, (p-1)/2]` for `|x| <= p + p/2`.
 #[inline(always)]
 unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
-    let h = vdupq_n_s16((p - 1) / 2);
-    let pv = vdupq_n_s16(p);
-    let over = vcgtq_s16(x, h);
-    let under = vcltq_s16(x, vnegq_s16(h));
-    let x = vsubq_s16(x, vandq_s16(vreinterpretq_s16_u16(over), pv));
-    vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
+    debug_assert_eq!(p, 9721);
+    // Rounded reciprocal, exact throughout the documented +/- (p + p/2) interval.
+    let q = vrshrq_n_s16::<11>(vqdmulhq_n_s16(x, 6903));
+    vmlsq_n_s16(x, q, 9721)
 }
 
 /// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
@@ -846,7 +844,7 @@ unsafe fn sums(
                 prefetch_words(words, e, i + PF_T);
                 indices(&at, nib);
                 let x = &mut xs[i];
-                pass_lut_asm(nib, x, kern);
+                pass_lut_sparse_asm(nib, x, kern);
                 pass_c_asm(x, kern);
                 pass_d_asm(x, kern);
             }
@@ -911,7 +909,7 @@ unsafe fn sums2(
                     prefetch_words(words[t], e, i + PF_T);
                     indices(&at, nib);
                     let x = &mut xs[i];
-                    pass_lut_asm(nib, x, kern);
+                    pass_lut_sparse_asm(nib, x, kern);
                     pass_c_asm(x, kern);
                     pass_d_asm(x, kern);
                 }
@@ -1163,6 +1161,35 @@ mod chunk_bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_reciprocal_is_exact() {
+        unsafe {
+            for x in -14581i16..=14581 {
+                let lanes = [x, -x, x / 2, -x / 2, 0, 4860, -4860, 9721];
+                let mut got = [0i16; 8];
+                vst1q_s16(got.as_mut_ptr(), canonical(vld1q_s16(lanes.as_ptr()), 9721));
+                for i in 0..8 {
+                    let expected = ((lanes[i] as i32 + 4860).rem_euclid(9721) - 4860) as i16;
+                    assert_eq!(got[i], expected, "x={}, lane={}", x, i);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repair_max_predicate_matches_mask() {
+        unsafe {
+            for v in -(P1 as i16 / 2)..=P1 as i16 / 2 {
+                let lanes = [v, 0, -v, v / 2, -v / 2, 1, -1, 0];
+                let magnitude = vabsq_s16(vld1q_s16(lanes.as_ptr()));
+                for threshold in [0, 1, v.abs(), v.abs() + 1, P1 as i16 / 2, P1 as i16] {
+                    let mask = vcgeq_s16(magnitude, vdupq_n_s16(threshold));
+                    assert_eq!(vmaxvq_u16(mask) != 0, vmaxvq_s16(magnitude) >= threshold);
+                }
+            }
+        }
+    }
 
     /// [`narrow_digits`] is congruent to the sum and within `p`, on the extremes of a chunk's sums
     /// (`+-CHUNK PRODUCT`), small and boundary values, and random values in range.
@@ -1459,6 +1486,32 @@ mod leap_bench {
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
             assert_eq!(x, y);
+        }
+    }
+
+    #[test]
+    fn pass_lut_sparse_asm_matches() {
+        let kern = &kernels()[PB];
+        let mut st = 35u64;
+        for case in 0..100 {
+            let mut idx = Box::new([unsafe { vdupq_n_u8(0) }; N / 4]);
+            for (slot, v) in idx.iter_mut().enumerate() {
+                let mask = if slot < 26 { 15 } else { 7 };
+                let lanes: [u16; 8] = core::array::from_fn(|lane| match case {
+                    0 => 0,
+                    1 => mask,
+                    2..=17 => ((case - 2) as u16) & mask,
+                    _ => (crate::ntt::tests::xorshift(&mut st) as u16 ^ lane as u16) & mask,
+                });
+                *v = unsafe { vreinterpretq_u8_u16(vld1q_u16(lanes.as_ptr())) };
+            }
+            let packed = crate::ntt::neon::tests::pack(&idx);
+            let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            let mut b = a.clone();
+            unsafe { pass_lut_asm(&packed, &mut a, kern); pass_lut_sparse_asm(&packed, &mut b, kern); }
+            let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
+            let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
+            assert_eq!(x, y, "case={case}");
         }
     }
 

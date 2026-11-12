@@ -791,6 +791,9 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
 
 #[path = "ntt_neon_asm.rs"]
 mod asm;
+#[path = "ntt_neon_idx.rs"]
+mod idx;
+pub use idx::indices_asm;
 pub use asm::{pass_c_asm, pass_d_asm, pass_lut_asm};
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
@@ -2234,5 +2237,49 @@ mod pass_timing {
             "masks+transform<1>: old median {:.0} min {:.0} ns, lut median {:.0} min {:.0} ns ({:+.1}% median, {:+.1}% min)",
             old[7], old[0], new[7], new[0], 100.0 * (new[7] / old[7] - 1.0), 100.0 * (new[0] / old[0] - 1.0)
         );
+    }
+}
+
+#[cfg(test)]
+mod indices_asm_tests {
+    use super::*;
+
+    /// The scheduled index builder writes the Rust builder's indices, and its timing.
+    #[test]
+    fn indices_asm_matches() {
+        let mut state = 7u64;
+        for case in 0..200 {
+            let words: [[u128; 4]; LANES] = core::array::from_fn(|_| core::array::from_fn(|_| match case {
+                0 => u128::MAX,
+                1 => 0,
+                _ => (crate::ntt::tests::xorshift(&mut state) as u128) << 64 | crate::ntt::tests::xorshift(&mut state) as u128,
+            }));
+            let ptrs: [*const u8; LANES] = core::array::from_fn(|l| words[l].as_ptr() as *const u8);
+            let mut a = [unsafe { vdupq_n_u8(9) }; GROUPS];
+            let mut b = [unsafe { vdupq_n_u8(9) }; GROUPS];
+            unsafe { indices(&ptrs, &mut a); indices_asm(&ptrs, &mut b); }
+            for g in 0..GROUPS {
+                let (x, y): ([u8; 16], [u8; 16]) = unsafe { (core::mem::transmute(a[g]), core::mem::transmute(b[g])) };
+                assert_eq!(x, y, "case {case} group {g}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn indices_asm_timing() {
+        let mut state = 7u64;
+        let words: Vec<u128> = (0..4 * 8 * 64).map(|_| (crate::ntt::tests::xorshift(&mut state) as u128) << 64 | crate::ntt::tests::xorshift(&mut state) as u128).collect();
+        let mut nib = Box::new([unsafe { vdupq_n_u8(0) }; GROUPS]);
+        let reps = 200_000;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            for r in 0..reps { let ptrs: [*const u8; LANES] = core::array::from_fn(|l| words[(r % 64) * 32 + 4 * l..].as_ptr() as *const u8); unsafe { indices(&ptrs, &mut nib) }; core::hint::black_box(&mut *nib); }
+            let a = t.elapsed().as_nanos() as f64 / reps as f64;
+            let t = std::time::Instant::now();
+            for r in 0..reps { let ptrs: [*const u8; LANES] = core::array::from_fn(|l| words[(r % 64) * 32 + 4 * l..].as_ptr() as *const u8); unsafe { indices_asm(&ptrs, &mut nib) }; core::hint::black_box(&mut *nib); }
+            let b = t.elapsed().as_nanos() as f64 / reps as f64;
+            println!("indices {a:.0} ns, indices_asm {b:.0} ns");
+        }
     }
 }

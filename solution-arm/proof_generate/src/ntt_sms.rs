@@ -844,7 +844,7 @@ unsafe fn sums(
             for i in 0..groups * LOCK {
                 let at = pass_words(words, a.elements, e, i);
                 prefetch_words(words, e, i + PF_T);
-                indices(&at, nib);
+                indices_asm(&at, nib);
                 let x = &mut xs[i];
                 pass_lut_asm(nib, x, kern);
                 pass_c_asm(x, kern);
@@ -909,7 +909,7 @@ unsafe fn sums2(
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     prefetch_words(words[t], e, i + PF_T);
-                    indices(&at, nib);
+                    indices_asm(&at, nib);
                     let x = &mut xs[i];
                     pass_lut_asm(nib, x, kern);
                     pass_c_asm(x, kern);

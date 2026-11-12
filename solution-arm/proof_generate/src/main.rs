@@ -171,6 +171,38 @@ impl Drop for Table {
     }
 }
 
+/// Tear down read-only file PTEs in parallel after the last witness reader.
+/// File contents remain in the page cache; no anonymous allocation is discarded.
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+fn release_readonly_pages(table: &Table) {
+    extern "C" { fn getpagesize() -> i32; }
+    let page = unsafe { getpagesize() };
+    if page <= 0 { return; }
+    let page = page as usize;
+    let mut regions = Vec::new();
+    if let Table::Mapped { ptr, len, .. } = table {
+        regions.push((*ptr as usize, 16 * *len / page * page));
+    }
+    for image in [&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0,
+        &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0] {
+        let addr = image.as_ptr() as usize;
+        let begin = addr.next_multiple_of(page);
+        let end = (addr + image.len()) / page * page;
+        if begin < end { regions.push((begin, end - begin)); }
+    }
+    let workers = threads();
+    labinius::par::pool().run(workers, |t| {
+        for &(addr, len) in &regions {
+            let (start, end) = labinius::par::block(len, workers, t, page);
+            if start < end {
+                // Only whole pages contained in read-only file mappings. A future read
+                // refaults identical bytes; the KEY anonymous copy is never touched.
+                unsafe { table_sys::madvise((addr + start) as *mut u8, end - start, 4); }
+            }
+        }
+    });
+}
+
 fn read_table(path: &str) -> Table {
     load_table(path, 1 << LOG_PACKED)
 }
@@ -960,6 +992,8 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    release_readonly_pages(&values);
     output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
@@ -989,6 +1023,13 @@ mod tests {
                 assert_eq!(*ptr as usize % (2 << 20), 0);
                 assert_eq!(*len, n);
                 assert!(*span >= 16 * n && *span % (2 << 20) == 0);
+            }
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            {
+                let before = blake3::hash(&SMS_DATA.0);
+                release_readonly_pages(&table);
+                assert_eq!(&*table, &words, "released witness refaults unchanged");
+                assert_eq!(blake3::hash(&SMS_DATA.0), before, "released key refaults unchanged");
             }
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }

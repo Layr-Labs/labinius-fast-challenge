@@ -133,7 +133,7 @@ fn threads() -> usize {
 /// The read-only file mapping avoids a 256 MiB copy. Other platforms retain the owned path.
 enum Table {
     #[cfg(all(target_os = "linux", target_endian = "little"))]
-    Mapped { ptr: *mut u8, len: usize },
+    Mapped { ptr: *mut u8, len: usize, span: usize },
     Owned(Vec<B128>),
 }
 
@@ -152,7 +152,7 @@ impl std::ops::Deref for Table {
     fn deref(&self) -> &[B128] {
         match self {
             #[cfg(all(target_os = "linux", target_endian = "little"))]
-            Self::Mapped { ptr, len } => {
+            Self::Mapped { ptr, len, .. } => {
                 // SAFETY: this mapping is read-only, alive until Drop, page aligned, and contains
                 // exactly len little-endian words. B128 is transparent over u128.
                 unsafe { std::slice::from_raw_parts(*ptr as *const B128, *len) }
@@ -165,8 +165,8 @@ impl std::ops::Deref for Table {
 impl Drop for Table {
     fn drop(&mut self) {
         #[cfg(all(target_os = "linux", target_endian = "little"))]
-        if let Self::Mapped { ptr, len } = self {
-            unsafe { table_sys::munmap(*ptr, 16 * *len) };
+        if let Self::Mapped { ptr, span, .. } = self {
+            unsafe { table_sys::munmap(*ptr, *span) };
         }
     }
 }
@@ -183,8 +183,28 @@ fn load_table(path: &str, n: usize) -> Table {
     #[cfg(all(target_os = "linux", target_endian = "little"))]
     if n != 0 {
         use std::os::fd::AsRawFd;
-        // PROT_READ | MAP_PRIVATE: the trusted input is never writable.
-        let ptr = unsafe { table_sys::mmap(std::ptr::null_mut(), 16 * n, 1, 2, file.as_raw_fd(), 0) };
+        // Keep the file offset and virtual address aligned for large file-page mappings.
+        // MAP_FIXED only replaces this thread's own PROT_NONE reservation. The mapped
+        // span can extend past a short test file, but no access extends past its words.
+        const HUGE: usize = 2 << 20;
+        let span = (16 * n).next_multiple_of(HUGE);
+        let ptr = unsafe {
+            let raw = table_sys::mmap(std::ptr::null_mut(), span + HUGE, 0, 2 | 0x20, -1, 0);
+            if raw as isize == -1 {
+                raw
+            } else {
+                let start = raw as usize;
+                let aligned = (start + HUGE - 1) & !(HUGE - 1);
+                let head = aligned - start;
+                if head != 0 { table_sys::munmap(raw, head); }
+                let tail = HUGE - head;
+                if tail != 0 { table_sys::munmap((aligned + span) as *mut u8, tail); }
+                // PROT_READ | MAP_PRIVATE: the trusted input is never writable.
+                let ptr = table_sys::mmap(aligned as *mut u8, span, 1, 2 | 0x10, file.as_raw_fd(), 0);
+                if ptr as isize == -1 { table_sys::munmap(aligned as *mut u8, span); }
+                ptr
+            }
+        };
         if ptr as isize != -1 {
             let base = ptr as usize;
             // The range boundaries are 2 MiB aligned, also valid on 4/16/64 KiB kernels.
@@ -199,7 +219,7 @@ fn load_table(path: &str, n: usize) -> Table {
                     }
                 }
             });
-            return Table::Mapped { ptr, len: n };
+            return Table::Mapped { ptr, len: n, span };
         }
     }
     let mut words = vec![0u128; n];
@@ -964,6 +984,12 @@ mod tests {
             std::fs::write(&path, &bytes).unwrap();
             let table = load_table(path.to_str().unwrap(), n);
             assert_eq!(&*table, &words);
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            if let Table::Mapped { ptr, len, span } = &table {
+                assert_eq!(*ptr as usize % (2 << 20), 0);
+                assert_eq!(*len, n);
+                assert!(*span >= 16 * n && *span % (2 << 20) == 0);
+            }
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
         std::fs::remove_file(path).unwrap();

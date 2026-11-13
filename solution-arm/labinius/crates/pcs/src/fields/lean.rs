@@ -90,6 +90,22 @@ impl Prepared {
         Self::with_prefix(words, r, PREFIX)
     }
 
+    /// Diagnostic: the partial-evaluation pass of [`Prepared::new`] with `parts` claimed parts,
+    /// timed (the sets are built and discarded).
+    pub fn time_parts(words: &[B128], r: &[B128], parts: usize) -> std::time::Duration {
+        let prefix = PREFIX.min(r.len() - 3);
+        let scale = r[..prefix].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
+        let eq = EqFactors::new(&r[prefix..], scale);
+        let t = std::time::Instant::now();
+        let parts = parts.min(eq.len() / 64).max(1);
+        let out = par::map_blocks(eq.len(), parts, 64.min(eq.len()), |_, start, end| {
+            neon::partial_evals_sets_tiled(words, eq.len(), start, end, |base, tile| eq.fill(base, tile))
+        });
+        let d = t.elapsed();
+        core::hint::black_box(out);
+        d
+    }
+
     fn with_prefix(words: &[B128], r: &[B128], requested: usize) -> Option<Self> {
         assert_eq!(words.len(), 1usize << r.len());
         if !neon::pmull() || r.len() < 3 || r.contains(&B128::ONE) {
@@ -101,7 +117,9 @@ impl Prepared {
         let ratios = r.iter().zip(&inverses).map(|(&x, &d)| x * d).collect();
         let scale = r[..prefix].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
         let eq = EqFactors::new(&r[prefix..], scale);
-        let parts = par::workers(words.len(), 1 << 16).min(eq.len() / 8);
+        // Four claimed parts per worker: a worker that loses its core for a while takes fewer
+        // parts instead of holding up the pass with a fixed share (the sets are XOR sums).
+        let parts = (4 * par::workers(words.len(), 1 << 16)).min(eq.len() / 64).max(1);
         let parts = par::map_blocks(eq.len(), parts, 64.min(eq.len()), |_, start, end| {
             neon::partial_evals_sets_tiled(words, eq.len(), start, end, |base, tile| eq.fill(base, tile))
         });
@@ -324,7 +342,8 @@ impl<'a> Switch<'a> {
         });
         let weights = eq_expand_f162(&self.prefix_r);
         let words = self.words;
-        let parts = par::workers(n, 1 << 12);
+        // Four claimed parts per worker, as in `Prepared::with_prefix`; the outputs are disjoint.
+        let parts = (4 * par::workers(n, 1 << 12)).min((n / 64).max(1));
         let edges: Vec<_> = (0..parts).map(|t| par::block(n, parts, t, 2)).collect();
         let [p0, p1, p2] = &mut self.planes;
         let chunks = par::split_mut(p0, &edges).into_iter()

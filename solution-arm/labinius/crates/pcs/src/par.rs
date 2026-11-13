@@ -351,9 +351,17 @@ impl Pool {
         // through it — measured as a commitment run by seven runners, 12-26 ms slower, in about
         // a third of the runs.
         let start = epoch_of(shared.claim.load(Ordering::Acquire));
+        let plan = cpu_plan(width);
         let handles = (1..width)
-            .map(|_| std::thread::spawn(move || worker(shared, start)))
+            .map(|i| {
+                let cpu = plan[i];
+                std::thread::spawn(move || {
+                    pin_to(cpu);
+                    worker(shared, start)
+                })
+            })
             .collect();
+        pin_to(plan[0]);
         Pool {
             shared,
             width,
@@ -487,6 +495,46 @@ impl Pool {
 
 /// A worker's loop. `seen` is the epoch the pool had when the worker was spawned: every later
 /// dispatch is one it has not served, however late the thread itself starts.
+#[repr(C)]
+struct SchedParam { sched_priority: i32 }
+
+extern "C" {
+    fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut u8) -> i32;
+    fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const u8) -> i32;
+    fn sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> i32;
+}
+const SCHED_FIFO: i32 = 1;
+const RT: bool = true;
+
+/// One CPU per thread, read from this process's allowed set: a worker never migrates
+/// mid-kernel, so its L1/L2 survive between dispatches. Best effort: skipped when the
+/// allowed set is smaller than the pool, and the syscall result is ignored.
+fn cpu_plan(width: usize) -> Vec<Option<usize>> {
+    let mut set = [0u64; 16];
+    let ok = unsafe { sched_getaffinity(0, 16 * 8, set.as_mut_ptr() as *mut u8) } == 0;
+    let allowed: Vec<usize> = if ok {
+        (0..16 * 64).filter(|c| set[c / 64] >> (c % 64) & 1 == 1).collect()
+    } else {
+        Vec::new()
+    };
+    if allowed.len() < width.max(1) { return vec![None; width]; }
+    (0..width).map(|i| Some(allowed[i])).collect()
+}
+
+fn pin_to(cpu: Option<usize>) {
+    if let Some(cpu) = cpu {
+        let mut set = [0u64; 16];
+        set[cpu / 64] = 1 << (cpu % 64);
+        unsafe {
+            sched_setaffinity(0, 16 * 8, set.as_ptr() as *const u8);
+            if RT {
+                let param = SchedParam { sched_priority: 1 };
+                sched_setscheduler(0, SCHED_FIFO, &param);
+            }
+        }
+    }
+}
+
 fn worker(s: &'static Shared, mut seen: u64) {
     loop {
         // Wait for a dispatch with a task left to take: spin (doing idle work if there is any),

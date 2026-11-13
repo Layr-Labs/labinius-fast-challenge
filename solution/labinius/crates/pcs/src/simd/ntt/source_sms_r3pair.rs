@@ -229,9 +229,10 @@ pub(crate) unsafe fn ntt_bin_batch32_r3pair_source<
                     tail27_out_of_line::<Q>(bpj, bpj, t4, t5, t6, cv);
                 }
             }
-        }
-        for j in 0..6 {
-            let kk = 6 * k + j;
+            // Block j is final once its H leaves are done (each leaf reads and writes only its
+            // own 27 vectors, and the later blocks' leaves touch only their own): hand it to the
+            // sink now, shortly after it was written, instead of after the other blocks' tails.
+            // The sink only reads the block; the callback order (kk = 0..23) is unchanged.
             sink.rows(kk, ro(buf(kk)), 0, 27);
         }
     }

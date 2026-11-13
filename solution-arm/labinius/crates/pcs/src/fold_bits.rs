@@ -1123,6 +1123,9 @@ pub mod neon {
     const _: () = assert!(GUARD + BIAS_PLANES >= Q162);
 
     type V = uint8x16_t;
+    /// A list entry: a plane's byte offset from its pair's base. 32-bit so that a pair of entries is
+    /// one `ldp w, w` and each register addresses its plane as it is (no shift or mask per entry).
+    type Off = u32;
 
     /// Whether the counters cannot overflow: a slot takes at most one entry per term.
     pub fn fits(challenges: &[Challenge]) -> bool {
@@ -1135,13 +1138,13 @@ pub mod neon {
         columns: usize,
         /// Per sign (0 positive, 1 negative), the group's entries sorted by position: byte
         /// offsets of the even slot's plane relative to the pair's base pointer.
-        list: [Vec<u16>; 2],
+        list: [Vec<Off>; 2],
         /// Per pair: positive `[lo, hi)`, negative `[lo, hi)`.
         win: Vec<[u16; 4]>,
         /// Per pair and sign, the last `len % SUB` entries of the window, then entries of the
         /// pad planes (zero for positive, all-ones for negative: neither adds anything), as
         /// offsets from that pair's base.
-        tail: Vec<[[u16; SUB]; 2]>,
+        tail: Vec<[[Off; SUB]; 2]>,
     }
 
     /// The number of groups of `columns` columns.
@@ -1170,7 +1173,7 @@ pub mod neon {
             // Each entry is `(key, offset)`; a term at `m` reaches pair `i` when `[2i, 2i + 1]`
             // meets `[m, m + 127]`, i.e. `2i - 127 <= m <= 2i + 1`.
             let mut start = [[0u16; KEYS + 1]; 2];
-            let each = |f: &mut dyn FnMut(usize, usize, u16)| {
+            let each = |f: &mut dyn FnMut(usize, usize, Off)| {
                 for (jl, c) in cs.iter().enumerate() {
                     assert!(c.weight <= c.positions.len());
                     let col = (GUARD + jl * STRIDE + BIAS_PLANES) as i32;
@@ -1179,12 +1182,12 @@ pub mod neon {
                         assert!(p < Q162, "a position is below 162");
                         let negative = ((c.signs >> t) & 1 == 1) ^ (p % 2 == 1);
                         let m = p as i32;
-                        f(negative as usize, (m + KEY0) as usize, (16 * (col - m)) as u16);
+                        f(negative as usize, (m + KEY0) as usize, (16 * (col - m)) as Off);
                         // Slots `p + q >= 243` wrap to `p + q - 243` with the other sign: a
                         // term at position `p - 243`.
                         if p + WORD_BITS > SLOTS {
                             let m = m - SLOTS as i32;
-                            f(!negative as usize, (m + KEY0) as usize, (16 * (col - m)) as u16);
+                            f(!negative as usize, (m + KEY0) as usize, (16 * (col - m)) as Off);
                         }
                     }
                 }
@@ -1196,7 +1199,7 @@ pub mod neon {
                 }
             }
             let mut at = start;
-            let mut list = [vec![0u16; start[0][KEYS] as usize], vec![0u16; start[1][KEYS] as usize]];
+            let mut list = [vec![0 as Off; start[0][KEYS] as usize], vec![0 as Off; start[1][KEYS] as usize]];
             each(&mut |sign, key, off| {
                 list[sign][at[sign][key] as usize] = off;
                 at[sign][key] += 1;
@@ -1216,7 +1219,7 @@ pub mod neon {
                         let (lo, hi) = (w[2 * sign] as usize, w[2 * sign + 1] as usize);
                         let full = lo + (hi - lo) / SUB * SUB;
                         let pad = [PAD_ZERO, PAD_ONES][sign];
-                        let pad = (16 * (BIAS_PLANES + pad) - 32 * i) as u16;
+                        let pad = (16 * (BIAS_PLANES + pad) - 32 * i) as Off;
                         core::array::from_fn(|k| if full + k < hi { list[sign][full + k] } else { pad })
                     })
                 })
@@ -1452,11 +1455,11 @@ pub mod neon {
     #[allow(clippy::too_many_arguments)]
     unsafe fn pass(
         be: *const u8,
-        pos: *const u16,
+        pos: *const Off,
         pos8: usize,
-        neg: *const u16,
+        neg: *const Off,
         neg8: usize,
-        tail: &[[u16; SUB]; 2],
+        tail: &[[Off; SUB]; 2],
         lo: *mut V,
         hi: *mut V,
     ) {
@@ -1472,7 +1475,7 @@ pub mod neon {
         // Carries in `h`: the trees' carries flush it at `H_MAX - 1`, which leaves room for
         // the one carry of the list's end.
         let mut hn = 0usize;
-        let mut t: *const u16;
+        let mut t: *const Off;
         macro_rules! add_h {
             ($c0:expr, $c1:expr) => {{
                 let (mut c0, mut c1) = ($c0, $c1);
@@ -1489,10 +1492,10 @@ pub mod neon {
         }
         macro_rules! two {
             ($off:expr, $neg:literal) => {{
-                // Four offsets per 64-bit load (one per four entries), split with shifts.
-                let w = (t.add($off & !3) as *const u64).read_unaligned();
-                let o0 = (w >> (16 * ($off % 4))) as u16 as usize;
-                let o1 = (w >> (16 * ($off % 4 + 1))) as u16 as usize;
+                // Two 32-bit offsets per pair of entries: one `ldp w, w` whose zero-extended
+                // registers address the planes directly (no shifts or masks per entry).
+                let o0 = *t.add($off) as usize;
+                let o1 = *t.add($off + 1) as usize;
                 let a0 = vld1q_u8(be.add(o0));
                 let a1 = vld1q_u8(bo.add(o0));
                 let b0 = vld1q_u8(be.add(o1));
@@ -1796,7 +1799,8 @@ pub mod neon {
         let words_addr = words.as_ptr() as usize;
         let next = AtomicUsize::new(0);
         let (groups, bias) = (&groups, &bias);
-        pool.run(workers, |_| {
+        crate::par::diag(format!("f0={}", crate::par::stamp()));
+        pool.run(workers, |w| {
             let mut ws = Workspace::new();
             let mut claim = || {
                 let b = next.fetch_add(1, Ordering::Relaxed);
@@ -1818,6 +1822,7 @@ pub mod neon {
                     )
                 };
             }
+            crate::par::diag(format!("fw{}={}", w, crate::par::stamp()));
         });
         // SAFETY: every block wrote all fields of its 32 elements.
         unsafe { out.set_len(elements) };

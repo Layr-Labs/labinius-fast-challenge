@@ -355,6 +355,10 @@ unsafe fn pass_a(m: &[int16x8_t; BITS], x: &mut [int16x8_t; N], kern: &Kernel) {
     }
 }
 
+/// The bound on the outputs of prime 9721's table-fed transform with the lazy reductions of
+/// `pass_c_asm` / `pass_d_asm` (`lazy_lut_intervals` checks every value): they fit `i16`.
+pub const LAZY_BOUND: u32 = i16::MAX as u32;
+
 /// Coefficient groups of the nibble tables: group `j < 162` is the coefficients `j + 162 g`.
 const GROUPS: usize = N / 4;
 
@@ -809,7 +813,7 @@ mod asm;
 #[path = "ntt_neon_idx.rs"]
 mod idx;
 pub use idx::indices_asm;
-pub use asm::{pass_c_asm, pass_d_asm, pass_d_out, pass_lut_asm, pass_lut_loop};
+pub use asm::{pass_c_asm, pass_c_crown, pass_d_asm, pass_d_out, pass_d_out_crown, pass_lut_asm};
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].
@@ -1529,6 +1533,66 @@ pub fn commit(values: &[B128], a: &Matrix, workers: usize) -> Vec<u128> {
 #[path = "ntt_hybrid.rs"]
 pub mod hybrid;
 
+/// The first-input reductions of prime 9721's table-fed levels 4 to 6 in the generated
+/// `pass_c_asm` / `pass_d_asm` (`gen/gen_pc.py`, `gen/gen_pd.py`), per level-3 node `n` (an
+/// independent 27-slot subtree), found by `lazy_search` and checked by `lazy_lut_intervals`:
+/// `LAZY4[n]` bit `j`: level-4 butterfly of slots `27 n + j + 9 i`; `LAZY5[n]` bit `3 m + j`:
+/// level-5 butterfly of slots `27 n + 9 m + j + 3 i`; `LAZY6[n]` bit `l`: level-6 butterfly of
+/// slots `3 (9 n + l) + i`.
+pub const LAZY4: [u16; 24] = [511, 9, 511, 511, 511, 511, 511, 511, 511, 511, 511, 511, 511, 511, 511, 7, 511, 511, 511, 511, 511, 511, 511, 511];
+pub const LAZY5: [u16; 24] = [455, 511, 511, 63, 511, 197, 95, 71, 455, 511, 203, 463, 449, 511, 127, 15, 127, 511, 127, 127, 479, 383, 495, 495];
+pub const LAZY6: [u16; 24] = [511, 195, 195, 476, 475, 56, 1, 63, 508, 199, 0, 5, 379, 147, 109, 453, 127, 55, 223, 372, 449, 135, 388, 0];
+
+/// Levels 4 and 5 (`L5 = false`: level 6) of the lazily reduced 9721 transform in scalar `i16`
+/// arithmetic, instruction for instruction as the generated assembly (wrapping `mul` / `mls`,
+/// saturating rounding `sqrdmulh`, rounding shift): the reference of the assembly tests.
+#[cfg(test)]
+pub(crate) fn lazy_ref(x: &mut [[i16; 8]; N], kern: &Kernel, levels45: bool) {
+    let p = kern.k[0];
+    let mulc = |a: i16, w: i16, wt: i16| -> i16 {
+        let lo = a.wrapping_mul(w);
+        let hi = ((2 * a as i32 * wt as i32 + (1 << 15)) >> 16).clamp(-32768, 32767) as i16;
+        lo.wrapping_sub(hi.wrapping_mul(p))
+    };
+    let red = |a: i16| -> i16 { a.wrapping_sub((((a as i32) + 4096) >> 13) as i16 * p) };
+    let r3 = |v: [i16; 3], t: &[i16]| -> [i16; 3] {
+        let (a, b1, c1) = (v[0], mulc(v[1], t[0], t[1]), mulc(v[2], t[2], t[3]));
+        let (s, d) = (b1.wrapping_add(c1), b1.wrapping_sub(c1));
+        let e = mulc(d, kern.k[2], kern.k[3]);
+        [a.wrapping_add(s), a.wrapping_sub(c1).wrapping_add(e), a.wrapping_sub(b1).wrapping_sub(e)]
+    };
+    for lane in 0..8 {
+        let mut y: [i16; N] = core::array::from_fn(|i| x[i][lane]);
+        if levels45 {
+            for n in 0..24 {
+                for j in 0..9 {
+                    let pos: [usize; 3] = core::array::from_fn(|i| 27 * n + j + 9 * i);
+                    let mut v = pos.map(|i| y[i]);
+                    if LAZY4[n] >> j & 1 != 0 { v[0] = red(v[0]); }
+                    for (i, a) in pos.into_iter().zip(r3(v, &kern.c[n])) { y[i] = a; }
+                }
+                for m in 0..3 {
+                    for j in 0..3 {
+                        let pos: [usize; 3] = core::array::from_fn(|i| 27 * n + 9 * m + j + 3 * i);
+                        let mut v = pos.map(|i| y[i]);
+                        if LAZY5[n] >> (3 * m + j) & 1 != 0 { v[0] = red(v[0]); }
+                        let t = if m == 0 { &kern.c[n][4..] } else { &kern.c[n][8 + 4 * (m - 1)..] };
+                        for (i, a) in pos.into_iter().zip(r3(v, t)) { y[i] = a; }
+                    }
+                }
+            }
+        } else {
+            for n6 in 0..216 {
+                let mut v: [i16; 3] = core::array::from_fn(|i| y[3 * n6 + i]);
+                if LAZY6[n6 / 9] >> (n6 % 9) & 1 != 0 { v[0] = red(v[0]); }
+                let out = r3(v, &kern.d[n6 / 2][4 * (n6 % 2)..]);
+                y[3 * n6..3 * n6 + 3].copy_from_slice(&out);
+            }
+        }
+        for i in 0..N { x[i][lane] = y[i]; }
+    }
+}
+
 #[path = "ntt_sms.rs"]
 pub mod sms;
 
@@ -1622,7 +1686,7 @@ mod tests {
             for j in 0..9 {
                 let pos: [usize; 3] = core::array::from_fn(|i| 27 * n + j + 9 * i);
                 let mut v = pos.map(|i| x[i]);
-                if n != 1 && n != 15 { v[0] = red(v[0]); }
+                if LAZY4[n] >> j & 1 != 0 { v[0] = red(v[0]); }
                 for (i, a) in pos.into_iter().zip(r3(v, &k.c[n], k)) { x[i] = a; }
             }
         }
@@ -1630,20 +1694,171 @@ mod tests {
             for j in 0..3 {
                 let pos: [usize; 3] = core::array::from_fn(|i| 9 * n + j + 3 * i);
                 let mut v = pos.map(|i| x[i]);
-                if !skip_lut5(n) { v[0] = red(v[0]); }
+                if LAZY5[n / 3] >> (3 * (n % 3) + j) & 1 != 0 { v[0] = red(v[0]); }
                 let t = if n % 3 == 0 { &k.c[n / 3][4..] } else { &k.c[n / 3][8 + 4 * (n % 3 - 1)..] };
                 for (i, a) in pos.into_iter().zip(r3(v, t, k)) { x[i] = a; }
             }
         }
-        let bound = super::super::lut_transform_bound(9721, SCHEDULES[1]) as i32;
+        let bound = LAZY_BOUND as i32;
         for n in 0..216 {
             let mut v = core::array::from_fn(|i| x[3 * n + i]);
-            v[0] = red(v[0]);
+            if LAZY6[n / 9] >> (n % 9) & 1 != 0 { v[0] = red(v[0]); }
             let t = &k.d[n / 2][4 * (n % 2)..];
             for a in r3(v, t, k) {
                 assert!(a.0 >= -bound && a.1 <= bound, "final {a:?} bound {bound}");
             }
         }
+    }
+
+    /// Search for fewer first-input reductions in levels 4 to 6 after the 9721 table front, per
+    /// level-3 node (an independent subtree): `cargo test --release lazy_search -- --ignored
+    /// --nocapture`, cap on the final outputs from `LAZY_CAP` (default the current bound).
+    #[test]
+    #[ignore]
+    fn lazy_search() {
+        type Range = (i32, i32);
+        fn fits(a: Range) -> bool { a.0 >= -32768 && a.1 <= 32767 }
+        fn add(a: Range, b: Range) -> Range { (a.0 + b.0, a.1 + b.1) }
+        fn sub(a: Range, b: Range) -> Range { (a.0 - b.1, a.1 - b.0) }
+        thread_local! {
+            static MEMO: std::cell::RefCell<std::collections::HashMap<(i32, i32, i32, i32), Range>> = Default::default();
+        }
+        fn map(a: Range, key: (i32, i32), f: impl Fn(i32) -> i32) -> Range {
+            MEMO.with(|m| {
+                *m.borrow_mut().entry((a.0, a.1, key.0, key.1)).or_insert_with(|| {
+                    (a.0..=a.1).map(f).fold((i32::MAX, i32::MIN), |r, v| (r.0.min(v), r.1.max(v)))
+                })
+            })
+        }
+        fn mul(a: Range, t: &[i16]) -> Option<Range> {
+            if !fits(a) { return None; }
+            Some(map(a, (t[0] as i32, t[1] as i32), |v| v * t[0] as i32 - ((v * t[1] as i32 + 16384) >> 15) * 9721))
+        }
+        fn red(a: Range) -> Option<Range> {
+            if !fits(a) { return None; }
+            Some(map(a, (1 << 20, 0), |v| v - ((v + 4096) >> 13) * 9721))
+        }
+        fn bare(v: [Range; 3], k: &Kernel) -> Option<[Range; 3]> {
+            let [a, b, c] = v;
+            let (s, d) = (add(b, c), sub(b, c));
+            if !fits(s) || !fits(d) { return None; }
+            let e = mul(d, &k.k[2..])?;
+            let (ac, ab) = (sub(a, c), sub(a, b));
+            let out = [add(a, s), add(ac, e), sub(ab, e)];
+            if [ac, ab].iter().chain(out.iter()).all(|&x| fits(x)) { Some(out) } else { None }
+        }
+        fn sixth(v: [Range; 3], k: &Kernel) -> [Range; 3] {
+            let [a, b, c] = v;
+            let e = mul(add(b, c), &k.k[2..]).unwrap();
+            [add(add(a, b), e), add(sub(a, b), c), sub(sub(a, c), e)]
+        }
+        fn r3(v: [Range; 3], t: &[i16], k: &Kernel) -> Option<[Range; 3]> {
+            if !v.iter().all(|&a| fits(a)) { return None; }
+            bare([v[0], mul(v[1], t)?, mul(v[2], &t[2..])?], k)
+        }
+        let k = &kernels()[1];
+        let mut x = [(0, 0); N];
+        for n in 0..4 {
+            for j in 0..27 {
+                let look = |t: usize, pos: usize| {
+                    (0..16).filter(|&pat| (0..4).all(|b| pat >> b & 1 == 0 || pos + 162 * b < BITS))
+                        .map(|pat| k.lut[n][t][pat] as i32)
+                        .fold((i32::MAX, i32::MIN), |r, v| (r.0.min(v), r.1.max(v)))
+                };
+                for h in 0..2 {
+                    let v = core::array::from_fn(|r| {
+                        let t = 2 * r;
+                        let a = look(t, j + 27 * r);
+                        let b = look(t + 1, j + 27 * r + 81);
+                        if h == 0 { add(a, b) } else { sub(a, b) }
+                    });
+                    let ys = if h == 0 { bare(v, k).unwrap() } else { sixth(v, k) };
+                    for (i, a) in ys.into_iter().enumerate() {
+                        x[162 * n + 81 * h + j + 27 * i] = a;
+                    }
+                }
+            }
+        }
+        let front = x;
+        let cap: i32 = std::env::var("LAZY_CAP").ok().map(|s| s.parse().unwrap())
+            .unwrap_or(super::super::lut_transform_bound(9721, SCHEDULES[1]) as i32);
+        // one level-3 node `n`: r[0..9] level 4 (j), r[9..18] level 5 (local node m = 0..3, j), r[18..27]
+        // level 6 (local node 0..9); the worst final output, or None if anything leaves i16 / the cap
+        let eval = |n: usize, r: &[bool; 27]| -> Option<i32> {
+            let mut x: [Range; 27] = core::array::from_fn(|i| front[27 * n + i]);
+            for j in 0..9 {
+                let pos: [usize; 3] = core::array::from_fn(|i| j + 9 * i);
+                let mut v = pos.map(|i| x[i]);
+                if r[j] { v[0] = red(v[0])?; }
+                for (i, a) in pos.into_iter().zip(r3(v, &k.c[n], k)?) { x[i] = a; }
+            }
+            for m in 0..3 {
+                let n5 = 3 * n + m;
+                for j in 0..3 {
+                    let pos: [usize; 3] = core::array::from_fn(|i| 9 * m + j + 3 * i);
+                    let mut v = pos.map(|i| x[i]);
+                    if r[9 + 3 * m + j] { v[0] = red(v[0])?; }
+                    let t = if n5 % 3 == 0 { &k.c[n5 / 3][4..] } else { &k.c[n5 / 3][8 + 4 * (n5 % 3 - 1)..] };
+                    for (i, a) in pos.into_iter().zip(r3(v, t, k)?) { x[i] = a; }
+                }
+            }
+            let mut worst = 0;
+            for l in 0..9 {
+                let n6 = 9 * n + l;
+                let mut v: [Range; 3] = core::array::from_fn(|i| x[3 * l + i]);
+                if r[18 + l] { v[0] = red(v[0])?; }
+                let t = &k.d[n6 / 2][4 * (n6 % 2)..];
+                for a in r3(v, t, k)? {
+                    worst = worst.max(a.0.abs().max(a.1.abs()));
+                }
+            }
+            if worst > cap { None } else { Some(worst) }
+        };
+        let mut total_cur = 0;
+        let mut total = 0;
+        let mut worst_all = 0;
+        let mut l4 = [0u16; 24];
+        let mut l5 = [0u16; 24];
+        let mut l6 = [0u16; 24];
+        for n in 0..24 {
+            let mut cur = [true; 27];
+            if n == 1 || n == 15 { for j in 0..9 { cur[j] = false; } }
+            for m in 0..3 { if skip_lut5(3 * n + m) { for j in 0..3 { cur[9 + 3 * m + j] = false; } } }
+            let cw = eval(n, &cur);
+            total_cur += cur.iter().filter(|&&b| b).count();
+            let mut best = cur;
+            let mut st = 0x9e3779b97f4a7c15u64 ^ n as u64;
+            let trials: usize = std::env::var("LAZY_TRIALS").ok().map_or(30, |s| s.parse().unwrap());
+            for trial in 0..trials {
+                let mut order: Vec<usize> = (0..27).collect();
+                for i in (1..27).rev() {
+                    st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+                    order.swap(i, (st % (i as u64 + 1)) as usize);
+                }
+                let mut r = if trial % 2 == 0 { [true; 27] } else { best };
+                for &i in &order {
+                    if !r[i] || (i >= 18 && std::env::var_os("LAZY_KEEP6").is_some()) { continue; }
+                    r[i] = false;
+                    if eval(n, &r).is_none() { r[i] = true; }
+                }
+                if std::env::var_os("LAZY_KEEP6").is_some() { for l in 0..9 { r[18 + l] = true; } }
+                if eval(n, &r).is_some() && r.iter().filter(|&&b| b).count() < best.iter().filter(|&&b| b).count() {
+                    best = r;
+                }
+            }
+            let w = eval(n, &best).unwrap();
+            worst_all = worst_all.max(w);
+            let c = best.iter().filter(|&&b| b).count();
+            total += c;
+            for i in 0..9 {
+                l4[n] |= (best[i] as u16) << i;
+                l5[n] |= (best[9 + i] as u16) << i;
+                l6[n] |= (best[18 + i] as u16) << i;
+            }
+            println!("node {n}: current {} (worst {:?}) -> {c} (worst {w})", cur.iter().filter(|&&b| b).count(), cw);
+        }
+        println!("cap {cap}: current {total_cur} reductions, found {total}, worst final {worst_all}");
+        println!("L4 = {l4:?}\nL5 = {l5:?}\nL6 = {l6:?}");
     }
 
     fn lanes(v: int16x8_t) -> [i16; 8] {

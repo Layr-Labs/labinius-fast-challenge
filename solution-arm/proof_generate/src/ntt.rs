@@ -450,10 +450,6 @@ pub const fn accumulator_bound(p: u32, s: Schedule) -> u64 {
     p as u64 + s.accumulate as u64 * ((p as u64 - 1) / 2) * transform_bound(p, s) as u64
 }
 
-/// [`accumulator_bound`] for the slots of the table-fed transform (`<= lut_transform_bound`).
-pub const fn lut_accumulator_bound(p: u32, s: Schedule) -> u64 {
-    p as u64 + s.accumulate as u64 * ((p as u64 - 1) / 2) * lut_transform_bound(p, s) as u64
-}
 
 const _: () = {
     let mut i = 0;

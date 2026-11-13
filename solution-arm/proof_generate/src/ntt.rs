@@ -512,12 +512,23 @@ pub fn for_blocks<T: Send>(
         .collect();
     let blocks = labinius::par::split_mut(out, &edges);
     let f = &f;
+    let started = std::time::Instant::now();
+    let ends: Vec<std::sync::atomic::AtomicU64> = edges.iter().map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let ends = &ends;
     std::thread::scope(|scope| {
-        for (block, &(s, _)) in blocks.into_iter().zip(&edges) {
-            scope.spawn(move || f(s / unit, block));
+        for (i, (block, &(s, _))) in blocks.into_iter().zip(&edges).enumerate() {
+            scope.spawn(move || {
+                f(s / unit, block);
+                ends[i].store(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            });
         }
     });
+    *BLOCK_ENDS_US.lock().unwrap() = ends.iter().map(|e| e.load(std::sync::atomic::Ordering::Relaxed)).collect();
 }
+
+/// Diagnostics: when each worker of the latest [`for_blocks`] finished, in microseconds from its
+/// start (the commitment's per-worker spread on the prover's stderr line).
+pub static BLOCK_ENDS_US: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 
 /// The transform of every element of `matrix` (`rq::ajtai_matrix` layout, residues below
 /// [`MODULUS`]) modulo each prime. The reference for [`matrix`].

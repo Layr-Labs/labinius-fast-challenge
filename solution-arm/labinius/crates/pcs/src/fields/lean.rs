@@ -101,7 +101,9 @@ impl Prepared {
         let ratios = r.iter().zip(&inverses).map(|(&x, &d)| x * d).collect();
         let scale = r[..prefix].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
         let eq = EqFactors::new(&r[prefix..], scale);
-        let parts = par::workers(words.len(), 1 << 16).min(eq.len() / 8);
+        // Four tasks per worker, claimed dynamically from the pool: a worker slowed by the host
+        // takes fewer of them instead of holding the pass up (each task keeps its own sums).
+        let parts = (4 * par::threads()).min((words.len() >> 14).max(1)).min(eq.len() / 8).max(1);
         let parts = par::map_blocks(eq.len(), parts, 64.min(eq.len()), |_, start, end| {
             neon::partial_evals_sets_tiled(words, eq.len(), start, end, |base, tile| eq.fill(base, tile))
         });
@@ -324,7 +326,8 @@ impl<'a> Switch<'a> {
         });
         let weights = eq_expand_f162(&self.prefix_r);
         let words = self.words;
-        let parts = par::workers(n, 1 << 12);
+        // Four ranges per worker, claimed dynamically, for the same reason as the partials pass.
+        let parts = (4 * par::threads()).min((n >> 10).max(1));
         let edges: Vec<_> = (0..parts).map(|t| par::block(n, parts, t, 2)).collect();
         let [p0, p1, p2] = &mut self.planes;
         let chunks = par::split_mut(p0, &edges).into_iter()

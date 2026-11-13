@@ -1,7 +1,10 @@
 """pass_d (level 6, prime 9721 schedule: FIRST13 inputs 0 and 3, no reduction of d) for U groups of six."""
 import sys
 from sched import Ins, schedule, allocate
-def build(U, outp=False):
+def build(U, outp=False, tstride=0):
+    """outp: stores go to YPTR (out of place). tstride > 0: the output is TRANSPOSED (slot-major):
+    slot k of this transform lands at YPTR + k * tstride (YPTR2 = YPTR + 36 * tstride for k >= 36),
+    one `str q` per slot."""
     ins = []; low = set(); cnt = [0]
     def v(n):
         cnt[0] += 1; return f'{n}{cnt[0]}'
@@ -39,7 +42,13 @@ def build(U, outp=False):
         t = v('t'); low.add(t)
         ins.append(Ins('L', [t], [], f'ldr q{{d0}}, [TPTR, #{16*g}]'))
         ys = bfly(red13(vin[0]), vin[1], vin[2], t, 0) + bfly(red13(vin[3]), vin[4], vin[5], t, 4)
-        for p in range(3):
+        if tstride:
+            for k in range(6):
+                slot = 6 * g + k
+                ptr, off = ('YPTR2', (slot - 36) * tstride) if slot >= 36 else ('YPTR', slot * tstride)
+                ins.append(Ins('T', [], [ys[k]], f'str q{{s0}}, [{ptr}, #{off}]'))
+        else:
+          for p in range(3):
             ptr, off = xaddr(96*g + 32*p)
             if outp: ptr = ptr.replace('XPTR', 'YPTR')
             ins.append(Ins('T', [], [ys[2*p], ys[2*p+1]], f'stp q{{s0}}, q{{s1}}, [{ptr}, #{off}]'))

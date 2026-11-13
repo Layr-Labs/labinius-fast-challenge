@@ -171,6 +171,39 @@ impl Drop for Table {
     }
 }
 
+/// Drops the page-table entries of the file-backed pages no phase reads after the fold: the
+/// witness table's mapping and the key image embedded in the binary (copied out at start, see
+/// `sms::prefetch_key`). The ranges are split over the pool, so the entries are removed on every
+/// core instead of by process exit on one CPU inside the timed window. The pages stay in the
+/// page cache; a later read would only refault them.
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+fn release_pages(values: &Table) {
+    // Whole pages on 4, 16 and 64 KiB kernels; the key's unaligned ends keep their entries.
+    const ALIGN: usize = 64 << 10;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    if let Table::Mapped { ptr, span, .. } = values {
+        ranges.push((*ptr as usize, *ptr as usize + *span));
+    }
+    let key = (SMS_DATA.0.as_ptr() as usize, SMS_DATA.0.len());
+    let (s, e) = (key.0.next_multiple_of(ALIGN), (key.0 + key.1) & !(ALIGN - 1));
+    if s < e {
+        ranges.push((s, e));
+    }
+    let parts = threads().max(1);
+    let pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .flat_map(|&(s, e)| {
+            let piece = (e - s).div_ceil(parts).next_multiple_of(ALIGN);
+            (s..e).step_by(piece).map(move |a| (a, (a + piece).min(e)))
+        })
+        .collect();
+    labinius::par::pool().run(pieces.len(), |i| {
+        let (a, b) = pieces[i];
+        // MADV_DONTNEED on read-only private file mappings: the entries go, the data stays.
+        unsafe { table_sys::madvise(a as *mut u8, b - a, 4) };
+    });
+}
+
 fn read_table(path: &str) -> Table {
     load_table(path, 1 << LOG_PACKED)
 }
@@ -968,7 +1001,19 @@ fn main() {
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
     output.write(&proof);
     timer.lap("write");
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    {
+        release_pages(&values);
+        timer.lap("release");
+    }
     eprintln!("labinius-arm {}", timer.1.join(" "));
+    #[cfg(target_arch = "aarch64")]
+    eprintln!(
+        "labinius-arm-diag key_copy_us={} key_wait_us={} commit_ends_us={}",
+        ntt::neon::sms::KEY_COPY_US.load(std::sync::atomic::Ordering::Relaxed),
+        ntt::neon::sms::KEY_WAIT_US.load(std::sync::atomic::Ordering::Relaxed),
+        ntt::BLOCK_ENDS_US.lock().unwrap().iter().map(|e| e.to_string()).collect::<Vec<_>>().join("/")
+    );
     // The proof file is complete. Let process teardown release the large allocations and
     // mappings together, instead of walking their Rust destructors first.
     std::mem::forget((values, proof, output));

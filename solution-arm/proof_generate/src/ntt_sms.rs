@@ -113,31 +113,87 @@ pub fn prefetch_key(image: &'static [u8]) {
         return;
     }
     let job = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
         let len = image.len();
         let mut v: Vec<u8> = Vec::with_capacity(len);
         let dst = v.as_mut_ptr() as usize;
+        // The image's bytes in the executable file: read with `pread` they come straight from the
+        // page cache, without faulting in (and later tearing down) ~9,000 4 KiB entries of the
+        // binary's mapping. The mapped image is the fallback.
+        let source = exe_source(image);
         // pieces of whole 2 MiB pages, so that each thread faults in its own huge pages
         let piece = len.div_ceil(8).next_multiple_of(2 << 20);
         std::thread::scope(|s| {
             for start in (0..len).step_by(piece) {
                 let n = piece.min(len - start);
+                let source = source.as_ref();
                 s.spawn(move || {
                     // SAFETY: disjoint ranges of the capacity and of the image.
-                    unsafe { core::ptr::copy_nonoverlapping(image.as_ptr().add(start), (dst as *mut u8).add(start), n) }
+                    let out = unsafe { core::slice::from_raw_parts_mut((dst as *mut u8).add(start), n) };
+                    let read = source.is_some_and(|(file, offset)| {
+                        use std::os::unix::fs::FileExt;
+                        file.read_exact_at(out, offset + start as u64).is_ok()
+                    });
+                    if !read {
+                        out.copy_from_slice(&image[start..start + n]);
+                    }
                 });
             }
         });
         // SAFETY: every byte below `len` was written above.
         unsafe { v.set_len(len) };
         let _ = KEY.set((image.as_ptr() as usize, v));
+        KEY_COPY_US.store(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     });
     *KEY_JOB.lock().unwrap() = Some(job);
 }
 
+/// The executable, opened, and the file offset of `image` in it: the one mapping of the
+/// executable in `/proc/self/maps` that holds all of `image` (read-only data, no relocations).
+fn exe_source(image: &[u8]) -> Option<(std::fs::File, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let (a, len) = (image.as_ptr() as usize, image.len());
+        let exe = std::fs::read_link("/proc/self/exe").ok()?;
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        for line in maps.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 6 || std::path::Path::new(f[5]) != exe {
+                continue;
+            }
+            let (s, e) = f[0].split_once('-')?;
+            let (s, e) = (usize::from_str_radix(s, 16).ok()?, usize::from_str_radix(e, 16).ok()?);
+            if a >= s && a + len <= e {
+                let offset = u64::from_str_radix(f[2], 16).ok()? + (a - s) as u64;
+                let file = std::fs::File::open("/proc/self/exe").ok()?;
+                return (file.metadata().ok()?.len() >= offset + len as u64).then_some((file, offset));
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = image;
+        None
+    }
+}
+
+/// Diagnostics: nanoseconds summed over the commitment's workers in the paired pass's
+/// transforms (indices, lookup and the two NEON passes), its accumulation sweeps and its chunk ends.
+pub static PROFILE_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+use std::sync::atomic::Ordering::Relaxed;
+
+/// Diagnostics for the prover's stderr line: the key copy's duration and the commitment's wait
+/// for it, in microseconds.
+pub static KEY_COPY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static KEY_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The copy of [`prefetch_key`] of `image`, once it is done (waiting for it), if one was started.
 fn key_copy(image: &'static [u8]) -> Option<&'static [u8]> {
     if let Some(job) = KEY_JOB.lock().unwrap().take() {
+        let waited = std::time::Instant::now();
         let _ = job.join();
+        KEY_WAIT_US.store(waited.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     KEY.get().filter(|(src, v)| *src == image.as_ptr() as usize && v.len() == image.len()).map(|(_, v)| &v[..])
 }
@@ -930,6 +986,7 @@ unsafe fn sums2(
             let groups = l.div_ceil(LOCK);
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
+                let t0 = std::time::Instant::now();
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
@@ -938,15 +995,19 @@ unsafe fn sums2(
                     pass_c_asm(x, kern);
                     pass_d_asm(x, kern);
                 }
+                let t1 = std::time::Instant::now();
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
+                PROFILE_NS[0].fetch_add((t1 - t0).as_nanos() as u64, Relaxed);
+                PROFILE_NS[1].fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
             }
             e += l;
         }
         let c = (end - 1) / CHUNK;
+        let t2 = std::time::Instant::now();
         for t in 0..2 {
             let dv = devs[t].as_mut_ptr();
             for d in (0..DIGITS).step_by(2) {
@@ -955,6 +1016,7 @@ unsafe fn sums2(
                 chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
             }
         }
+        PROFILE_NS[2].fetch_add(t2.elapsed().as_nanos() as u64, Relaxed);
     }
     for t in 0..2 {
         narrow(accs[t], 0, ys[t]);

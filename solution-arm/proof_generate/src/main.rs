@@ -383,9 +383,12 @@ fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
         use ntt::neon::sms;
+        labinius::par::diag(format!("c0={}", labinius::par::stamp()));
         let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+        labinius::par::diag(format!("key={}", labinius::par::stamp()));
         sms::commit(values, &matrix, threads(), modulus, out);
+        labinius::par::diag(format!("c1={}", labinius::par::stamp()));
         return;
     }
     #[cfg(target_arch = "aarch64")]
@@ -858,7 +861,9 @@ impl Proof {
 
 fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
     #[cfg(target_arch = "aarch64")]
+    labinius::par::diag(format!("s0={}", labinius::par::stamp()));
     if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
+        labinius::par::diag(format!("prep={}", labinius::par::stamp()));
         let partials = prepared.partials();
         let value = partials.iter().zip(cf::eq_expand_b128(lo))
             .fold(B128::ZERO, |a, (&v, e)| a + v * e);
@@ -875,7 +880,11 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
             rounds.push(msg.map(|v| v.0));
             coords.push(r);
             switch.fold(r);
+            if rounds.len() == 6 || rounds.len() == 8 {
+                labinius::par::diag(format!("r{}={}", rounds.len(), labinius::par::stamp()));
+            }
         }
+        labinius::par::diag(format!("s1={}", labinius::par::stamp()));
         return (partials, rounds, coords, switch.final_eval());
     }
     let mut ws = cf::Workspace::new(LOG_PACKED, 1);
@@ -946,6 +955,7 @@ impl Timer {
 }
 
 fn main() {
+    labinius::par::epoch();
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 5 || args.len() == 7,
@@ -969,6 +979,37 @@ fn main() {
     output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
+    // DIAGNOSTIC (after the proof file is complete): the fold with GROUP 30 / u16 offsets (the
+    // proof's) against GROUP 60 / u32 offsets, six interleaved rounds on the real table, the same
+    // 1024 short challenges for both; the outputs must be identical.
+    #[cfg(target_arch = "aarch64")]
+    {
+        use labinius::fold_bits as fb;
+        let mut t = Transcript::new(b"fold-ab");
+        let ch = labinius::challenge::sample_short_challenges(&mut t, COLUMNS, DEFAULT_WEIGHT, DEFAULT_BOUND);
+        let cs: Vec<fb::Challenge> = ch.iter().map(|c| fb::Challenge { positions: c.positions, signs: c.signs, weight: c.weight }).collect();
+        let words = unsafe { core::slice::from_raw_parts(values.as_ptr() as *const u128, values.len()) };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut same = true;
+        for round in 0..6 {
+            for k in 0..2 {
+                let which = if round % 2 == 0 { k } else { 1 - k };
+                let s = std::time::Instant::now();
+                let out = if which == 0 { fb::neon::fold(words, COLUMN_LEN, &cs, threads()) } else { fb::neon60::fold(words, COLUMN_LEN, &cs, threads()) };
+                let ms = s.elapsed().as_secs_f64() * 1e3;
+                if which == 0 { a.push(ms) } else { b.push(ms) }
+                if round == 0 && k == 1 {
+                    let other = if which == 0 { fb::neon60::fold(words, COLUMN_LEN, &cs, threads()) } else { fb::neon::fold(words, COLUMN_LEN, &cs, threads()) };
+                    same = out.iter().zip(&other).all(|(x, y)| x.v == y.v);
+                }
+            }
+        }
+        let med = |v: &mut Vec<f64>| { v.sort_by(|x, y| x.partial_cmp(y).unwrap()); v[v.len() / 2] };
+        eprintln!("fold-ab g30={:.2} g60={:.2} same={}", med(&mut a), med(&mut b), same);
+    }
+    if let Ok(d) = labinius::par::DIAG.lock() {
+        eprintln!("labinius-diag end={} {}", labinius::par::stamp(), d.join(" "));
+    }
     // The proof file is complete. Let process teardown release the large allocations and
     // mappings together, instead of walking their Rust destructors first.
     std::mem::forget((values, proof, output));

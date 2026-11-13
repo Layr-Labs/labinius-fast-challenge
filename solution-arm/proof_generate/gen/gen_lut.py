@@ -27,7 +27,7 @@ def build_node(n, steps):
     def mulc_eps(a):
         lo, hi, r = v('lo'), v('hi'), v('r')
         ins.append(Ins('M', [lo], [a, 'k'], 'mul v{d0}.8h, v{s0}.8h, v{s1}.h[2]'))
-        ins.append(Ins('M', [hi], [a, 'k'], 'sqrdmulh v{d0}.8h, v{s0}.8h, v{s1}.h[3]'))
+        ins.append(Ins('M', [hi], [a, 'k3'], 'sqrdmulh v{d0}.8h, v{s0}.8h, v{s1}.8h') if os.environ.get('SQVEC') else Ins('M', [hi], [a, 'k'], 'sqrdmulh v{d0}.8h, v{s0}.8h, v{s1}.h[3]'))
         ins.append(Ins('M', [r], [lo, hi, 'k'], 'mls v{d0}.8h, v{s1}.8h, v{s2}.h[0]', tie=0))
         return r
     g = 0
@@ -60,14 +60,23 @@ def base_names(a):
     for m in range(12):
         a = a.replace(f'IB{m}X', f'{{i{m}}}')
     return a
-def emit(per=27, K=8, B=17, width=6, ls=2):
-    out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"']
+def emit(per=27, K=8, B=17, width=6, ls=2, v2=False):
+    out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"'] + (['"dup v14.8h, v15.h[3]"'] if os.environ.get('SQVEC') else [])
     for n in range(4):
         for t in range(6):
             out.append(f'"ldp q{16+2*t}, q{17+2*t}, [{{lut}}, #{n*192 + 32*t}]"')
         for c in range(0, 27, per):
             ins = build_node(n, list(range(c, min(27, c + per))))
-            seq, _ = schedule(ins, skew=K, budget=B, cap=18, width=width, ls=ls)
-            asm, _ = allocate(seq, {'k': 15}, set(), reserved=RESERVED)
+            sq = bool(os.environ.get('SQVEC'))
+            for b in range(B - sq, 9, -1):
+                pass
+                try: seq, _ = schedule(ins, skew=K, budget=b, cap=18 - sq, width=width, ls=ls, v2=v2)
+                except RuntimeError: continue
+                try:
+                    asm, _ = allocate(seq, {'k': 15, 'k3': 14} if sq else {'k': 15}, set(), reserved=RESERVED)
+                    break
+                except RuntimeError:
+                    if not sq:
+                        raise
             out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
     return ',\n        '.join(out)

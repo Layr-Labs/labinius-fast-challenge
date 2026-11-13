@@ -60,7 +60,20 @@ def base_names(a):
     for m in range(12):
         a = a.replace(f'IB{m}X', f'{{i{m}}}')
     return a
-def emit(per=27, K=8, B=17, width=6, ls=2):
+def emit(per=27, K=8, B=17, width=6, ls=2, loop=False):
+    if loop:
+        # the four level-1 nodes' bodies are identical but for the table base (lut + 192 n) and
+        # the output base (x + 2592 n): one scheduled body in a four-iteration loop
+        out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"', '"mov {n}, #4"', '"2:"']
+        for t in range(6):
+            out.append(f'"ldp q{16+2*t}, q{17+2*t}, [{{lut}}, #{32*t}]"')
+        for c in range(0, 27, per):
+            ins = build_node(0, list(range(c, min(27, c + per))))
+            seq, _ = schedule(ins, skew=K, budget=B, cap=18, width=width, ls=ls)
+            asm, _ = allocate(seq, {'k': 15}, set(), reserved=RESERVED)
+            out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
+        out += ['"add {x}, {x}, #2592"', '"add {lut}, {lut}, #192"', '"subs {n}, {n}, #1"', '"b.ne 2b"']
+        return ',\n        '.join(out)
     out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"']
     for n in range(4):
         for t in range(6):

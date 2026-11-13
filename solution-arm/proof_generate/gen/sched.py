@@ -9,6 +9,27 @@ class Ins:
     def __init__(self, cls, dsts, srcs, fmt, tie=None):
         self.cls, self.dsts, self.srcs, self.fmt, self.tie = cls, list(dsts), list(srcs), fmt, tie
 
+# V2PIPES=1: explicit Neoverse V2 vector pipes per cycle (LLVM AArch64SchedNeoverseV2): M on V0/V2,
+# S on V1/V3, A on any; a q-register store also takes a V0/V1 slot (`stp q` two).
+V2PIPES = bool(os.environ.get('V2PIPES'))
+_PIPES = {'M': [(0, 2)], 'S': [(1, 3)], 'A': [(0, 1, 2, 3)], 'L': [], 'T': [(0, 1)]}
+
+def _demand(x):
+    d = _PIPES[x.cls]
+    if x.cls == 'T' and x.fmt.lstrip().startswith('stp'):
+        d = d * 2
+    return d
+
+def _fits(demands):
+    """Whether the per-cycle demands (each a tuple of allowed pipes) fit V0..V3, one op per pipe."""
+    if len(demands) > 4:
+        return False
+    def go(k, used):
+        if k == len(demands):
+            return True
+        return any(go(k + 1, used | (1 << p)) for p in demands[k] if not used >> p & 1)
+    return go(0, 0)
+
 def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31):
     n = len(ins)
     prod = {}
@@ -49,12 +70,17 @@ def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31):
         avail.sort(key=key)
         oldest = min(g for g, c in gleft.items() if c > 0)
         m = s = a = l = w = 0
+        vd = []
         issued = []
         for i in avail:
             c = ins[i].cls
             if w >= width:
                 break
-            if c == 'M':
+            if V2PIPES:
+                if c in 'LT' and l >= ls: continue
+                dem = _demand(ins[i])
+                if dem and not _fits(vd + dem): continue
+            elif c == 'M':
                 if m >= 2: continue
             elif c == 'S':
                 if s >= 2 or m + s + a >= 4: continue
@@ -67,6 +93,8 @@ def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31):
             frees = sum(1 for s_ in set(x.srcs) if s_ in uses and uses[s_] == x.srcs.count(s_) and (x.tie is None or s_ != x.srcs[x.tie]))
             if new > 0 and live + new - frees > budget and not (getattr(x, 'g', 0) == oldest and live + new - frees <= cap - reserve):
                 continue
+            if V2PIPES:
+                vd += dem
             if c in 'LT':
                 l += 1
             elif c == 'M':

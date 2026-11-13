@@ -1329,14 +1329,19 @@ fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
 /// microseconds from the fold's dispatch to the end of its last task, and the tasks it ran.
 pub static FOLD_END_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
 pub static FOLD_TASKS: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// The teams of hyperthread siblings the last bitsliced fold ran as (0: independent workers),
+/// and how many team members stopped waiting for a stalled sibling and finished on their own.
+pub static FOLD_TEAMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static FOLD_DETACHED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The diagnostics above as ` fold_end_us=a/b/.. fold_tasks=a/b/..`.
+/// The diagnostics above as ` fold_end_us=a/b/.. fold_tasks=a/b/.. fold_teams=n fold_detached=n`.
 pub fn fold_report(workers: usize) -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let w = workers.min(16);
     let ends: Vec<String> = (0..w).map(|i| FOLD_END_US[i].load(Relaxed).to_string()).collect();
     let tasks: Vec<String> = (0..w).map(|i| FOLD_TASKS[i].load(Relaxed).to_string()).collect();
-    format!(" fold_end_us={} fold_tasks={}", ends.join("/"), tasks.join("/"))
+    format!(" fold_end_us={} fold_tasks={} fold_teams={} fold_detached={}", ends.join("/"), tasks.join("/"),
+        FOLD_TEAMS.load(Relaxed), FOLD_DETACHED.load(Relaxed))
 }
 
 pub fn fold_witness_bitsliced(
@@ -2190,8 +2195,9 @@ mod bitsliced {
         acc: *const __m512i,
         bias: &[i32; SLOTS],
         output: usize,
+        slots: core::ops::Range<usize>,
     ) {
-        if !WIRE {
+        if !WIRE && slots.start == 0 {
             let output = output as *mut RingElement;
             for e in 0..LANES / 4 {
                 core::ptr::addr_of_mut!((*output.add(e)).representation).write(Representation::Coefficients);
@@ -2204,7 +2210,8 @@ mod bitsliced {
         let idx1 = _mm512_load_si512(INTERLEAVE.0[1].as_ptr() as *const __m512i);
         #[cfg(test)]
         let mut overflow = 0u32;
-        for s0 in (0..OUT_SLOTS).step_by(8) {
+        // `slots` starts at a multiple of 8: each step writes slots s0 .. s0 + 8 of every element.
+        for s0 in slots.step_by(8) {
             let n = (OUT_SLOTS - s0).min(8);
             let mask = ((1u32 << n) - 1) as __mmask8;
             let mut s_lo = [[zero; 8]; 8];
@@ -2386,7 +2393,7 @@ mod bitsliced {
                 } else {
                     out_addr + element * core::mem::size_of::<RingElement>()
                 };
-                write_acc::<WIRE>(acc.as_ptr(), bias, output);
+                write_acc::<WIRE>(acc.as_ptr(), bias, output, 0..OUT_SLOTS);
                 #[cfg(test)]
                 if let Some(start) = start { times[2] += start.elapsed(); }
                 continue;
@@ -2427,6 +2434,262 @@ mod bitsliced {
         }
         ran
     }
+
+    /// The two hyperthreads of one physical core folding one block together: a team.
+    ///
+    /// A block's work is a chain of phases: for each column group, slice (stream 8 KB per
+    /// column of the table into bit planes) then accumulate (about a hundred reads of the
+    /// L2-resident planes per table byte), and at the end the block's output write. With
+    /// independent workers the two hyperthreads of a core each hold their own planes and
+    /// counters, and usually one of them streams the table into L2 while the other accumulates
+    /// at the L2's bandwidth. A team shares one plane buffer and one counter set and moves
+    /// through the phases together: every phase has two halves (half the group's columns, the
+    /// slot pairs on either side of [`pair_split`], the output slots on either side of row 88),
+    /// one per member. The core's L2 then holds one working set instead of two, and no table
+    /// stream runs while the core accumulates.
+    ///
+    /// The team's progress is one word, [`Team::state`]: the block (task) in progress, its
+    /// phase, which halves of the phase are claimed and which are done. A member claims a free
+    /// half of the open phase only; the member whose half completes the phase opens the next
+    /// one and claims its own half of it in the same update, or, after the write, fetches the
+    /// next block. A member therefore waits only for a half its sibling is running, and holds
+    /// nothing while it waits. If the sibling does not finish within [`TEAM_WAIT`] (it has lost
+    /// its CPU: under `SCHED_IDLE` any other runnable task takes it at once), the waiting member
+    /// leaves the team and folds the remaining blocks on its own buffers like an independent
+    /// worker; the sibling, once it runs again, finds no one holding a half and completes its
+    /// block, and every later one, alone. A member that never arrives is the same case: the
+    /// other runs every half in turn.
+    #[repr(C, align(128))]
+    struct Team {
+        state: std::sync::atomic::AtomicU64,
+        _pad: [u8; 120],
+        planes: usize,
+        acc: usize,
+    }
+
+    /// How long a team member waits for its sibling's half before leaving the team: a half
+    /// takes tens of microseconds at the scored host's clock, so this is a lost CPU, not a
+    /// slow half.
+    const TEAM_WAIT: std::time::Duration = std::time::Duration::from_micros(500);
+
+    // `Team::state`: claimed halves (bits 0-1), done halves (bits 2-3), phase (bits 8-31),
+    // block task (bits 32-63) or one of the markers below.
+    /// No block fetched yet.
+    const TEAM_IDLE: u32 = u32::MAX;
+    /// A member is fetching the team's first block.
+    const TEAM_FETCH: u32 = u32::MAX - 1;
+    /// No block is left.
+    const TEAM_END: u32 = u32::MAX - 2;
+
+    #[inline(always)]
+    fn team_pack(task: u32, phase: usize, claimed: u64, done: u64) -> u64 {
+        ((task as u64) << 32) | ((phase as u64) << 8) | (done << 2) | claimed
+    }
+
+    #[inline(always)]
+    fn team_unpack(s: u64) -> (u32, usize, u64, u64) {
+        ((s >> 32) as u32, ((s >> 8) & 0xFF_FFFF) as usize, s & 3, (s >> 2) & 3)
+    }
+
+    /// A team member's loop (see [`Team`]): the blocks it took part in, and whether it left the
+    /// team for a stalled sibling (the caller then runs the remaining blocks on its own).
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+    unsafe fn run_team<const GROUP: usize, const WIRE: bool>(
+        team: &Team,
+        words: &[B128],
+        column_words: usize,
+        groups: &[Group],
+        bias: &[i32; SLOTS],
+        pair_split: usize,
+        tasks: usize,
+        next: &std::sync::atomic::AtomicUsize,
+        out_addr: usize,
+        #[cfg(test)] worker: usize,
+    ) -> (u32, bool) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+        let zero = _mm512_setzero_si512();
+        let planes = team.planes as *mut __m512i;
+        let acc = team.acc as *mut __m512i;
+        let phases = 2 * groups.len() + 1;
+        // The write's two halves: whole 8-slot rows, about half the output each.
+        let slot_split = (OUT_SLOTS / 2).next_multiple_of(8);
+        let state = &team.state;
+        let mut ran = 0u32;
+        let mut last_task = TEAM_IDLE;
+        let mut s = state.load(Acquire);
+        // A half this member already holds: the one it claimed when it completed a phase.
+        let mut job: Option<(u32, usize, usize)> = None;
+        loop {
+            let (task, p, h) = match job.take() {
+                Some(j) => j,
+                None => loop {
+                    let (task, p, claimed, _) = team_unpack(s);
+                    if task == TEAM_END {
+                        return (ran, false);
+                    }
+                    if task == TEAM_IDLE {
+                        match state.compare_exchange(s, team_pack(TEAM_FETCH, 0, 0, 0), AcqRel, Acquire) {
+                            Ok(_) => {
+                                let t = next.fetch_add(1, Relaxed);
+                                if t >= tasks {
+                                    state.store(team_pack(TEAM_END, 0, 0, 0), Release);
+                                    return (ran, false);
+                                }
+                                s = team_pack(t as u32, 0, 1, 0);
+                                state.store(s, Release);
+                                break (t as u32, 0, 0);
+                            }
+                            Err(x) => {
+                                s = x;
+                                continue;
+                            }
+                        }
+                    }
+                    if task != TEAM_FETCH && claimed != 3 {
+                        let h = (claimed & 1) as usize;
+                        match state.compare_exchange(s, s | 1 << h, AcqRel, Acquire) {
+                            Ok(_) => break (task, p, h),
+                            Err(x) => {
+                                s = x;
+                                continue;
+                            }
+                        }
+                    }
+                    // The sibling runs the open phase's other half (or fetches the first block):
+                    // wait for the state to change, or leave a sibling that has lost its CPU.
+                    let mut spins = 0u32;
+                    let mut since: Option<std::time::Instant> = None;
+                    loop {
+                        core::hint::spin_loop();
+                        let x = state.load(Acquire);
+                        if x != s {
+                            s = x;
+                            break;
+                        }
+                        spins += 1;
+                        if spins % 64 == 0 {
+                            let start = *since.get_or_insert_with(std::time::Instant::now);
+                            if start.elapsed() > TEAM_WAIT {
+                                return (ran, true);
+                            }
+                        }
+                    }
+                },
+            };
+            if task != last_task {
+                last_task = task;
+                ran += 1;
+            }
+            #[cfg(test)]
+            if p == 3 && TEST_STALL_WORKER.load(Relaxed) == worker + 1 {
+                TEST_STALL_WORKER.store(0, Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let block = tasks - 1 - task as usize;
+            let pairs = if h == 0 { 0..pair_split } else { pair_split..PAIRS };
+            if p + 1 < phases {
+                let gi = p / 2;
+                let group = &groups[gi];
+                if p % 2 == 0 {
+                    if gi == 0 {
+                        for i in 2 * BITS * pairs.start..2 * BITS * pairs.end {
+                            _mm512_store_si512(acc.add(i), zero);
+                        }
+                    }
+                    let half = group.columns / 2;
+                    let cols = if h == 0 { 0..half } else { half..group.columns };
+                    for j in cols.clone() {
+                        let src = words.as_ptr().add((group.first + j) * column_words + block * LANES);
+                        // What this member likely slices next: the next column of its half, else
+                        // the same half's first column of the next group.
+                        let next_src = if j + 1 < cols.end {
+                            src.add(column_words)
+                        } else if gi + 1 < groups.len() {
+                            let g2 = &groups[gi + 1];
+                            let j2 = if h == 0 { 0 } else { g2.columns / 2 };
+                            words.as_ptr().add((g2.first + j2) * column_words + block * LANES)
+                        } else {
+                            src
+                        };
+                        slice(src, planes.add(GUARD + j * STRIDE), next_src);
+                    }
+                } else {
+                    for q in pairs {
+                        accumulate_pair(
+                            planes,
+                            &group.terms[group.offsets[q]..group.mid[q]],
+                            &group.terms[group.mid[q]..group.offsets[q + 1]],
+                            acc.add(2 * q * BITS),
+                        );
+                    }
+                }
+            } else {
+                let element = block * (LANES / 4);
+                let output = if WIRE {
+                    out_addr + element * crate::params::N * core::mem::size_of::<i32>()
+                } else {
+                    out_addr + element * core::mem::size_of::<RingElement>()
+                };
+                let slots = if h == 0 { 0..slot_split } else { slot_split..OUT_SLOTS };
+                write_acc::<WIRE>(acc, bias, output, slots);
+            }
+            // Mark the half done. The member that completes the phase opens the next one and
+            // claims its own half of it, or after the write fetches the next block (once); a
+            // member whose sibling has not claimed the phase's other half claims it as well.
+            let mut fetched: Option<usize> = None;
+            s = state.load(Acquire);
+            loop {
+                let (t2, p2, claimed, done) = team_unpack(s);
+                debug_assert!(t2 == task && p2 == p && claimed >> h & 1 == 1 && done >> h & 1 == 0);
+                let done = done | 1 << h;
+                let (new, then) = if done == 3 {
+                    if p + 1 < phases {
+                        (team_pack(task, p + 1, 1 << h, 0), Some((task, p + 1, h)))
+                    } else {
+                        let t = *fetched.get_or_insert_with(|| next.fetch_add(1, Relaxed));
+                        if t >= tasks {
+                            (team_pack(TEAM_END, 0, 0, 0), None)
+                        } else {
+                            (team_pack(t as u32, 0, 1 << h, 0), Some((t as u32, 0, h)))
+                        }
+                    }
+                } else if claimed == 3 {
+                    (team_pack(task, p, 3, done), None)
+                } else {
+                    (team_pack(task, p, 3, done), Some((task, p, h ^ 1)))
+                };
+                match state.compare_exchange(s, new, AcqRel, Acquire) {
+                    Ok(_) => {
+                        s = new;
+                        job = then;
+                        break;
+                    }
+                    Err(x) => s = x,
+                }
+            }
+        }
+    }
+
+    /// The slot pair splitting the groups' schedule entries (plus a fixed cost per pair call)
+    /// into two halves of about equal work.
+    fn pair_split(groups: &[Group]) -> usize {
+        const PER_CALL: usize = 24;
+        let cost = |q: usize| -> usize { groups.iter().map(|g| g.offsets[q + 1] - g.offsets[q] + PER_CALL).sum() };
+        let total: usize = (0..PAIRS).map(cost).sum();
+        let mut at = 0;
+        for q in 0..PAIRS {
+            at += cost(q);
+            if 2 * at >= total {
+                return q + 1;
+            }
+        }
+        PAIRS
+    }
+
+    /// A team member (by its slot) that sleeps once inside a claimed half, for the tests of
+    /// the stalled-sibling path; 0: none.
+    #[cfg(test)]
+    static TEST_STALL_WORKER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     pub(super) fn fold_words(
         words: &[B128],
@@ -2489,6 +2752,71 @@ mod bitsliced {
             out.as_mut_ptr() as usize
         };
         let t0 = std::time::Instant::now();
+        // Teams of hyperthread siblings ([`Team`]) when the workers can be placed as pairs on
+        // the cores' two hyperthreads (the placement the commitment uses).
+        let paired = if FUSED && workers >= 4 && workers % 2 == 0 && tasks >= workers / 2 {
+            crate::par::CorePlacement::for_sibling_pairs(workers)
+        } else {
+            None
+        };
+        super::FOLD_TEAMS.store(paired.as_ref().map_or(0, |_| (workers / 2) as u32), std::sync::atomic::Ordering::Relaxed);
+        super::FOLD_DETACHED.store(0, std::sync::atomic::Ordering::Relaxed);
+        if let Some(placement) = paired {
+            // Each team's planes and counters, at the sizes [`run_worker`] allocates (the size
+            // classes [`prewarm`] stocks), with the same zero guards.
+            let mut buffers: Vec<(Vec<__m512i>, Vec<__m512i>)> = (0..workers / 2)
+                .map(|_| unsafe {
+                    let zero = _mm512_setzero_si512();
+                    let mut planes: Vec<__m512i> = Vec::with_capacity(GUARD + GROUP * STRIDE);
+                    planes.as_mut_ptr().write(zero);
+                    planes.as_mut_ptr().add(1).write(zero);
+                    for j in 0..GROUP {
+                        planes.as_mut_ptr().add(GUARD + j * STRIDE + 128).write(zero);
+                    }
+                    (planes, Vec::with_capacity(2 * PAIRS * BITS))
+                })
+                .collect();
+            let teams: Vec<Team> = buffers
+                .iter_mut()
+                .map(|(planes, acc)| Team {
+                    state: std::sync::atomic::AtomicU64::new(team_pack(TEAM_IDLE, 0, 0, 0)),
+                    _pad: [0; 120],
+                    planes: planes.as_mut_ptr() as usize,
+                    acc: acc.as_mut_ptr() as usize,
+                })
+                .collect();
+            let split = pair_split(&groups);
+            let taken: Vec<std::sync::atomic::AtomicBool> = (0..workers).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+            let (groups, bias, cuts, pending, free, next, teams, placement, taken) =
+                (&groups, &bias, &cuts, &pending, &free, &next, &teams, &placement, &taken);
+            crate::par::pool().run(workers, |_| unsafe {
+                // The slot of the CPU this runner is on, so that pinning it moves nothing.
+                let worker = placement.claim(taken);
+                let _guard = placement.pin(worker);
+                let (mut ran, detached) = run_team::<GROUP, WIRE>(
+                    &teams[worker / 2], words, column_words, groups, bias, split, tasks, next, out_addr,
+                    #[cfg(test)]
+                    worker,
+                );
+                if detached {
+                    super::FOLD_DETACHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ran += run_worker::<GROUP, FUSED, WIRE>(
+                        worker, words, column_words, groups, bias, cuts, parts, tasks, pending, free, next, out_addr,
+                        #[cfg(test)]
+                        profile,
+                    );
+                }
+                if worker < 16 {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    super::FOLD_END_US[worker].store(t0.elapsed().as_micros() as u32, Relaxed);
+                    super::FOLD_TASKS[worker].store(ran, Relaxed);
+                }
+            });
+            drop(buffers);
+            // Every block was written by its team or by a member that left one.
+            if !WIRE { unsafe { out.set_len(len) }; }
+            return out;
+        }
         let (groups, bias, cuts, pending, free, next) = (&groups, &bias, &cuts, &pending, &free, &next);
         crate::par::pool().run(workers.clamp(1, tasks), |worker| unsafe {
             let ran = run_worker::<GROUP, FUSED, WIRE>(
@@ -2525,8 +2853,8 @@ mod bitsliced {
       for fixture in 0..12{
        for slot in 0..SLOTS {let counts:[u16;LANES]=core::array::from_fn(|lane|{state^=state<<13;state^=state>>7;state^=state<<17;match fixture{0=>0,1=>32767,2=>16384,3=>if (lane+slot)&1==0{0}else{32767},_=>(state&32767)as u16}});
         for bit in 0..BITS {let bits:[u64;8]=core::array::from_fn(|word|{let mut v=0;for b in 0..64{v|=(((counts[64*word+b]>>bit)&1)as u64)<<b;}v});acc[slot*BITS+bit]=core::mem::transmute(bits);}}
-       let mut old:Vec<RingElement>=Vec::with_capacity(LANES/4);write_acc::<false>(acc.as_ptr(),&bias,old.as_mut_ptr() as usize);old.set_len(LANES/4);
-       let mut got=vec![0x1a2b3c4di32;(LANES/4)*N+64];write_acc::<true>(acc.as_ptr(),&bias,got.as_mut_ptr().add(32) as usize);
+       let mut old:Vec<RingElement>=Vec::with_capacity(LANES/4);write_acc::<false>(acc.as_ptr(),&bias,old.as_mut_ptr() as usize,0..OUT_SLOTS);old.set_len(LANES/4);
+       let mut got=vec![0x1a2b3c4di32;(LANES/4)*N+64];write_acc::<true>(acc.as_ptr(),&bias,got.as_mut_ptr().add(32) as usize,0..OUT_SLOTS);
        assert!(got[..32].iter().chain(got[32+LANES/4*N..].iter()).all(|&x|x==0x1a2b3c4d));
        for (i,e)in old.iter().enumerate(){for j in 0..N{assert_eq!(got[32+i*N+j],e.v[j]as i32,"fixture={fixture} e={i} j={j}");}}
       }
@@ -2780,6 +3108,45 @@ mod bitsliced {
                 }).collect();
                 let words: Vec<_> = (0..cs.len() * LANES).map(|i| B128(if i % 7 == 0 { 0 } else { u128::MAX })).collect();
                 assert_eq!(fold_words(&words, &cs, LANES, 2), scalar(&words, &cs, LANES));
+            }
+        }
+
+        /// Teams of hyperthread siblings (eight workers on a 4-core, 2-thread CPU set) against two
+        /// independent workers, with a short last group (odd column halves); then with one member
+        /// stalled inside a half, which its sibling must leave rather than wait for.
+        #[test]
+        fn teams_match_independent_workers() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let columns = 4 * COL_GROUP + 7;
+            let blocks = 12;
+            let words = table(columns * blocks * LANES);
+            let cs = challenges(columns);
+            let one = fold_words(&words, &cs, blocks * LANES, 2);
+            let paired = crate::par::CorePlacement::for_sibling_pairs(8).is_some();
+            for workers in [8, 6, 4] {
+                assert!(fold_words(&words, &cs, blocks * LANES, workers) == one, "workers {workers}");
+                if workers == 8 && paired {
+                    assert_eq!(super::super::FOLD_TEAMS.load(Relaxed), 4);
+                }
+            }
+            let mut wire = vec![0i32; blocks * 128 * crate::params::N];
+            fold_words_into(&words, &cs, blocks * LANES, 8, &mut wire);
+            for (i, e) in one.iter().enumerate() {
+                for j in 0..crate::params::N {
+                    assert_eq!(wire[i * crate::params::N + j], e.v[j] as i32);
+                }
+            }
+            if !paired {
+                eprintln!("no 4-core x 2-thread placement here: teams not exercised");
+                return;
+            }
+            for stalled in [3, 4] {
+                TEST_STALL_WORKER.store(stalled, Relaxed);
+                assert!(fold_words(&words, &cs, blocks * LANES, 8) == one, "stalled member {stalled}");
+                let detached = super::super::FOLD_DETACHED.load(Relaxed);
+                eprintln!("stalled member {} detached {} tasks {}", stalled, detached, super::super::fold_report(8));
+                assert!(detached >= 1, "the stalled member's sibling did not leave the team");
+                TEST_STALL_WORKER.store(0, Relaxed);
             }
         }
 

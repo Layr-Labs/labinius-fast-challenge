@@ -208,6 +208,8 @@ impl Output {
     }
     /// Called before transcript absorb, while the caller is about to run alone. Avoid file
     /// population chunks at commitment dispatch: they can delay a coarse commitment task.
+    /// Test-only since the record disabled the output prefault; the idle workers cover it.
+    #[cfg(test)]
     pub fn populate(&self) {
         let worker = Arc::downgrade(&self.state);
         let chunks = self.state.layout.len().div_ceil(CHUNK);
@@ -245,6 +247,7 @@ fn encode_vec(p: &ProofParts) -> Vec<u8> {
 
 /// Pack commitment coefficients into the buffer faulted in by idle workers. The ring math and
 /// transcript absorb stay unchanged; chunks cover disjoint, whole coefficient encodings.
+#[cfg(test)]
 pub(super) fn pack_commitment(values: &[u128], q: u128, mut bytes: Vec<u8>) -> Vec<u8> {
     pack_into(values, q, &mut bytes);
     bytes

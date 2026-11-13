@@ -931,22 +931,31 @@ unsafe fn sums2(
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
                 for i in 0..groups * LOCK {
+                    let t0 = diag::now();
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
+                    let t1 = diag::now();
                     let x = &mut xs[i];
                     lut_pass(nib, x, kern);
+                    let t2 = diag::now();
                     pass_c_asm(x, kern);
+                    let t3 = diag::now();
                     pass_d_asm(x, kern);
+                    let t4 = diag::now();
+                    diag::add([t1 - t0, t2 - t1, t3 - t2, t4 - t3, 0, 0, 1, 0]);
                 }
+                let t5 = diag::now();
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
+                let ds = diag::now() - t5; if t == 0 { diag::add([0, 0, 0, 0, ds, 0, 0, 0]) } else { diag::add([0, 0, 0, 0, 0, 0, 0, ds]) }
             }
             e += l;
         }
         let c = (end - 1) / CHUNK;
+        let t6 = diag::now();
         for t in 0..2 {
             let dv = devs[t].as_mut_ptr();
             for d in (0..DIGITS).step_by(2) {
@@ -955,12 +964,133 @@ unsafe fn sums2(
                 chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
             }
         }
+        diag::add([0, 0, 0, 0, 0, diag::now() - t6, 0, 0]);
     }
     for t in 0..2 {
         narrow(accs[t], 0, ys[t]);
         super::inverse_folded::<PB>(ys[t]);
     }
     let _ = (&mut accs, &mut ys, &mut devs);
+}
+
+/// Diagnostic only: instruction-class throughputs and isolated pass costs on the host, printed on
+/// stderr after the proof is written (`micro ...` lines). Every loop body holds independent
+/// instructions of one class; `ns/ins` x clock = cycles per instruction (reciprocal throughput).
+pub mod micro {
+    use super::*;
+    const IT: u64 = 200_000;
+    fn report(name: &str, per_iter: u64, ticks: u64, f: u64) {
+        let ns = ticks as f64 * 1e9 / f as f64;
+        eprintln!("micro {name}: ns/iter={:.3} ns/ins={:.4}", ns / IT as f64, ns / (IT * per_iter) as f64);
+    }
+    macro_rules! loop_bench {
+        ($name:expr, $k:expr, $f:expr, [$($ins:literal),*] $(, $op:ident = $kind:ident($val:expr))*) => {{
+            let t = super::diag::now();
+            core::arch::asm!(
+                "2:",
+                $($ins,)*
+                "subs {n}, {n}, #1",
+                "b.ne 2b",
+                n = inout(reg) IT => _,
+                $($op = $kind(reg) $val,)*
+                out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+                out("v8") _, out("v9") _, out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+                out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+                out("x9") _, out("x10") _,
+                options(nostack)
+            );
+            report($name, $k, super::diag::now() - t, $f);
+        }};
+    }
+    pub fn run() {
+        let f: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        let mut buf = vec![0u8; 1 << 14];
+        let b = buf.as_mut_ptr();
+        unsafe {
+            // clock: a dependent scalar chain, one cycle per add
+            loop_bench!("calib_add_chain(1cyc)", 16, f, ["add x9, x9, #1", "add x9, x9, #1", "add x9, x9, #1", "add x9, x9, #1",
+                "add x9, x9, #1", "add x9, x9, #1", "add x9, x9, #1", "add x9, x9, #1", "add x9, x9, #1", "add x9, x9, #1",
+                "add x9, x9, #1", "add x9, x9, #1", "add x9, x9, #1", "add x9, x9, #1", "add x9, x9, #1", "add x9, x9, #1"]);
+            loop_bench!("add.8h", 16, f, ["add v0.8h, v16.8h, v17.8h", "add v1.8h, v16.8h, v17.8h", "add v2.8h, v16.8h, v17.8h", "add v3.8h, v16.8h, v17.8h",
+                "add v4.8h, v16.8h, v17.8h", "add v5.8h, v16.8h, v17.8h", "add v6.8h, v16.8h, v17.8h", "add v7.8h, v16.8h, v17.8h",
+                "add v8.8h, v16.8h, v17.8h", "add v9.8h, v16.8h, v17.8h", "add v10.8h, v16.8h, v17.8h", "add v11.8h, v16.8h, v17.8h",
+                "add v12.8h, v16.8h, v17.8h", "add v13.8h, v16.8h, v17.8h", "add v14.8h, v16.8h, v17.8h", "add v15.8h, v16.8h, v17.8h"]);
+            loop_bench!("mul.8h_elem", 8, f, ["mul v0.8h, v16.8h, v15.h[2]", "mul v1.8h, v16.8h, v15.h[2]", "mul v2.8h, v16.8h, v15.h[2]", "mul v3.8h, v16.8h, v15.h[2]",
+                "mul v4.8h, v16.8h, v15.h[2]", "mul v5.8h, v16.8h, v15.h[2]", "mul v6.8h, v16.8h, v15.h[2]", "mul v7.8h, v16.8h, v15.h[2]"]);
+            loop_bench!("neon_tbl2", 8, f, ["tbl v0.16b, {{v16.16b, v17.16b}}, v24.16b", "tbl v1.16b, {{v16.16b, v17.16b}}, v24.16b", "tbl v2.16b, {{v16.16b, v17.16b}}, v24.16b", "tbl v3.16b, {{v16.16b, v17.16b}}, v24.16b",
+                "tbl v4.16b, {{v16.16b, v17.16b}}, v24.16b", "tbl v5.16b, {{v16.16b, v17.16b}}, v24.16b", "tbl v6.16b, {{v16.16b, v17.16b}}, v24.16b", "tbl v7.16b, {{v16.16b, v17.16b}}, v24.16b"]);
+            loop_bench!("ldr_q_L1", 8, f, ["ldr q0, [{p}]", "ldr q1, [{p}, #16]", "ldr q2, [{p}, #32]", "ldr q3, [{p}, #48]",
+                "ldr q4, [{p}, #64]", "ldr q5, [{p}, #80]", "ldr q6, [{p}, #96]", "ldr q7, [{p}, #112]"], p = in(b));
+            loop_bench!("str_q_L1", 8, f, ["str q0, [{p}]", "str q1, [{p}, #16]", "str q2, [{p}, #32]", "str q3, [{p}, #48]",
+                "str q4, [{p}, #64]", "str q5, [{p}, #80]", "str q6, [{p}, #96]", "str q7, [{p}, #112]"], p = in(b));
+            loop_bench!("stp_q_L1", 4, f, ["stp q0, q1, [{p}]", "stp q2, q3, [{p}, #32]", "stp q4, q5, [{p}, #64]", "stp q6, q7, [{p}, #96]"], p = in(b));
+            loop_bench!("prfm_L1", 8, f, ["prfm pldl1keep, [{p}]", "prfm pldl1keep, [{p}, #64]", "prfm pldl1keep, [{p}, #128]", "prfm pldl1keep, [{p}, #192]",
+                "prfm pldl1keep, [{p}, #256]", "prfm pldl1keep, [{p}, #320]", "prfm pldl1keep, [{p}, #384]", "prfm pldl1keep, [{p}, #448]"], p = in(b));
+            #[cfg(target_feature = "sve")]
+            {
+                loop_bench!("sve_tbl2.h", 8, f, ["tbl z0.h, {{z16.h, z17.h}}, z24.h", "tbl z1.h, {{z16.h, z17.h}}, z24.h", "tbl z2.h, {{z16.h, z17.h}}, z24.h", "tbl z3.h, {{z16.h, z17.h}}, z24.h",
+                    "tbl z4.h, {{z18.h, z19.h}}, z25.h", "tbl z5.h, {{z18.h, z19.h}}, z25.h", "tbl z6.h, {{z18.h, z19.h}}, z25.h", "tbl z7.h, {{z18.h, z19.h}}, z25.h"]);
+                loop_bench!("sve_ld1b.h", 8, f, ["ptrue p7.h", "ld1b {{z0.h}}, p7/z, [{p}]", "ld1b {{z1.h}}, p7/z, [{p}, #1, mul vl]", "ld1b {{z2.h}}, p7/z, [{p}, #2, mul vl]", "ld1b {{z3.h}}, p7/z, [{p}, #3, mul vl]",
+                    "ld1b {{z4.h}}, p7/z, [{p}, #4, mul vl]", "ld1b {{z5.h}}, p7/z, [{p}, #5, mul vl]", "ld1b {{z6.h}}, p7/z, [{p}, #6, mul vl]", "ld1b {{z7.h}}, p7/z, [{p}, #7, mul vl]"], p = in(b));
+                loop_bench!("sve_sdot.d.h", 16, f, ["sdot z0.d, z16.h, z24.h[0]", "sdot z1.d, z16.h, z24.h[0]", "sdot z2.d, z16.h, z24.h[0]", "sdot z3.d, z16.h, z24.h[0]",
+                    "sdot z4.d, z16.h, z24.h[1]", "sdot z5.d, z16.h, z24.h[1]", "sdot z6.d, z16.h, z24.h[1]", "sdot z7.d, z16.h, z24.h[1]",
+                    "sdot z8.d, z17.h, z24.h[0]", "sdot z9.d, z17.h, z24.h[0]", "sdot z10.d, z17.h, z24.h[0]", "sdot z11.d, z17.h, z24.h[0]",
+                    "sdot z12.d, z17.h, z24.h[1]", "sdot z13.d, z17.h, z24.h[1]", "sdot z14.d, z17.h, z24.h[1]", "sdot z15.d, z17.h, z24.h[1]"]);
+                // the table front's mix per output: 1 ld1b, 1 tbl, ~3.3 add, 1 str (+ 1 mul-class per output)
+                loop_bench!("lut_mix", 12, f, ["ptrue p7.h", "ld1b {{z0.h}}, p7/z, [{p}]", "tbl z1.h, {{z16.h, z17.h}}, z0.h", "add v2.8h, v1.8h, v18.8h", "add v3.8h, v1.8h, v19.8h",
+                    "add v4.8h, v1.8h, v20.8h", "str q2, [{p}, #512]", "ld1b {{z5.h}}, p7/z, [{p}, #1, mul vl]", "tbl z6.h, {{z16.h, z17.h}}, z5.h", "add v7.8h, v6.8h, v18.8h", "add v8.8h, v6.8h, v19.8h", "str q7, [{p}, #528]"], p = in(b));
+            }
+        }
+        // the generated passes on L1-hot data, one call after another
+        let kern = &kernels()[PB];
+        let mut x: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+        let nib: Box<[uint8x16_t; N / 4]> = unsafe { Box::new(core::mem::zeroed()) };
+        let calls = 20_000u64;
+        let time = |name: &str, g: &mut dyn FnMut()| {
+            for _ in 0..1000 { g(); }
+            let t = super::diag::now();
+            for _ in 0..calls { g(); }
+            let ns = (super::diag::now() - t) as f64 * 1e9 / f as f64 / calls as f64;
+            eprintln!("micro pass {name}: ns/call={ns:.1}");
+        };
+        unsafe {
+            #[cfg(target_feature = "sve")]
+            time("pass_lut_asm", &mut || { pass_lut_asm(&nib, &mut x, kern); core::hint::black_box(&mut *x); });
+            time("pass_c_asm", &mut || { pass_c_asm(&mut x, kern); core::hint::black_box(&mut *x); });
+            time("pass_d_asm", &mut || { pass_d_asm(&mut x, kern); core::hint::black_box(&mut *x); });
+        }
+        core::hint::black_box(&mut buf);
+    }
+}
+
+/// Diagnostic only: per-thread totals of `cntvct_el0` ticks spent in each part of [`sums2`]
+/// (indices, table front, levels 4-5, level 6, sink, chunk end) and the transform count, printed per
+/// worker on stderr at the end of [`commit`].
+mod diag {
+    use std::cell::Cell;
+    thread_local! { static T: Cell<[u64; 8]> = const { Cell::new([0; 8]) }; }
+    #[inline(always)]
+    pub fn now() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+    #[inline(always)]
+    pub fn add(d: [u64; 8]) {
+        T.with(|c| { let mut v = c.get(); for i in 0..8 { v[i] += d[i]; } c.set(v); });
+    }
+    pub fn report(first: usize) {
+        let f: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        let v = T.with(|c| c.get());
+        let n = v[6].max(1) as f64;
+        // ticks -> ns per 8-lane transform (the sink and chunk end are spread over the transforms too)
+        let ns = |t: u64| t as f64 * 1e9 / f as f64 / n;
+        eprintln!("diag col0={first} transforms={} freq={f} ns_per_transform: idx={:.1} lut={:.1} c={:.1} d={:.1} sinkA={:.1} sinkB={:.1} chunk={:.1}",
+            v[6], ns(v[0]), ns(v[1]), ns(v[2]), ns(v[3]), ns(v[4]), ns(v[7]), ns(v[5]));
+    }
 }
 
 #[inline]
@@ -1120,6 +1250,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 }
             }
         }
+        diag::report(first);
     });
 }
 

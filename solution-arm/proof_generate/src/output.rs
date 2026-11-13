@@ -7,7 +7,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub(super) struct ProofParts {
     pub modulus: u128,
+    /// Commitment bytes owned here; empty when they were written in place (see below).
     pub commitment: Vec<u8>,
+    /// Length of a commitment that `prove` wrote directly into the mapped proof file at
+    /// `Layout::HEAD` (0 when the bytes are in `commitment`). Exactly one of the two is non-empty.
+    pub commitment_mapped: usize,
     pub partials: Vec<u128>,
     pub rounds: Vec<[[u64; 3]; 2]>,
     pub opened: [u64; 3],
@@ -37,7 +41,7 @@ impl Layout {
     }
     fn parts(p: &ProofParts) -> Self {
         Self {
-            commitment: p.commitment.len(),
+            commitment: p.commitment.len() + p.commitment_mapped,
             partials: p.partials.len(),
             rounds: p.rounds.len(),
             row: p.row.len(),
@@ -57,6 +61,8 @@ impl Layout {
 unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
     assert_eq!(layout, Layout::parts(p));
     assert!(layout.len() as u64 <= LIMIT, "proof exceeds the size limit");
+    // An in-place commitment is already at `HEAD..middle_at()` of this same mapping.
+    assert!(p.commitment_mapped == 0 || p.commitment.is_empty());
     let put = |at: &mut usize, bytes: &[u8]| {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(*at), bytes.len());
         *at += bytes.len();
@@ -64,7 +70,9 @@ unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
     let mut at = 0;
     put(&mut at, &1u32.to_le_bytes());
     put(&mut at, &p.modulus.to_le_bytes());
-    put(&mut at, &(p.commitment.len() as u64).to_le_bytes());
+    // The byte string's length is the layout's: an in-place commitment has no owned bytes but
+    // occupies `HEAD..middle_at()` all the same.
+    put(&mut at, &(layout.commitment as u64).to_le_bytes());
     assert_eq!(at, Layout::HEAD);
     let mut at = layout.middle_at();
     put(&mut at, &(p.partials.len() as u64).to_le_bytes());
@@ -206,6 +214,30 @@ impl Output {
         self.finish_setup();
         self.commitment.lock().unwrap().take().expect("commitment buffer used once")
     }
+    /// The commitment's final place in the mapped proof file, `HEAD..HEAD + len`, when the
+    /// fixed layout is mapped; the commit then writes the wire bytes there once and the final
+    /// encode skips copying them. `None` leaves the incumbent separate buffer in its slot for
+    /// `commitment_buffer`.
+    #[allow(clippy::mut_from_ref)]
+    pub fn commitment_in_place(&self) -> Option<&mut [u8]> {
+        let spare = self.commitment_buffer();
+        let len = self.state.layout.commitment;
+        let map = match self.state.mapped() {
+            Some(map) if spare.len() == len && Layout::HEAD + len <= self.state.layout.len() => map,
+            _ => {
+                *self.commitment.lock().unwrap() = Some(spare);
+                return None;
+            }
+        };
+        // The setup thread already faulted this buffer; dropping it here would put a munmap on
+        // the critical path. Process teardown releases it with the other allocations.
+        std::mem::forget(spare);
+        // SAFETY: setup has finished, so the mapping exists for as long as `self.state` (held by
+        // `self`); the range lies inside the mapped layout; the one-shot slot taken above means
+        // no second view of it is handed out; until `write` only the caller writes these bytes
+        // (population jobs only advise the kernel), and `encode_into` does not touch them.
+        Some(unsafe { core::slice::from_raw_parts_mut((map.addr + Layout::HEAD) as *mut u8, len) })
+    }
     /// Called before transcript absorb, while the caller is about to run alone. Avoid file
     /// population chunks at commitment dispatch: they can delay a coarse commitment task.
     pub fn populate(&self) {
@@ -227,6 +259,8 @@ impl Output {
         }
         // A generic modulus/layout or unsupported file mapping still gets exactly the codec.
         // Ordinary write shares the harness's persistence contract: neither path calls fsync.
+        // (An in-place commitment exists only when the mapped instance layout does, above.)
+        assert_eq!(p.commitment_mapped, 0, "in-place commitment without its mapped layout");
         std::fs::write(&self.state.path, encode_vec(p)).expect("write proof");
     }
     fn quiesce(&self) {
@@ -307,6 +341,7 @@ mod tests {
         let p = ProofParts {
             modulus: 35039150080,
             commitment: (0..n * 648 + 3).map(|_| next() as u8).collect(),
+            commitment_mapped: 0,
             partials: (0..n + 2).map(|_| (next() as u128) << 64 | next() as u128).collect(),
             rounds: (0..n + 1).map(|_| [[next(), next(), next()], [next(), next(), next()]]).collect(),
             opened: [next(), next(), next()],
@@ -346,6 +381,65 @@ mod tests {
             assert_eq!(pack_commitment(&values, q, vec![0; old.len()]), old, "width {width}");
         }
         assert_eq!(Layout::instance(35039150080).len(), 13958612);
+    }
+
+    /// The fixture with its commitment moved out of `p`, as `prove` leaves an in-place one.
+    fn mapped_fixture(n: usize) -> (ProofParts, Vec<u8>, Vec<u8>) {
+        let (mut p, want) = fixture(n);
+        let commitment = core::mem::take(&mut p.commitment);
+        p.commitment_mapped = commitment.len();
+        (p, commitment, want)
+    }
+
+    /// A nonempty commitment already at `HEAD..middle_at()` of the output: the encoding leaves
+    /// those bytes alone and its header still announces their length (an empty owned buffer's
+    /// zero made the checker read the whole proof as a 0-byte commitment and run out of input).
+    #[test]
+    fn mapped_commitment_encodes_as_bincode() {
+        for n in [0, 1, 37] {
+            let (p, commitment, want) = mapped_fixture(n);
+            let layout = Layout::parts(&p);
+            assert_eq!(layout.len(), want.len());
+            assert!(!commitment.is_empty());
+            let mut out = vec![0x5a; layout.len()];
+            out[Layout::HEAD..layout.middle_at()].copy_from_slice(&commitment);
+            unsafe { encode_into(&p, layout, out.as_mut_ptr()); }
+            assert_eq!(&out[20..28], &(commitment.len() as u64).to_le_bytes(), "n {n}");
+            assert_eq!(out, want, "n {n}");
+            // Owned and in-place commitments of the same bytes encode identically.
+            let (owned, _) = fixture(n);
+            assert_eq!(encode_vec(&owned), out);
+        }
+    }
+
+    /// The same through the mapped proof file, as `prove` and `Output::write` run it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_commitment_in_the_proof_file_matches_bincode() {
+        let path = std::env::temp_dir().join(format!("labinius-mapped-commitment-{}", std::process::id()));
+        for n in [1, 37] {
+            let (p, commitment, want) = mapped_fixture(n);
+            let output = test_output(path.to_str().unwrap(), Layout::parts(&p), false);
+            let map = output.state.mapped().expect("test filesystem must support mapping");
+            unsafe {
+                core::ptr::copy_nonoverlapping(commitment.as_ptr(), (map.addr + Layout::HEAD) as *mut u8, commitment.len());
+            }
+            output.write(&p);
+            assert_eq!(std::fs::read(&path).unwrap(), want, "n {n}");
+            drop(output);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Without the mapping there is nowhere the in-place bytes could be: the write fallback
+    /// refuses rather than encoding a commitment it does not have.
+    #[test]
+    #[should_panic(expected = "in-place commitment without its mapped layout")]
+    fn mapped_commitment_never_takes_the_write_fallback() {
+        let (p, _, _) = mapped_fixture(1);
+        let path = std::env::temp_dir().join(format!("labinius-mapped-fallback-{}", std::process::id()));
+        let output = test_output(path.to_str().unwrap(), Layout::parts(&p), true);
+        output.write(&p);
     }
 
     fn test_output(path: &str, layout: Layout, force_write: bool) -> Output {

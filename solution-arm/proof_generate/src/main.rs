@@ -901,14 +901,18 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
-    let mut commitment = output.commitment_buffer();
-    commit(values, modulus, &mut commitment);
+    // Commit straight into the commitment's place in the mapped proof file when possible.
+    let mut in_place = output.commitment_in_place();
+    let mut owned = if in_place.is_none() { output.commitment_buffer() } else { Vec::new() };
+    let commitment_mapped = in_place.as_ref().map_or(0, |s| s.len());
+    let commitment: &mut [u8] = match in_place.as_mut() { Some(s) => &mut **s, None => owned.as_mut_slice() };
+    commit(values, modulus, commitment);
     labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
     // round, and idle population workers measurably slowed it. The final encode faults the
     // file pages itself, in parallel.
-    let mut t = transcript(seed, modulus, &commitment);
+    let mut t = transcript(seed, modulus, commitment);
     let lo = t.sample_b128(b"r-lo", 7);
     let hi = t.sample_b128(b"r-hi", LOG_PACKED);
     let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t);
@@ -922,7 +926,8 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
     timer.lap("fold");
     ProofParts {
         modulus,
-        commitment,
+        commitment: owned,
+        commitment_mapped,
         partials: partials.iter().map(|v| v.0).collect(),
         rounds,
         opened: opened.0,

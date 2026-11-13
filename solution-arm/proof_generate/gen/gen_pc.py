@@ -3,6 +3,11 @@ import sys, os
 from sched import Ins, schedule, allocate
 NODES = [1, 11, 15, 16, 17, 19, 20, 22, 23, 25, 28, 30, 31, 32, 34, 35, 36, 37, 44, 50, 56, 59, 61, 65, 67, 70, 71]
 def skip_lut5(n): return n in NODES
+# Optional per-butterfly first-input reductions (lazy schedule, from the `lazy_search` test):
+# L4[n] bit j + 3 i: level-4 butterfly of slots j + 3 i (+ 0, 9, 18) of node n; L5[n] bit 3 q + j:
+# level-5 butterfly q of the group started at j. None: the node-level schedule below.
+L4 = None
+L5 = None
 def kind(n):
     skip = sum(1 << g for g in range(3) if skip_lut5(3 * n + g))
     return (n != 1 and n != 15, skip)
@@ -44,12 +49,12 @@ def build(nodes):
             for i in range(9):
                 d = v('in'); vv.append(d)
                 ins.append(Ins('L', [d], [], f'ldr q{{d0}}, [XPTR, #{16*(at+3*i)}]'))
-            if r4:
-                for i in range(3): vv[i] = red13(vv[i])
+            for i in range(3):
+                if (L4[n] >> (j + 3 * i) & 1) if L4 else r4: vv[i] = red13(vv[i])
             for i in range(3):
                 vv[i], vv[i+3], vv[i+6] = bfly(vv[i], vv[i+3], vv[i+6], t0, 0)
             for q in range(3):
-                if not (skip >> q & 1): vv[3*q] = red13(vv[3*q])
+                if (L5[n] >> (3 * q + j) & 1) if L5 else not (skip >> q & 1): vv[3*q] = red13(vv[3*q])
             outs = [bfly(vv[0], vv[1], vv[2], t0, 4), bfly(vv[3], vv[4], vv[5], t1, 0), bfly(vv[6], vv[7], vv[8], t1, 4)]
             for q, (a, b, c) in enumerate(outs):
                 for o, val in zip((0, 3, 6), (a, b, c)):

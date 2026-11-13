@@ -1,7 +1,14 @@
 """pass_d (level 6, prime 9721 schedule: FIRST13 inputs 0 and 3, no reduction of d) for U groups of six."""
 import sys
 from sched import Ins, schedule, allocate
-def build(U):
+# Optional level-6 first-input reductions (`LAZY6`): L6[n] bit l reduces the first input of the
+# butterfly of slots 3 (9 n + l) + i. None: both groups' first inputs reduced (the default).
+L6 = None
+def reduces(q, h):
+    n6 = 2 * q + h
+    return True if L6 is None else bool(L6[n6 // 9] >> (n6 % 9) & 1)
+def build(U, q0=0, cls=None):
+    """cls = (r0, r3): the indirect form, group g at XG{g} / TG{g}, every group of that class."""
     ins = []; low = set(); cnt = [0]
     def v(n):
         cnt[0] += 1; return f'{n}{cnt[0]}'
@@ -33,14 +40,18 @@ def build(U):
     for g in range(U):
         start = len(ins)
         vin = [v('in') for _ in range(6)]
+        addr = (lambda p: (f'XG{g}', 32*p)) if cls else (lambda p: xaddr(96*g + 32*p))
         for p in range(3):
-            ptr, off = xaddr(96*g + 32*p)
+            ptr, off = addr(p)
             ins.append(Ins('L', [vin[2*p], vin[2*p+1]], [], f'ldp q{{d0}}, q{{d1}}, [{ptr}, #{off}]'))
         t = v('t'); low.add(t)
-        ins.append(Ins('L', [t], [], f'ldr q{{d0}}, [TPTR, #{16*g}]'))
-        ys = bfly(red13(vin[0]), vin[1], vin[2], t, 0) + bfly(red13(vin[3]), vin[4], vin[5], t, 4)
+        ins.append(Ins('L', [t], [], f'ldr q{{d0}}, [TG{g}]' if cls else f'ldr q{{d0}}, [TPTR, #{16*g}]'))
+        r0, r3 = cls if cls else (reduces(q0 + g, 0), reduces(q0 + g, 1))
+        a0 = red13(vin[0]) if r0 else vin[0]
+        a3 = red13(vin[3]) if r3 else vin[3]
+        ys = bfly(a0, vin[1], vin[2], t, 0) + bfly(a3, vin[4], vin[5], t, 4)
         for p in range(3):
-            ptr, off = xaddr(96*g + 32*p)
+            ptr, off = addr(p)
             ins.append(Ins('T', [], [ys[2*p], ys[2*p+1]], f'stp q{{s0}}, q{{s1}}, [{ptr}, #{off}]'))
         for x in ins[start:]:
             x.g = g

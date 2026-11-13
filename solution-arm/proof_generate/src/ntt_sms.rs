@@ -634,13 +634,17 @@ unsafe fn narrow(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
 }
 
 /// The largest product of a key slot (a centered residue) and a transform slot.
-const PRODUCT: u64 = (P1 as u64 - 1) / 2 * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64;
-/// `2^16 mod p`, centered.
-const C16: i32 = centered(1 << 16, P1) as i32;
+const PRODUCT: u64 = (P1 as u64 - 1) / 2 * super::LAZY_BOUND as u64;
+/// The split of [`narrow_digit`]: `v = h 2^SPLIT + l`.
+const SPLIT: i32 = 18;
+/// `2^SPLIT mod p`, centered: `-323` for 9721, small, so `h C + l` stays far inside `i32`.
+const C16: i32 = centered(1 << SPLIT, P1) as i32;
+const _: () = assert!(C16 == -323);
 /// `round(2^31 / p)`.
 const V31: i32 = ((1u64 << 32) / P1 as u64).div_ceil(2) as i32;
-// a chunk's digit sums `v` (|v| <= CHUNK PRODUCT): `(v >> 16) C16 + (v mod 2^16)` fits i32
-const _: () = assert!(((CHUNK as u64 * PRODUCT >> 16) + 1) * C16.unsigned_abs() as u64 + 65535 < i32::MAX as u64);
+// a chunk's digit sums `v` (|v| <= CHUNK PRODUCT): `(v >> SPLIT) C16 + (v mod 2^SPLIT)` fits i32
+// with room for the Barrett step's rounding (`|t| < 2^30`)
+const _: () = assert!(((CHUNK as u64 * PRODUCT >> SPLIT) + 1) * C16.unsigned_abs() as u64 + (1 << SPLIT) < 1 << 30);
 
 /// [`narrow`] for a chunk's digit rows, in integers: `v = h 2^16 + l`, `l = v mod 2^16`, so
 /// `v = h (2^16 mod p) + l (mod p)` within `i32`, then a 32-bit Barrett reduction to
@@ -656,9 +660,9 @@ unsafe fn narrow_digits(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
 #[inline(always)]
 unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
     let c = vdupq_n_s32(C16);
-    let low = vdupq_n_s32(0xFFFF);
+    let low = vdupq_n_s32((1 << SPLIT) - 1);
     let half = |a: int64x2_t, b: int64x2_t| -> int32x4_t {
-        let h = vshrn_high_n_s64::<16>(vshrn_n_s64::<16>(a), b);
+        let h = vshrn_high_n_s64::<18>(vshrn_n_s64::<18>(a), b);
         let l = vandq_s32(vmovn_high_s64(vmovn_s64(a), b), low);
         let t = vmlaq_s32(l, h, c);
         vmlsq_n_s32(t, vqrdmulhq_n_s32(t, V31), P1 as i32)
@@ -1203,7 +1207,7 @@ mod tests {
     fn digit_narrowing_is_exact() {
         let bound = (CHUNK as u64 * PRODUCT) as i64;
         let mut state = 5u64;
-        let edge = [bound, -bound, bound - 1, -bound + 1, 0, 1, -1, 65535, -65536, 65536, 4860, -4861];
+        let edge = [bound, -bound, bound - 1, -bound + 1, 0, 1, -1, 65535, -65536, 65536, 4860, -4861, (1 << 18) - 1, -(1 << 18), 1 << 18];
         let mut want = vec![0i64; ROWS * 8 * N];
         for (i, w) in want.iter_mut().enumerate() {
             *w = if i < edge.len() { edge[i] } else { (crate::ntt::tests::xorshift(&mut state) % (2 * bound as u64 + 1)) as i64 - bound };
@@ -1462,9 +1466,13 @@ mod leap_bench {
             let bound = crate::ntt::lut_transform_bound(P1, crate::ntt::SCHEDULES[PB]) as u64;
             let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             let raw: Vec<i16> = (0..N * 8).map(|_| ((crate::ntt::tests::xorshift(&mut st) % (2 * bound + 1)) as i64 - bound as i64) as i16).collect();
+            let _ = bound;
             for (i, v) in a.iter_mut().enumerate() { *v = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) }; }
             let mut b = a.clone();
-            unsafe { pass_d::<PB, false>(&mut a, kern, &[], &mut []); pass_d_asm(&mut b, kern); }
+            unsafe { pass_d_asm(&mut b, kern); }
+            let mut r: Box<[[i16; 8]; N]> = Box::new(unsafe { core::mem::transmute(*a) });
+            super::lazy_ref(&mut r, kern, false);
+            for (v, w) in a.iter_mut().zip(r.iter()) { *v = unsafe { vld1q_s16(w.as_ptr()) }; }
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
             assert_eq!(x, y);
@@ -1505,7 +1513,10 @@ mod leap_bench {
             let raw: Vec<i16> = (0..N * 8).map(|_| crate::ntt::tests::xorshift(&mut st) as i16).collect();
             for (i, v) in a.iter_mut().enumerate() { *v = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) }; }
             let mut b = a.clone();
-            unsafe { pass_c::<4>(&mut a, kern); pass_c_asm(&mut b, kern); }
+            unsafe { pass_c_asm(&mut b, kern); }
+            let mut r: Box<[[i16; 8]; N]> = Box::new(unsafe { core::mem::transmute(*a) });
+            super::lazy_ref(&mut r, kern, true);
+            for (v, w) in a.iter_mut().zip(r.iter()) { *v = unsafe { vld1q_s16(w.as_ptr()) }; }
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
             assert_eq!(x, y);

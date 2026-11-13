@@ -824,19 +824,6 @@ unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Ker
     pass_lut_asm(nib, x, kern);
 }
 
-/// Diagnostic only: side 1 of the paired test runs the table front as a 4-iteration loop.
-#[cfg(target_feature = "sve")]
-#[inline(always)]
-unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    if ctx::side1() { super::pass_lut_loop(nib, x, kern) } else { pass_lut_asm(nib, x, kern) }
-}
-
-#[cfg(not(target_feature = "sve"))]
-#[inline(always)]
-unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    lut_pass(nib, x, kern)
-}
-
 #[cfg(not(target_feature = "sve"))]
 #[inline(always)]
 unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
@@ -885,8 +872,7 @@ unsafe fn sums(
                 indices_asm(&at, nib);
                 let x = &mut xs[i];
                 lut_pass(nib, sc, kern);
-                pass_c_asm(sc, kern);
-                pass_d_out(sc, x, kern);
+                pass_cd_out(sc, x, kern);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             // the chunk's first sweep starts the digit rows' sums afresh
@@ -951,9 +937,8 @@ unsafe fn sums2(
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
-                    lut_pass2(nib, sc, kern);
-                    pass_c_asm(sc, kern);
-                    pass_d_out(sc, x, kern);
+                    lut_pass(nib, sc, kern);
+                    if ctx::side1() { pass_cd_out(sc, x, kern); } else { pass_c_asm(sc, kern); pass_d_out(sc, x, kern); }
                 }
                 ctx::add([ctx::now() - t0, 0, 0, 0, (groups * LOCK) as u64]);
                 let t1 = ctx::now();
@@ -1537,6 +1522,47 @@ mod leap_bench {
     }
 
     #[test]
+    fn pass_cd_out_matches() {
+        let kern = &kernels()[PB];
+        let mut st = 17u64;
+        for _ in 0..50 {
+            let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            let raw: Vec<i16> = (0..N * 8).map(|_| crate::ntt::tests::xorshift(&mut st) as i16).collect();
+            for (i, v) in a.iter_mut().enumerate() { *v = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) }; }
+            let mut b = a.clone();
+            let mut ya: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            let mut yb = ya.clone();
+            unsafe { pass_c_asm(&mut a, kern); pass_d_out(&a, &mut ya, kern); pass_cd_out(&mut b, &mut yb, kern); }
+            let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(ya.as_ptr() as *const [i16; 8], N) };
+            let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(yb.as_ptr() as *const [i16; 8], N) };
+            assert_eq!(x, y);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn fused_timing() {
+        let kern = &kernels()[PB];
+        let mut st = 5u64;
+        let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+        let raw: Vec<i16> = (0..N * 8).map(|_| (crate::ntt::tests::xorshift(&mut st) % 9000) as i16).collect();
+        for (i, v) in a.iter_mut().enumerate() { *v = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) }; }
+        let mut s = a.clone();
+        let mut y = a.clone();
+        let reps = 20000;
+        let (mut best0, mut best1) = (f64::MAX, f64::MAX);
+        for _ in 0..15 {
+            let t = std::time::Instant::now();
+            for _ in 0..reps { s.copy_from_slice(&a[..]); unsafe { pass_c_asm(&mut s, kern); pass_d_out(&s, &mut y, kern); } core::hint::black_box(&mut *y); }
+            best0 = best0.min(t.elapsed().as_nanos() as f64 / reps as f64);
+            let t = std::time::Instant::now();
+            for _ in 0..reps { s.copy_from_slice(&a[..]); unsafe { pass_cd_out(&mut s, &mut y, kern); } core::hint::black_box(&mut *y); }
+            best1 = best1.min(t.elapsed().as_nanos() as f64 / reps as f64);
+        }
+        println!("crown pass_c + pass_d_out {best0:.0} ns, fused pass_cd_out {best1:.0} ns ({:+.1}%) (incl. copy)", 100.0 * (best1 / best0 - 1.0));
+    }
+
+    #[test]
     #[ignore]
     #[cfg(target_feature = "sve")]
     fn transform_timing() {
@@ -1583,9 +1609,10 @@ mod leap_bench {
         }
     }
 }
+
 /// Diagnostic only: same-core paired comparison inside the commitment. Every worker alternates its
-/// batch pairs between side 0 (the crown: `pass_lut_asm`, straight line) and side 1 (`pass_lut_loop`,
-/// the same code as a 4-iteration loop); workers 0 and 4 run side 0 on both (controls). Per side `cntvct` totals of the
+/// batch pairs between side 0 (the crown: `pass_c_asm` then `pass_d_out`) and side 1 (`pass_cd_out`,
+/// levels 4-6 fused); workers 0 and 4 run side 0 on both (controls). Per side `cntvct` totals of the
 /// transforms (table front included) and of the sinks, and the transform count.
 mod ctx {
     use std::cell::Cell;
@@ -1616,7 +1643,7 @@ mod ctx {
         let w = SEL.with(|s| s.get());
         let ns = |s: usize, i: usize| v[s][i] as f64 * 1e9 / f as f64 / v[s][4].max(1) as f64;
         eprintln!("ctxf w={w} side1={} transforms={}/{} s0_tr_ns={:.0} s1_tr_ns={:.0} tr_delta%={:+.2} s0_sink_ns={:.0} s1_sink_ns={:.0} sink_delta%={:+.2}",
-            if control() { "control" } else { "lutloop" }, v[0][4], v[1][4], ns(0, 0), ns(1, 0), 100.0 * (ns(1, 0) / ns(0, 0) - 1.0),
+            if control() { "control" } else { "fused" }, v[0][4], v[1][4], ns(0, 0), ns(1, 0), 100.0 * (ns(1, 0) / ns(0, 0) - 1.0),
             ns(0, 1), ns(1, 1), 100.0 * (ns(1, 1) / ns(0, 1) - 1.0));
     }
 }

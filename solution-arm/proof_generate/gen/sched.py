@@ -4,18 +4,24 @@ Ins(cls, dsts, srcs, fmt, tie): fmt placeholders {d0} {d1} {s0} {s1} ... are reg
 write them as v{d0}.8h or q{d0}. Classes: M mul-class (V0/V2), S shift (V1/V3), A any vector pipe,
 L load, T store. tie: index of the source whose register d0 reuses (destructive ops like mls)."""
 LAT = {'M': 4, 'S': 2, 'A': 2, 'L': 6, 'T': 1}
+# TVEC=1: V2 pipe model with store data: str q takes one of V0/V1 and stp q two; M on V0/V2, S on V1/V3,
+# A on any. fits() is Hall's condition for assigning one cycle's vector uops to the four pipes.
+TVEC = os.environ.get('TVEC') == '1'
+def fits(m, s, a, t):
+    return m <= 2 and s <= 2 and t <= 2 and m + t <= 3 and s + t <= 3 and m + s + t <= 4 and m + s + a + t <= 4
 
 class Ins:
     def __init__(self, cls, dsts, srcs, fmt, tie=None):
         self.cls, self.dsts, self.srcs, self.fmt, self.tie = cls, list(dsts), list(srcs), fmt, tie
 
-def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31):
+def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31, lres=0):
     n = len(ins)
     prod = {}
     deps = []
     for i, x in enumerate(ins):
-        deps.append(sorted({prod[s] for s in x.srcs if s in prod}))
-        for d in x.dsts:
+        # msrc/mdst: memory-order tokens (no registers), e.g. a reload after its spill store
+        deps.append(sorted({prod[s] for s in x.srcs + getattr(x, 'msrc', []) if s in prod}))
+        for d in x.dsts + getattr(x, 'mdst', []):
             prod[d] = i
     # memory: keep stores in program order relative to earlier loads of the same group (disjoint
     # addresses across groups, so only order T after all earlier L to be safe w.r.t. aliasing of x)
@@ -48,7 +54,7 @@ def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31):
         avail = [i for i in ready if all(finish[j] <= cycle for j in deps[i])]
         avail.sort(key=key)
         oldest = min(g for g, c in gleft.items() if c > 0)
-        m = s = a = l = w = 0
+        m = s = a = l = w = tv = 0
         issued = []
         for i in avail:
             c = ins[i].cls
@@ -62,13 +68,18 @@ def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31):
                 if m + s + a >= 4: continue
             else:
                 if l >= ls: continue
+            if TVEC:
+                dm, ds, da, dt = {'M': (1, 0, 0, 0), 'S': (0, 1, 0, 0), 'A': (0, 0, 1, 0), 'L': (0, 0, 0, 0), 'T': (0, 0, 0, len(ins[i].srcs))}[c]
+                if not fits(m + dm, s + ds, a + da, tv + dt): continue
             x = ins[i]
             new = len(x.dsts) - (1 if x.tie is not None else 0)
             frees = sum(1 for s_ in set(x.srcs) if s_ in uses and uses[s_] == x.srcs.count(s_) and (x.tie is None or s_ != x.srcs[x.tie]))
-            if new > 0 and live + new - frees > budget and not (getattr(x, 'g', 0) == oldest and live + new - frees <= cap - reserve):
+            lr = lres if c == "L" else 0
+            if new > 0 and live + new - frees > budget - lr and not (getattr(x, "g", 0) == oldest and live + new - frees <= cap - reserve - lr):
                 continue
             if c in 'LT':
                 l += 1
+                if c == 'T': tv += len(ins[i].srcs)
             elif c == 'M':
                 m += 1
             elif c == 'S':
@@ -100,7 +111,8 @@ def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31):
         stall = 0 if issued else stall + 1
         cycle += 1
         if stall > 100:
-            raise RuntimeError('schedule deadlock')
+            raise RuntimeError(f'schedule deadlock: live {live}, oldest {oldest}, left {left}, ready '
+                               + '; '.join(f'{ins[i].fmt}/g{getattr(ins[i], "g", 0)}' for i in ready[:6]))
     return [ins[i] for i in order], cycle
 
 def allocate(seq, pinned, low, reserved=()):

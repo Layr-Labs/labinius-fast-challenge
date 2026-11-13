@@ -174,20 +174,17 @@ impl Output {
     pub fn start(path: &str, q: u128) -> Self {
         let layout = Layout::instance(q);
         let state = Arc::new(State { path: path.to_owned(), layout, map: OnceLock::new() });
-        let mut commitment = vec![0u8; layout.commitment];
-        let addr = commitment.as_mut_ptr() as usize;
-        let bytes = commitment.len();
+        // Fresh zero pages; the commitment's workers fault them in as they write.
+        let commitment = vec![0u8; layout.commitment];
         let worker = Arc::downgrade(&state);
         // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
         let setup = std::thread::spawn(move || {
             let state = worker.upgrade();
             if let Some(state) = &state { let _ = state.mapped(); }
             labinius::challenge::warm();
-            for offset in (0..bytes).step_by(4096) {
-                unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
-            }
-            // Fault the whole proof mapping while the table read still runs on the other
-            // cores: the write phase then only has to encode, not populate file pages.
+            // Fault the whole proof mapping alongside the commitment (which no longer waits for
+            // this thread; its work-stealing absorbs the core this takes): the write phase then
+            // only has to encode, not populate file pages. Joined before the proof is written.
             if let Some(state) = &state {
                 for i in 0..state.layout.len().div_ceil(CHUNK) { state.populate(i); }
             }
@@ -202,8 +199,9 @@ impl Output {
             thread.join().expect("output preparation thread panicked");
         }
     }
+    /// The commitment's output buffer: a plain zeroed vector the setup thread never touches, so
+    /// the commitment need not wait for the setup (the proof mapping's population).
     pub fn commitment_buffer(&self) -> Vec<u8> {
-        self.finish_setup();
         self.commitment.lock().unwrap().take().expect("commitment buffer used once")
     }
     /// Called before transcript absorb, while the caller is about to run alone. Avoid file

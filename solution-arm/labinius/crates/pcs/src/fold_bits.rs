@@ -1796,7 +1796,8 @@ pub mod neon {
         let words_addr = words.as_ptr() as usize;
         let next = AtomicUsize::new(0);
         let (groups, bias) = (&groups, &bias);
-        pool.run(workers, |_| {
+        crate::par::diag(format!("f0={}", crate::par::stamp()));
+        pool.run(workers, |w| {
             let mut ws = Workspace::new();
             let mut claim = || {
                 let b = next.fetch_add(1, Ordering::Relaxed);
@@ -1818,6 +1819,7 @@ pub mod neon {
                     )
                 };
             }
+            crate::par::diag(format!("fw{}={}", w, crate::par::stamp()));
         });
         // SAFETY: every block wrote all fields of its 32 elements.
         unsafe { out.set_len(elements) };

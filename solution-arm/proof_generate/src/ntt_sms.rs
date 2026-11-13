@@ -910,6 +910,28 @@ unsafe fn sums2(
     y: [&mut [int16x8_t; N]; 2],
     dev: [&mut [int32x4_t]; 2],
 ) {
+    sums2_range(words, a, nib, xs, acc, y, dev, 0, a.elements, true);
+}
+
+/// [`sums2`] over the elements `e0 .. e1` only (chunk boundaries, or the column's end). The digit
+/// rows' chunk ends are added into `dev` as usual; the base row's sums stay in `acc` (row 0) and,
+/// only with `finish`, become the residues in `y` (narrow and inverse), as in [`sums2`]. Without
+/// `finish`, `y` is scratch.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sums2_range(
+    words: [&[(*const u8, usize); LANES]; 2],
+    a: &SmsMatrix,
+    nib: &mut [uint8x16_t; N / 4],
+    xs: &mut [[int16x8_t; N]; SWEEP],
+    acc: [&mut [int64x2_t]; 2],
+    y: [&mut [int16x8_t; N]; 2],
+    dev: [&mut [int32x4_t]; 2],
+    e0: usize,
+    e1: usize,
+    finish: bool,
+) {
+    debug_assert!(e0 % CHUNK == 0 && (e1 % CHUNK == 0 || e1 == a.elements) && e1 <= a.elements);
     let kern = &kernels()[PB];
     let [acc0, acc1] = acc;
     let [y0, y1] = y;
@@ -923,8 +945,8 @@ unsafe fn sums2(
             accs[t][idx(s, 0)..][..4].fill(vdupq_n_s64(0));
         }
     }
-    let mut e = 0usize;
-    while e < a.elements {
+    let mut e = e0;
+    while e < e1 {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
         while e < end {
             let l = SWEEP.min(end - e);
@@ -958,9 +980,11 @@ unsafe fn sums2(
             }
         }
     }
-    for t in 0..2 {
-        narrow(accs[t], 0, ys[t]);
-        super::inverse_folded::<PB>(ys[t]);
+    if finish {
+        for t in 0..2 {
+            narrow(accs[t], 0, ys[t]);
+            super::inverse_folded::<PB>(ys[t]);
+        }
     }
     let _ = (&mut accs, &mut ys, &mut devs);
 }
@@ -1026,25 +1050,94 @@ impl Drop for Arena {
     }
 }
 
+/// Five wire bytes per coefficient: `MODULUS < 2^40`, a constant so the stores are fixed-size.
+const WIRE: usize = 5;
+const _: () = assert!(MODULUS < 1 << (8 * WIRE) && MODULUS >= 1 << (8 * (WIRE - 1)));
+
+/// One batch's commitment coefficients from its base-row residues `y` (centered, as
+/// [`super::inverse_folded`] returns them) and its digit deviations `dev`, written as the wire
+/// encoding into `target` (whole columns; a partial batch has fewer than eight).
+unsafe fn finish_batch(a: &SmsMatrix, y: &[int16x8_t; N], dev: &[int32x4_t], tail: &mut [[i64; LANES]; N], target: &mut [u8]) {
+    let p = P1 as i16;
+    // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
+    // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
+    let pv = vdupq_n_s16(p);
+    let mut base = [[0u16; LANES]; N];
+    for (k, b) in base.iter_mut().enumerate() {
+        let v = y[k];
+        let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+        vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
+    }
+    // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at once.
+    for k in 0..N / 2 {
+        let h = k + N / 2;
+        let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
+        let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
+        for d in 0..DIGITS {
+            let (u, v) = lattice::WEIGHTS[d];
+            let w = u + v;
+            for half in 0..2 {
+                let x = dev[d * 2 * N + 2 * k + half];
+                let y = dev[d * 2 * N + 2 * h + half];
+                let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
+                let (i, j) = (2 * half, 2 * half + 1);
+                lo[i] = vmlal_n_s32(lo[i], xl, u);
+                lo[j] = vmlal_high_n_s32(lo[j], x, u);
+                lo[i] = vmlsl_n_s32(lo[i], yl, v);
+                lo[j] = vmlsl_high_n_s32(lo[j], y, v);
+                hi[i] = vmlal_n_s32(hi[i], xl, v);
+                hi[j] = vmlal_high_n_s32(hi[j], x, v);
+                hi[i] = vmlal_n_s32(hi[i], yl, w);
+                hi[j] = vmlal_high_n_s32(hi[j], y, w);
+            }
+        }
+        for q in 0..4 {
+            vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
+            vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
+        }
+    }
+    for (c, column) in target.chunks_exact_mut(N * WIRE).enumerate() {
+        let (slots, _) = column.as_chunks_mut::<WIRE>();
+        for (k, slot) in slots.iter_mut().enumerate() {
+            let bytes = crt(base[k][c] as u32, tail[k][c]).to_le_bytes();
+            *slot = core::array::from_fn(|i| bytes[i]);
+        }
+    }
+}
+
+/// One batch pair's results while its chunks are being summed by several workers.
+#[repr(C)]
+struct PairSums {
+    /// The base row's residues so far, centered (`|x| <= (p - 1) / 2`).
+    y: [[int16x8_t; N]; 2],
+    dev: [[int32x4_t; DIGITS * 2 * N]; 2],
+}
+
 /// The commitment of every column of `values` (columns of `4 a.elements` words) modulo `q`,
 /// written straight into `out` as the wire encoding (`rq::coefficient_bytes(q)` little-endian
 /// bytes per coefficient, column after column), so the separate packing pass over a `u128`
 /// buffer is not needed.
+///
+/// Whole batch pairs are cut into chunks ([`CHUNK`] elements, a few milliseconds each) that the
+/// workers claim one at a time: a worker that loses its core for a while takes fewer chunks
+/// instead of holding up the whole phase with a fixed share of the columns. Each chunk adds its
+/// base-row residues and its digit deviations into its pair's [`PairSums`] (exact: residues
+/// modulo `p` and integer deviations add), and the pair's last chunk writes the pair's output.
+/// `LABINIUS_STATIC_COMMIT` set: the fixed per-worker column ranges instead (same bytes).
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
-    // `MODULUS < 2^40`: five wire bytes per coefficient, a constant so the stores are fixed-size.
-    const W: usize = 5;
-    const _: () = assert!(MODULUS < 1 << (8 * W) && MODULUS >= 1 << (8 * (W - 1)));
-    assert_eq!(crate::rq::coefficient_bytes(q), W);
-    let width = W;
-    assert_eq!(out.len(), columns * N * width);
-    for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
+    assert_eq!(crate::rq::coefficient_bytes(q), WIRE);
+    assert_eq!(out.len(), columns * N * WIRE);
+    if columns % (2 * LANES) == 0 && columns > 0 && std::env::var_os("LABINIUS_STATIC_COMMIT").is_none() {
+        commit_claimed(values, a, workers, out);
+        return;
+    }
+    for_blocks(out, N * WIRE, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
         let Scratch { xs, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
-        let p = P1 as i16;
-        let count = block.len() / (N * width);
+        let count = block.len() / (N * WIRE);
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
             let col0 = first + LANES * b;
             let here = (count - LANES * b).min(LANES);
@@ -1057,7 +1150,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
             })
         };
         let batches = count.div_ceil(LANES);
-        let mut targets: Vec<&mut [u8]> = block.chunks_mut(LANES * N * width).collect();
+        let mut targets: Vec<&mut [u8]> = block.chunks_mut(LANES * N * WIRE).collect();
         for b in 0..batches {
             // pairs of batches share one key sweep; the second one's results wait in `*2`
             if b % 2 == 0 {
@@ -1073,55 +1166,82 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 core::mem::swap(dev, dev2);
                 core::mem::swap(y, y2);
             }
-            let target = &mut *targets[b];
-            // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
-            // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
-            let pv = vdupq_n_s16(p);
-            let mut base = [[0u16; LANES]; N];
-            for (k, b) in base.iter_mut().enumerate() {
-                let v = y[k];
-                let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
-                vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
-            }
-            // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
-            let tail = &mut *tail;
-            for k in 0..N / 2 {
-                let h = k + N / 2;
-                let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
-                let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
-                for d in 0..DIGITS {
-                    let (u, v) = lattice::WEIGHTS[d];
-                    let w = u + v;
-                    for half in 0..2 {
-                        let x = dev[d * 2 * N + 2 * k + half];
-                        let y = dev[d * 2 * N + 2 * h + half];
-                        let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
-                        let (i, j) = (2 * half, 2 * half + 1);
-                        lo[i] = vmlal_n_s32(lo[i], xl, u);
-                        lo[j] = vmlal_high_n_s32(lo[j], x, u);
-                        lo[i] = vmlsl_n_s32(lo[i], yl, v);
-                        lo[j] = vmlsl_high_n_s32(lo[j], y, v);
-                        hi[i] = vmlal_n_s32(hi[i], xl, v);
-                        hi[j] = vmlal_high_n_s32(hi[j], x, v);
-                        hi[i] = vmlal_n_s32(hi[i], yl, w);
-                        hi[j] = vmlal_high_n_s32(hi[j], y, w);
+            finish_batch(a, y, &dev[..], tail, &mut *targets[b]);
+        }
+        labinius::par::diag(format!("cw{}={}", first / LANES, labinius::par::stamp()));
+    });
+}
+
+/// [`commit`] with claimed chunks of whole batch pairs (`columns % 16 == 0`).
+fn commit_claimed(values: &[B128], a: &SmsMatrix, workers: usize, out: &mut [u8]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let len = 4 * a.elements;
+    let columns = values.len() / len;
+    let pairs = columns / (2 * LANES);
+    let chunks = a.elements.div_ceil(CHUNK);
+    let units = pairs * chunks;
+    let layout = std::alloc::Layout::array::<PairSums>(pairs).expect("the pair sums layout");
+    // SAFETY: all-zero bytes are valid `PairSums` (zero residues and deviations).
+    let sums_ptr = unsafe { std::alloc::alloc_zeroed(layout) } as *mut PairSums;
+    if sums_ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    let locks: Vec<Mutex<()>> = (0..pairs).map(|_| Mutex::new(())).collect();
+    let done: Vec<AtomicUsize> = (0..pairs).map(|_| AtomicUsize::new(0)).collect();
+    let next = AtomicUsize::new(0);
+    let (sums_addr, out_addr) = (sums_ptr as usize, out.as_mut_ptr() as usize);
+    let batch_bytes = LANES * N * WIRE;
+    let words_of = |b: usize| -> [(*const u8, usize); LANES] {
+        core::array::from_fn(|c| (values[(LANES * b + c) * len..].as_ptr() as *const u8, 64))
+    };
+    std::thread::scope(|scope| {
+        for w in 0..workers.clamp(1, units) {
+            let (locks, done, next, words_of) = (&locks, &done, &next, &words_of);
+            scope.spawn(move || unsafe {
+                let arena = Arena::new();
+                let Scratch { xs, acc, dev, acc2, dev2, y2, nib, y, tail, .. } = &mut *arena.0;
+                loop {
+                    let u = next.fetch_add(1, Ordering::Relaxed);
+                    if u >= units {
+                        break;
                     }
+                    let (pair, c) = (u / chunks, u % chunks);
+                    let (e0, e1) = (c * CHUNK, ((c + 1) * CHUNK).min(a.elements));
+                    let (w0, w1) = (words_of(2 * pair), words_of(2 * pair + 1));
+                    dev.fill(vdupq_n_s32(0));
+                    dev2.fill(vdupq_n_s32(0));
+                    sums2_range([&w0, &w1], a, nib, xs, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], e0, e1, false);
+                    // this chunk's base-row sums as residues (`|x| <= 4861`)
+                    narrow(&acc[..], 0, y);
+                    narrow(&acc2[..], 0, y2);
+                    let ps = &mut *(sums_addr as *mut PairSums).add(pair);
+                    let guard = locks[pair].lock().unwrap();
+                    let pv = P1 as i16;
+                    for (t, (yc, dc)) in [(&*y, &dev[..]), (&*y2, &dev2[..])].into_iter().enumerate() {
+                        for s in 0..N {
+                            ps.y[t][s] = canonical(vaddq_s16(ps.y[t][s], yc[s]), pv);
+                        }
+                        for (o, &x) in ps.dev[t].iter_mut().zip(dc) {
+                            *o = vaddq_s32(*o, x);
+                        }
+                    }
+                    let last = done[pair].fetch_add(1, Ordering::AcqRel) + 1 == chunks;
+                    if last {
+                        for t in 0..2 {
+                            super::inverse_folded::<PB>(&mut ps.y[t]);
+                            let target = core::slice::from_raw_parts_mut((out_addr as *mut u8).add((2 * pair + t) * batch_bytes), batch_bytes);
+                            finish_batch(a, &ps.y[t], &ps.dev[t][..], tail, target);
+                        }
+                    }
+                    drop(guard);
                 }
-                for q in 0..4 {
-                    vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
-                    vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
-                }
-            }
-            // a partial batch has fewer than eight columns in `target`: only those lanes are written
-            for (c, column) in target.chunks_exact_mut(N * width).enumerate() {
-                let (slots, _) = column.as_chunks_mut::<W>();
-                for (k, slot) in slots.iter_mut().enumerate() {
-                    let bytes = crt(base[k][c] as u32, tail[k][c]).to_le_bytes();
-                    *slot = core::array::from_fn(|i| bytes[i]);
-                }
-            }
+                labinius::par::diag(format!("cw{}={}", w, labinius::par::stamp()));
+            });
         }
     });
+    // SAFETY: allocated above with this layout; every pair has been finished.
+    unsafe { std::alloc::dealloc(sums_ptr as *mut u8, layout) };
 }
 
 #[cfg(test)]

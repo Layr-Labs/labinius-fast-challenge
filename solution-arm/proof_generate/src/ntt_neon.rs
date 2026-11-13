@@ -806,6 +806,9 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
 
 #[path = "ntt_neon_asm.rs"]
 mod asm;
+#[path = "ntt_neon_inv.rs"]
+mod inv;
+pub use inv::inverse_asm;
 #[path = "ntt_neon_idx.rs"]
 mod idx;
 pub use idx::indices_asm;
@@ -2092,6 +2095,32 @@ mod tests {
                         assert_eq!((got - lanes(old[slot])[c] as i64).rem_euclid(p), 0, "case {case} prime {p} column {c} slot {slot}");
                     }
                 }
+            }
+        }
+    }
+
+    /// The generated inverse ([`inverse_asm`]) equals [`inverse_lazy_io2`] bit for bit on inputs
+    /// `|x| <= p`.
+    #[test]
+    fn inverse_asm_matches() {
+        let mut st = 31u64;
+        let kern = &kernels()[1];
+        let inv = &lazy_inverses()[1];
+        for _ in 0..40 {
+            let src: [Vec<i16>; 2] = core::array::from_fn(|_| (0..N * 8).map(|_| ((xorshift(&mut st) % 19443) as i64 - 9721) as i16).collect());
+            let vin: [Vec<int16x8_t>; 2] = core::array::from_fn(|h| (0..N).map(|s| unsafe { vld1q_s16(src[h].as_ptr().add(8 * s)) }).collect());
+            let mut want = [[[0i16; 8]; N]; 2];
+            let mut b0: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            let mut b1 = b0.clone();
+            unsafe {
+                inverse_lazy_io2([&mut *b0, &mut *b1], |h, s| vin[h][s], |h, s, v| want[h][s] = core::mem::transmute(v));
+            }
+            for h in 0..2 {
+                let mut x: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+                for s in 0..N { x[s] = vin[h][s]; }
+                unsafe { inverse_asm(&mut x, inv, kern) };
+                let got: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(x.as_ptr() as *const [i16; 8], N) };
+                assert_eq!(got, &want[h][..], "row {h}");
             }
         }
     }

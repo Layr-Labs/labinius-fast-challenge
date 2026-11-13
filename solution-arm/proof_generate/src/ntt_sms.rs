@@ -684,8 +684,7 @@ unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_
     });
 }
 
-#[inline(always)]
-unsafe fn chunk_row2(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
+unsafe fn chunk_row2_old(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
     let p = P1 as i16;
     let thr = [vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r - 1]), vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r])];
     super::inverse_lazy_io2(y, |h, s| narrow_digit(acc, s, r + h), |h, s, x| {
@@ -698,6 +697,33 @@ unsafe fn chunk_row2(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut in
         *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
         *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
     });
+}
+#[inline(always)]
+unsafe fn chunk_row2(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
+    let p = P1 as i16;
+    let thr = [vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r - 1]), vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r])];
+    // narrow both rows, the generated inverse ([`super::inverse_asm`], the same arithmetic as
+    // `inverse_lazy_io2`) in place on each, then the deviations
+    let (kern, inv) = (&kernels()[PB], &super::lazy_inverses()[PB]);
+    let [y0, y1] = y;
+    for s in 0..N {
+        *y0.get_unchecked_mut(s) = narrow_digit(acc, s, r);
+        *y1.get_unchecked_mut(s) = narrow_digit(acc, s, r + 1);
+    }
+    super::inverse_asm(y0, inv, kern);
+    super::inverse_asm(y1, inv, kern);
+    for (h, yh) in [&*y0, &*y1].into_iter().enumerate() {
+        let dv = dev[h];
+        for s in 0..N {
+            let mut v = canonical(vsubq_s16(*yh.get_unchecked(s), vld1q_dup_s16(mr[h].as_ptr().add(s))), p);
+            let flag = vcgeq_s16(vabsq_s16(v), thr[h]);
+            if vmaxvq_u16(flag) != 0 {
+                v = repair_lanes(ctx, r - 1 + h, s, v, flag, dv);
+            }
+            *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
+            *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
+        }
+    }
 }
 
 
@@ -912,6 +938,7 @@ unsafe fn sums2(
     dev: [&mut [int32x4_t]; 2],
 ) {
     let kern = &kernels()[PB];
+    ctx::flip();
     let [acc0, acc1] = acc;
     let [y0, y1] = y;
     let [dev0, dev1] = dev;
@@ -949,14 +976,20 @@ unsafe fn sums2(
             e += l;
         }
         let c = (end - 1) / CHUNK;
+        let t6 = ctx::now();
         for t in 0..2 {
             let dv = devs[t].as_mut_ptr();
             for d in (0..DIGITS).step_by(2) {
                 let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
                 let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
-                chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
+                if ctx::side1() {
+                    chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
+                } else {
+                    chunk_row2_old(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
+                }
             }
         }
+        ctx::add([0, 0, 0, ctx::now() - t6, 1]);
     }
     for t in 0..2 {
         narrow(accs[t], 0, ys[t]);
@@ -965,6 +998,43 @@ unsafe fn sums2(
     let _ = (&mut accs, &mut ys, &mut devs);
 }
 
+
+/// Diagnostic only: same-core paired comparison inside the commitment. Every worker alternates its
+/// batch pairs between side 0 (the crown's fused chunk end, `chunk_row2_old`) and side 1
+/// (narrowing + the generated inverse + deviations, `chunk_row2`); workers 0 and 4 run side 0 on both
+/// (controls). Per side `cntvct` totals of the chunk ends and their count.
+mod ctx {
+    use std::cell::Cell;
+    thread_local! {
+        static SEL: Cell<usize> = const { Cell::new(0) };
+        static SIDE: Cell<usize> = const { Cell::new(1) };
+        static T: Cell<[[u64; 5]; 2]> = const { Cell::new([[0; 5]; 2]) };
+    }
+    pub fn select(worker: usize) { SEL.with(|s| s.set(worker % 8)); }
+    pub fn flip() { SIDE.with(|s| s.set(1 - s.get())); }
+    fn control() -> bool { matches!(SEL.with(|s| s.get()), 0 | 4) }
+    pub fn side1() -> bool { SIDE.with(|s| s.get()) == 1 && !control() }
+    #[inline(always)]
+    pub fn now() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+    #[inline(always)]
+    pub fn add(d: [u64; 5]) {
+        let side = SIDE.with(|s| s.get());
+        T.with(|c| { let mut v = c.get(); for i in 0..5 { v[side][i] += d[i]; } c.set(v); });
+    }
+    pub fn report() {
+        let f: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        let v = T.with(|c| c.get());
+        let w = SEL.with(|s| s.get());
+        let ns = |s: usize| v[s][3] as f64 * 1e9 / f as f64 / v[s][4].max(1) as f64;
+        eprintln!("ctxc w={w} side1={} chunk_ends={}/{} s0_ns_per_chunk_end={:.0} s1_ns_per_chunk_end={:.0} delta%={:+.2}",
+            if control() { "control" } else { "geninv" }, v[0][4], v[1][4], ns(0), ns(1), 100.0 * (ns(1) / ns(0) - 1.0));
+    }
+}
 #[inline]
 fn crt(r: u32, t: i64) -> u64 {
     const INV: u64 = {
@@ -1045,6 +1115,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     assert_eq!(out.len(), columns * N * width);
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
+        ctx::select(first * 8 / columns);
         let Scratch { xs, sc, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
@@ -1125,12 +1196,68 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 }
             }
         }
+        ctx::report();
     });
 }
 
 #[cfg(test)]
 mod chunk_bench {
     use super::*;
+
+    /// A digit-row pair's chunk end, the crown's fused `inverse_lazy_io2` against narrowing + the
+    /// generated [`super::super::inverse_asm`] twice + the deviations (repair omitted in both):
+    /// `cargo test --release chunk_asm_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn chunk_asm_timing() {
+        let mut st = 9u64;
+        let bound = 1i64 << 34;
+        let acc: Vec<int64x2_t> = (0..ROWS * 4 * N).map(|_| unsafe { vcombine_s64(vdup_n_s64((crate::ntt::tests::xorshift(&mut st) % (2 * bound as u64)) as i64 - bound), vdup_n_s64((crate::ntt::tests::xorshift(&mut st) % (2 * bound as u64)) as i64 - bound)) }).collect();
+        let mr: Vec<i16> = (0..N).map(|i| (i as i16 * 37) % 4860).collect();
+        let mut dev = vec![unsafe { vdupq_n_s32(0) }; 4 * N];
+        let mut y0 = Box::new([unsafe { vdupq_n_s16(0) }; N]);
+        let mut y1 = Box::new([unsafe { vdupq_n_s16(0) }; N]);
+        let (kern, inv) = (&kernels()[PB], &super::super::lazy_inverses()[PB]);
+        let reps = 3000;
+        let p = P1 as i16;
+        let dv = dev.as_mut_ptr();
+        let mut best = [f64::MAX; 2];
+        for round in 0..10 {
+            for k in 0..2 {
+                let side = (round + k) % 2;
+                let t = std::time::Instant::now();
+                unsafe {
+                    for _ in 0..reps {
+                        if side == 0 {
+                            super::super::inverse_lazy_io2([&mut *y0, &mut *y1], |h, s| narrow_digit(&acc, s, 1 + h), |h, s, x| {
+                                let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
+                                let d = dv.add(h * 2 * N);
+                                *d.add(2 * s) = vaddw_s16(*d.add(2 * s), vget_low_s16(v));
+                                *d.add(2 * s + 1) = vaddw_high_s16(*d.add(2 * s + 1), v);
+                            });
+                        } else {
+                            for s in 0..N {
+                                y0[s] = narrow_digit(&acc, s, 1);
+                                y1[s] = narrow_digit(&acc, s, 2);
+                            }
+                            super::super::inverse_asm(&mut y0, inv, kern);
+                            super::super::inverse_asm(&mut y1, inv, kern);
+                            for (h, yh) in [&*y0, &*y1].into_iter().enumerate() {
+                                let d = dv.add(h * 2 * N);
+                                for s in 0..N {
+                                    let v = canonical(vsubq_s16(yh[s], vld1q_dup_s16(mr.as_ptr().add(s))), p);
+                                    *d.add(2 * s) = vaddw_s16(*d.add(2 * s), vget_low_s16(v));
+                                    *d.add(2 * s + 1) = vaddw_high_s16(*d.add(2 * s + 1), v);
+                                }
+                            }
+                        }
+                    }
+                }
+                best[side] = best[side].min(t.elapsed().as_nanos() as f64 / reps as f64);
+            }
+        }
+        println!("chunk end per row pair (ns): crown fused {:.0}, generated inverse {:.0} ({:+.1}%)", best[0], best[1], 100.0 * (best[1] / best[0] - 1.0));
+    }
 
     /// One digit row's chunk end, the record's three passes against [`chunk_row`]: `cargo test
     /// --release chunk_end_timing -- --ignored --nocapture` (on the board's core).

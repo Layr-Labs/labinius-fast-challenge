@@ -137,6 +137,11 @@ enum Table {
     Owned(Vec<B128>),
 }
 
+// SAFETY: a `Mapped` table is a PROT_READ private file mapping that is only read through
+// `Deref` and released with `madvise(MADV_DONTNEED)`, which takes no Rust references; sharing
+// `&Table` across the encode's workers is therefore sound.
+unsafe impl Sync for Table {}
+
 #[cfg(all(target_os = "linux", target_endian = "little"))]
 mod table_sys {
     extern "C" {
@@ -159,6 +164,32 @@ impl std::ops::Deref for Table {
             }
             Self::Owned(words) => words,
         }
+    }
+}
+
+impl Table {
+    /// Release pieces of a mapped table ([`Table::release`]); none for an owned one.
+    const PIECE: usize = 2 << 20;
+    fn pieces(&self) -> usize {
+        match self {
+            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            Self::Mapped { span, .. } => span.div_ceil(Self::PIECE),
+            Self::Owned(_) => 0,
+        }
+    }
+    /// Drop this process's page-table entries for piece `i` of the mapping (`MADV_DONTNEED`;
+    /// the file's page cache is untouched). The table must not be read afterwards: a read
+    /// would fault the same bytes back in, so it stays correct, only slower.
+    fn release(&self, i: usize) {
+        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        if let Self::Mapped { ptr, span, .. } = self {
+            let at = i * Self::PIECE;
+            if at < *span {
+                unsafe { table_sys::madvise(ptr.add(at), Self::PIECE.min(span - at), 4) };
+            }
+        }
+        #[cfg(not(all(target_os = "linux", target_endian = "little")))]
+        let _ = i;
     }
 }
 
@@ -963,7 +994,9 @@ fn main() {
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
-    output.write(&proof);
+    // The table is dead once `prove` returns: its page-table entries are dropped on the
+    // encode's workers instead of by the single-threaded address-space teardown at exit.
+    output.write_with(&proof, values.pieces(), &|i| values.release(i));
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
     // The proof file is complete. Let process teardown release the large allocations and

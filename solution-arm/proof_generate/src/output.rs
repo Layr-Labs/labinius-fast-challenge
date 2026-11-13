@@ -55,6 +55,16 @@ impl Layout {
 /// `out` is writable for exactly `layout.len()` bytes and does not overlap `p`'s storage.
 /// The caller must supply Layout::parts(p). Only disjoint output ranges are sent to workers.
 unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
+    encode_into_with(p, layout, out, 0, &|_| {});
+}
+
+/// [`encode_into`], with `extra` tasks `after(0 .. extra)` appended to the same parallel
+/// dispatch: the workers claim them once the encoding tasks are handed out, so independent
+/// work (the table's page release) fills the encode's tail instead of following it.
+///
+/// # Safety
+/// As [`encode_into`]; `after` must not touch `out` or `p`'s storage.
+unsafe fn encode_into_with(p: &ProofParts, layout: Layout, out: *mut u8, extra: usize, after: &(dyn Fn(usize) + Sync)) {
     assert_eq!(layout, Layout::parts(p));
     assert!(layout.len() as u64 <= LIMIT, "proof exceeds the size limit");
     let put = |at: &mut usize, bytes: &[u8]| {
@@ -82,9 +92,11 @@ unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
     let addr = out as usize;
     let ctasks = if p.commitment.is_empty() { 0 } else { 4 };
     let ftasks = if elements.is_empty() { 0 } else { 4 * par::threads() };
-    par::pool().run(ctasks + ftasks, |i| {
+    par::pool().run(ctasks + ftasks + extra, |i| {
         let out = addr as *mut u8;
-        if i < ctasks {
+        if i >= ctasks + ftasks {
+            after(i - ctasks - ftasks);
+        } else if i < ctasks {
             let (s, e) = par::block(p.commitment.len(), ctasks, i, 4096);
             core::ptr::copy_nonoverlapping(p.commitment.as_ptr().add(s), out.add(Layout::HEAD + s), e - s);
         } else {
@@ -217,11 +229,16 @@ impl Output {
         assert!(self.populate.set(job).is_ok(), "output populated once");
     }
     pub fn write(&self, p: &ProofParts) {
+        self.write_with(p, 0, &|_| {});
+    }
+    /// [`Output::write`], running `after(0 .. extra)` in the encode's parallel dispatch (after its
+    /// own tasks) when the proof goes through the file mapping; otherwise `after` is not run.
+    pub fn write_with(&self, p: &ProofParts, extra: usize, after: &(dyn Fn(usize) + Sync)) {
         self.quiesce();
         let layout = Layout::parts(p);
         if layout == self.state.layout {
             if let Some(map) = self.state.mapped() {
-                unsafe { encode_into(p, layout, map.addr as *mut u8); }
+                unsafe { encode_into_with(p, layout, map.addr as *mut u8, extra, after); }
                 return;
             }
         }

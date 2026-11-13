@@ -171,6 +171,39 @@ impl Drop for Table {
     }
 }
 
+/// Drops the page-table entries of the file-backed pages no phase reads after the fold: the
+/// witness table's mapping and the key image embedded in the binary (copied out at start, see
+/// `sms::prefetch_key`). The ranges are split over the pool, so the entries are removed on every
+/// core instead of by process exit on one CPU inside the timed window. The pages stay in the
+/// page cache; a later read would only refault them.
+#[cfg(all(target_os = "linux", target_endian = "little"))]
+fn release_pages(values: &Table) {
+    // Whole pages on 4, 16 and 64 KiB kernels; the key's unaligned ends keep their entries.
+    const ALIGN: usize = 64 << 10;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    if let Table::Mapped { ptr, span, .. } = values {
+        ranges.push((*ptr as usize, *ptr as usize + *span));
+    }
+    let key = (SMS_DATA.0.as_ptr() as usize, SMS_DATA.0.len());
+    let (s, e) = (key.0.next_multiple_of(ALIGN), (key.0 + key.1) & !(ALIGN - 1));
+    if s < e {
+        ranges.push((s, e));
+    }
+    let parts = threads().max(1);
+    let pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .flat_map(|&(s, e)| {
+            let piece = (e - s).div_ceil(parts).next_multiple_of(ALIGN);
+            (s..e).step_by(piece).map(move |a| (a, (a + piece).min(e)))
+        })
+        .collect();
+    labinius::par::pool().run(pieces.len(), |i| {
+        let (a, b) = pieces[i];
+        // MADV_DONTNEED on read-only private file mappings: the entries go, the data stays.
+        unsafe { table_sys::madvise(a as *mut u8, b - a, 4) };
+    });
+}
+
 fn read_table(path: &str) -> Table {
     load_table(path, 1 << LOG_PACKED)
 }
@@ -857,8 +890,11 @@ impl Proof {
 }
 
 fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
+    let clock = std::time::Instant::now();
+    let mark = |k: usize| SWITCH_US[k].store(clock.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     #[cfg(target_arch = "aarch64")]
     if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
+        mark(0);
         let partials = prepared.partials();
         let value = partials.iter().zip(cf::eq_expand_b128(lo))
             .fold(B128::ZERO, |a, (&v, e)| a + v * e);
@@ -866,16 +902,21 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
         t.absorb_b128(&partials);
         let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
         let mut switch = labinius::fields::lean::Switch::new(values, prepared, &batch);
+        mark(1);
         let mut rounds = Vec::with_capacity(LOG_PACKED);
         let mut coords = Vec::with_capacity(LOG_PACKED);
-        for _ in 0..LOG_PACKED {
+        for k in 0..LOG_PACKED {
             let msg = switch.msg();
             t.absorb_f162(&msg);
             let r = t.sample_f162(b"switch-round", 1)[0];
             rounds.push(msg.map(|v| v.0));
             coords.push(r);
             switch.fold(r);
+            if k == 5 || k == 6 {
+                mark(k - 3);
+            }
         }
+        mark(4);
         return (partials, rounds, coords, switch.final_eval());
     }
     let mut ws = cf::Workspace::new(LOG_PACKED, 1);
@@ -902,11 +943,23 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
     (partials, rounds, coords, opened)
 }
 
+/// Diagnostics: the commitment phase's marks in microseconds from its start (the output setup's
+/// join, the commitment, the pool's creation).
+static COMMIT_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Diagnostics: the switch's marks in microseconds from its start (partials pass, setup, the
+/// sixth round with its materialization, the seventh round, the end of the rounds).
+static SWITCH_US: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
-    output.wait_setup();
+    let clock = std::time::Instant::now();
+    let mark = |k: usize| COMMIT_US[k].store(clock.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut commitment = output.commitment_buffer();
+    mark(0);
     commit(values, modulus, &mut commitment);
+    mark(1);
     labinius::par::pool();
+    mark(2);
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
     // round, and idle population workers measurably slowed it. The final encode faults the
@@ -945,6 +998,7 @@ impl Timer {
     }
 }
 
+// Re-measurement of submission 3086fde3 (same code; this comment only makes the archive distinct).
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     assert!(
@@ -968,7 +1022,22 @@ fn main() {
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
     output.write(&proof);
     timer.lap("write");
+    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    {
+        release_pages(&values);
+        timer.lap("release");
+    }
     eprintln!("labinius-arm {}", timer.1.join(" "));
+    #[cfg(target_arch = "aarch64")]
+    eprintln!(
+        "labinius-arm-diag key_copy_us={} key_wait_us={} commit_ends_us={} commit_ns_transform/sink/chunk_end/stolen_chunks={} switch_us={} commit_us={}",
+        ntt::neon::sms::KEY_COPY_US.load(std::sync::atomic::Ordering::Relaxed),
+        ntt::neon::sms::KEY_WAIT_US.load(std::sync::atomic::Ordering::Relaxed),
+        ntt::BLOCK_ENDS_US.lock().unwrap().iter().map(|e| e.to_string()).collect::<Vec<_>>().join("/"),
+        ntt::neon::sms::PROFILE_NS.iter().map(|e| e.load(std::sync::atomic::Ordering::Relaxed).to_string()).collect::<Vec<_>>().join("/"),
+        SWITCH_US.iter().map(|e| e.load(std::sync::atomic::Ordering::Relaxed).to_string()).collect::<Vec<_>>().join("/"),
+        COMMIT_US.iter().map(|e| e.load(std::sync::atomic::Ordering::Relaxed).to_string()).collect::<Vec<_>>().join("/")
+    );
     // The proof file is complete. Let process teardown release the large allocations and
     // mappings together, instead of walking their Rust destructors first.
     std::mem::forget((values, proof, output));

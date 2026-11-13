@@ -1775,6 +1775,7 @@ pub mod neon {
 
     /// `v = sum_j c_j W_j` for every ring element of the `columns` columns of `column_words`
     pub fn fold(words: &[u128], column_words: usize, challenges: &[Challenge], threads: usize) -> Vec<RingElement> {
+        debug_assert_eq!(column_words % LANES, 0, "whole 128-word transforms per column");
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::OnceLock;
         assert!(column_words % LANES == 0, "a column is whole blocks");

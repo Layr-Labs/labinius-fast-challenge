@@ -18,7 +18,7 @@ static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
 #[allow(dead_code)]
 mod rq;
 
-use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
+use labinius::challenge::{ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
 use labinius::eval::eq_table;
 use labinius::fields::{
     crossfield as cf,
@@ -216,7 +216,7 @@ fn load_table(path: &str, n: usize) -> Table {
                     // in parallel and overlap with compute. A full MADV_POPULATE_READ pass
                     // costs about 9 ms on the development Graviton4 and does not speed the
                     // commit up. MADV_HUGEPAGE is a best-effort hint for the file.
-                    // Noise draw 12 of the promoted stack (populate removal + u64 CRT + prefetch removal); behaviour identical; prior draws: 296.3248; 299.6629; 296.9924; 296.7474.
+                    // Noise draw 30 of the promoted stack (+ robustness part 6: fold transform-alignment debug_assert); behaviour identical; prior draws: 296.4929; 297.3017; 296.5610; 296.4173.
                     unsafe {
                         table_sys::madvise(addr, 16 * (e - s), 14);
                     }
@@ -469,6 +469,7 @@ fn dot_lifted(eq: &[F162], column: &[B128]) -> F162 {
 }
 
 fn row_evaluate(values: &[B128], p0: &[F162]) -> Vec<F162> {
+    debug_assert_eq!(p0.len(), COLUMN_LOG as usize, "row point shape");
     let eq = eq_table(p0);
     let mut out = vec![F162::ZERO; COLUMNS];
     let eq = &eq;
@@ -645,6 +646,7 @@ fn expand_mask(words: &[B128], mask: &mut [i8; WITNESS_COEFFICIENTS]) {
 }
 
 fn fold(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement648> {
+    debug_assert_eq!(challenges.len(), COLUMNS, "one fold challenge per column");
     // The NEON bit-sliced fold's 16-plane counters hold sums below 2^15.
     #[cfg(target_arch = "aarch64")]
     if challenges.iter().map(|c| c.weight).sum::<usize>() < 1 << 15 {
@@ -903,8 +905,11 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 }
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
+    debug_assert_eq!(values.len(), COLUMNS * COLUMN_LEN, "packed witness shape");
     output.wait_setup();
     let mut commitment = output.commitment_buffer();
+    debug_assert_eq!(commitment.len(), 648 * 1024 * rq::coefficient_bytes(modulus),
+        "one packed wire coefficient per ring coefficient");
     commit(values, modulus, &mut commitment);
     labinius::par::pool();
     timer.lap("commit");
@@ -915,6 +920,8 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
     let lo = t.sample_b128(b"r-lo", 7);
     let hi = t.sample_b128(b"r-hi", LOG_PACKED);
     let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t);
+    debug_assert_eq!(rounds.len(), LOG_PACKED);
+    debug_assert_eq!(coords.len(), LOG_PACKED);
     t.absorb_f162(&[opened]);
     timer.lap("switch");
     let (p0, _) = split_point(&coords);
@@ -994,6 +1001,8 @@ fn sms_packed(values: &[B128], a: &ntt::neon::sms::SmsMatrix, workers: usize, q:
 
 #[cfg(test)]
 mod tests {
+
+    use labinius::challenge::sample_short_challenge;
     use super::*;
 
     #[test]

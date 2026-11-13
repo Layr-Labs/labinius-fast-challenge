@@ -182,15 +182,27 @@ impl Output {
         let setup = std::thread::spawn(move || {
             let state = worker.upgrade();
             if let Some(state) = &state { let _ = state.mapped(); }
-            labinius::challenge::warm();
-            for offset in (0..bytes).step_by(4096) {
-                unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
-            }
-            // Fault the whole proof mapping while the table read still runs on the other
-            // cores: the write phase then only has to encode, not populate file pages.
-            if let Some(state) = &state {
-                for i in 0..state.layout.len().div_ceil(CHUNK) { state.populate(i); }
-            }
+            labinius::par::diag(format!("om={}", labinius::par::stamp()));
+            // Fault the commitment buffer and the whole proof mapping (2 MiB chunks) on parallel
+            // threads while the table is mapped: the commitment waits for this thread, and one
+            // thread faulting 3.3 MB and 14 MB page by page was most of its start-up delay.
+            std::thread::scope(|s| {
+                s.spawn(|| labinius::challenge::warm());
+                for part in 0..2usize {
+                    s.spawn(move || {
+                        let (lo, hi) = (part * bytes / 2, (part + 1) * bytes / 2);
+                        for offset in (lo..hi).step_by(4096) {
+                            unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
+                        }
+                    });
+                }
+                if let Some(state) = &state {
+                    for i in 0..state.layout.len().div_ceil(CHUNK) {
+                        s.spawn(move || state.populate(i));
+                    }
+                }
+            });
+            labinius::par::diag(format!("op={}", labinius::par::stamp()));
         });
         Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
     }

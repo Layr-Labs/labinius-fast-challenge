@@ -1121,6 +1121,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 }
             }
         }
+        labinius::par::diag(format!("cw{}={}", first / LANES, labinius::par::stamp()));
     });
 }
 

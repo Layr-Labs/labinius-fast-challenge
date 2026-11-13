@@ -126,7 +126,7 @@ unsafe fn red16<const Q: u16>(x: __m512i) -> __m512i {
     );
     _mm512_madd_epi16(r, _mm512_set1_epi16(1))
 }
-// finish_stream only reads accumulators after a fold. Their signed dword
+// finish_pair only reads accumulators after a fold. Their signed dword
 // range is much smaller than red16's general contract. For s=floor(x/4096),
 // round(s*13807/32768) approximates x/P closely enough that x-qhat*P is in
 // (-P,P). Multiplication and subtraction still give the exact residue.
@@ -611,24 +611,24 @@ impl<const RED: bool, const FIRST: bool> WideSink<RED, FIRST> {
     }
 }
 
-const PAIR_PACK_PERM: [i64; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
-
-/// Stream `s` of the accumulators modulo 9721 as `i16` representatives (`|r| < 2q`) into lanes
-/// `16 half .. 16 half + 16` of `out`. The stream's next chunk starts from the worker's bias
-/// instead ([`Sink`] with `FIRST`), so nothing is written back into the accumulator here.
+/// Streams `s0` and `s1` of the accumulators modulo 9721 as `i16` representatives (`|r| < P`,
+/// [`red_folded`]) into `out`, column-interleaved: lane `2c` holds column `c` of `s0`, lane
+/// `2c + 1` column `c` of `s1`. That is the pair order [`reconstruct_words`] multiplies with
+/// `vpmaddwd` (and the inverse transform is lane-wise), so the banks are written once in it:
+/// each lane pair is one dword, `s0`'s residue in its low word and `s1`'s in its high word.
+/// The streams' next chunk starts from the worker's bias instead ([`Sink`] with `FIRST`), so
+/// nothing is written back into the accumulator here.
 #[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn finish_stream(a: &mut SAcc, s: usize, out: &mut Batch32, half: usize) {
-    let p = (a.v.as_mut_ptr() as *mut __m512i).add(s);
-    let perm = _mm512_loadu_si512(PAIR_PACK_PERM.as_ptr() as *const __m512i);
-    let l0 = 16 * half;
-    for k in 0..N / 2 {
-        let j = 2 * k;
-        let x0 = _mm512_load_si512(p.add(STREAMS * j));
-        let x1 = _mm512_load_si512(p.add(STREAMS * (j + 1)));
-        let packed = _mm512_packs_epi32(red_folded(x0), red_folded(x1));
-        let u = _mm512_permutexvar_epi64(perm, packed);
-        _mm256_storeu_si256(out.v[j].as_mut_ptr().add(l0) as *mut __m256i, _mm512_castsi512_si256(u));
-        _mm256_storeu_si256(out.v[j + 1].as_mut_ptr().add(l0) as *mut __m256i, _mm512_extracti64x4_epi64::<1>(u));
+unsafe fn finish_pair(a: &mut SAcc, s0: usize, s1: usize, out: &mut Batch32) {
+    let base = a.v.as_mut_ptr() as *mut __m512i;
+    let (p0, p1) = (base.add(s0), base.add(s1));
+    for j in 0..N {
+        // Both residues are in (-P, P), i16 range: the low word of each dword is the value
+        // the former saturating pack produced.
+        let r0 = red_folded(_mm512_load_si512(p0.add(STREAMS * j)));
+        let r1 = red_folded(_mm512_load_si512(p1.add(STREAMS * j)));
+        let v = _mm512_mask_blend_epi16(0xAAAA_AAAA, r0, _mm512_slli_epi32::<16>(r1));
+        _mm512_store_si512(out.v[j].as_mut_ptr() as *mut __m512i, v);
     }
 }
 
@@ -675,10 +675,9 @@ unsafe fn reconstruct(b:&Batch32,d0:usize,c0:usize,d1:usize,c1:usize,keys:&SmsKe
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn reconstruct_words<const HIGH:bool>(b:&Batch32,d0:usize,_chunk:usize,d1:usize,_keys:&SmsKeys,total:&mut Total) {
-    let interleave:[i16;32]=core::array::from_fn(|i| (i/2+16*(i%2)) as i16);
-    let interleave=_mm512_loadu_si512(interleave.as_ptr().cast());
-    // The auxiliary stream already subtracted its scaled mean before inversion.
-    let load=|m:usize| _mm512_permutexvar_epi16(interleave,_mm512_load_si512(b.v[m].as_ptr().cast()));
+    // The auxiliary stream already subtracted its scaled mean before inversion. The banks are
+    // column-interleaved ([`finish_pair`]): dword `c` is (digit d0, digit d1) of column `c`.
+    let load=|m:usize| _mm512_load_si512(b.v[m].as_ptr().cast());
     let (u0,v0)=digit_weight(d0);let (u1,v1)=digit_weight(d1);
     let pack=|a:i32,b:i32| _mm512_set1_epi32((a as u16 as u32|((b as u16 as u32)<<16)) as i32);
     let (wu,wv,wh)=(pack(u0,u1),pack(v0,v1),pack(u0+v0,u1+v1));
@@ -709,7 +708,7 @@ unsafe fn reconstruct_words<const HIGH:bool>(b:&Batch32,d0:usize,_chunk:usize,d1
 #[derive(Clone,Copy)]struct RepairFlag{d:usize,m:usize,col:usize,residue:i16}
 #[cold]#[inline(never)]
 fn record_repair_flags(b:&Batch32,m:usize,mut mx:u32,mut my:u32,d0:usize,g:usize,flags:&mut Vec<RepairFlag>){
- for (coefficient,mask)in[(m,&mut mx),(m+N/2,&mut my)]{while *mask!=0{let bit=mask.trailing_zeros()as usize;*mask&=*mask-1;let bank=bit&1;let col=bit/2;if col<g{flags.push(RepairFlag{d:d0+bank,m:coefficient,col,residue:b.v[coefficient][col+16*bank]});#[cfg(test)]crate::repair176_runtime::FLAGS.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}}}
+ for (coefficient,mask)in[(m,&mut mx),(m+N/2,&mut my)]{while *mask!=0{let bit=mask.trailing_zeros()as usize;*mask&=*mask-1;let bank=bit&1;let col=bit/2;if col<g{flags.push(RepairFlag{d:d0+bank,m:coefficient,col,residue:b.v[coefficient][2*col+bank]});#[cfg(test)]crate::repair176_runtime::FLAGS.fetch_add(1,std::sync::atomic::Ordering::Relaxed);}}}
 }
 #[cold]#[inline(never)]
 unsafe fn apply_repair_flags(flags:&mut Vec<RepairFlag>,keys:&SmsKeys,cols:&[&[B128]],chunk:usize,total:&mut Total){
@@ -724,10 +723,9 @@ unsafe fn reconstruct_repair(b:&Batch32,d0:usize,chunk:usize,keys:&SmsKeys,total
 
 #[target_feature(enable="avx512f,avx512bw,avx512vl")]
 unsafe fn reconstruct_words_repair<const HIGH:bool>(b:&Batch32,d0:usize,chunk:usize,d1:usize,keys:&SmsKeys,total:&mut Total,g:usize,flags:&mut Vec<RepairFlag>) {
-    let interleave:[i16;32]=core::array::from_fn(|i| (i/2+16*(i%2)) as i16);
-    let interleave=_mm512_loadu_si512(interleave.as_ptr().cast());
-    // The auxiliary stream already subtracted its scaled mean before inversion.
-    let load=|m:usize| _mm512_permutexvar_epi16(interleave,_mm512_load_si512(b.v[m].as_ptr().cast()));
+    // The auxiliary stream already subtracted its scaled mean before inversion. The banks are
+    // column-interleaved ([`finish_pair`]): dword `c` is (digit d0, digit d1) of column `c`.
+    let load=|m:usize| _mm512_load_si512(b.v[m].as_ptr().cast());
     let (u0,v0)=digit_weight(d0);let (u1,v1)=digit_weight(d1);
     let pack=|a:i32,b:i32| _mm512_set1_epi32((a as u16 as u32|((b as u16 as u32)<<16)) as i32);
     let (wu,wv,wh)=(pack(u0,u1),pack(v0,v1),pack(u0+v0,u1+v1));
@@ -1056,8 +1054,7 @@ unsafe fn group<F: FnMut(usize), C: FnMut(usize) -> bool>(cols: &[&[B128]], keys
             bias = keys.mur.as_ptr().add((chunk + 1) * N * DIGITS);
             for d in (0..CHUNKED-1).step_by(2) {
                 let pd = &mut ws.pend[0];
-                finish_stream(&mut ws.acc[0], 1 + d, pd, 0);
-                finish_stream(&mut ws.acc[0], 2 + d, pd, 1);
+                finish_pair(&mut ws.acc[0], 1 + d, 2 + d, pd);
                 pd.representation = Representation::Ntt;
                 gen_small::intt_sms_scaled_batch32_9721(pd);
                 reconstruct_repair(pd,d,chunk,keys,&mut ws.total[0],g,&mut repair_flags);
@@ -1688,7 +1685,7 @@ mod tests {
         let elements=1024;let chunks=chunk_count(elements);let mut seed=0xa2e78139ca040d65;let mur=vec![0i32;mur_len(elements)];let means=[0u32;N];let keys=SmsKeys{pairs:&[],mur:&mur,mu:&means,elements,repair:None};let mut batch=zeroed_slice::<Batch32>(1);let mut total=zeroed_slice::<Total>(1);
         for row in &mut total[0].t{for v in row{*v=(xorshift(&mut seed)&65535)as i32;}}for row in &mut total[0].hi{for v in row{*v=(xorshift(&mut seed)%2001)as i32-1000;}}
         for c in 0..chunks{for d in (0..DIGITS-1).step_by(2){for row in &mut batch[0].v{for v in row{*v=(xorshift(&mut seed)%P as u64)as i16-(P/2)as i16;}}let before=total[0].t.to_vec();let high=total[0].hi.to_vec();unsafe{reconstruct(&batch[0],d,c,d+1,c,&keys,&mut total[0]);}
-            for m in 0..N/2{for col in 0..16{let(mut lo,mut hi)=(before[m][col]as i64+65536*high[m][col]as i64,before[m+N/2][col]as i64+65536*high[m+N/2][col]as i64);for bank in 0..2{let digit=d+bank;let delta=|j:usize|batch[0].v[j][col+16*bank]as i64;let(x,y)=(delta(m),delta(m+N/2));let(u,v)=digit_weight(digit);lo+=x*u as i64-y*v as i64;hi+=x*v as i64+y*(u+v)as i64;}assert_eq!(total[0].t[m][col]as i64+65536*total[0].hi[m][col]as i64,lo);assert_eq!(total[0].t[m+N/2][col]as i64+65536*total[0].hi[m+N/2][col]as i64,hi);}}
+            for m in 0..N/2{for col in 0..16{let(mut lo,mut hi)=(before[m][col]as i64+65536*high[m][col]as i64,before[m+N/2][col]as i64+65536*high[m+N/2][col]as i64);for bank in 0..2{let digit=d+bank;let delta=|j:usize|batch[0].v[j][2*col+bank]as i64;let(x,y)=(delta(m),delta(m+N/2));let(u,v)=digit_weight(digit);lo+=x*u as i64-y*v as i64;hi+=x*v as i64+y*(u+v)as i64;}assert_eq!(total[0].t[m][col]as i64+65536*total[0].hi[m][col]as i64,lo);assert_eq!(total[0].t[m+N/2][col]as i64+65536*total[0].hi[m+N/2][col]as i64,hi);}}
             if d==DIGITS-2 {for row in &total[0].t{for &v in row{assert!((0..65536).contains(&v));}}}
         }}
     }
@@ -1890,10 +1887,10 @@ mod bench_parts {
         let mut acc = zeroed_slice::<SAcc>(1);
         let t = std::time::Instant::now();
         for _ in 0..n {
-            unsafe { finish_stream(&mut acc[0], 3, &mut b[0], 1) };
+            unsafe { finish_pair(&mut acc[0], 3, 4, &mut b[0]) };
         }
         let dt = t.elapsed().as_secs_f64() / n as f64;
-        eprintln!("finish_stream: {:.2} us", dt * 1e6);
+        eprintln!("finish_pair: {:.2} us", dt * 1e6);
     }
 }
 

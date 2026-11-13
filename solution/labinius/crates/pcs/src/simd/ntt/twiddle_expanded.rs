@@ -3,6 +3,11 @@
 // butterfly schedule, reductions, and output representatives are unchanged.
 macro_rules! mont_mem {
     ($tw:literal, $off:literal, $a1:literal, $a2:literal, $t:literal) => {
+        mont_mem!($tw, $off, $a1, $a2, $t, "[{c}+128]")
+    };
+    // `$rot` is the rotation's Montgomery low factor: the constant-block operand above, or a
+    // register that holds the same 64 bytes for a whole run of leaves.
+    ($tw:literal, $off:literal, $a1:literal, $a2:literal, $t:literal, $rot:literal) => {
         concat!(
             "vpmullw zmm", $t, ", zmm", $a1, ", [{", $tw, "}+0", $off, "*16+64]\n",
             "vpmulhw zmm", $a1, ", zmm", $a1, ", [{", $tw, "}+0", $off, "*16+0]\n",
@@ -13,7 +18,7 @@ macro_rules! mont_mem {
             "vpmulhw zmm", $t, ", zmm", $t, ", zmm27\n",
             "vpsubw zmm", $a2, ", zmm", $a2, ", zmm", $t, "\n",
             "vpsubw zmm", $t, ", zmm", $a1, ", zmm", $a2, "\n",
-            "vpmullw zmm30, zmm", $t, ", [{c}+128]\n",
+            "vpmullw zmm30, zmm", $t, ", ", $rot, "\n",
             "vpmulhw zmm", $t, ", zmm", $t, ", [{c}+64]\n",
             "vpmulhw zmm30, zmm30, zmm27\n",
             "vpsubw zmm", $t, ", zmm", $t, ", zmm30\n",
@@ -23,18 +28,18 @@ macro_rules! mont_mem {
 
 macro_rules! level4_mem {
     (plain $a0:literal, $a1:literal, $a2:literal,
-     $o0:literal, $o1:literal, $o2:literal, $t:literal) => {
+     $o0:literal, $o1:literal, $o2:literal, $t:literal $(, $rot:literal)?) => {
         concat!(
             "vmovdqa64 zmm", $a0, ", [{i}+", $o0, "]\n",
             "vmovdqa64 zmm", $a1, ", [{i}+", $o1, "]\n",
             "vmovdqa64 zmm", $a2, ", [{i}+", $o2, "]\n",
-            mont_mem!("t4", "", $a1, $a2, $t),
+            mont_mem!("t4", "", $a1, $a2, $t $(, $rot)?),
         )
     };
     (lut $a0:literal, $a1:literal, $a2:literal,
-     $o0:literal, $o1:literal, $o2:literal, $t:literal) => {
+     $o0:literal, $o1:literal, $o2:literal, $t:literal $(, $rot:literal)?) => {
         concat!(
-            level4_mem!(plain $a0, $a1, $a2, $o0, $o1, $o2, $t),
+            level4_mem!(plain $a0, $a1, $a2, $o0, $o1, $o2, $t $(, $rot)?),
             // logical a >> 11 is the window (a >> 11) & 31 (bits 11..15 of the lane), and
             // vpermw only reads the low 5 bits of each word index anyway.
             "vpsrlw zmm30, zmm", $a0, ", 11\n",
@@ -45,8 +50,8 @@ macro_rules! level4_mem {
 }
 
 macro_rules! level6_mem {
-    (plain $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal) => {
-        mont_mem!("t6", $off, $a1, $a2, $t)
+    (plain $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal $(, $rot:literal)?) => {
+        mont_mem!("t6", $off, $a1, $a2, $t $(, $rot)?)
     };
     (barrett $off:literal, $a0:literal, $a1:literal, $a2:literal, $t:literal) => {
         concat!(

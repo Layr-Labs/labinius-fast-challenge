@@ -3,7 +3,6 @@
 //! each qword. Each `vpermt2b` index comes from the two bit layouts around it ([`round_idx`]);
 //! the byte order inside a tile is the scramble [`word_at`].
 use core::arch::x86_64::*;
-use std::sync::OnceLock;
 
 /// `affine(ident, D)` is the bit transpose of each qword of `D`.
 pub const GF_IDENT: i64 = 0x8040_2010_0804_0201u64 as i64;
@@ -12,96 +11,114 @@ const E: [u8; 6] = [0, 1, 2, 3, 4, 5];
 const K: [u8; 4] = [10, 11, 12, 13];
 const C: [u8; 3] = [20, 21, 22];
 
-/// `zmm[s]`: the logical bit in vector-index bit `s` from the top; `pos[b]`: in position bit `5 - b`.
-#[derive(Clone)]
+/// `zmm[s]` (`s < n`): the logical bit in vector-index bit `s` from the top; `pos[b]`: in
+/// position bit `5 - b`.
+#[derive(Clone, Copy)]
 struct Layout {
-    zmm: Vec<u8>,
+    zmm: [u8; 4],
+    n: usize,
     pos: [u8; 6],
 }
 
 impl Layout {
-    fn slot_of(&self, id: u8) -> Option<usize> {
-        self.zmm.iter().position(|&x| x == id)
-    }
-
-    fn value(&self, id: u8, z: usize, p: usize) -> usize {
-        if let Some(s) = self.slot_of(id) {
-            (z >> (self.zmm.len() - 1 - s)) & 1
-        } else {
-            let b = self.pos.iter().position(|&x| x == id).expect("a placed bit");
-            (p >> (5 - b)) & 1
+    const fn value(&self, id: u8, z: usize, p: usize) -> usize {
+        let mut s = 0;
+        while s < self.n {
+            if self.zmm[s] == id {
+                return (z >> (self.n - 1 - s)) & 1;
+            }
+            s += 1;
         }
+        let mut b = 0;
+        while b < 6 {
+            if self.pos[b] == id {
+                return (p >> (5 - b)) & 1;
+            }
+            b += 1;
+        }
+        panic!("a placed bit")
     }
 }
 
 /// One round moves one bit between a vector slot and a byte position; the two vectors differing
 /// in that slot feed the two outputs, and this is the index for the output whose new bit is `v`.
-fn round_idx(from: &Layout, to: &Layout, v: usize) -> [u8; 64] {
-    let slot = (0..to.zmm.len())
-        .find(|&s| from.zmm[s] != to.zmm[s])
-        .expect("one slot moves");
+const fn round_idx(from: &Layout, to: &Layout, v: usize) -> [u8; 64] {
+    let mut slot = 0;
+    while slot < to.n && from.zmm[slot] == to.zmm[slot] {
+        slot += 1;
+    }
+    assert!(slot < to.n, "one slot moves");
     let mut idx = [0u8; 64];
-    let z = v << (to.zmm.len() - 1 - slot);
-    for (p, i) in idx.iter_mut().enumerate() {
+    let z = v << (to.n - 1 - slot);
+    let mut p = 0;
+    while p < 64 {
         let mut q = 0;
-        for b in 0..6 {
+        let mut b = 0;
+        while b < 6 {
             q |= to.value(from.pos[b], z, p) << (5 - b);
+            b += 1;
         }
         let s = to.value(from.zmm[slot], z, p);
-        *i = ((s << 6) | q) as u8;
+        idx[p] = ((s << 6) | q) as u8;
+        p += 1;
     }
     idx
 }
 
-fn rounds(mut layout: Layout, steps: &[(usize, usize)]) -> Vec<[[u8; 64]; 2]> {
-    steps
-        .iter()
-        .map(|&(slot, pos_bit)| {
-            let mut next = layout.clone();
-            let out = next.zmm[slot];
-            next.zmm[slot] = next.pos[pos_bit];
-            next.pos[pos_bit] = out;
-            let r = [round_idx(&layout, &next, 0), round_idx(&layout, &next, 1)];
-            layout = next;
-            r
-        })
-        .collect()
+const fn rounds<const N: usize>(mut layout: Layout, steps: [(usize, usize); N]) -> Rounds<N> {
+    let mut out = [[[0u8; 64]; 2]; N];
+    let mut i = 0;
+    while i < N {
+        let (slot, pos_bit) = steps[i];
+        let mut next = layout;
+        let moved = next.zmm[slot];
+        next.zmm[slot] = next.pos[pos_bit];
+        next.pos[pos_bit] = moved;
+        out[i] = [round_idx(&layout, &next, 0), round_idx(&layout, &next, 1)];
+        layout = next;
+        i += 1;
+    }
+    Rounds(out)
 }
 
-struct Tables {
-    input: Vec<[[u8; 64]; 2]>,
-    output: Vec<[[u8; 64]; 2]>,
-    output_fix: [u8; 64],
-}
+/// The `vpermt2b` index pairs of a transpose's rounds, one cache line each.
+#[repr(C, align(64))]
+struct Rounds<const N: usize>([[[u8; 64]; 2]; N]);
 
-fn tables() -> &'static Tables {
-    static T: OnceLock<Tables> = OnceLock::new();
-    T.get_or_init(|| {
-        let input = rounds(
-            Layout {
-                zmm: vec![E[5], E[4], E[3], E[2]],
-                pos: [E[1], E[0], K[3], K[2], K[1], K[0]],
-            },
-            &[(0, 2), (1, 3), (2, 4), (3, 5)],
-        );
-        let after = Layout {
-            zmm: vec![C[2], C[1], C[0]],
-            pos: [E[1], E[0], E[5], E[4], E[3], E[2]],
-        };
-        let output = rounds(after, &[(0, 2), (1, 3), (2, 4)]);
-        // pos is now [E1, E0, C2, C1, C0, E2]; the qword order is [E2, E1, E0, C2, C1, C0].
-        let mut output_fix = [0u8; 64];
-        for (p, f) in output_fix.iter_mut().enumerate() {
-            let (e2, e1, e0, c) = ((p >> 5) & 1, (p >> 4) & 1, (p >> 3) & 1, p & 7);
-            *f = ((e1 << 5) | (e0 << 4) | (c << 1) | e2) as u8;
-        }
-        Tables {
-            input,
-            output,
-            output_fix,
-        }
-    })
-}
+#[repr(C, align(64))]
+struct Fix([u8; 64]);
+
+// The tables are built at compile time from the bit layouts, so a tile neither checks a lazy
+// initialization nor reads a table list of run-time length: the rounds unroll with constant slot
+// bits and a tile's vectors stay in registers through them.
+static INPUT_ROUNDS: Rounds<4> = rounds(
+    Layout {
+        zmm: [E[5], E[4], E[3], E[2]],
+        n: 4,
+        pos: [E[1], E[0], K[3], K[2], K[1], K[0]],
+    },
+    [(0, 2), (1, 3), (2, 4), (3, 5)],
+);
+static OUTPUT_ROUNDS: Rounds<3> = rounds(
+    Layout {
+        zmm: [C[2], C[1], C[0], 0],
+        n: 3,
+        pos: [E[1], E[0], E[5], E[4], E[3], E[2]],
+    },
+    [(0, 2), (1, 3), (2, 4)],
+);
+// After the output rounds pos is [E1, E0, C2, C1, C0, E2]; the qword order is
+// [E2, E1, E0, C2, C1, C0].
+static OUTPUT_FIX: Fix = {
+    let mut f = [0u8; 64];
+    let mut p = 0;
+    while p < 64 {
+        let (e2, e1, e0, c) = ((p >> 5) & 1, (p >> 4) & 1, (p >> 3) & 1, p & 7);
+        f[p] = ((e1 << 5) | (e0 << 4) | (c << 1) | e2) as u8;
+        p += 1;
+    }
+    Fix(f)
+};
 
 /// The word at byte position `p` of a transposed tile.
 #[inline]
@@ -131,11 +148,10 @@ unsafe fn apply_round(z: &mut [__m512i], slot_bit: usize, r: &[[u8; 64]; 2]) {
 /// `out[k].byte[p]` = byte `k` of word `word_at(p)` of the 64 words at `src`.
 #[inline(always)]
 pub unsafe fn transpose_tile(src: *const u8, out: &mut [__m512i; 16]) {
-    let t = tables();
     for (i, o) in out.iter_mut().enumerate() {
         *o = _mm512_loadu_si512(src.add(64 * i) as *const __m512i);
     }
-    for (r, round) in t.input.iter().enumerate() {
+    for (r, round) in INPUT_ROUNDS.0.iter().enumerate() {
         apply_round(out, 8 >> r, round);
     }
 }
@@ -144,11 +160,10 @@ pub unsafe fn transpose_tile(src: *const u8, out: &mut [__m512i; 16]) {
 /// `8g + i`.
 #[inline(always)]
 pub unsafe fn untranspose_planes(mut planes: [__m512i; 8]) -> [__m512i; 8] {
-    let t = tables();
-    for (r, round) in t.output.iter().enumerate() {
+    for (r, round) in OUTPUT_ROUNDS.0.iter().enumerate() {
         apply_round(&mut planes, 4 >> r, round);
     }
-    let fix = idx(&t.output_fix);
+    let fix = idx(&OUTPUT_FIX.0);
     planes.map(|z| _mm512_permutexvar_epi8(fix, z))
 }
 

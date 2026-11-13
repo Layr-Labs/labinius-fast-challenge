@@ -969,6 +969,9 @@ fn main() {
     output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
+    // Diagnostic only: the new pass schedules against the crown's, after the proof is written.
+    #[cfg(target_arch = "aarch64")]
+    ntt::neon::sms::ab_passes();
     // The proof file is complete. Let process teardown release the large allocations and
     // mappings together, instead of walking their Rust destructors first.
     std::mem::forget((values, proof, output));

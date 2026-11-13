@@ -810,6 +810,10 @@ mod asm;
 mod idx;
 pub use idx::indices_asm;
 pub use asm::{pass_c_asm, pass_d_asm, pass_lut_asm};
+// Diagnostic only: the crown's generated passes for the post-proof A/B timing (`sms::ab_passes`).
+#[path = "ntt_neon_asm_old.rs"]
+#[allow(dead_code)]
+pub mod asm_old;
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].

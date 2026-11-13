@@ -963,6 +963,51 @@ unsafe fn sums2(
     let _ = (&mut accs, &mut ys, &mut devs);
 }
 
+/// Diagnostic only, run after the proof is written: the generated passes (new schedules) against
+/// the crown's (`asm_old`), alternately on the same L1-hot buffers, 5 rounds of 20,000 calls each;
+/// one `ab ...` line per pass on stderr with each side's best round in ns per call.
+pub fn ab_passes() {
+    #[inline(always)]
+    fn now() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+    let f: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+    let kern = &kernels()[PB];
+    let mut x: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+    let nib: Box<[uint8x16_t; N / 4]> = unsafe { Box::new(core::mem::zeroed()) };
+    let calls = 5_000u64;
+    let mut run = |g: &mut dyn FnMut(&mut [int16x8_t; N])| -> f64 {
+        for _ in 0..500 { g(&mut x); }
+        let t = now();
+        for _ in 0..calls { g(&mut x); core::hint::black_box(&mut *x); }
+        (now() - t) as f64 * 1e9 / f as f64 / calls as f64
+    };
+    // pass_d is byte-identical in both trees: its delta is the measurement's own bias (control).
+    let mut best = [[f64::MAX; 2]; 3];
+    for round in 0..6 {
+        for k in 0..2 {
+            let side = (round + k) % 2; // alternate which side runs first
+            unsafe {
+                best[0][side] = best[0][side].min(if side == 0 { run(&mut |x| super::asm_old::pass_c_asm_old(x, kern)) } else { run(&mut |x| pass_c_asm(x, kern)) });
+                #[cfg(target_feature = "sve")]
+                {
+                    best[1][side] = best[1][side].min(if side == 0 { run(&mut |x| super::asm_old::pass_lut_asm_old(&nib, x, kern)) } else { run(&mut |x| pass_lut_asm(&nib, x, kern)) });
+                }
+                best[2][side] = best[2][side].min(if side == 0 { run(&mut |x| super::asm_old::pass_d_asm_old(x, kern)) } else { run(&mut |x| pass_d_asm(x, kern)) });
+            }
+        }
+    }
+    let _ = &nib;
+    for (name, b) in ["pass_c", "pass_lut", "pass_d(control)"].iter().zip(best) {
+        if b[0] < f64::MAX {
+            eprintln!("ab {name}: crown_ns={:.1} new_ns={:.1} delta={:+.2}%", b[0], b[1], 100.0 * (b[1] / b[0] - 1.0));
+        }
+    }
+}
+
 #[inline]
 fn crt(r: u32, t: i64) -> u64 {
     const INV: u64 = {

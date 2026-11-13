@@ -376,38 +376,34 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 /// registers, so the accumulator is read and written once per block instead of once per group.
 ///
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
-fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
+fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
         use ntt::neon::sms;
         let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
-        sms::commit(values, &matrix, threads(), modulus, out);
-        return;
+        return sms::commit(values, &matrix, threads());
     }
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::hybrid::MODULUS {
         use ntt::neon::hybrid;
         let matrix = hybrid::HybridMatrix::from_image(&HYBRID_MATRIX.0, RING_ELEMENTS)
             .unwrap_or_else(|| hybrid::matrix(RING_ELEMENTS, threads()));
-        output::pack_into(&hybrid::commit(values, &matrix, threads()), modulus, out);
-        return;
+        return hybrid::commit(values, &matrix, threads());
     }
     if modulus == ntt::MODULUS {
-        output::pack_into(&ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads()), modulus, out);
-        return;
+        return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
     }
     let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
     if modulus >= FAST_MODULUS {
-        output::pack_into(&commit_reference(values, &matrix, modulus), modulus, out);
-        return;
+        return commit_reference(values, &matrix, modulus);
     }
     let matrix: Vec<u64> = matrix.iter().map(|&a| a as u64).collect();
     let q = modulus as u64;
     let per = COLUMNS.div_ceil(threads());
-    let mut coeffs = vec![0u128; COLUMNS * rq::N];
+    let mut out = vec![0u128; COLUMNS * rq::N];
     std::thread::scope(|scope| {
-        for (block, first) in coeffs.chunks_mut(per * rq::N).zip((0..).step_by(per)) {
+        for (block, first) in out.chunks_mut(per * rq::N).zip((0..).step_by(per)) {
             let matrix = &matrix;
             scope.spawn(move || {
                 let count = block.len() / rq::N;
@@ -433,7 +429,7 @@ fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
             });
         }
     });
-    output::pack_into(&coeffs, modulus, out);
+    out
 }
 
 /// The checker's schoolbook commitment, for a modulus too wide for [`commit`]'s `u64` lanes.
@@ -901,8 +897,9 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
-    let mut commitment = output.commitment_buffer();
-    commit(values, modulus, &mut commitment);
+    let coefficients = commit(values, modulus);
+    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
+    std::mem::forget(coefficients);
     labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
@@ -970,23 +967,6 @@ fn main() {
     // mappings together, instead of walking their Rust destructors first.
     std::mem::forget((values, proof, output));
     std::process::exit(0);
-}
-
-#[cfg(test)]
-fn unpack(bytes: &[u8], q: u128) -> Vec<u128> {
-    let w = rq::coefficient_bytes(q);
-    bytes.chunks_exact(w).map(|s| {
-        let mut b = [0u8; 16];
-        b[..w].copy_from_slice(s);
-        u128::from_le_bytes(b)
-    }).collect()
-}
-
-#[cfg(test)]
-fn sms_packed(values: &[B128], a: &ntt::neon::sms::SmsMatrix, workers: usize, q: u128) -> Vec<u8> {
-    let mut out = vec![0u8; values.len() / (4 * a.elements) * rq::N * rq::coefficient_bytes(q)];
-    ntt::neon::sms::commit(values, a, workers, q, &mut out);
-    out
 }
 
 #[cfg(test)]
@@ -1068,7 +1048,7 @@ mod tests {
         let a = sms::matrix(RING_ELEMENTS, 8);
         eprintln!("sms margin {}", a.margin);
         for workers in [1, 3] {
-            assert!(unpack(&sms_packed(&values, &a, workers, q), q) == want, "workers {workers}");
+            assert!(sms::commit(&values, &a, workers) == want, "workers {workers}");
         }
         // a short last chunk and a short last lockstep group, partial batches; the last sweep of
         // the column with one to four tiles (whole and short), a column of one short tile, and a
@@ -1078,7 +1058,7 @@ mod tests {
             let matrix = rq::ajtai_matrix(q, elements);
             let want = commit_reference(&values, &matrix, q);
             let a = sms::matrix(elements, 3);
-            assert!(unpack(&sms_packed(&values, &a, 3, q), q) == want, "{elements} elements");
+            assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
         }
     }
     /// With every repair threshold at zero each chunk deviation is recomputed exactly by
@@ -1093,7 +1073,7 @@ mod tests {
             let want = commit_reference(&values, &matrix, q);
             let mut a = sms::matrix(elements, 3);
             a.threshold = std::borrow::Cow::Owned(vec![0; a.threshold.len()]);
-            assert!(unpack(&sms_packed(&values, &a, 3, q), q) == want, "{elements} elements, every coefficient repaired");
+            assert!(sms::commit(&values, &a, 3) == want, "{elements} elements, every coefficient repaired");
         }
     }
     #[test]
@@ -1166,9 +1146,7 @@ mod tests {
                 }
             })
             .collect();
-        let mut packed = vec![0u8; COLUMNS * rq::N * rq::coefficient_bytes(modulus)];
-        commit(&values, modulus, &mut packed);
-        let fast = unpack(&packed, modulus);
+        let fast = commit(&values, modulus);
         let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
         for j in 0..2 {
             let witness: Vec<F162> = values[j * COLUMN_LEN..][..COLUMN_LEN]

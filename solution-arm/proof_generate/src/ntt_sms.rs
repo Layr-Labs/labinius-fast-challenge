@@ -401,8 +401,14 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 }
 
 /// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 12;
-/// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
+///
+/// A sweep's transforms wait in [`xs`] between `pass_d`'s writes and [`sink`]'s read-back, so the
+/// sweep length sets how much of L2 that buffer shares with the accumulators ([`ROWS`]` * 4 * N`
+/// `i64` pairs, re-read and re-written per sweep) and the streamed key tiles. The shortest legal
+/// sweep, one [`PASS`] of transforms, measured fastest on Neoverse N3: commit `279 ms` against
+/// `328 ms` for the previous `SINK = 12` on one fixed table and seed (paired, 16/16 wins).
+const SINK: usize = 2;
+/// Elements transformed per sweep: [`SINK`] tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
 
@@ -815,31 +821,6 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
     vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
 }
 
-/// Levels 0 to 3 of the transform from the nibble tables: the SVE2 `tbl` kernel on a host
-/// built with SVE (the official Neoverse V2 target), the equivalent NEON `pass_lut` otherwise,
-/// so that the portable path builds and runs on AArch64 hosts without SVE.
-#[cfg(target_feature = "sve")]
-#[inline(always)]
-unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    pass_lut_asm(nib, x, kern);
-}
-
-#[cfg(not(target_feature = "sve"))]
-#[inline(always)]
-unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    // `indices` writes the packed byte layout the SVE `ld1b` consumer reads; expand each
-    // slot's eight bytes to the `(2 v, 2 v + 1)` byte pairs `pass_lut`'s `vqtbl2q_u8` indexes.
-    let bytes = core::slice::from_raw_parts(nib.as_ptr() as *const u8, 16 * (N / 4));
-    let mut idx = [vdupq_n_u8(0); N / 4];
-    for (s, slot) in idx.iter_mut().enumerate() {
-        let v = vld1_u8(bytes.as_ptr().add(super::packed_slot(s)));
-        let lo = vshl_n_u8::<1>(v);
-        let hi = vorr_u8(lo, vdup_n_u8(1));
-        *slot = vzip1q_u8(vcombine_u8(lo, lo), vcombine_u8(hi, hi));
-    }
-    super::pass_lut::<PB>(&idx, x, kern);
-}
-
 /// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
 /// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients.
 #[inline(never)]
@@ -869,9 +850,9 @@ unsafe fn sums(
             for i in 0..groups * LOCK {
                 let at = pass_words(words, a.elements, e, i);
                 prefetch_words(words, e, i + PF_T);
-                indices_asm(&at, nib);
+                indices(&at, nib);
                 let x = &mut xs[i];
-                lut_pass(nib, x, kern);
+                pass_lut_asm(nib, x, kern);
                 pass_c_asm(x, kern);
                 pass_d_asm(x, kern);
             }
@@ -934,9 +915,9 @@ unsafe fn sums2(
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     prefetch_words(words[t], e, i + PF_T);
-                    indices_asm(&at, nib);
+                    indices(&at, nib);
                     let x = &mut xs[i];
-                    lut_pass(nib, x, kern);
+                    pass_lut_asm(nib, x, kern);
                     pass_c_asm(x, kern);
                     pass_d_asm(x, kern);
                 }
@@ -1026,25 +1007,18 @@ impl Drop for Arena {
     }
 }
 
-/// The commitment of every column of `values` (columns of `4 a.elements` words) modulo `q`,
-/// written straight into `out` as the wire encoding (`rq::coefficient_bytes(q)` little-endian
-/// bytes per coefficient, column after column), so the separate packing pass over a `u128`
-/// buffer is not needed.
-pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
+/// The commitment of every column of `values` (columns of `4 a.elements` words) modulo
+/// [`MODULUS`].
+pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize) -> Vec<u128> {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
-    // `MODULUS < 2^40`: five wire bytes per coefficient, a constant so the stores are fixed-size.
-    const W: usize = 5;
-    const _: () = assert!(MODULUS < 1 << (8 * W) && MODULUS >= 1 << (8 * (W - 1)));
-    assert_eq!(crate::rq::coefficient_bytes(q), W);
-    let width = W;
-    assert_eq!(out.len(), columns * N * width);
-    for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
+    let mut out = vec![0u128; columns * N];
+    for_blocks(&mut out, N, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
         let Scratch { xs, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
-        let count = block.len() / (N * width);
+        let count = block.len() / N;
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
             let col0 = first + LANES * b;
             let here = (count - LANES * b).min(LANES);
@@ -1057,7 +1031,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
             })
         };
         let batches = count.div_ceil(LANES);
-        let mut targets: Vec<&mut [u8]> = block.chunks_mut(LANES * N * width).collect();
+        let mut targets: Vec<&mut [u128]> = block.chunks_mut(LANES * N).collect();
         for b in 0..batches {
             // pairs of batches share one key sweep; the second one's results wait in `*2`
             if b % 2 == 0 {
@@ -1113,15 +1087,14 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 }
             }
             // a partial batch has fewer than eight columns in `target`: only those lanes are written
-            for (c, column) in target.chunks_exact_mut(N * width).enumerate() {
-                let (slots, _) = column.as_chunks_mut::<W>();
-                for (k, slot) in slots.iter_mut().enumerate() {
-                    let bytes = crt(base[k][c] as u32, tail[k][c]).to_le_bytes();
-                    *slot = core::array::from_fn(|i| bytes[i]);
+            for (c, column) in target.chunks_exact_mut(N).enumerate() {
+                for (k, o) in column.iter_mut().enumerate() {
+                    *o = crt(base[k][c] as u32, tail[k][c]);
                 }
             }
         }
     });
+    out
 }
 
 #[cfg(test)]
@@ -1283,8 +1256,8 @@ mod tests {
     /// unscaled one ([`super::super::inverse`], the path before the fold), bit for bit, on every
     /// row of one chunk: random key vectors (centered residues, and the extremes `+-(p - 1) / 2`),
     /// random transforms over all of `i16`, [`CHUNK`]` / `[`SWEEP`] full sweeps through [`sink`] and
-    /// a last one of one to three tiles (on SVE hosts, [`slot_sink`]'s `sdot`), then [`narrow`] and
-    /// the inverse.
+    /// a last one of one to three tiles, at most [`SINK`] (the sweep buffer's size, [`xs`], also on
+    /// SVE hosts, [`slot_sink`]'s `sdot`), then [`narrow`] and the inverse.
     #[test]
     fn folded_key_matches_unscaled_path() {
         use core::arch::aarch64::*;
@@ -1297,7 +1270,10 @@ mod tests {
             let mut old_acc = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
             let mut new_acc = old_acc.clone();
             for sweep in 0..=CHUNK / SWEEP {
-                let groups = if sweep < CHUNK / SWEEP { SINK } else { 1 + case };
+                // The last sweep is short; it may not hold more tiles than the sweep buffer does,
+                // so its tile count saturates at SINK.
+                let groups = if sweep < CHUNK / SWEEP { SINK } else { (1 + case).min(SINK) };
+                assert!(groups * LOCK <= SWEEP);
                 let old: Vec<i16> = (0..groups * N * ROWS * LOCK)
                     .map(|_| match case {
                         1 => if next() & 1 == 0 { h as i16 } else { -h as i16 },
@@ -1472,7 +1448,6 @@ mod leap_bench {
     }
 
     #[test]
-    #[cfg(target_feature = "sve")]
     fn pass_lut_asm_matches() {
         let kern = &kernels()[PB];
         let mut st = 17u64;
@@ -1514,7 +1489,6 @@ mod leap_bench {
 
     #[test]
     #[ignore]
-    #[cfg(target_feature = "sve")]
     fn transform_timing() {
         let kern = &kernels()[PB];
         let mut st = 7u64;

@@ -60,9 +60,15 @@ def base_names(a):
     for m in range(12):
         a = a.replace(f'IB{m}X', f'{{i{m}}}')
     return a
-def emit(per=27, K=8, B=17, width=6, ls=2):
+def emit(per=27, K=8, B=17, width=6, ls=2, loop=False):
+    """Straight-line over the four level-1 nodes, or (`loop`) node 0's scheduled body once in a
+    4-iteration loop that advances `{x}` by 162 slots and `{lut}` by one node's six tables: the
+    nodes differ only in those two bases (the nibble indices depend on `j` alone), so the loop
+    runs the same instructions on the same values, in a quarter of the code (L1I)."""
     out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"']
-    for n in range(4):
+    if loop:
+        out += ['"mov {n}, #4"', '"2:"']
+    for n in range(1 if loop else 4):
         for t in range(6):
             out.append(f'"ldp q{16+2*t}, q{17+2*t}, [{{lut}}, #{n*192 + 32*t}]"')
         for c in range(0, 27, per):
@@ -70,4 +76,6 @@ def emit(per=27, K=8, B=17, width=6, ls=2):
             seq, _ = schedule(ins, skew=K, budget=B, cap=18, width=width, ls=ls)
             asm, _ = allocate(seq, {'k': 15}, set(), reserved=RESERVED)
             out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
+    if loop:
+        out += [f'"add {{x}}, {{x}}, #{16 * 162}"', '"add {lut}, {lut}, #192"', '"subs {n}, {n}, #1"', '"b.ne 2b"']
     return ',\n        '.join(out)

@@ -114,8 +114,6 @@ mod sys {
     pub const MAP_NORESERVE: i32 = 0x4000;
     pub const MADV_DONTNEED: i32 = 4;
     pub const MADV_HUGEPAGE: i32 = 14;
-    /// Linux 5.14+: fault the range in now, read-only, without blocking a later writer.
-    pub const MADV_POPULATE_READ: i32 = 22;
     /// Linux 5.14+: fault the range in now, writable (for a shared file mapping: page-cache pages
     /// allocated and their blocks reserved, as a first write would).
     pub const MADV_POPULATE_WRITE: i32 = 23;
@@ -436,45 +434,6 @@ impl Table {
         }
     }
 
-}
-
-/// Fault the words' pages in, page-cache pages into page tables: `MADV_POPULATE_READ` where the
-/// kernel has it (older kernels refuse it, harmlessly), one read per page otherwise (the
-/// fault-around maps a run of pages per fault). A read-only touch, so it runs on another thread
-/// while the key is built.
-#[allow(dead_code)]
-fn populate_words(words: &[B128], keys: &[u8], threads: usize) {
-    let runs = labinius::par::ranges(words.len(), threads, 4096 / 16);
-    let kruns = labinius::par::ranges(keys.len(), threads, 4096);
-    labinius::par::pool().run(runs.len().max(kruns.len()), |i| {
-        if let Some(r) = kruns.get(i) {
-            populate_part(keys[r.clone()].as_ptr() as usize, r.len());
-        }
-        if let Some(r) = runs.get(i) {
-            populate_part(words[r.clone()].as_ptr() as usize, r.len() * 16);
-        }
-    });
-}
-
-fn populate_part(addr: usize, bytes: usize) {
-    #[cfg(target_os = "linux")]
-    {
-        // whole pages: the range need not start on one
-        let start = addr & !4095;
-        let done = unsafe {
-            sys::madvise(start as *mut core::ffi::c_void, bytes + (addr - start), sys::MADV_POPULATE_READ)
-        };
-        if done == 0 {
-            return;
-        }
-    }
-    let mut off = 0;
-    let mut sink = 0u8;
-    while off < bytes {
-        sink ^= unsafe { core::ptr::read_volatile((addr as *const u8).add(off)) };
-        off += 4096;
-    }
-    std::hint::black_box(sink);
 }
 
 /// The table and key ranges whose release `encode_into` runs: (words, bytes, keys, bytes).

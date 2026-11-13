@@ -1209,6 +1209,7 @@ pub fn lazy_inverses() -> &'static [LazyInverse; 3] {
 }
 
 /// The factor [`inverse_lazy`]'s output carries: `3^4 2^2`, the radices it does not divide by.
+#[cfg(test)]
 pub const LAZY_SCALE: u64 = 324;
 
 /// `a - round(a / 2^13) p`: `|result| <= 0.18664 |a| + p / 2` for `p = 9721`.
@@ -1245,6 +1246,7 @@ unsafe fn ib2(y0: int16x8_t, y1: int16x8_t, t: int16x8_t, k: int16x8_t) -> (int1
 /// 10915; the radix-2 sums 21830 and 17870, outputs 8935 and 8196; the unsplit outputs 7499
 /// and 7292. The test `lazy_inverse_matches` checks the congruence and the output bound.
 #[inline(never)]
+#[cfg(test)]
 pub unsafe fn inverse_lazy(x: &mut [int16x8_t; N]) {
     let at = x.as_mut_ptr();
     inverse_lazy_io(x, |i| *at.add(i), |i, v| *at.add(i) = v);

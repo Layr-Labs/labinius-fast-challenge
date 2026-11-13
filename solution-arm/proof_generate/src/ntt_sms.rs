@@ -58,7 +58,10 @@ const TERMS: i64 = 836;
 const _: () = assert!((CHUNK as i64) * TERMS * (lattice::MAX_DIGIT_ABS as i64) * 4 < i32::MAX as i64);
 
 /// The SMS matrix: in the transform domain, slot `j` of row `r` of element `m` is
-/// `data[(((m / 8) N + j) ROWS + r) 8 + m % 8]`, centered residues, so that one vector holds the
+/// `data[((j GT + m / 8) ROWS + r) 8 + m % 8]` (`GT` = tiles per column; candidate keylay:
+/// slot-major, so one slot's keys for every tile are contiguous and the sink reads them as
+/// one sequential stream per slot instead of `SINK` streams strided by a whole tile),
+/// centered residues, so that one vector holds the
 /// eight elements of a tile, each residue negated because the forward kernel transforms `-s` and
 /// multiplied by [`KEY_SCALE`] `= 324^-1` so that the inverses need no `1 / r`; per chunk and digit
 /// the centered residue
@@ -113,31 +116,87 @@ pub fn prefetch_key(image: &'static [u8]) {
         return;
     }
     let job = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
         let len = image.len();
         let mut v: Vec<u8> = Vec::with_capacity(len);
         let dst = v.as_mut_ptr() as usize;
+        // The image's bytes in the executable file: read with `pread` they come straight from the
+        // page cache, without faulting in (and later tearing down) ~9,000 4 KiB entries of the
+        // binary's mapping. The mapped image is the fallback.
+        let source = exe_source(image);
         // pieces of whole 2 MiB pages, so that each thread faults in its own huge pages
         let piece = len.div_ceil(8).next_multiple_of(2 << 20);
         std::thread::scope(|s| {
             for start in (0..len).step_by(piece) {
                 let n = piece.min(len - start);
+                let source = source.as_ref();
                 s.spawn(move || {
                     // SAFETY: disjoint ranges of the capacity and of the image.
-                    unsafe { core::ptr::copy_nonoverlapping(image.as_ptr().add(start), (dst as *mut u8).add(start), n) }
+                    let out = unsafe { core::slice::from_raw_parts_mut((dst as *mut u8).add(start), n) };
+                    let read = source.is_some_and(|(file, offset)| {
+                        use std::os::unix::fs::FileExt;
+                        file.read_exact_at(out, offset + start as u64).is_ok()
+                    });
+                    if !read {
+                        out.copy_from_slice(&image[start..start + n]);
+                    }
                 });
             }
         });
         // SAFETY: every byte below `len` was written above.
         unsafe { v.set_len(len) };
         let _ = KEY.set((image.as_ptr() as usize, v));
+        KEY_COPY_US.store(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     });
     *KEY_JOB.lock().unwrap() = Some(job);
 }
 
+/// The executable, opened, and the file offset of `image` in it: the one mapping of the
+/// executable in `/proc/self/maps` that holds all of `image` (read-only data, no relocations).
+fn exe_source(image: &[u8]) -> Option<(std::fs::File, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let (a, len) = (image.as_ptr() as usize, image.len());
+        let exe = std::fs::read_link("/proc/self/exe").ok()?;
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        for line in maps.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 6 || std::path::Path::new(f[5]) != exe {
+                continue;
+            }
+            let (s, e) = f[0].split_once('-')?;
+            let (s, e) = (usize::from_str_radix(s, 16).ok()?, usize::from_str_radix(e, 16).ok()?);
+            if a >= s && a + len <= e {
+                let offset = u64::from_str_radix(f[2], 16).ok()? + (a - s) as u64;
+                let file = std::fs::File::open("/proc/self/exe").ok()?;
+                return (file.metadata().ok()?.len() >= offset + len as u64).then_some((file, offset));
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = image;
+        None
+    }
+}
+
+/// Diagnostics: nanoseconds summed over the commitment's workers in the paired pass's
+/// transforms (indices, lookup and the two NEON passes), its accumulation sweeps and its chunk ends.
+pub static PROFILE_NS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+use std::sync::atomic::Ordering::Relaxed;
+
+/// Diagnostics for the prover's stderr line: the key copy's duration and the commitment's wait
+/// for it, in microseconds.
+pub static KEY_COPY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static KEY_WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The copy of [`prefetch_key`] of `image`, once it is done (waiting for it), if one was started.
 fn key_copy(image: &'static [u8]) -> Option<&'static [u8]> {
     if let Some(job) = KEY_JOB.lock().unwrap().take() {
+        let waited = std::time::Instant::now();
         let _ = job.join();
+        KEY_WAIT_US.store(waited.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     KEY.get().filter(|(src, v)| *src == image.as_ptr() as usize && v.len() == image.len()).map(|(_, v)| &v[..])
 }
@@ -339,6 +398,19 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
             }
         }
     });
+    // Candidate keylay: transpose the tile-major image just built to slot-major
+    // (`data[((j GT + g) ROWS + r) LOCK + e]`), at build time only.
+    let data = {
+        let gt = elements.div_ceil(LOCK);
+        let mut tdata = vec![0i16; data.len()];
+        for g in 0..gt {
+            for j in 0..N {
+                let src = &data[(g * N + j) * ROWS * LOCK..][..ROWS * LOCK];
+                tdata[(j * gt + g) * ROWS * LOCK..][..ROWS * LOCK].copy_from_slice(src);
+            }
+        }
+        tdata
+    };
     use std::borrow::Cow::Owned;
     SmsMatrix { elements, data: Owned(data), mean_residues: Owned(mean_residues), mu: Owned(mu), digits: Owned(digits), mean_int: Owned(mean_int), threshold: Owned(threshold), margin, column_failure }
 }
@@ -516,7 +588,7 @@ macro_rules! slot_sink_body {
 #[inline(never)]
 unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
     const XS: usize = N * 16;
-    const KS: usize = N * ROWS * LOCK * 2;
+    const KS: usize = ROWS * LOCK * 2; // keylay: this slot's next tile is adjacent
     debug_assert!((1..=SINK).contains(&groups));
     slot_sink_body!(acc, z, k, groups, ["ldp q20, q21, [{a}, #64]", "ldp q22, q23, [{a}, #96]", "ldp q24, q25, [{a}, #128]", "ldp q26, q27, [{a}, #160]", "ldp q28, q29, [{a}, #192]", "ldp q30, q31, [{a}, #224]"], ["ldp q16, q17, [{a}, #256]", "ldp q18, q19, [{a}, #288]", "ldp q20, q21, [{a}, #320]", "ldp q22, q23, [{a}, #352]", "ldp q24, q25, [{a}, #384]", "ldp q26, q27, [{a}, #416]"]);
 }
@@ -528,18 +600,19 @@ unsafe fn slot_sink(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, gro
 #[inline(never)]
 unsafe fn slot_sink_fresh(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
     const XS: usize = N * 16;
-    const KS: usize = N * ROWS * LOCK * 2;
+    const KS: usize = ROWS * LOCK * 2; // keylay: this slot's next tile is adjacent
     debug_assert!((1..=SINK).contains(&groups));
     slot_sink_body!(acc, z, k, groups, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
 }
 
 /// `acc +=` the products of the first `groups` tiles of `xs` (transforms `8 g..8 g + 8` of tile
-/// `g`) with the key tiles at `keys` (`N ROWS LOCK` entries apart), every slot and row; the sums of
+/// `g`) with the key tiles at `keys` (slot-major: tile `g0 + g` of slot `s` at
+/// `((s gt + g0 + g) ROWS) LOCK`), every slot and row; the sums of
 /// [`dot`] per tile, in another order. A tile past the column's end has zero keys. With `FRESH` (a
 /// chunk's first sweep) the digit rows' sums are overwritten instead of added to, so the chunk end
 /// needs no zeroing pass; the base row always accumulates.
 #[inline(never)]
-unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, g0: usize, gt: usize, acc: &mut [int64x2_t], groups: usize) {
     debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
     let accp = acc.as_mut_ptr();
     #[cfg(target_feature = "sve")]
@@ -547,16 +620,16 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
         let z = xs.as_ptr() as *const int16x8_t;
         for s in 0..N {
             if FRESH {
-                slot_sink_fresh(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+                slot_sink_fresh(z.add(s), keys.add((s * gt + g0) * ROWS * LOCK), accp.add(idx(s, 0)), groups);
             } else {
-                slot_sink(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+                slot_sink(z.add(s), keys.add((s * gt + g0) * ROWS * LOCK), accp.add(idx(s, 0)), groups);
             }
         }
     }
     #[cfg(not(target_feature = "sve"))]
     for g in 0..groups {
-        let tile = keys.add(g * N * ROWS * LOCK);
         for s in 0..N {
+            let tile = keys.add(((s * gt + g0 + g) * ROWS) * LOCK);
             let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *xs[LOCK * g + i].get_unchecked(s));
             let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
             for r in 0..ROWS {
@@ -565,7 +638,7 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
                         *accp.add(idx(s, r) + q) = vdupq_n_s64(0);
                     }
                 }
-                dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
+                dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add(r * LOCK)));
             }
         }
     }
@@ -874,12 +947,12 @@ unsafe fn sums(
                 pass_c_asm(x, kern);
                 pass_d_asm(x, kern);
             }
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            let keys = a.data.as_ptr();
             // the chunk's first sweep starts the digit rows' sums afresh
             if e % CHUNK == 0 {
-                sink::<true>(xs, keys, acc, groups);
+                sink::<true>(xs, keys, e / LOCK, a.elements.div_ceil(LOCK), acc, groups);
             } else {
-                sink::<false>(xs, keys, acc, groups);
+                sink::<false>(xs, keys, e / LOCK, a.elements.div_ceil(LOCK), acc, groups);
             }
             e += l;
         }
@@ -928,8 +1001,9 @@ unsafe fn sums2(
         while e < end {
             let l = SWEEP.min(end - e);
             let groups = l.div_ceil(LOCK);
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            let keys = a.data.as_ptr();
             for t in 0..2 {
+                let t0 = std::time::Instant::now();
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
@@ -938,15 +1012,19 @@ unsafe fn sums2(
                     pass_c_asm(x, kern);
                     pass_d_asm(x, kern);
                 }
+                let t1 = std::time::Instant::now();
                 if e % CHUNK == 0 {
-                    sink::<true>(xs, keys, accs[t], groups);
+                    sink::<true>(xs, keys, e / LOCK, a.elements.div_ceil(LOCK), accs[t], groups);
                 } else {
-                    sink::<false>(xs, keys, accs[t], groups);
+                    sink::<false>(xs, keys, e / LOCK, a.elements.div_ceil(LOCK), accs[t], groups);
                 }
+                PROFILE_NS[0].fetch_add((t1 - t0).as_nanos() as u64, Relaxed);
+                PROFILE_NS[1].fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
             }
             e += l;
         }
         let c = (end - 1) / CHUNK;
+        let t2 = std::time::Instant::now();
         for t in 0..2 {
             let dv = devs[t].as_mut_ptr();
             for d in (0..DIGITS).step_by(2) {
@@ -955,6 +1033,7 @@ unsafe fn sums2(
                 chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
             }
         }
+        PROFILE_NS[2].fetch_add(t2.elapsed().as_nanos() as u64, Relaxed);
     }
     for t in 0..2 {
         narrow(accs[t], 0, ys[t]);
@@ -1028,6 +1107,234 @@ impl Drop for Arena {
 /// written straight into `out` as the wire encoding (`rq::coefficient_bytes(q)` little-endian
 /// bytes per coefficient, column after column), so the separate packing pass over a `u128`
 /// buffer is not needed.
+/// One participant's share of chunk `c` of a pair of batches (or of a lone batch, `nb == 1`): the
+/// chunk's sweeps, each batch's transforms and sink against the same key lines, then each batch's
+/// chunk end into `devs`. Row 0 keeps accumulating in `accs` across the chunks this participant
+/// takes; the digit rows start afresh at the chunk's first sweep. The steps of [`sums2`]'s chunk
+/// loop, for one chunk.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn chunk_pass(
+    words: [&[(*const u8, usize); LANES]; 2],
+    nb: usize,
+    a: &SmsMatrix,
+    c: usize,
+    nib: &mut [uint8x16_t; N / 4],
+    xs: &mut [[int16x8_t; N]; SWEEP],
+    accs: [&mut [int64x2_t]; 2],
+    ys: [&mut [int16x8_t; N]; 2],
+    devs: [&mut [int32x4_t]; 2],
+) {
+    let kern = &kernels()[PB];
+    let [acc0, acc1] = accs;
+    let [y0, y1] = ys;
+    let [dev0, dev1] = devs;
+    let accs: [&mut [int64x2_t]; 2] = [acc0, acc1];
+    let ys: [&mut [int16x8_t; N]; 2] = [y0, y1];
+    let devs: [&mut [int32x4_t]; 2] = [dev0, dev1];
+    let (mut accs, mut ys, mut devs) = (accs, ys, devs);
+    let start = c * CHUNK;
+    let end = ((c + 1) * CHUNK).min(a.elements);
+    let mut e = start;
+    while e < end {
+        let l = SWEEP.min(end - e);
+        let groups = l.div_ceil(LOCK);
+        let keys = a.data.as_ptr();
+        let (g0, gt) = (e / LOCK, a.elements.div_ceil(LOCK));
+        for t in 0..nb {
+            for i in 0..groups * LOCK {
+                let at = pass_words(words[t], a.elements, e, i);
+                indices_asm(&at, nib);
+                let x = &mut xs[i];
+                lut_pass(nib, x, kern);
+                pass_c_asm(x, kern);
+                pass_d_asm(x, kern);
+            }
+            let t1 = std::time::Instant::now();
+            if e == start {
+                sink::<true>(xs, keys, g0, gt, accs[t], groups);
+            } else {
+                sink::<false>(xs, keys, g0, gt, accs[t], groups);
+            }
+            PROFILE_NS[1].fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
+            // The chunk's last sweep: this batch's chunk end now, while its accumulators are still
+            // in the caches from the sink, instead of after the other batch's transforms and sink
+            // have streamed 1 MB of slots and its own accumulators through them. The slots are free
+            // (the other batch's transforms rewrite them next), so `xs[0]` serves as scratch.
+            if e + l == end {
+                let t2 = std::time::Instant::now();
+                let dv = devs[t].as_mut_ptr();
+                for d in (0..DIGITS).step_by(2) {
+                    let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
+                    let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
+                    chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
+                }
+                PROFILE_NS[2].fetch_add(t2.elapsed().as_nanos() as u64, Relaxed);
+            }
+        }
+        e += l;
+    }
+    let _ = (&mut accs, &mut ys, &mut devs);
+}
+
+/// What a participant that did not take all of a pair's chunks leaves for the one that completes
+/// it: per batch, its row-0 sums (`acc[idx(s, 0)..][..4]` for every slot `s`) and its deviation
+/// sums. Integer sums, so the order of the deposits does not matter.
+struct Partial {
+    row0: [Vec<int64x2_t>; 2],
+    dev: [Vec<int32x4_t>; 2],
+}
+
+impl Partial {
+    unsafe fn take(accs: [&[int64x2_t]; 2], devs: [&[int32x4_t]; 2], nb: usize) -> Partial {
+        let row0 = core::array::from_fn(|t| if t < nb { (0..N).flat_map(|s| accs[t][idx(s, 0)..][..4].iter().copied()).collect() } else { Vec::new() });
+        let dev = core::array::from_fn(|t| if t < nb { devs[t].to_vec() } else { Vec::new() });
+        Partial { row0, dev }
+    }
+    unsafe fn add(&mut self, accs: [&[int64x2_t]; 2], devs: [&[int32x4_t]; 2], nb: usize) {
+        for t in 0..nb {
+            for s in 0..N {
+                for q in 0..4 {
+                    let r = &mut self.row0[t][4 * s + q];
+                    *r = vaddq_s64(*r, accs[t][idx(s, 0) + q]);
+                }
+            }
+            for (d, &x) in self.dev[t].iter_mut().zip(devs[t]) {
+                *d = vaddq_s32(*d, x);
+            }
+        }
+    }
+    unsafe fn restore(&self, accs: [&mut [int64x2_t]; 2], devs: [&mut [int32x4_t]; 2], nb: usize) {
+        let [acc0, acc1] = accs;
+        let [dev0, dev1] = devs;
+        let (accs, devs): ([&mut [int64x2_t]; 2], [&mut [int32x4_t]; 2]) = ([acc0, acc1], [dev0, dev1]);
+        let (mut accs, mut devs) = (accs, devs);
+        for t in 0..nb {
+            for s in 0..N {
+                accs[t][idx(s, 0)..][..4].copy_from_slice(&self.row0[t][4 * s..][..4]);
+            }
+            devs[t].copy_from_slice(&self.dev[t]);
+        }
+    }
+}
+
+/// A pair's chunk claims and the deposits of its participants: chunks taken, and under the lock
+/// the chunks deposited with their summed [`Partial`].
+struct PairState {
+    next: std::sync::atomic::AtomicUsize,
+    deposits: std::sync::Mutex<(usize, Option<Box<Partial>>)>,
+}
+
+/// The batch's commitment from its base-row coefficients `y` and deviation sums `dev`, written
+/// to its `target` columns.
+unsafe fn finalize_batch(a: &SmsMatrix, y: &[int16x8_t; N], dev: &[int32x4_t], tail: &mut [[i64; LANES]; N], target: &mut [u8]) {
+    const W: usize = 5;
+    let width = W;
+    let p = P1 as i16;
+    // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
+    // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
+    let pv = vdupq_n_s16(p);
+    let mut base = [[0u16; LANES]; N];
+    for (k, b) in base.iter_mut().enumerate() {
+        let v = y[k];
+        let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
+        vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
+    }
+    // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
+    let tail = &mut *tail;
+    for k in 0..N / 2 {
+        let h = k + N / 2;
+        let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
+        let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
+        for d in 0..DIGITS {
+            let (u, v) = lattice::WEIGHTS[d];
+            let w = u + v;
+            for half in 0..2 {
+                let x = dev[d * 2 * N + 2 * k + half];
+                let y = dev[d * 2 * N + 2 * h + half];
+                let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
+                let (i, j) = (2 * half, 2 * half + 1);
+                lo[i] = vmlal_n_s32(lo[i], xl, u);
+                lo[j] = vmlal_high_n_s32(lo[j], x, u);
+                lo[i] = vmlsl_n_s32(lo[i], yl, v);
+                lo[j] = vmlsl_high_n_s32(lo[j], y, v);
+                hi[i] = vmlal_n_s32(hi[i], xl, v);
+                hi[j] = vmlal_high_n_s32(hi[j], x, v);
+                hi[i] = vmlal_n_s32(hi[i], yl, w);
+                hi[j] = vmlal_high_n_s32(hi[j], y, w);
+            }
+        }
+        for q in 0..4 {
+            vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
+            vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
+        }
+    }
+    // a partial batch has fewer than eight columns in `target`: only those lanes are written
+    for (c, column) in target.chunks_exact_mut(N * width).enumerate() {
+        let (slots, _) = column.as_chunks_mut::<W>();
+        for (k, slot) in slots.iter_mut().enumerate() {
+            let v = crt(base[k][c] as u32, tail[k][c]);
+            slot[..4].copy_from_slice(&(v as u32).to_le_bytes());
+            slot[4] = (v >> 32) as u8;
+        }
+    }
+
+}
+
+/// Takes chunks of pair `p` (batches `2 p` and `2 p + 1`, or a lone last batch) until none is
+/// left; then either completes the pair (all its chunks were this participant's, or its deposit
+/// brought the pair's total to every chunk) or leaves its sums for whoever does.
+#[allow(clippy::too_many_arguments)]
+unsafe fn participate(st: &PairState, owner: bool, chunks: usize, a: &SmsMatrix, sc: &mut Scratch, words: [[(*const u8, usize); LANES]; 2], nb: usize, targets: [&mut [u8]; 2]) {
+    let Scratch { xs, acc, dev, acc2, dev2, y2, nib, y, tail, .. } = sc;
+    let mut n = 0usize;
+    loop {
+        let c = st.next.fetch_add(1, Relaxed);
+        if c >= chunks {
+            break;
+        }
+        if n == 0 {
+            for s in 0..N {
+                acc[idx(s, 0)..][..4].fill(vdupq_n_s64(0));
+                acc2[idx(s, 0)..][..4].fill(vdupq_n_s64(0));
+            }
+            dev.fill(vdupq_n_s32(0));
+            dev2.fill(vdupq_n_s32(0));
+        }
+        chunk_pass([&words[0], &words[1]], nb, a, c, nib, xs, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]]);
+        n += 1;
+        if !owner {
+            PROFILE_NS[3].fetch_add(1, Relaxed);
+        }
+    }
+    if n == 0 {
+        return;
+    }
+    if n < chunks {
+        let mut g = st.deposits.lock().unwrap();
+        match &mut g.1 {
+            None => g.1 = Some(Box::new(Partial::take([&acc[..], &acc2[..]], [&dev[..], &dev2[..]], nb))),
+            Some(d) => d.add([&acc[..], &acc2[..]], [&dev[..], &dev2[..]], nb),
+        }
+        g.0 += n;
+        if g.0 < chunks {
+            return;
+        }
+        let part = g.1.take().expect("every chunk deposited");
+        drop(g);
+        part.restore([&mut acc[..], &mut acc2[..]], [&mut dev[..], &mut dev2[..]], nb);
+    }
+    let [t0, t1] = targets;
+    narrow(acc, 0, y);
+    super::inverse_folded::<PB>(y);
+    finalize_batch(a, y, dev, tail, t0);
+    if nb == 2 {
+        narrow(acc2, 0, y2);
+        super::inverse_folded::<PB>(y2);
+        finalize_batch(a, y2, dev2, tail, t1);
+    }
+}
+
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
@@ -1036,91 +1343,75 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     const W: usize = 5;
     const _: () = assert!(MODULUS < 1 << (8 * W) && MODULUS >= 1 << (8 * (W - 1)));
     assert_eq!(crate::rq::coefficient_bytes(q), W);
-    let width = W;
-    assert_eq!(out.len(), columns * N * width);
-    for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
-        let arena = Arena::new();
-        let Scratch { xs, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
-        let p = P1 as i16;
-        let count = block.len() / (N * width);
-        let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
-            let col0 = first + LANES * b;
-            let here = (count - LANES * b).min(LANES);
-            core::array::from_fn(|c| {
-                if c < here {
-                    (values[(col0 + c) * len..].as_ptr() as *const u8, 64)
-                } else {
-                    (ZERO_WORDS.as_ptr() as *const u8, 0)
-                }
-            })
-        };
-        let batches = count.div_ceil(LANES);
-        let mut targets: Vec<&mut [u8]> = block.chunks_mut(LANES * N * width).collect();
-        for b in 0..batches {
-            // pairs of batches share one key sweep; the second one's results wait in `*2`
-            if b % 2 == 0 {
-                dev.fill(vdupq_n_s32(0));
-                if b + 1 < batches {
-                    dev2.fill(vdupq_n_s32(0));
-                    let (w0, w1) = (batch_words(b), batch_words(b + 1));
-                    sums2([&w0, &w1], a, nib, xs, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]]);
-                } else {
-                    sums(&batch_words(b), a, m, nib, xs, acc, y, dev);
-                }
+    assert_eq!(out.len(), columns * N * W);
+    if columns == 0 {
+        return;
+    }
+    // Pairs of batches of eight columns share one key sweep; the last batch may be alone. Each
+    // worker owns a contiguous run of pairs, as the static split did. A worker done with its own
+    // pairs takes chunks of whichever pair still has the most left (at least two), so a worker
+    // held up by the host no longer holds up the whole phase; on a quiet host every worker
+    // finishes its own pairs at about the same time and nothing is taken.
+    let batches = columns.div_ceil(LANES);
+    let pairs = batches.div_ceil(2);
+    let chunks = a.elements.div_ceil(CHUNK);
+    let states: Vec<PairState> = (0..pairs).map(|_| PairState { next: Default::default(), deposits: Default::default() }).collect();
+    let workers = workers.clamp(1, pairs);
+    let out_addr = out.as_mut_ptr() as usize;
+    let values_addr = values.as_ptr() as usize;
+    let batch_words = move |g: usize| -> [(*const u8, usize); LANES] {
+        core::array::from_fn(|c| {
+            let col = LANES * g + c;
+            if col < columns {
+                ((values_addr as *const B128).wrapping_add(col * len) as *const u8, 64)
             } else {
-                core::mem::swap(dev, dev2);
-                core::mem::swap(y, y2);
+                (ZERO_WORDS.as_ptr() as *const u8, 0)
             }
-            let target = &mut *targets[b];
-            // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
-            // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
-            let pv = vdupq_n_s16(p);
-            let mut base = [[0u16; LANES]; N];
-            for (k, b) in base.iter_mut().enumerate() {
-                let v = y[k];
-                let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
-                vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
-            }
-            // `tail = mu + sum_d W_d dev_d` ([`add_weighted`]'s map) for the eight columns at
-            let tail = &mut *tail;
-            for k in 0..N / 2 {
-                let h = k + N / 2;
-                let mut lo = [vdupq_n_s64(a.mu[k] as i64); 4];
-                let mut hi = [vdupq_n_s64(a.mu[h] as i64); 4];
-                for d in 0..DIGITS {
-                    let (u, v) = lattice::WEIGHTS[d];
-                    let w = u + v;
-                    for half in 0..2 {
-                        let x = dev[d * 2 * N + 2 * k + half];
-                        let y = dev[d * 2 * N + 2 * h + half];
-                        let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
-                        let (i, j) = (2 * half, 2 * half + 1);
-                        lo[i] = vmlal_n_s32(lo[i], xl, u);
-                        lo[j] = vmlal_high_n_s32(lo[j], x, u);
-                        lo[i] = vmlsl_n_s32(lo[i], yl, v);
-                        lo[j] = vmlsl_high_n_s32(lo[j], y, v);
-                        hi[i] = vmlal_n_s32(hi[i], xl, v);
-                        hi[j] = vmlal_high_n_s32(hi[j], x, v);
-                        hi[i] = vmlal_n_s32(hi[i], yl, w);
-                        hi[j] = vmlal_high_n_s32(hi[j], y, w);
+        })
+    };
+    // Batch `g`'s columns of the output; only the pair's completer writes them.
+    let target = move |g: usize| -> &'static mut [u8] {
+        let s = LANES * g * N * W;
+        let e = (LANES * (g + 1)).min(columns) * N * W;
+        // SAFETY: disjoint ranges of `out`, each written by one thread, before `commit` returns.
+        unsafe { core::slice::from_raw_parts_mut((out_addr as *mut u8).add(s), e - s) }
+    };
+    let started = std::time::Instant::now();
+    let ends: Vec<std::sync::atomic::AtomicU64> = (0..workers).map(|_| Default::default()).collect();
+    std::thread::scope(|scope| {
+        for w in 0..workers {
+            let (states, ends) = (&states, &ends);
+            scope.spawn(move || unsafe {
+                let arena = Arena::new();
+                let sc = &mut *arena.0;
+                let run = |sc: &mut Scratch, p: usize, owner: bool| {
+                    let (g0, g1) = (2 * p, 2 * p + 1);
+                    let nb = if g1 < batches { 2 } else { 1 };
+                    let words = [batch_words(g0), batch_words(if nb == 2 { g1 } else { g0 })];
+                    let targets = [target(g0), if nb == 2 { target(g1) } else { Default::default() }];
+                    participate(&states[p], owner, chunks, a, sc, words, nb, targets);
+                };
+                for p in w * pairs / workers..(w + 1) * pairs / workers {
+                    run(sc, p, true);
+                }
+                loop {
+                    let mut best = None;
+                    let mut most = 1usize;
+                    for (p, s) in states.iter().enumerate() {
+                        let left = chunks.saturating_sub(s.next.load(Relaxed));
+                        if left > most {
+                            most = left;
+                            best = Some(p);
+                        }
                     }
+                    let Some(p) = best else { break };
+                    run(sc, p, false);
                 }
-                for q in 0..4 {
-                    vst1q_s64(tail[k].as_mut_ptr().add(2 * q), lo[q]);
-                    vst1q_s64(tail[h].as_mut_ptr().add(2 * q), hi[q]);
-                }
-            }
-            // a partial batch has fewer than eight columns in `target`: only those lanes are written
-            for (c, column) in target.chunks_exact_mut(N * width).enumerate() {
-                let (slots, _) = column.as_chunks_mut::<W>();
-                for (k, slot) in slots.iter_mut().enumerate() {
-                    let v = crt(base[k][c] as u32, tail[k][c]);
-                    slot[..4].copy_from_slice(&(v as u32).to_le_bytes());
-                    slot[4] = (v >> 32) as u8;
-                }
-            }
+                ends[w].store(started.elapsed().as_micros() as u64, Relaxed);
+            });
         }
     });
+    *crate::ntt::BLOCK_ENDS_US.lock().unwrap() = ends.iter().map(|e| e.load(Relaxed)).collect();
 }
 
 #[cfg(test)]
@@ -1250,8 +1541,8 @@ mod tests {
                 }
             }
             unsafe {
-                sink::<true>(&xs, keys.as_ptr(), &mut fresh, groups);
-                sink::<false>(&xs, keys.as_ptr(), &mut zeroed, groups);
+                sink::<true>(&xs, keys.as_ptr(), 0, groups, &mut fresh, groups);
+                sink::<false>(&xs, keys.as_ptr(), 0, groups, &mut zeroed, groups);
             }
             let words = |v: &[int64x2_t]| -> Vec<[i64; 2]> { v.iter().map(|&x| unsafe { core::mem::transmute(x) }).collect() };
             assert!(words(&fresh) == words(&zeroed), "{groups} tiles");
@@ -1312,8 +1603,8 @@ mod tests {
                     *x = unsafe { vld1q_s16(v.as_ptr()) };
                 }
                 unsafe {
-                    sink::<false>(&xs, old.as_ptr(), &mut old_acc, groups);
-                    sink::<false>(&xs, new.as_ptr(), &mut new_acc, groups);
+                    sink::<false>(&xs, old.as_ptr(), 0, groups, &mut old_acc, groups);
+                    sink::<false>(&xs, new.as_ptr(), 0, groups, &mut new_acc, groups);
                 }
             }
             let mut y = Box::new([unsafe { vdupq_n_s16(0) }; N]);

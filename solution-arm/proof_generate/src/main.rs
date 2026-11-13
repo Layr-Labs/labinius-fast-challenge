@@ -206,19 +206,11 @@ fn load_table(path: &str, n: usize) -> Table {
             }
         };
         if ptr as isize != -1 {
-            let base = ptr as usize;
-            // The range boundaries are 2 MiB aligned, also valid on 4/16/64 KiB kernels.
-            labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
-                if s < e {
-                    let addr = (base + 16 * s) as *mut u8;
-                    // Linux 5.14+: install the page-cache pages in parallel. Older kernels
-                    // simply fault on access. MADV_HUGEPAGE is a best-effort hint for the file.
-                    unsafe {
-                        table_sys::madvise(addr, 16 * (e - s), 14);
-                        table_sys::madvise(addr, 16 * (e - s), 22);
-                    }
-                }
-            });
+            // The table was just written by the trusted writer, so its pages are resident:
+            // leave them to demand faults, which the commit's workers take in parallel and
+            // overlap with compute. Both the eager MADV_POPULATE_READ pass and the
+            // MADV_HUGEPAGE hint measured neutral-to-negative here; the final tree issues no
+            // per-block madvise at all.
             return Table::Mapped { ptr, len: n, span };
         }
     }

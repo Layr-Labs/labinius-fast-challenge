@@ -401,7 +401,7 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 }
 
 /// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 12;
+const SINK: usize = 24;
 /// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
@@ -584,32 +584,6 @@ unsafe fn pass_words(words: &[(*const u8, usize); LANES], elements: usize, e: us
         let (w, stride) = words[2 * q + l];
         if element < elements { w.add(element * stride) } else { ZERO_WORDS.as_ptr() as *const u8 }
     })
-}
-
-/// Transforms ahead whose input words [`prefetch_words`] requests (into L2): four transforms span one
-/// element group, so this is `PF_T / 4` element groups (of four elements, eight columns) ahead,
-/// running into the next sweep's first elements at a sweep's end.
-const PF_T: usize = 32;
-
-/// Prefetches the input words of transform `t` of a pass starting at element `e` (the lines
-/// [`pass_words`] would address: four consecutive 64-byte elements of two columns). The table
-/// streams are eight (sixteen with paired batches) 64-byte-per-element column walks; this keeps
-/// them ahead of the transforms instead of relying on the hardware stream prefetcher. A hint:
-/// addresses past a column's end are never dereferenced. Official Graviton4 runs show the same
-/// commit lap with and without it (234-235 ms against 233-234): the table stream does not stall
-/// there, so this is neutral, kept as the measured variant.
-#[inline(always)]
-unsafe fn prefetch_words(words: &[(*const u8, usize); LANES], e: usize, t: usize) {
-    let (h, q) = (t / 4, t % 4);
-    for l in 0..2 {
-        let (w, stride) = words[2 * q + l];
-        let p = w.wrapping_add((e + 4 * h) * stride);
-        core::arch::asm!(
-            "prfm pldl2keep, [{p}]", "prfm pldl2keep, [{p}, #64]",
-            "prfm pldl2keep, [{p}, #128]", "prfm pldl2keep, [{p}, #192]",
-            p = in(reg) p, options(nostack, preserves_flags, readonly)
-        );
-    }
 }
 
 /// The centered residue of a sum below `2^41` in magnitude. Binary64 holds such a sum exactly and
@@ -846,7 +820,7 @@ unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Ker
 unsafe fn sums(
     words: &[(*const u8, usize); LANES],
     a: &SmsMatrix,
-    m: &mut [int16x8_t; BITS],
+    _m: &mut [int16x8_t; BITS],
     nib: &mut [uint8x16_t; N / 4],
     xs: &mut [[int16x8_t; N]; SWEEP],
     acc: &mut [int64x2_t],

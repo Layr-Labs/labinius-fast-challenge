@@ -872,8 +872,7 @@ unsafe fn sums(
                 indices_asm(&at, nib);
                 let x = &mut xs[i];
                 lut_pass(nib, sc, kern);
-                pass_c_asm(sc, kern);
-                pass_d_out(sc, x, kern);
+                pass_cd_out(sc, x, kern);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             // the chunk's first sweep starts the digit rows' sums afresh
@@ -912,6 +911,7 @@ unsafe fn sums2(
     dev: [&mut [int32x4_t]; 2],
 ) {
     let kern = &kernels()[PB];
+    ctx::flip();
     let [acc0, acc1] = acc;
     let [y0, y1] = y;
     let [dev0, dev1] = dev;
@@ -932,19 +932,22 @@ unsafe fn sums2(
             let groups = l.div_ceil(LOCK);
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
+                let t0 = ctx::now();
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
                     lut_pass(nib, sc, kern);
-                    pass_c_asm(sc, kern);
-                    pass_d_out(sc, x, kern);
+                    if ctx::side1() { pass_cd_out(sc, x, kern); } else { pass_c_asm(sc, kern); pass_d_out(sc, x, kern); }
                 }
+                ctx::add([ctx::now() - t0, 0, 0, 0, (groups * LOCK) as u64]);
+                let t1 = ctx::now();
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
+                ctx::add([0, ctx::now() - t1, 0, 0, 0]);
             }
             e += l;
         }
@@ -1045,6 +1048,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     assert_eq!(out.len(), columns * N * width);
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
+        ctx::select(first * 8 / columns);
         let Scratch { xs, sc, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
@@ -1125,6 +1129,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 }
             }
         }
+        ctx::report();
     });
 }
 
@@ -1517,6 +1522,47 @@ mod leap_bench {
     }
 
     #[test]
+    fn pass_cd_out_matches() {
+        let kern = &kernels()[PB];
+        let mut st = 17u64;
+        for _ in 0..50 {
+            let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            let raw: Vec<i16> = (0..N * 8).map(|_| crate::ntt::tests::xorshift(&mut st) as i16).collect();
+            for (i, v) in a.iter_mut().enumerate() { *v = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) }; }
+            let mut b = a.clone();
+            let mut ya: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            let mut yb = ya.clone();
+            unsafe { pass_c_asm(&mut a, kern); pass_d_out(&a, &mut ya, kern); pass_cd_out(&mut b, &mut yb, kern); }
+            let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(ya.as_ptr() as *const [i16; 8], N) };
+            let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(yb.as_ptr() as *const [i16; 8], N) };
+            assert_eq!(x, y);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn fused_timing() {
+        let kern = &kernels()[PB];
+        let mut st = 5u64;
+        let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+        let raw: Vec<i16> = (0..N * 8).map(|_| (crate::ntt::tests::xorshift(&mut st) % 9000) as i16).collect();
+        for (i, v) in a.iter_mut().enumerate() { *v = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) }; }
+        let mut s = a.clone();
+        let mut y = a.clone();
+        let reps = 20000;
+        let (mut best0, mut best1) = (f64::MAX, f64::MAX);
+        for _ in 0..15 {
+            let t = std::time::Instant::now();
+            for _ in 0..reps { s.copy_from_slice(&a[..]); unsafe { pass_c_asm(&mut s, kern); pass_d_out(&s, &mut y, kern); } core::hint::black_box(&mut *y); }
+            best0 = best0.min(t.elapsed().as_nanos() as f64 / reps as f64);
+            let t = std::time::Instant::now();
+            for _ in 0..reps { s.copy_from_slice(&a[..]); unsafe { pass_cd_out(&mut s, &mut y, kern); } core::hint::black_box(&mut *y); }
+            best1 = best1.min(t.elapsed().as_nanos() as f64 / reps as f64);
+        }
+        println!("crown pass_c + pass_d_out {best0:.0} ns, fused pass_cd_out {best1:.0} ns ({:+.1}%) (incl. copy)", 100.0 * (best1 / best0 - 1.0));
+    }
+
+    #[test]
     #[ignore]
     #[cfg(target_feature = "sve")]
     fn transform_timing() {
@@ -1561,5 +1607,43 @@ mod leap_bench {
             println!("pass_d_asm {pda:.0} ns vs pass_d {pd:.0} ns; pass_c_asm {pca:.0} ns vs pass_c {pc:.0} ns; pass_lut_asm {la:.0} vs {lut:.0} ns");
             println!("per transform (648 vectors): L1 {l1:.0} ns ({:.2} cyc/vec), cycling xs {l2:.0} ns; indices {ix:.0}, lut {lut:.0}, pass_c {pc:.0}, pass_d {pd:.0} ns", l1 * 2.99 / N as f64);
         }
+    }
+}
+
+/// Diagnostic only: same-core paired comparison inside the commitment. Every worker alternates its
+/// batch pairs between side 0 (the crown: `pass_c_asm` then `pass_d_out`) and side 1 (`pass_cd_out`,
+/// levels 4-6 fused); workers 0 and 4 run side 0 on both (controls). Per side `cntvct` totals of the
+/// transforms (table front included) and of the sinks, and the transform count.
+mod ctx {
+    use std::cell::Cell;
+    thread_local! {
+        static SEL: Cell<usize> = const { Cell::new(0) };
+        static SIDE: Cell<usize> = const { Cell::new(1) };
+        static T: Cell<[[u64; 5]; 2]> = const { Cell::new([[0; 5]; 2]) };
+    }
+    pub fn select(worker: usize) { SEL.with(|s| s.set(worker % 8)); }
+    pub fn flip() { SIDE.with(|s| s.set(1 - s.get())); }
+    fn control() -> bool { matches!(SEL.with(|s| s.get()), 0 | 4) }
+    pub fn side1() -> bool { SIDE.with(|s| s.get()) == 1 && !control() }
+    #[inline(always)]
+    pub fn now() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+    #[inline(always)]
+    pub fn add(d: [u64; 5]) {
+        let side = SIDE.with(|s| s.get());
+        T.with(|c| { let mut v = c.get(); for i in 0..5 { v[side][i] += d[i]; } c.set(v); });
+    }
+    pub fn report() {
+        let f: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        let v = T.with(|c| c.get());
+        let w = SEL.with(|s| s.get());
+        let ns = |s: usize, i: usize| v[s][i] as f64 * 1e9 / f as f64 / v[s][4].max(1) as f64;
+        eprintln!("ctxf w={w} side1={} transforms={}/{} s0_tr_ns={:.0} s1_tr_ns={:.0} tr_delta%={:+.2} s0_sink_ns={:.0} s1_sink_ns={:.0} sink_delta%={:+.2}",
+            if control() { "control" } else { "fused" }, v[0][4], v[1][4], ns(0, 0), ns(1, 0), 100.0 * (ns(1, 0) / ns(0, 0) - 1.0),
+            ns(0, 1), ns(1, 1), 100.0 * (ns(1, 1) / ns(0, 1) - 1.0));
     }
 }

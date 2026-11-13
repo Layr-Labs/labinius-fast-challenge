@@ -9,13 +9,14 @@ class Ins:
     def __init__(self, cls, dsts, srcs, fmt, tie=None):
         self.cls, self.dsts, self.srcs, self.fmt, self.tie = cls, list(dsts), list(srcs), fmt, tie
 
-def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31):
+def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31, lres=0):
     n = len(ins)
     prod = {}
     deps = []
     for i, x in enumerate(ins):
-        deps.append(sorted({prod[s] for s in x.srcs if s in prod}))
-        for d in x.dsts:
+        # msrc/mdst: memory-order tokens (no registers), e.g. a reload after its spill store
+        deps.append(sorted({prod[s] for s in x.srcs + getattr(x, 'msrc', []) if s in prod}))
+        for d in x.dsts + getattr(x, 'mdst', []):
             prod[d] = i
     # memory: keep stores in program order relative to earlier loads of the same group (disjoint
     # addresses across groups, so only order T after all earlier L to be safe w.r.t. aliasing of x)
@@ -65,7 +66,8 @@ def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31):
             x = ins[i]
             new = len(x.dsts) - (1 if x.tie is not None else 0)
             frees = sum(1 for s_ in set(x.srcs) if s_ in uses and uses[s_] == x.srcs.count(s_) and (x.tie is None or s_ != x.srcs[x.tie]))
-            if new > 0 and live + new - frees > budget and not (getattr(x, 'g', 0) == oldest and live + new - frees <= cap - reserve):
+            lr = lres if c == "L" else 0
+            if new > 0 and live + new - frees > budget - lr and not (getattr(x, "g", 0) == oldest and live + new - frees <= cap - reserve - lr):
                 continue
             if c in 'LT':
                 l += 1
@@ -100,7 +102,8 @@ def schedule(ins, width=6, ls=2, budget=27, skew=8, reserve=1, cap=31):
         stall = 0 if issued else stall + 1
         cycle += 1
         if stall > 100:
-            raise RuntimeError('schedule deadlock')
+            raise RuntimeError(f'schedule deadlock: live {live}, oldest {oldest}, left {left}, ready '
+                               + '; '.join(f'{ins[i].fmt}/g{getattr(ins[i], "g", 0)}' for i in ready[:6]))
     return [ins[i] for i in order], cycle
 
 def allocate(seq, pinned, low, reserved=()):

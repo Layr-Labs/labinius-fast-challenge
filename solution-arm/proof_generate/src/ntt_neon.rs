@@ -806,6 +806,9 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
 
 #[path = "ntt_neon_asm.rs"]
 mod asm;
+#[path = "ntt_neon_fused.rs"]
+mod fused;
+pub use fused::pass_cd_out;
 #[path = "ntt_neon_idx.rs"]
 mod idx;
 pub use idx::indices_asm;

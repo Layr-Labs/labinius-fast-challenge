@@ -101,7 +101,9 @@ impl Prepared {
         let ratios = r.iter().zip(&inverses).map(|(&x, &d)| x * d).collect();
         let scale = r[..prefix].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
         let eq = EqFactors::new(&r[prefix..], scale);
-        let parts = par::workers(words.len(), 1 << 16).min(eq.len() / 8);
+        // Four claimed parts per worker: a worker that loses its core for a while takes fewer
+        // parts instead of holding up the pass with a fixed share (the sets are XOR sums).
+        let parts = (4 * par::workers(words.len(), 1 << 16)).min(eq.len() / 64).max(1);
         let parts = par::map_blocks(eq.len(), parts, 64.min(eq.len()), |_, start, end| {
             neon::partial_evals_sets_tiled(words, eq.len(), start, end, |base, tile| eq.fill(base, tile))
         });
@@ -324,7 +326,8 @@ impl<'a> Switch<'a> {
         });
         let weights = eq_expand_f162(&self.prefix_r);
         let words = self.words;
-        let parts = par::workers(n, 1 << 12);
+        // Four claimed parts per worker, as in `Prepared::with_prefix`; the outputs are disjoint.
+        let parts = (4 * par::workers(n, 1 << 12)).min((n / 64).max(1));
         let edges: Vec<_> = (0..parts).map(|t| par::block(n, parts, t, 2)).collect();
         let [p0, p1, p2] = &mut self.planes;
         let chunks = par::split_mut(p0, &edges).into_iter()

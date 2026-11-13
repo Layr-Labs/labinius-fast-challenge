@@ -211,14 +211,11 @@ fn load_table(path: &str, n: usize) -> Table {
             labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
                 if s < e {
                     let addr = (base + 16 * s) as *mut u8;
-                    // The table was just written by the trusted writer, so its pages are
-                    // resident: leave them to demand faults, which the commit's workers take
-                    // in parallel and overlap with compute. A full MADV_POPULATE_READ pass
-                    // costs about 9 ms on the development Graviton4 and does not speed the
-                    // commit up. MADV_HUGEPAGE is a best-effort hint for the file.
-                    // Noise draw 12 of the promoted stack (populate removal + u64 CRT + prefetch removal); behaviour identical; prior draws: 296.3248; 299.6629; 296.9924; 296.7474.
+                    // Linux 5.14+: install the page-cache pages in parallel. Older kernels
+                    // simply fault on access. MADV_HUGEPAGE is a best-effort hint for the file.
                     unsafe {
                         table_sys::madvise(addr, 16 * (e - s), 14);
+                        table_sys::madvise(addr, 16 * (e - s), 22);
                     }
                 }
             });
@@ -383,9 +380,12 @@ fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
         use ntt::neon::sms;
+        labinius::par::diag(format!("c0={}", labinius::par::stamp()));
         let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+        labinius::par::diag(format!("key={}", labinius::par::stamp()));
         sms::commit(values, &matrix, threads(), modulus, out);
+        labinius::par::diag(format!("c1={}", labinius::par::stamp()));
         return;
     }
     #[cfg(target_arch = "aarch64")]
@@ -858,7 +858,9 @@ impl Proof {
 
 fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
     #[cfg(target_arch = "aarch64")]
+    labinius::par::diag(format!("s0={}", labinius::par::stamp()));
     if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
+        labinius::par::diag(format!("prep={}", labinius::par::stamp()));
         let partials = prepared.partials();
         let value = partials.iter().zip(cf::eq_expand_b128(lo))
             .fold(B128::ZERO, |a, (&v, e)| a + v * e);
@@ -875,7 +877,11 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
             rounds.push(msg.map(|v| v.0));
             coords.push(r);
             switch.fold(r);
+            if rounds.len() == 6 || rounds.len() == 8 {
+                labinius::par::diag(format!("r{}={}", rounds.len(), labinius::par::stamp()));
+            }
         }
+        labinius::par::diag(format!("s1={}", labinius::par::stamp()));
         return (partials, rounds, coords, switch.final_eval());
     }
     let mut ws = cf::Workspace::new(LOG_PACKED, 1);
@@ -946,6 +952,7 @@ impl Timer {
 }
 
 fn main() {
+    labinius::par::epoch();
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 5 || args.len() == 7,
@@ -969,6 +976,9 @@ fn main() {
     output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
+    if let Ok(d) = labinius::par::DIAG.lock() {
+        eprintln!("labinius-diag end={} {}", labinius::par::stamp(), d.join(" "));
+    }
     // The proof file is complete. Let process teardown release the large allocations and
     // mappings together, instead of walking their Rust destructors first.
     std::mem::forget((values, proof, output));

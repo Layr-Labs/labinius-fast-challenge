@@ -571,6 +571,61 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
     }
 }
 
+/// [`slot_sink`] on the TRANSPOSED sweep layout ([`pass_d_t`]): the transforms of a slot are
+/// consecutive vectors, so the sink reads one sequential stream per slot.
+#[cfg(target_feature = "sve")]
+#[inline(never)]
+unsafe fn slot_sink_t(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
+    const XS: usize = 64;
+    const KS: usize = N * ROWS * LOCK * 2;
+    debug_assert!((1..=SINK).contains(&groups));
+    slot_sink_body!(acc, z, k, groups, ["ldp q20, q21, [{a}, #64]", "ldp q22, q23, [{a}, #96]", "ldp q24, q25, [{a}, #128]", "ldp q26, q27, [{a}, #160]", "ldp q28, q29, [{a}, #192]", "ldp q30, q31, [{a}, #224]"], ["ldp q16, q17, [{a}, #256]", "ldp q18, q19, [{a}, #288]", "ldp q20, q21, [{a}, #320]", "ldp q22, q23, [{a}, #352]", "ldp q24, q25, [{a}, #384]", "ldp q26, q27, [{a}, #416]"]);
+}
+
+/// [`slot_sink_fresh`] on the transposed sweep layout.
+#[cfg(target_feature = "sve")]
+#[inline(never)]
+unsafe fn slot_sink_fresh_t(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t, groups: usize) {
+    const XS: usize = 64;
+    const KS: usize = N * ROWS * LOCK * 2;
+    debug_assert!((1..=SINK).contains(&groups));
+    slot_sink_body!(acc, z, k, groups, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
+}
+
+/// Transforms per block of the blocked sweep layout: one more than `SWEEP`, so that a transform's
+/// 162 lines (97 lines apart) spread over every L1 set instead of 8 (96 lines apart).
+const BP: usize = SWEEP + 1;
+/// [`sink`] on the transposed sweep layout: slot `s` of transform `i` is vector `s * SWEEP + i` of `xt`.
+#[inline(never)]
+unsafe fn sink_t<const FRESH: bool>(xt: *const int16x8_t, keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+    debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
+    let accp = acc.as_mut_ptr();
+    #[cfg(target_feature = "sve")]
+    for s in 0..N {
+        if FRESH {
+            slot_sink_fresh_t(xt.add(s / 4 * BP * 4 + s % 4), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+        } else {
+            slot_sink_t(xt.add(s / 4 * BP * 4 + s % 4), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
+        }
+    }
+    #[cfg(not(target_feature = "sve"))]
+    for g in 0..groups {
+        let tile = keys.add(g * N * ROWS * LOCK);
+        for s in 0..N {
+            let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *xt.add((s / 4 * BP + LOCK * g + i) * 4 + s % 4));
+            let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
+            for r in 0..ROWS {
+                if FRESH && g == 0 && r > 0 {
+                    for q in 0..4 {
+                        *accp.add(idx(s, r) + q) = vdupq_n_s64(0);
+                    }
+                }
+                dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
+            }
+        }
+    }
+}
+
 /// The eight witness pointers of transform `t` of a pass starting at element `e`, in dot-product
 /// lane order: lane `4 l + k` of transform `4 h + q` is column `2 q + l` of element `e + 4 h + k`.
 /// Each lane is an independent transform, so a 64-bit lane then holds one column's four elements
@@ -907,11 +962,13 @@ unsafe fn sums2(
     nib: &mut [uint8x16_t; N / 4],
     xs: &mut [[int16x8_t; N]; SWEEP],
     sc: &mut [int16x8_t; N],
+    xb: *mut int16x8_t,
     acc: [&mut [int64x2_t]; 2],
     y: [&mut [int16x8_t; N]; 2],
     dev: [&mut [int32x4_t]; 2],
 ) {
     let kern = &kernels()[PB];
+    ctx::flip();
     let [acc0, acc1] = acc;
     let [y0, y1] = y;
     let [dev0, dev1] = dev;
@@ -931,20 +988,35 @@ unsafe fn sums2(
             let l = SWEEP.min(end - e);
             let groups = l.div_ceil(LOCK);
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            let tr = ctx::side1();
             for t in 0..2 {
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
-                    let x = &mut xs[i];
+                    let t1 = ctx::now();
                     lut_pass(nib, sc, kern);
+                    let t2 = ctx::now();
                     pass_c_asm(sc, kern);
-                    pass_d_out(sc, x, kern);
+                    let t3 = ctx::now();
+                    if tr {
+                        // blocked layout: slot s of transform i at vector (s / 4 * BP + i) * 4 + s % 4 of `xb`
+                        pass_d_bp(sc, xb.add(4 * i), kern);
+                    } else {
+                        pass_d_out(sc, &mut xs[i], kern);
+                    }
+                    let t4 = ctx::now();
+                    ctx::add([t2 - t1, t3 - t2, t4 - t3, 0, 1]);
                 }
-                if e % CHUNK == 0 {
+                let t5 = ctx::now();
+                if tr {
+                    let xt = xb as *const int16x8_t;
+                    if e % CHUNK == 0 { sink_t::<true>(xt, keys, accs[t], groups) } else { sink_t::<false>(xt, keys, accs[t], groups) }
+                } else if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
+                ctx::add([0, 0, 0, ctx::now() - t5, 0]);
             }
             e += l;
         }
@@ -965,6 +1037,44 @@ unsafe fn sums2(
     let _ = (&mut accs, &mut ys, &mut devs);
 }
 
+
+/// Diagnostic only: same-core paired comparison inside the commitment. Every worker alternates its
+/// batch pairs between side 0 (the scratch pipeline, level 6 out of place into `xs[i]`) and side 1
+/// (level 6 written in the BLOCKED slot-major layout, 4 slots per line, read by [`sink_t`]); workers 0 and 4 run side 0 on both
+/// (controls). Per side `cntvct` totals of the table front, levels 4-5, level 6 and the sink.
+mod ctx {
+    use std::cell::Cell;
+    thread_local! {
+        static SEL: Cell<usize> = const { Cell::new(0) };
+        static SIDE: Cell<usize> = const { Cell::new(1) };
+        static T: Cell<[[u64; 5]; 2]> = const { Cell::new([[0; 5]; 2]) };
+    }
+    pub fn select(worker: usize) { SEL.with(|s| s.set(worker % 8)); }
+    pub fn flip() { SIDE.with(|s| s.set(1 - s.get())); }
+    fn control() -> bool { matches!(SEL.with(|s| s.get()), 0 | 4) }
+    pub fn side1() -> bool { SIDE.with(|s| s.get()) == 1 && !control() }
+    #[inline(always)]
+    pub fn now() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+    #[inline(always)]
+    pub fn add(d: [u64; 5]) {
+        let side = SIDE.with(|s| s.get());
+        T.with(|c| { let mut v = c.get(); for i in 0..5 { v[side][i] += d[i]; } c.set(v); });
+    }
+    pub fn report() {
+        let f: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        let v = T.with(|c| c.get());
+        let w = SEL.with(|s| s.get());
+        let ns = |s: usize, i: usize| v[s][i] as f64 * 1e9 / f as f64 / v[s][4].max(1) as f64;
+        let d = |i: usize| 100.0 * (ns(1, i) / ns(0, i) - 1.0);
+        eprintln!("ctx2 w={w} side1={} transforms={}/{} s0_ns: lut={:.1} c={:.1} d={:.1} sink={:.1} s1_ns: lut={:.1} c={:.1} d={:.1} sink={:.1} delta%: lut={:+.2} c={:+.2} d={:+.2} sink={:+.2}",
+            if control() { "control" } else { "blocked" }, v[0][4], v[1][4], ns(0, 0), ns(0, 1), ns(0, 2), ns(0, 3), ns(1, 0), ns(1, 1), ns(1, 2), ns(1, 3), d(0), d(1), d(2), d(3));
+    }
+}
 #[inline]
 fn crt(r: u32, t: i64) -> u64 {
     const INV: u64 = {
@@ -991,6 +1101,8 @@ struct Scratch {
     /// The transform scratch: the table front and levels 4-5 run here (L1-resident, reused for every
     /// transform) and level 6 writes the sweep buffer out of place ([`pass_d_out`]).
     sc: [int16x8_t; N],
+    /// Diagnostic: the blocked slot-major sweep buffer, padded to `BP` transforms per block.
+    xb: [[int16x8_t; N]; BP],
     acc: [int64x2_t; ROWS * 4 * N],
     dev: [int32x4_t; DIGITS * 2 * N],
     acc2: [int64x2_t; ROWS * 4 * N],
@@ -1045,7 +1157,8 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     assert_eq!(out.len(), columns * N * width);
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
-        let Scratch { xs, sc, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
+        ctx::select(first * 8 / columns);
+        let Scratch { xs, sc, xb, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
@@ -1068,7 +1181,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 if b + 1 < batches {
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
-                    sums2([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]]);
+                    sums2([&w0, &w1], a, nib, xs, sc, xb.as_mut_ptr() as *mut int16x8_t, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]]);
                 } else {
                     sums(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
                 }
@@ -1125,6 +1238,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 }
             }
         }
+        ctx::report();
     });
 }
 

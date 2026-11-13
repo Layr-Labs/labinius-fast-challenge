@@ -6,14 +6,28 @@ def skip_lut5(n): return n in NODES
 def kind(n):
     skip = sum(1 << g for g in range(3) if skip_lut5(3 * n + g))
     return (n != 1 and n != 15, skip)
+# SQVEC=1: `sqrdmulh` by vector (on Neoverse V2 the by-element form is slower): node twiddles
+# broadcast once per node with `dup`, eps' from the pinned `k3` (v14 = k.h[3] broadcast).
+SQVEC = bool(os.environ.get('SQVEC'))
 def build(nodes):
-    ins = []; low = set(); cnt = [0]
+    ins = []; low = set(); cnt = [0]; dups = {}
     def v(n):
         cnt[0] += 1; return f'{n}{cnt[0]}'
+    def bcast(t, tt):
+        if t == 'k':
+            assert tt == 3
+            return 'k3'
+        if (t, tt) not in dups:
+            c = v('bc'); dups[(t, tt)] = c
+            ins.append(Ins('A', [c], [t], f'dup v{{d0}}.8h, v{{s0}}.h[{tt}]'))
+        return dups[(t, tt)]
     def mulc(a, t, w, tt):
         lo, hi, r = v('lo'), v('hi'), v('r')
         ins.append(Ins('M', [lo], [a, t], f'mul v{{d0}}.8h, v{{s0}}.8h, v{{s1}}.h[{w}]'))
-        ins.append(Ins('M', [hi], [a, t], f'sqrdmulh v{{d0}}.8h, v{{s0}}.8h, v{{s1}}.h[{tt}]'))
+        if SQVEC:
+            ins.append(Ins('M', [hi], [a, bcast(t, tt)], 'sqrdmulh v{d0}.8h, v{s0}.8h, v{s1}.8h'))
+        else:
+            ins.append(Ins('M', [hi], [a, t], f'sqrdmulh v{{d0}}.8h, v{{s0}}.8h, v{{s1}}.h[{tt}]'))
         ins.append(Ins('M', [r], [lo, hi, 'k'], 'mls v{d0}.8h, v{s1}.8h, v{s2}.h[0]', tie=0))
         return r
     def A(op, a, b):
@@ -57,12 +71,19 @@ def build(nodes):
             for x in ins[start:]: x.g = g
             g += 1
     return ins, low
-def emit(per=2, K=8, B=27):
-    out = ['"ldr q15, [{kp}]",']
+def emit(per=2, K=8, B=27, width=6, ls=2, v2=False):
+    out = ['"ldr q15, [{kp}]",'] + (['"dup v14.8h, v15.h[3]",'] if SQVEC else [])
+    pin = {'k': 15, 'k3': 14} if SQVEC else {'k': 15}
     for c in range(0, 24, per):
         ins, low = build(list(range(c, c + per)))
-        seq, cyc = schedule(ins, skew=K, budget=B)
-        asm, live = allocate(seq, {'k': 15}, low)
+        for b in range(B, 15, -1):
+            seq, cyc = schedule(ins, skew=K, budget=b, width=width, ls=ls, v2=v2)
+            try:
+                asm, live = allocate(seq, pin, low)
+                break
+            except RuntimeError:
+                if not SQVEC:
+                    raise
         out += [f'"{a.replace("XPTR", "{x}").replace("CPTR", "{c}")}",' for a in asm]
     return '\n'.join(out)
 if __name__ == '__main__':

@@ -18,7 +18,7 @@ static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
 #[allow(dead_code)]
 mod rq;
 
-use labinius::challenge::{sample_short_challenge, ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
+use labinius::challenge::{ShortChallenge, DEFAULT_BOUND, DEFAULT_WEIGHT};
 use labinius::eval::eq_table;
 use labinius::fields::{
     crossfield as cf,
@@ -216,7 +216,7 @@ fn load_table(path: &str, n: usize) -> Table {
                     // in parallel and overlap with compute. A full MADV_POPULATE_READ pass
                     // costs about 9 ms on the development Graviton4 and does not speed the
                     // commit up. MADV_HUGEPAGE is a best-effort hint for the file.
-                    // Noise draw 12 of the promoted stack (populate removal + u64 CRT + prefetch removal); behaviour identical; prior draws: 296.3248; 299.6629; 296.9924; 296.7474.
+                    // Noise draw 24 of the promoted stack (+ cleanup part 4: narrow_digits cfg(test)-gated, its only callers are the chunk-bench tests); behaviour identical; prior draws: 312.4804; 300.5391; 296.8371; 297.3618.
                     unsafe {
                         table_sys::madvise(addr, 16 * (e - s), 14);
                     }
@@ -994,6 +994,8 @@ fn sms_packed(values: &[B128], a: &ntt::neon::sms::SmsMatrix, workers: usize, q:
 
 #[cfg(test)]
 mod tests {
+
+    use labinius::challenge::sample_short_challenge;
     use super::*;
 
     #[test]

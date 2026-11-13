@@ -101,10 +101,15 @@ impl Prepared {
         let ratios = r.iter().zip(&inverses).map(|(&x, &d)| x * d).collect();
         let scale = r[..prefix].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
         let eq = EqFactors::new(&r[prefix..], scale);
+        par::diag(format!("pa={}", par::stamp()));
         let parts = par::workers(words.len(), 1 << 16).min(eq.len() / 8);
         let parts = par::map_blocks(eq.len(), parts, 64.min(eq.len()), |_, start, end| {
-            neon::partial_evals_sets_tiled(words, eq.len(), start, end, |base, tile| eq.fill(base, tile))
+            let s = par::stamp();
+            let out = neon::partial_evals_sets_tiled(words, eq.len(), start, end, |base, tile| eq.fill(base, tile));
+            par::diag(format!("pw{}={}-{}", start / (eq.len() / 8).max(1), s, par::stamp()));
+            out
         });
+        par::diag(format!("pb={}", par::stamp()));
         let mut sets = vec![vec![B128::ZERO; PACK]; 1 << prefix];
         for part in parts {
             for (dst, src) in sets.iter_mut().zip(part) {

@@ -71,16 +71,3 @@ def emit(per=27, K=8, B=17, width=6, ls=2):
             asm, _ = allocate(seq, {'k': 15}, set(), reserved=RESERVED)
             out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
     return ',\n        '.join(out)
-def emit_loop(per=27, K=8, B=17, width=6, ls=2):
-    """The same per-node code as `emit` as a 4-iteration loop: nodes differ only in the table base
-    (lut + 192 n) and the output base (x + 2592 n); the ld1b index offsets depend on j only."""
-    out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"', '"mov {n}, #4"', '"3:"']
-    for t in range(6):
-        out.append(f'"ldp q{16+2*t}, q{17+2*t}, [{{lut}}, #{32*t}]"')
-    for c in range(0, 27, per):
-        ins = build_node(0, list(range(c, min(27, c + per))))
-        seq, _ = schedule(ins, skew=K, budget=B, cap=18, width=width, ls=ls)
-        asm, _ = allocate(seq, {'k': 15}, set(), reserved=RESERVED)
-        out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
-    out += ['"add {x}, {x}, #2592"', '"add {lut}, {lut}, #192"', '"subs {n}, {n}, #1"', '"b.ne 3b"']
-    return ',\n        '.join(out)

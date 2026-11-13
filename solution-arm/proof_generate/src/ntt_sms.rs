@@ -931,22 +931,34 @@ unsafe fn sums2(
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
                 for i in 0..groups * LOCK {
+                    let t0 = diag::now();
+                    if i + 1 < groups * LOCK {
+                        store_prefetch(&xs[i + 1]);
+                    }
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
+                    let t1 = diag::now();
                     let x = &mut xs[i];
                     lut_pass(nib, x, kern);
+                    let t2 = diag::now();
                     pass_c_asm(x, kern);
+                    let t3 = diag::now();
                     pass_d_asm(x, kern);
+                    let t4 = diag::now();
+                    diag::add([t1 - t0, t2 - t1, t3 - t2, t4 - t3, 0, 0, 1, 0]);
                 }
+                let t5 = diag::now();
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
+                let ds = diag::now() - t5; if t == 0 { diag::add([0, 0, 0, 0, ds, 0, 0, 0]) } else { diag::add([0, 0, 0, 0, 0, 0, 0, ds]) }
             }
             e += l;
         }
         let c = (end - 1) / CHUNK;
+        let t6 = diag::now();
         for t in 0..2 {
             let dv = devs[t].as_mut_ptr();
             for d in (0..DIGITS).step_by(2) {
@@ -955,12 +967,54 @@ unsafe fn sums2(
                 chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
             }
         }
+        diag::add([0, 0, 0, 0, 0, diag::now() - t6, 0, 0]);
     }
     for t in 0..2 {
         narrow(accs[t], 0, ys[t]);
         super::inverse_folded::<PB>(ys[t]);
     }
     let _ = (&mut accs, &mut ys, &mut devs);
+}
+
+/// Prefetch the next transform's buffer for writing (`prfm pstl1keep`, every 64-byte line of its
+/// 10,368 bytes): the table front is its first writer, and its lines were last touched by an earlier
+/// sink sweep, so without this each of its 162 lines is a store miss to L2 inside the table front.
+#[inline(always)]
+unsafe fn store_prefetch(x: &[int16x8_t; N]) {
+    let p = x.as_ptr() as *const u8;
+    let mut off = 0;
+    while off < N * 16 {
+        core::arch::asm!("prfm pstl1keep, [{p}]", p = in(reg) p.add(off), options(nostack, preserves_flags, readonly));
+        off += 64;
+    }
+}
+
+/// Diagnostic only: per-thread totals of `cntvct_el0` ticks spent in each part of [`sums2`]
+/// (indices, table front, levels 4-5, level 6, sink, chunk end) and the transform count, printed per
+/// worker on stderr at the end of [`commit`].
+mod diag {
+    use std::cell::Cell;
+    thread_local! { static T: Cell<[u64; 8]> = const { Cell::new([0; 8]) }; }
+    #[inline(always)]
+    pub fn now() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+    #[inline(always)]
+    pub fn add(d: [u64; 8]) {
+        T.with(|c| { let mut v = c.get(); for i in 0..8 { v[i] += d[i]; } c.set(v); });
+    }
+    pub fn report(first: usize) {
+        let f: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        let v = T.with(|c| c.get());
+        let n = v[6].max(1) as f64;
+        // ticks -> ns per 8-lane transform (the sink and chunk end are spread over the transforms too)
+        let ns = |t: u64| t as f64 * 1e9 / f as f64 / n;
+        eprintln!("diag col0={first} transforms={} freq={f} ns_per_transform: idx={:.1} lut={:.1} c={:.1} d={:.1} sinkA={:.1} sinkB={:.1} chunk={:.1}",
+            v[6], ns(v[0]), ns(v[1]), ns(v[2]), ns(v[3]), ns(v[4]), ns(v[7]), ns(v[5]));
+    }
 }
 
 #[inline]
@@ -1120,6 +1174,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 }
             }
         }
+        diag::report(first);
     });
 }
 

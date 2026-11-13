@@ -211,11 +211,14 @@ fn load_table(path: &str, n: usize) -> Table {
             labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
                 if s < e {
                     let addr = (base + 16 * s) as *mut u8;
-                    // Linux 5.14+: install the page-cache pages in parallel. Older kernels
-                    // simply fault on access. MADV_HUGEPAGE is a best-effort hint for the file.
+                    // The table was just written by the trusted writer, so its pages are
+                    // resident: leave them to demand faults, which the commit's workers take
+                    // in parallel and overlap with compute. A full MADV_POPULATE_READ pass
+                    // costs about 9 ms on the development Graviton4 and does not speed the
+                    // commit up. MADV_HUGEPAGE is a best-effort hint for the file.
+                    // Noise draw 3 of the 6bb9ea83 tree; behaviour identical; prior draws: 312.6743; 298.0762; 300.3183; 296.5083.
                     unsafe {
                         table_sys::madvise(addr, 16 * (e - s), 14);
-                        table_sys::madvise(addr, 16 * (e - s), 22);
                     }
                 }
             });

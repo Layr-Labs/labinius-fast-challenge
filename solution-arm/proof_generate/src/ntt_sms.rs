@@ -868,7 +868,6 @@ unsafe fn sums(
             let groups = l.div_ceil(LOCK);
             for i in 0..groups * LOCK {
                 let at = pass_words(words, a.elements, e, i);
-                prefetch_words(words, e, i + PF_T);
                 indices_asm(&at, nib);
                 let x = &mut xs[i];
                 lut_pass(nib, x, kern);
@@ -933,7 +932,6 @@ unsafe fn sums2(
             for t in 0..2 {
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
-                    prefetch_words(words[t], e, i + PF_T);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
                     lut_pass(nib, x, kern);
@@ -965,8 +963,8 @@ unsafe fn sums2(
     let _ = (&mut accs, &mut ys, &mut devs);
 }
 
-#[inline]
-fn crt(r: u32, t: i64) -> u128 {
+#[inline(always)]
+fn crt(r: u32, t: i64) -> u64 {
     const INV: u64 = {
         // 9721^-1 mod M by the extended Euclidean algorithm
         let (mut a, mut b) = (P1 as i64, TAIL as i64);
@@ -982,7 +980,7 @@ fn crt(r: u32, t: i64) -> u128 {
     const _: () = assert!(P1 as u64 * INV % TAIL as u64 == 1);
     const _: () = assert!(P1 < TAIL && MODULUS < 1 << 63);
     let k = (t - r as i64).rem_euclid(TAIL as i64) as u64 * INV % TAIL as u64;
-    (r as u64 + P1 as u64 * k) as u128
+    r as u64 + P1 as u64 * k
 }
 
 #[repr(C)]
@@ -1116,8 +1114,9 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
             for (c, column) in target.chunks_exact_mut(N * width).enumerate() {
                 let (slots, _) = column.as_chunks_mut::<W>();
                 for (k, slot) in slots.iter_mut().enumerate() {
-                    let bytes = crt(base[k][c] as u32, tail[k][c]).to_le_bytes();
-                    *slot = core::array::from_fn(|i| bytes[i]);
+                    let v = crt(base[k][c] as u32, tail[k][c]);
+                    slot[..4].copy_from_slice(&(v as u32).to_le_bytes());
+                    slot[4] = (v >> 32) as u8;
                 }
             }
         }

@@ -2254,7 +2254,6 @@ mod pass_timing {
         );
     }
 }
-
 #[cfg(test)]
 mod indices_asm_tests {
     use super::*;

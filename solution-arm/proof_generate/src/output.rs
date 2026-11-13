@@ -108,6 +108,7 @@ mod sys {
         pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
         pub fn munmap(addr: *mut u8, len: usize) -> i32;
         pub fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        pub fn sched_setscheduler(pid: i32, policy: i32, param: *const i32) -> i32;
     }
 }
 
@@ -129,6 +130,8 @@ struct State {
     path: String,
     layout: Layout,
     map: OnceLock<Option<Mapped>>,
+    /// Set by the write: the background setup stops faulting proof pages.
+    stop: std::sync::atomic::AtomicBool,
 }
 impl State {
     #[cfg(target_os = "linux")]
@@ -173,29 +176,32 @@ pub(super) struct Output {
 impl Output {
     pub fn start(path: &str, q: u128) -> Self {
         let layout = Layout::instance(q);
-        let state = Arc::new(State { path: path.to_owned(), layout, map: OnceLock::new() });
-        let mut commitment = vec![0u8; layout.commitment];
-        let addr = commitment.as_mut_ptr() as usize;
-        let bytes = commitment.len();
+        let state = Arc::new(State { path: path.to_owned(), layout, map: OnceLock::new(), stop: Default::default() });
+        let commitment = vec![0u8; layout.commitment];
         let worker = Arc::downgrade(&state);
-        // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
+        // Nothing here is on the commitment's path, which no longer waits for it: the thread
+        // runs at idle priority, so it takes no core from the prover's workers, and does what it
+        // can of the file setup in their idle moments. The commitment workers fault their own
+        // pages of the commitment buffer. The proof pages are faulted one write at a time (each
+        // fault holds the address-space lock only briefly, unlike a populate call over a whole
+        // chunk); whatever is left when the proof is written, the parallel encode faults itself.
         let setup = std::thread::spawn(move || {
+            idle_priority();
             let state = worker.upgrade();
             if let Some(state) = &state { let _ = state.mapped(); }
             labinius::challenge::warm();
-            for offset in (0..bytes).step_by(4096) {
-                unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
-            }
-            // Fault the whole proof mapping while the table read still runs on the other
-            // cores: the write phase then only has to encode, not populate file pages.
-            if let Some(state) = &state {
-                for i in 0..state.layout.len().div_ceil(CHUNK) { state.populate(i); }
+            if let Some(map) = state.as_ref().and_then(|s| s.mapped().map(|m| (s, m.addr))) {
+                let (state, addr) = map;
+                for offset in (0..state.layout.len()).step_by(4096) {
+                    if offset % (64 << 12) == 0 && state.stop.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
+                    // The file is preallocated, so its bytes read as zero: this changes no content.
+                    unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
+                }
             }
         });
         Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
-    }
-    pub fn wait_setup(&self) {
-        self.finish_setup();
     }
     fn finish_setup(&self) {
         if let Some(thread) = self.setup.lock().unwrap().take() {
@@ -203,7 +209,6 @@ impl Output {
         }
     }
     pub fn commitment_buffer(&self) -> Vec<u8> {
-        self.finish_setup();
         self.commitment.lock().unwrap().take().expect("commitment buffer used once")
     }
     /// Called before transcript absorb, while the caller is about to run alone. Avoid file
@@ -230,11 +235,20 @@ impl Output {
         std::fs::write(&self.state.path, encode_vec(p)).expect("write proof");
     }
     fn quiesce(&self) {
+        self.state.stop.store(true, std::sync::atomic::Ordering::Release);
         self.finish_setup();
         if let Some(job) = self.populate.get() { par::pool().quiesce(job); }
     }
 }
 impl Drop for Output { fn drop(&mut self) { self.quiesce(); } }
+
+/// `SCHED_IDLE` for the calling thread (Linux; best effort).
+fn idle_priority() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        sys::sched_setscheduler(0, 5, &0);
+    }
+}
 
 fn encode_vec(p: &ProofParts) -> Vec<u8> {
     let layout = Layout::parts(p);
@@ -352,7 +366,7 @@ mod tests {
         let map = OnceLock::new();
         if force_write { assert!(map.set(None).is_ok()); }
         Output {
-            state: Arc::new(State { path: path.to_owned(), layout, map }),
+            state: Arc::new(State { path: path.to_owned(), layout, map, stop: Default::default() }),
             setup: Mutex::new(None),
             populate: OnceLock::new(),
             commitment: Mutex::new(None),

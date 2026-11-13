@@ -669,3 +669,20 @@ mod scheduling_tests {
         assert_eq!(hits.load(Ordering::Relaxed), count);
     }
 }
+
+/// Diagnostic notes for stderr (timings only; no effect on the proof).
+pub static DIAG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// The process's diagnostic epoch, set by the first call.
+pub fn epoch() -> std::time::Instant {
+    static E: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *E.get_or_init(std::time::Instant::now)
+}
+/// Milliseconds since [`epoch`], to 0.1 ms.
+pub fn stamp() -> f64 {
+    (epoch().elapsed().as_micros() / 100) as f64 / 10.0
+}
+pub fn diag(s: String) {
+    if let Ok(mut d) = DIAG.lock() {
+        d.push(s);
+    }
+}

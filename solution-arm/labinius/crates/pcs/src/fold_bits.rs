@@ -1099,7 +1099,9 @@ pub mod neon {
     /// Slot pairs; the odd slot of the last pair (243) is a dummy.
     const PAIRS: usize = SLOTS.div_ceil(2);
     /// Most columns per group: the groups split the columns as evenly as they can.
-    pub const GROUP: usize = 30;
+    /// 12 keeps the plane buffer at ~25 KB, inside Neoverse V2's 64 KB L1D next to the streamed
+    /// counters (30 made it 62 KB: the planes alone filled L1).
+    pub const GROUP: usize = 12;
     /// Zero planes in front of the first column (plane 1 is column 0's leading guard).
     const GUARD: usize = 2;
     /// Planes per column: 128 and the trailing zero guard (the next column's leading guard).
@@ -1123,6 +1125,9 @@ pub mod neon {
     const _: () = assert!(GUARD + BIAS_PLANES >= Q162);
 
     type V = uint8x16_t;
+    /// A list entry: a plane's byte offset from its pair's base. (`u32` offsets, one `ldp` per two
+    /// entries, cut the M5's instructions ~6% but left Graviton4's fold at 33 ms: 5c9f3193.)
+    type Off = u16;
 
     /// Whether the counters cannot overflow: a slot takes at most one entry per term.
     pub fn fits(challenges: &[Challenge]) -> bool {
@@ -1135,13 +1140,13 @@ pub mod neon {
         columns: usize,
         /// Per sign (0 positive, 1 negative), the group's entries sorted by position: byte
         /// offsets of the even slot's plane relative to the pair's base pointer.
-        list: [Vec<u16>; 2],
+        list: [Vec<Off>; 2],
         /// Per pair: positive `[lo, hi)`, negative `[lo, hi)`.
         win: Vec<[u16; 4]>,
         /// Per pair and sign, the last `len % SUB` entries of the window, then entries of the
         /// pad planes (zero for positive, all-ones for negative: neither adds anything), as
         /// offsets from that pair's base.
-        tail: Vec<[[u16; SUB]; 2]>,
+        tail: Vec<[[Off; SUB]; 2]>,
     }
 
     /// The number of groups of `columns` columns.
@@ -1170,7 +1175,7 @@ pub mod neon {
             // Each entry is `(key, offset)`; a term at `m` reaches pair `i` when `[2i, 2i + 1]`
             // meets `[m, m + 127]`, i.e. `2i - 127 <= m <= 2i + 1`.
             let mut start = [[0u16; KEYS + 1]; 2];
-            let each = |f: &mut dyn FnMut(usize, usize, u16)| {
+            let each = |f: &mut dyn FnMut(usize, usize, Off)| {
                 for (jl, c) in cs.iter().enumerate() {
                     assert!(c.weight <= c.positions.len());
                     let col = (GUARD + jl * STRIDE + BIAS_PLANES) as i32;
@@ -1179,12 +1184,12 @@ pub mod neon {
                         assert!(p < Q162, "a position is below 162");
                         let negative = ((c.signs >> t) & 1 == 1) ^ (p % 2 == 1);
                         let m = p as i32;
-                        f(negative as usize, (m + KEY0) as usize, (16 * (col - m)) as u16);
+                        f(negative as usize, (m + KEY0) as usize, (16 * (col - m)) as Off);
                         // Slots `p + q >= 243` wrap to `p + q - 243` with the other sign: a
                         // term at position `p - 243`.
                         if p + WORD_BITS > SLOTS {
                             let m = m - SLOTS as i32;
-                            f(!negative as usize, (m + KEY0) as usize, (16 * (col - m)) as u16);
+                            f(!negative as usize, (m + KEY0) as usize, (16 * (col - m)) as Off);
                         }
                     }
                 }
@@ -1196,7 +1201,7 @@ pub mod neon {
                 }
             }
             let mut at = start;
-            let mut list = [vec![0u16; start[0][KEYS] as usize], vec![0u16; start[1][KEYS] as usize]];
+            let mut list = [vec![0 as Off; start[0][KEYS] as usize], vec![0 as Off; start[1][KEYS] as usize]];
             each(&mut |sign, key, off| {
                 list[sign][at[sign][key] as usize] = off;
                 at[sign][key] += 1;
@@ -1216,7 +1221,7 @@ pub mod neon {
                         let (lo, hi) = (w[2 * sign] as usize, w[2 * sign + 1] as usize);
                         let full = lo + (hi - lo) / SUB * SUB;
                         let pad = [PAD_ZERO, PAD_ONES][sign];
-                        let pad = (16 * (BIAS_PLANES + pad) - 32 * i) as u16;
+                        let pad = (16 * (BIAS_PLANES + pad) - 32 * i) as Off;
                         core::array::from_fn(|k| if full + k < hi { list[sign][full + k] } else { pad })
                     })
                 })
@@ -1452,11 +1457,11 @@ pub mod neon {
     #[allow(clippy::too_many_arguments)]
     unsafe fn pass(
         be: *const u8,
-        pos: *const u16,
+        pos: *const Off,
         pos8: usize,
-        neg: *const u16,
+        neg: *const Off,
         neg8: usize,
-        tail: &[[u16; SUB]; 2],
+        tail: &[[Off; SUB]; 2],
         lo: *mut V,
         hi: *mut V,
     ) {
@@ -1472,7 +1477,7 @@ pub mod neon {
         // Carries in `h`: the trees' carries flush it at `H_MAX - 1`, which leaves room for
         // the one carry of the list's end.
         let mut hn = 0usize;
-        let mut t: *const u16;
+        let mut t: *const Off;
         macro_rules! add_h {
             ($c0:expr, $c1:expr) => {{
                 let (mut c0, mut c1) = ($c0, $c1);
@@ -1796,7 +1801,8 @@ pub mod neon {
         let words_addr = words.as_ptr() as usize;
         let next = AtomicUsize::new(0);
         let (groups, bias) = (&groups, &bias);
-        pool.run(workers, |_| {
+        crate::par::diag(format!("f0={}", crate::par::stamp()));
+        pool.run(workers, |w| {
             let mut ws = Workspace::new();
             let mut claim = || {
                 let b = next.fetch_add(1, Ordering::Relaxed);
@@ -1818,6 +1824,7 @@ pub mod neon {
                     )
                 };
             }
+            crate::par::diag(format!("fw{}={}", w, crate::par::stamp()));
         });
         // SAFETY: every block wrote all fields of its 32 elements.
         unsafe { out.set_len(elements) };

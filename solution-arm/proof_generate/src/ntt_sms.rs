@@ -824,19 +824,6 @@ unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Ker
     pass_lut_asm(nib, x, kern);
 }
 
-/// Diagnostic only: side 1 of the paired test runs the table front as a 4-iteration loop.
-#[cfg(target_feature = "sve")]
-#[inline(always)]
-unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    if ctx::side1() { super::pass_lut_loop(nib, x, kern) } else { pass_lut_asm(nib, x, kern) }
-}
-
-#[cfg(not(target_feature = "sve"))]
-#[inline(always)]
-unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    lut_pass(nib, x, kern)
-}
-
 #[cfg(not(target_feature = "sve"))]
 #[inline(always)]
 unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
@@ -925,7 +912,6 @@ unsafe fn sums2(
     dev: [&mut [int32x4_t]; 2],
 ) {
     let kern = &kernels()[PB];
-    ctx::flip();
     let [acc0, acc1] = acc;
     let [y0, y1] = y;
     let [dev0, dev1] = dev;
@@ -946,23 +932,19 @@ unsafe fn sums2(
             let groups = l.div_ceil(LOCK);
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
-                let t0 = ctx::now();
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
-                    lut_pass2(nib, sc, kern);
+                    lut_pass(nib, sc, kern);
                     pass_c_asm(sc, kern);
                     pass_d_out(sc, x, kern);
                 }
-                ctx::add([ctx::now() - t0, 0, 0, 0, (groups * LOCK) as u64]);
-                let t1 = ctx::now();
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
-                ctx::add([0, ctx::now() - t1, 0, 0, 0]);
             }
             e += l;
         }
@@ -1062,8 +1044,9 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     let width = W;
     assert_eq!(out.len(), columns * N * width);
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
+        #[cfg(target_feature = "sve")]
+        if first == 0 { probe::run(); }
         let arena = Arena::new();
-        ctx::select(first * 8 / columns);
         let Scratch { xs, sc, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
@@ -1144,7 +1127,6 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 }
             }
         }
-        ctx::report();
     });
 }
 
@@ -1583,40 +1565,117 @@ mod leap_bench {
         }
     }
 }
-/// Diagnostic only: same-core paired comparison inside the commitment. Every worker alternates its
-/// batch pairs between side 0 (the crown: `pass_lut_asm`, straight line) and side 1 (`pass_lut_loop`,
-/// the same code as a 4-iteration loop); workers 0 and 4 run side 0 on both (controls). Per side `cntvct` totals of the
-/// transforms (table front included) and of the sinks, and the transform count.
-mod ctx {
-    use std::cell::Cell;
-    thread_local! {
-        static SEL: Cell<usize> = const { Cell::new(0) };
-        static SIDE: Cell<usize> = const { Cell::new(1) };
-        static T: Cell<[[u64; 5]; 2]> = const { Cell::new([[0; 5]; 2]) };
+
+/// Diagnostic only: Neoverse V2 pipe probe. Loops of 16 independent vector ops per iteration (sources
+/// v0/v1 never written), 200,000 iterations, timed with cntvct, printed as cycles per iteration at
+/// 2.79 GHz: tells whether sdot and the multiply-class ops share pipes.
+#[cfg(target_feature = "sve")]
+pub(crate) mod probe {
+    fn now() -> u64 { let v: u64; unsafe { core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) v, options(nostack)) }; v }
+    fn freq() -> u64 { let v: u64; unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v, options(nomem, nostack)) }; v }
+    macro_rules! probe {
+        ($name:literal, $($b:literal),*) => {{
+            let mut best = u64::MAX;
+            for _ in 0..3 {
+                let t = now();
+                unsafe { core::arch::asm!("2:", $($b,)* "subs {n}, {n}, #1", "b.ne 2b", n = inout(reg) 200000u64 => _,
+                    out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                    out("v24") _, out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+                    options(nomem, nostack)) };
+                best = best.min(now() - t);
+            }
+            eprintln!("pipeprobe {} cycles_per_iter={:.2}", $name, best as f64 / freq() as f64 * 2.79e9 / 200000.0);
+        }};
     }
-    pub fn select(worker: usize) { SEL.with(|s| s.set(worker % 8)); }
-    pub fn flip() { SIDE.with(|s| s.set(1 - s.get())); }
-    fn control() -> bool { matches!(SEL.with(|s| s.get()), 0 | 4) }
-    pub fn side1() -> bool { SIDE.with(|s| s.get()) == 1 && !control() }
-    #[inline(always)]
-    pub fn now() -> u64 {
-        let v: u64;
-        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
-        v
+    // X1 feasibility: two sink tiles (2-row pass: 8 accumulators, 4 x, 2 keys; 32 sdot) and one
+    // table-front step (5 ld1b + 5 two-register tbl + adds + 2 mulc_eps + 6 str) in the register
+    // plan an interleaved kernel would use (tables z8-z11, z24-z31; temps z2, z3, z12-z14; k z15).
+    macro_rules! tile { () => { concat!(
+        "ldr q4, [{xp}]\n", "ldr q5, [{xp}, #16]\n", "ldr q6, [{xp}, #32]\n", "ldr q7, [{xp}, #48]\n",
+        "ldr q0, [{kp}]\n", "ldr q1, [{kp}, #16]\n",
+        "sdot z16.d, z4.h, z0.h[0]\n", "sdot z17.d, z5.h, z0.h[0]\n", "sdot z18.d, z6.h, z0.h[0]\n", "sdot z19.d, z7.h, z0.h[0]\n",
+        "sdot z20.d, z4.h, z1.h[0]\n", "sdot z21.d, z5.h, z1.h[0]\n", "sdot z22.d, z6.h, z1.h[0]\n", "sdot z23.d, z7.h, z1.h[0]\n",
+        "ldr q4, [{xp}, #64]\n", "ldr q5, [{xp}, #80]\n", "ldr q6, [{xp}, #96]\n", "ldr q7, [{xp}, #112]\n",
+        "sdot z16.d, z4.h, z0.h[1]\n", "sdot z17.d, z5.h, z0.h[1]\n", "sdot z18.d, z6.h, z0.h[1]\n", "sdot z19.d, z7.h, z0.h[1]\n",
+        "sdot z20.d, z4.h, z1.h[1]\n", "sdot z21.d, z5.h, z1.h[1]\n", "sdot z22.d, z6.h, z1.h[1]\n", "sdot z23.d, z7.h, z1.h[1]\n",
+    ) } }
+    macro_rules! step { () => { concat!(
+        "ld1b z2.h, p7/z, [{ip}]\n", "ld1b z3.h, p7/z, [{ip}, #1, mul vl]\n", "ld1b z12.h, p7/z, [{ip}, #2, mul vl]\n", "ld1b z13.h, p7/z, [{ip}, #3, mul vl]\n",
+        "tbl z2.h, {{z24.h, z25.h}}, z2.h\n", "tbl z3.h, {{z26.h, z27.h}}, z3.h\n", "tbl z12.h, {{z28.h, z29.h}}, z12.h\n", "tbl z13.h, {{z30.h, z31.h}}, z13.h\n",
+        "add v14.8h, v2.8h, v3.8h\n", "sub v2.8h, v2.8h, v3.8h\n", "add v3.8h, v12.8h, v13.8h\n", "sub v12.8h, v12.8h, v13.8h\n",
+        "ld1b z13.h, p7/z, [{ip}, #4, mul vl]\n", "tbl z13.h, {{z8.h, z9.h}}, z13.h\n", "add v13.8h, v13.8h, v14.8h\n",
+        "mul v14.8h, v3.8h, v15.h[2]\n", "sqrdmulh v3.8h, v3.8h, v15.h[3]\n", "mls v14.8h, v3.8h, v15.h[0]\n",
+        "add v2.8h, v2.8h, v14.8h\n", "sub v12.8h, v12.8h, v14.8h\n", "add v3.8h, v13.8h, v12.8h\n",
+        "mul v14.8h, v12.8h, v15.h[2]\n", "sqrdmulh v12.8h, v12.8h, v15.h[3]\n", "mls v14.8h, v12.8h, v15.h[0]\n",
+        "str q2, [{op}]\n", "str q3, [{op}, #16]\n", "str q12, [{op}, #32]\n", "str q13, [{op}, #48]\n", "str q14, [{op}, #64]\n", "str q2, [{op}, #80]\n",
+    ) } }
+    macro_rules! step_noload { () => { concat!(
+        "tbl z2.h, {{z24.h, z25.h}}, z0.h\n", "tbl z3.h, {{z26.h, z27.h}}, z1.h\n", "tbl z12.h, {{z28.h, z29.h}}, z0.h\n", "tbl z13.h, {{z30.h, z31.h}}, z1.h\n",
+        "add v14.8h, v2.8h, v3.8h\n", "sub v2.8h, v2.8h, v3.8h\n", "add v3.8h, v12.8h, v13.8h\n", "sub v12.8h, v12.8h, v13.8h\n",
+        "tbl z13.h, {{z8.h, z9.h}}, z0.h\n", "add v13.8h, v13.8h, v14.8h\n",
+        "mul v14.8h, v3.8h, v15.h[2]\n", "sqrdmulh v3.8h, v3.8h, v15.h[3]\n", "mls v14.8h, v3.8h, v15.h[0]\n",
+        "add v2.8h, v2.8h, v14.8h\n", "sub v12.8h, v12.8h, v14.8h\n", "add v3.8h, v13.8h, v12.8h\n",
+        "mul v14.8h, v12.8h, v15.h[2]\n", "sqrdmulh v12.8h, v12.8h, v15.h[3]\n", "mls v14.8h, v12.8h, v15.h[0]\n",
+        "str q2, [{op}]\n", "str q3, [{op}, #16]\n", "str q12, [{op}, #32]\n", "str q13, [{op}, #48]\n", "str q14, [{op}, #64]\n", "str q2, [{op}, #80]\n",
+    ) } }
+    macro_rules! step_nostore { () => { concat!(
+        "ld1b z2.h, p7/z, [{ip}]\n", "ld1b z3.h, p7/z, [{ip}, #1, mul vl]\n", "ld1b z12.h, p7/z, [{ip}, #2, mul vl]\n", "ld1b z13.h, p7/z, [{ip}, #3, mul vl]\n",
+        "tbl z2.h, {{z24.h, z25.h}}, z2.h\n", "tbl z3.h, {{z26.h, z27.h}}, z3.h\n", "tbl z12.h, {{z28.h, z29.h}}, z12.h\n", "tbl z13.h, {{z30.h, z31.h}}, z13.h\n",
+        "add v14.8h, v2.8h, v3.8h\n", "sub v2.8h, v2.8h, v3.8h\n", "add v3.8h, v12.8h, v13.8h\n", "sub v12.8h, v12.8h, v13.8h\n",
+        "ld1b z13.h, p7/z, [{ip}, #4, mul vl]\n", "tbl z13.h, {{z8.h, z9.h}}, z13.h\n", "add v13.8h, v13.8h, v14.8h\n",
+        "mul v14.8h, v3.8h, v15.h[2]\n", "sqrdmulh v3.8h, v3.8h, v15.h[3]\n", "mls v14.8h, v3.8h, v15.h[0]\n",
+        "add v2.8h, v2.8h, v14.8h\n", "sub v12.8h, v12.8h, v14.8h\n", "add v3.8h, v13.8h, v12.8h\n",
+        "mul v14.8h, v12.8h, v15.h[2]\n", "sqrdmulh v12.8h, v12.8h, v15.h[3]\n", "mls v14.8h, v12.8h, v15.h[0]\n",
+        "add v12.8h, v12.8h, v14.8h\n", "add v13.8h, v13.8h, v2.8h\n", "add v3.8h, v3.8h, v12.8h\n",
+    ) } }
+    macro_rules! ops8 { ($a:literal) => { concat!($a, $a, $a, $a, $a, $a, $a, $a) } }
+    macro_rules! mix {
+        ($name:literal, $body:expr) => {{
+            let buf = vec![0u8; 4096];
+            let out = vec![0u8; 4096];
+            let mut best = u64::MAX;
+            for _ in 0..3 {
+                let t = now();
+                unsafe { core::arch::asm!("// {xp} {kp} {ip} {op}", "ptrue p7.h", "2:", $body, "subs {n}, {n}, #1", "b.ne 2b",
+                    n = inout(reg) 200000u64 => _, xp = in(reg) buf.as_ptr(), kp = in(reg) buf.as_ptr().add(1024),
+                    ip = in(reg) buf.as_ptr().add(2048), op = in(reg) out.as_ptr(),
+                    out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+                    out("v12") _, out("v13") _, out("v14") _,
+                    out("v16") _, out("v17") _, out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+                    out("p7") _, options(nostack)) };
+                best = best.min(now() - t);
+            }
+            core::hint::black_box(&out);
+            eprintln!("pipeprobe {} cycles_per_iter={:.2}", $name, best as f64 / freq() as f64 * 2.79e9 / 200000.0);
+        }};
     }
-    #[inline(always)]
-    pub fn add(d: [u64; 5]) {
-        let side = SIDE.with(|s| s.get());
-        T.with(|c| { let mut v = c.get(); for i in 0..5 { v[side][i] += d[i]; } c.set(v); });
-    }
-    pub fn report() {
-        let f: u64;
-        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
-        let v = T.with(|c| c.get());
-        let w = SEL.with(|s| s.get());
-        let ns = |s: usize, i: usize| v[s][i] as f64 * 1e9 / f as f64 / v[s][4].max(1) as f64;
-        eprintln!("ctxf w={w} side1={} transforms={}/{} s0_tr_ns={:.0} s1_tr_ns={:.0} tr_delta%={:+.2} s0_sink_ns={:.0} s1_sink_ns={:.0} sink_delta%={:+.2}",
-            if control() { "control" } else { "lutloop" }, v[0][4], v[1][4], ns(0, 0), ns(1, 0), 100.0 * (ns(1, 0) / ns(0, 0) - 1.0),
-            ns(0, 1), ns(1, 1), 100.0 * (ns(1, 1) / ns(0, 1) - 1.0));
+    pub fn run() {
+        mix!("x2_sdot8", concat!("sdot z16.d, z4.h, z0.h[0]\n", "sdot z17.d, z5.h, z0.h[0]\n", "sdot z18.d, z6.h, z0.h[0]\n", "sdot z19.d, z7.h, z0.h[0]\n", "sdot z20.d, z4.h, z1.h[0]\n", "sdot z21.d, z5.h, z1.h[0]\n", "sdot z22.d, z6.h, z1.h[0]\n", "sdot z23.d, z7.h, z1.h[0]\n"));
+        mix!("x2_sdot8_ld1b8", concat!("sdot z16.d, z4.h, z0.h[0]\n", "ld1b z2.h, p7/z, [{ip}]\n", "sdot z17.d, z5.h, z0.h[0]\n", "ld1b z3.h, p7/z, [{ip}, #1, mul vl]\n", "sdot z18.d, z6.h, z0.h[0]\n", "ld1b z12.h, p7/z, [{ip}, #2, mul vl]\n", "sdot z19.d, z7.h, z0.h[0]\n", "ld1b z13.h, p7/z, [{ip}, #3, mul vl]\n", "sdot z20.d, z4.h, z1.h[0]\n", "ld1b z14.h, p7/z, [{ip}, #4, mul vl]\n", "sdot z21.d, z5.h, z1.h[0]\n", "ld1b z2.h, p7/z, [{ip}, #5, mul vl]\n", "sdot z22.d, z6.h, z1.h[0]\n", "ld1b z3.h, p7/z, [{ip}, #6, mul vl]\n", "sdot z23.d, z7.h, z1.h[0]\n", "ld1b z12.h, p7/z, [{ip}, #7, mul vl]\n"));
+        mix!("x2_sdot8_str8", concat!("sdot z16.d, z4.h, z0.h[0]\n", "str q2, [{op}]\n", "sdot z17.d, z5.h, z0.h[0]\n", "str q3, [{op}, #16]\n", "sdot z18.d, z6.h, z0.h[0]\n", "str q12, [{op}, #32]\n", "sdot z19.d, z7.h, z0.h[0]\n", "str q13, [{op}, #48]\n", "sdot z20.d, z4.h, z1.h[0]\n", "str q14, [{op}, #64]\n", "sdot z21.d, z5.h, z1.h[0]\n", "str q2, [{op}, #80]\n", "sdot z22.d, z6.h, z1.h[0]\n", "str q3, [{op}, #96]\n", "sdot z23.d, z7.h, z1.h[0]\n", "str q12, [{op}, #112]\n"));
+        mix!("x2_step_noload", step_noload!());
+        mix!("x2_step_nostore", step_nostore!());
+        mix!("x2_sink2_step_noload", concat!(tile!(), step_noload!(), tile!()));
+        mix!("x2_sink2_step_nostore", concat!(tile!(), step_nostore!(), tile!()));
+        mix!("x1_sink2tiles", concat!(tile!(), tile!()));
+        mix!("x1_lutstep", step!());
+        mix!("x1_sink2tiles_lutstep", concat!(tile!(), step!(), tile!()));
+        mix!("x1_sink2tiles_lut2steps", concat!(tile!(), step!(), tile!(), step!()));
+        probe!("sdot16", "sdot z16.d,  z0.h,  z1.h[0]", "sdot z17.d,  z0.h,  z1.h[0]", "sdot z18.d,  z0.h,  z1.h[0]", "sdot z19.d,  z0.h,  z1.h[0]", "sdot z20.d,  z0.h,  z1.h[0]", "sdot z21.d,  z0.h,  z1.h[0]", "sdot z22.d,  z0.h,  z1.h[0]", "sdot z23.d,  z0.h,  z1.h[0]", "sdot z24.d,  z0.h,  z1.h[0]", "sdot z25.d,  z0.h,  z1.h[0]", "sdot z26.d,  z0.h,  z1.h[0]", "sdot z27.d,  z0.h,  z1.h[0]", "sdot z28.d,  z0.h,  z1.h[0]", "sdot z29.d,  z0.h,  z1.h[0]", "sdot z30.d,  z0.h,  z1.h[0]", "sdot z31.d,  z0.h,  z1.h[0]");
+        probe!("mul16", "mul v16.8h,  v0.8h,  v1.h[0]", "mul v17.8h,  v0.8h,  v1.h[0]", "mul v18.8h,  v0.8h,  v1.h[0]", "mul v19.8h,  v0.8h,  v1.h[0]", "mul v20.8h,  v0.8h,  v1.h[0]", "mul v21.8h,  v0.8h,  v1.h[0]", "mul v22.8h,  v0.8h,  v1.h[0]", "mul v23.8h,  v0.8h,  v1.h[0]", "mul v24.8h,  v0.8h,  v1.h[0]", "mul v25.8h,  v0.8h,  v1.h[0]", "mul v26.8h,  v0.8h,  v1.h[0]", "mul v27.8h,  v0.8h,  v1.h[0]", "mul v28.8h,  v0.8h,  v1.h[0]", "mul v29.8h,  v0.8h,  v1.h[0]", "mul v30.8h,  v0.8h,  v1.h[0]", "mul v31.8h,  v0.8h,  v1.h[0]");
+        probe!("sqrdmulh16", "sqrdmulh v16.8h,  v0.8h,  v1.h[1]", "sqrdmulh v17.8h,  v0.8h,  v1.h[1]", "sqrdmulh v18.8h,  v0.8h,  v1.h[1]", "sqrdmulh v19.8h,  v0.8h,  v1.h[1]", "sqrdmulh v20.8h,  v0.8h,  v1.h[1]", "sqrdmulh v21.8h,  v0.8h,  v1.h[1]", "sqrdmulh v22.8h,  v0.8h,  v1.h[1]", "sqrdmulh v23.8h,  v0.8h,  v1.h[1]", "sqrdmulh v24.8h,  v0.8h,  v1.h[1]", "sqrdmulh v25.8h,  v0.8h,  v1.h[1]", "sqrdmulh v26.8h,  v0.8h,  v1.h[1]", "sqrdmulh v27.8h,  v0.8h,  v1.h[1]", "sqrdmulh v28.8h,  v0.8h,  v1.h[1]", "sqrdmulh v29.8h,  v0.8h,  v1.h[1]", "sqrdmulh v30.8h,  v0.8h,  v1.h[1]", "sqrdmulh v31.8h,  v0.8h,  v1.h[1]");
+        probe!("add16", "add v16.8h,  v0.8h,  v1.8h", "add v17.8h,  v0.8h,  v1.8h", "add v18.8h,  v0.8h,  v1.8h", "add v19.8h,  v0.8h,  v1.8h", "add v20.8h,  v0.8h,  v1.8h", "add v21.8h,  v0.8h,  v1.8h", "add v22.8h,  v0.8h,  v1.8h", "add v23.8h,  v0.8h,  v1.8h", "add v24.8h,  v0.8h,  v1.8h", "add v25.8h,  v0.8h,  v1.8h", "add v26.8h,  v0.8h,  v1.8h", "add v27.8h,  v0.8h,  v1.8h", "add v28.8h,  v0.8h,  v1.8h", "add v29.8h,  v0.8h,  v1.8h", "add v30.8h,  v0.8h,  v1.8h", "add v31.8h,  v0.8h,  v1.8h");
+        probe!("srshr16", "srshr v16.8h,  v0.8h,  #13", "srshr v17.8h,  v0.8h,  #13", "srshr v18.8h,  v0.8h,  #13", "srshr v19.8h,  v0.8h,  #13", "srshr v20.8h,  v0.8h,  #13", "srshr v21.8h,  v0.8h,  #13", "srshr v22.8h,  v0.8h,  #13", "srshr v23.8h,  v0.8h,  #13", "srshr v24.8h,  v0.8h,  #13", "srshr v25.8h,  v0.8h,  #13", "srshr v26.8h,  v0.8h,  #13", "srshr v27.8h,  v0.8h,  #13", "srshr v28.8h,  v0.8h,  #13", "srshr v29.8h,  v0.8h,  #13", "srshr v30.8h,  v0.8h,  #13", "srshr v31.8h,  v0.8h,  #13");
+        probe!("sdot8_mul8", "sdot z16.d,  z0.h,  z1.h[0]", "mul v24.8h,  v0.8h,  v1.h[0]", "sdot z17.d,  z0.h,  z1.h[0]", "mul v25.8h,  v0.8h,  v1.h[0]", "sdot z18.d,  z0.h,  z1.h[0]", "mul v26.8h,  v0.8h,  v1.h[0]", "sdot z19.d,  z0.h,  z1.h[0]", "mul v27.8h,  v0.8h,  v1.h[0]", "sdot z20.d,  z0.h,  z1.h[0]", "mul v28.8h,  v0.8h,  v1.h[0]", "sdot z21.d,  z0.h,  z1.h[0]", "mul v29.8h,  v0.8h,  v1.h[0]", "sdot z22.d,  z0.h,  z1.h[0]", "mul v30.8h,  v0.8h,  v1.h[0]", "sdot z23.d,  z0.h,  z1.h[0]", "mul v31.8h,  v0.8h,  v1.h[0]");
+        probe!("sdot8_add8", "sdot z16.d,  z0.h,  z1.h[0]", "add v24.8h,  v0.8h,  v1.8h", "sdot z17.d,  z0.h,  z1.h[0]", "add v25.8h,  v0.8h,  v1.8h", "sdot z18.d,  z0.h,  z1.h[0]", "add v26.8h,  v0.8h,  v1.8h", "sdot z19.d,  z0.h,  z1.h[0]", "add v27.8h,  v0.8h,  v1.8h", "sdot z20.d,  z0.h,  z1.h[0]", "add v28.8h,  v0.8h,  v1.8h", "sdot z21.d,  z0.h,  z1.h[0]", "add v29.8h,  v0.8h,  v1.8h", "sdot z22.d,  z0.h,  z1.h[0]", "add v30.8h,  v0.8h,  v1.8h", "sdot z23.d,  z0.h,  z1.h[0]", "add v31.8h,  v0.8h,  v1.8h");
+        probe!("sdot8_srshr8", "sdot z16.d,  z0.h,  z1.h[0]", "srshr v24.8h,  v0.8h,  #13", "sdot z17.d,  z0.h,  z1.h[0]", "srshr v25.8h,  v0.8h,  #13", "sdot z18.d,  z0.h,  z1.h[0]", "srshr v26.8h,  v0.8h,  #13", "sdot z19.d,  z0.h,  z1.h[0]", "srshr v27.8h,  v0.8h,  #13", "sdot z20.d,  z0.h,  z1.h[0]", "srshr v28.8h,  v0.8h,  #13", "sdot z21.d,  z0.h,  z1.h[0]", "srshr v29.8h,  v0.8h,  #13", "sdot z22.d,  z0.h,  z1.h[0]", "srshr v30.8h,  v0.8h,  #13", "sdot z23.d,  z0.h,  z1.h[0]", "srshr v31.8h,  v0.8h,  #13");
+        probe!("mul8_add8", "mul v16.8h,  v0.8h,  v1.h[0]", "add v24.8h,  v0.8h,  v1.8h", "mul v17.8h,  v0.8h,  v1.h[0]", "add v25.8h,  v0.8h,  v1.8h", "mul v18.8h,  v0.8h,  v1.h[0]", "add v26.8h,  v0.8h,  v1.8h", "mul v19.8h,  v0.8h,  v1.h[0]", "add v27.8h,  v0.8h,  v1.8h", "mul v20.8h,  v0.8h,  v1.h[0]", "add v28.8h,  v0.8h,  v1.8h", "mul v21.8h,  v0.8h,  v1.h[0]", "add v29.8h,  v0.8h,  v1.8h", "mul v22.8h,  v0.8h,  v1.h[0]", "add v30.8h,  v0.8h,  v1.8h", "mul v23.8h,  v0.8h,  v1.h[0]", "add v31.8h,  v0.8h,  v1.8h");
+        probe!("mul8_srshr8", "mul v16.8h,  v0.8h,  v1.h[0]", "srshr v24.8h,  v0.8h,  #13", "mul v17.8h,  v0.8h,  v1.h[0]", "srshr v25.8h,  v0.8h,  #13", "mul v18.8h,  v0.8h,  v1.h[0]", "srshr v26.8h,  v0.8h,  #13", "mul v19.8h,  v0.8h,  v1.h[0]", "srshr v27.8h,  v0.8h,  #13", "mul v20.8h,  v0.8h,  v1.h[0]", "srshr v28.8h,  v0.8h,  #13", "mul v21.8h,  v0.8h,  v1.h[0]", "srshr v29.8h,  v0.8h,  #13", "mul v22.8h,  v0.8h,  v1.h[0]", "srshr v30.8h,  v0.8h,  #13", "mul v23.8h,  v0.8h,  v1.h[0]", "srshr v31.8h,  v0.8h,  #13");
+        probe!("tbl16", "tbl z16.h,  {{z2.h,  z3.h}},  z0.h", "tbl z17.h,  {{z2.h,  z3.h}},  z0.h", "tbl z18.h,  {{z2.h,  z3.h}},  z0.h", "tbl z19.h,  {{z2.h,  z3.h}},  z0.h", "tbl z20.h,  {{z2.h,  z3.h}},  z0.h", "tbl z21.h,  {{z2.h,  z3.h}},  z0.h", "tbl z22.h,  {{z2.h,  z3.h}},  z0.h", "tbl z23.h,  {{z2.h,  z3.h}},  z0.h", "tbl z24.h,  {{z2.h,  z3.h}},  z0.h", "tbl z25.h,  {{z2.h,  z3.h}},  z0.h", "tbl z26.h,  {{z2.h,  z3.h}},  z0.h", "tbl z27.h,  {{z2.h,  z3.h}},  z0.h", "tbl z28.h,  {{z2.h,  z3.h}},  z0.h", "tbl z29.h,  {{z2.h,  z3.h}},  z0.h", "tbl z30.h,  {{z2.h,  z3.h}},  z0.h", "tbl z31.h,  {{z2.h,  z3.h}},  z0.h");
+        probe!("sdot8_tbl8", "sdot z16.d,  z0.h,  z1.h[0]", "tbl z24.h,  {{z2.h,  z3.h}},  z0.h", "sdot z17.d,  z0.h,  z1.h[0]", "tbl z25.h,  {{z2.h,  z3.h}},  z0.h", "sdot z18.d,  z0.h,  z1.h[0]", "tbl z26.h,  {{z2.h,  z3.h}},  z0.h", "sdot z19.d,  z0.h,  z1.h[0]", "tbl z27.h,  {{z2.h,  z3.h}},  z0.h", "sdot z20.d,  z0.h,  z1.h[0]", "tbl z28.h,  {{z2.h,  z3.h}},  z0.h", "sdot z21.d,  z0.h,  z1.h[0]", "tbl z29.h,  {{z2.h,  z3.h}},  z0.h", "sdot z22.d,  z0.h,  z1.h[0]", "tbl z30.h,  {{z2.h,  z3.h}},  z0.h", "sdot z23.d,  z0.h,  z1.h[0]", "tbl z31.h,  {{z2.h,  z3.h}},  z0.h");
+        probe!("mul8_tbl8", "mul v16.8h,  v0.8h,  v1.h[0]", "tbl z24.h,  {{z2.h,  z3.h}},  z0.h", "mul v17.8h,  v0.8h,  v1.h[0]", "tbl z25.h,  {{z2.h,  z3.h}},  z0.h", "mul v18.8h,  v0.8h,  v1.h[0]", "tbl z26.h,  {{z2.h,  z3.h}},  z0.h", "mul v19.8h,  v0.8h,  v1.h[0]", "tbl z27.h,  {{z2.h,  z3.h}},  z0.h", "mul v20.8h,  v0.8h,  v1.h[0]", "tbl z28.h,  {{z2.h,  z3.h}},  z0.h", "mul v21.8h,  v0.8h,  v1.h[0]", "tbl z29.h,  {{z2.h,  z3.h}},  z0.h", "mul v22.8h,  v0.8h,  v1.h[0]", "tbl z30.h,  {{z2.h,  z3.h}},  z0.h", "mul v23.8h,  v0.8h,  v1.h[0]", "tbl z31.h,  {{z2.h,  z3.h}},  z0.h");
+        probe!("srshr8_tbl8", "srshr v16.8h,  v0.8h,  #13", "tbl z24.h,  {{z2.h,  z3.h}},  z0.h", "srshr v17.8h,  v0.8h,  #13", "tbl z25.h,  {{z2.h,  z3.h}},  z0.h", "srshr v18.8h,  v0.8h,  #13", "tbl z26.h,  {{z2.h,  z3.h}},  z0.h", "srshr v19.8h,  v0.8h,  #13", "tbl z27.h,  {{z2.h,  z3.h}},  z0.h", "srshr v20.8h,  v0.8h,  #13", "tbl z28.h,  {{z2.h,  z3.h}},  z0.h", "srshr v21.8h,  v0.8h,  #13", "tbl z29.h,  {{z2.h,  z3.h}},  z0.h", "srshr v22.8h,  v0.8h,  #13", "tbl z30.h,  {{z2.h,  z3.h}},  z0.h", "srshr v23.8h,  v0.8h,  #13", "tbl z31.h,  {{z2.h,  z3.h}},  z0.h");
+        probe!("add8_tbl8", "add v16.8h,  v0.8h,  v1.8h", "tbl z24.h,  {{z2.h,  z3.h}},  z0.h", "add v17.8h,  v0.8h,  v1.8h", "tbl z25.h,  {{z2.h,  z3.h}},  z0.h", "add v18.8h,  v0.8h,  v1.8h", "tbl z26.h,  {{z2.h,  z3.h}},  z0.h", "add v19.8h,  v0.8h,  v1.8h", "tbl z27.h,  {{z2.h,  z3.h}},  z0.h", "add v20.8h,  v0.8h,  v1.8h", "tbl z28.h,  {{z2.h,  z3.h}},  z0.h", "add v21.8h,  v0.8h,  v1.8h", "tbl z29.h,  {{z2.h,  z3.h}},  z0.h", "add v22.8h,  v0.8h,  v1.8h", "tbl z30.h,  {{z2.h,  z3.h}},  z0.h", "add v23.8h,  v0.8h,  v1.8h", "tbl z31.h,  {{z2.h,  z3.h}},  z0.h");
+        probe!("sdot8_tbl4_add4", "sdot z16.d,  z0.h,  z1.h[0]", "tbl z24.h,  {{z2.h,  z3.h}},  z0.h", "sdot z17.d,  z0.h,  z1.h[0]", "add v28.8h,  v0.8h,  v1.8h", "sdot z18.d,  z0.h,  z1.h[0]", "tbl z25.h,  {{z2.h,  z3.h}},  z0.h", "sdot z19.d,  z0.h,  z1.h[0]", "add v29.8h,  v0.8h,  v1.8h", "sdot z20.d,  z0.h,  z1.h[0]", "tbl z26.h,  {{z2.h,  z3.h}},  z0.h", "sdot z21.d,  z0.h,  z1.h[0]", "add v30.8h,  v0.8h,  v1.8h", "sdot z22.d,  z0.h,  z1.h[0]", "tbl z27.h,  {{z2.h,  z3.h}},  z0.h", "sdot z23.d,  z0.h,  z1.h[0]", "add v31.8h,  v0.8h,  v1.8h");
     }
 }

@@ -963,6 +963,56 @@ unsafe fn sums2(
     let _ = (&mut accs, &mut ys, &mut devs);
 }
 
+/// Diagnostic only, run after the proof is written: every generator variant in `asm_var` against
+/// the crown's pass (the proof's `ntt_neon_asm.rs`) on the same L1-hot buffers, alternating which
+/// runs first, best of 4 rounds of 4,000 calls each side; one `tune ...` line per variant on stderr.
+/// The first variant of each table is the crown's own setting (expected delta ~0).
+pub fn tune_passes() {
+    use super::asm_var::{LUT_VARIANTS, PC_VARIANTS, PD_VARIANTS};
+    #[inline(always)]
+    fn now() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+    let f: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+    let kern = &kernels()[PB];
+    let mut x: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+    let nib: Box<[uint8x16_t; N / 4]> = unsafe { Box::new(core::mem::zeroed()) };
+    let calls = 4_000u64;
+    let mut run = |g: &mut dyn FnMut(&mut [int16x8_t; N])| -> f64 {
+        for _ in 0..300 { g(&mut x); }
+        let t = now();
+        for _ in 0..calls { g(&mut x); core::hint::black_box(&mut *x); }
+        (now() - t) as f64 * 1e9 / f as f64 / calls as f64
+    };
+    let mut ab = |name: &str, a: &mut dyn FnMut(&mut [int16x8_t; N]), b: &mut dyn FnMut(&mut [int16x8_t; N])| {
+        let mut best = [f64::MAX; 2];
+        for round in 0..4 {
+            for k in 0..2 {
+                let side = (round + k) % 2;
+                let t = if side == 0 { run(&mut *a) } else { run(&mut *b) };
+                best[side] = best[side].min(t);
+            }
+        }
+        eprintln!("tune {name}: crown_ns={:.1} var_ns={:.1} delta={:+.2}%", best[0], best[1], 100.0 * (best[1] / best[0] - 1.0));
+    };
+    unsafe {
+        for &(name, g) in PC_VARIANTS {
+            ab(name, &mut |x| pass_c_asm(x, kern), &mut |x| g(x, kern));
+        }
+        for &(name, g) in PD_VARIANTS {
+            ab(name, &mut |x| pass_d_asm(x, kern), &mut |x| g(x, kern));
+        }
+        #[cfg(target_feature = "sve")]
+        for &(name, g) in LUT_VARIANTS {
+            ab(name, &mut |x| pass_lut_asm(&nib, x, kern), &mut |x| g(&nib, x, kern));
+        }
+    }
+    let _ = (&nib, LUT_VARIANTS);
+}
+
 #[inline]
 fn crt(r: u32, t: i64) -> u64 {
     const INV: u64 = {

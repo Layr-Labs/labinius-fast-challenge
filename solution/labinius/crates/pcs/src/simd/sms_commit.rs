@@ -1,13 +1,14 @@
 //! One-witness-NTT commitment modulo 9721 * 55 * 2^16.
-//! Six short public coefficient banks use fixed Phi_6 pair weights. Public-key
-//! encoding and exact second moments are computed without instance data.
-//! The 176-pair chunks require 36 auxiliary inverse batches per column group.
-//! Boundary residues are recomputed exactly; public moments certify a 7.75-sigma
-//! recovery window under the same independent Boolean-input model as centering.
-//! Split16 totals preserve exact integers until the final modulo 55 reduction.
+//! Six public banks use Phi24 octets with Y=X^81; the table is always read fresh.
+//! At the fixed shape, 208-pair chunks use 30 paired auxiliary inverse batches.
+//! Public moments retain the 7.75-sigma recovery window. Every flagged boundary
+//! residue is recomputed with the exact dot product.
+//! Split16 totals preserve the integer result until reduction modulo 55*2^16.
 use super::*;
 #[path="sms_lattice.rs"]mod lattice_code;
 use crate::simd::ntt::gen_small;
+#[path="sms_phi24_codec.rs"]mod phi24_codec;
+#[path="sms_phi24_source_bounds.rs"]pub(crate)mod source_bounds;
 
 pub const P: u16 = 9721;
 const RECON_BOUND:i64=P as i64/2;
@@ -37,7 +38,7 @@ const _: () = {
     }
 };
 /// Pair batches per reconstruction chunk; the build checks the public matrix's margin.
-pub const CHUNK_PAIRS: usize = 176;
+pub const CHUNK_PAIRS: usize = 208;
 const FOLD_PAIRS:usize=64;
 fn folds_in_chunk(np:usize,c:usize)->usize{let r=chunk_range(np,c);(r.end-r.start).div_ceil(FOLD_PAIRS)}
 fn folds_in_range(np:usize,r:core::ops::Range<usize>)->usize{(chunk_at(np,r.start)..chunk_at(np,r.end)).map(|c|folds_in_chunk(np,c)).sum()}
@@ -215,7 +216,7 @@ impl SmsKeyData {
     }
 }
 
-/// The public lattice encoder returns two exact residue coefficient banks.
+/// Legacy Phi6 pair utility; public key construction below uses the Phi24 octet codec.
 pub fn digits_pair(x:u128,y:u128,_salt:usize)->([i8;DIGITS],[i8;DIGITS]){lattice_code::digits_pair(x,y)}
 
 /// `sum_i M(L)[m][i]^k` over the 512 witness coefficients `i` for `k = 1` and `k = 2`, where
@@ -262,16 +263,7 @@ impl SmsKeyData {
         assert!((elements / 4) % LOCK == 0 && ((elements / 4) % CHUNK_PAIRS) % LOCK == 0, "whole lockstep steps per chunk");
         let base = Modulus::ALL.into_iter().find(|m| m.prime() == P).unwrap();
         let len_f162 = 4 * elements;
-        let mut dig = vec![[0i8; DIGITS]; a.len()];
-        for (ring_index, (coefficients, out)) in
-            a.chunks_exact(N).zip(dig.chunks_exact_mut(N)).enumerate()
-        {
-            for j in 0..N / 2 {
-                let (lo, hi) = digits_pair(coefficients[j], coefficients[j + N / 2], ring_index * (N / 2) + j);
-                out[j] = lo;
-                out[j + N / 2] = hi;
-            }
-        }
+        let dig = phi24_codec::build_digits(a,elements);
         let mut keys = Vec::with_capacity(STREAMS);
         keys.push(CommitmentKey::from_coefficients(len_f162, a, MODULUS, base, &[]));
         for d in 0..DIGITS {
@@ -349,13 +341,9 @@ impl SmsKeyData {
                     mean_residues[mean_index(d, c, m, chunks)] = if r > (P as i64 - 1) / 2 { (r - P as i64) as i16 } else { r as i16 };
                     let (u,v)=digit_weight(d);
                     let mean=mean as i64;
-                    if m < N/2 {
-                        mu[m]=mu[m].wrapping_add(mean.wrapping_mul(u as i64));
-                        mu[m+N/2]=mu[m+N/2].wrapping_add(mean.wrapping_mul(v as i64));
-                    } else {
-                        mu[m-N/2]=mu[m-N/2].wrapping_sub(mean.wrapping_mul(v as i64));
-                        mu[m]=mu[m].wrapping_add(mean.wrapping_mul((u+v) as i64));
-                    }
+                    mu[m]+=mean*u as i64;
+                    let shifted=m+81;
+                    if shifted<N {mu[shifted]+=mean*v as i64;} else {mu[shifted-324]+=mean*v as i64;mu[shifted-648]-=mean*v as i64;}
                 }
             }
         }
@@ -634,18 +622,10 @@ unsafe fn finish_stream(a: &mut SAcc, s: usize, out: &mut Batch32, half: usize) 
 
 // All signed-low products of a chunk fit before its final carry. The first
 // four weights have no high words, so only the last digit pair touches high.
-const LOW_CHUNK_BOUND:i64={
-    let(mut lo,mut hi)=(0i64,0i64);let mut d=0;
-    while d<DIGITS {let(u,v)=digit_weight(d);let a=u as i16 as i64;let b=v as i16 as i64;let c=(u+v)as i16 as i64;lo+=(if a<0{-a}else{a})+(if b<0{-b}else{b});hi+=(if b<0{-b}else{b})+(if c<0{-c}else{c});d+=1;}
-    (if lo>hi{lo}else{hi})*RECON_BOUND
-};
+const LOW_CHUNK_BOUND:i64={let mut sum=0i64;let mut d=0;while d<DIGITS{let(u,v)=digit_weight(d);let a=(u as i16 as i64).abs();let b=(v as i16 as i64).abs();sum+=a+2*b;d+=1;}sum*RECON_BOUND};
 const _:()=assert!(LOW_CHUNK_BOUND+65535<i32::MAX as i64);
-const LOW_UPDATE_BOUND:i64=4*RECON_BOUND*32768;
-const HIGH_UPDATE_BOUND:i64={
-    let mut largest=0i64;let mut d=0;
-    while d<DIGITS {let(u,v)=digit_weight(d);let w=[u,v,u+v];let mut k=0;while k<3{let hi=(w[k]as i64-w[k]as i16 as i64)/65536;let hi=if hi<0{-hi}else{hi};if hi>largest{largest=hi;}k+=1;}d+=1;}
-    4*RECON_BOUND*largest+(LOW_UPDATE_BOUND+65535+65535)/65536
-};
+const LOW_UPDATE_BOUND:i64=6*RECON_BOUND*32768;
+const HIGH_UPDATE_BOUND:i64={let mut largest=0i64;let mut d=0;while d<DIGITS{let(u,v)=digit_weight(d);let w=[u,v];let mut k=0;while k<2{let hi=((w[k]as i64-w[k]as i16 as i64)/65536).abs();if hi>largest{largest=hi;}k+=1;}d+=1;}6*RECON_BOUND*largest+(LOW_UPDATE_BOUND+131070)/65536};
 const HIGH_LIMIT:i64=1<<26;
 const _:()={assert!(LOW_UPDATE_BOUND+65535<i32::MAX as i64);assert!((DIGITS/2*chunk_count(4096))as i64*HIGH_UPDATE_BOUND<HIGH_LIMIT);};
 
@@ -663,7 +643,7 @@ struct Total {
     hi: [[i32;16];N],
 }
 
-/// Recover two same-chunk digit banks and apply their fixed Phi_6 weights.
+/// Recover two same-chunk digit banks and apply their fixed Phi24 octet weights.
 /// Splitting weights into signed low words and high words keeps all products exact
 /// in signed dword arithmetic, including the final pair's high coefficients.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
@@ -675,35 +655,18 @@ unsafe fn reconstruct(b:&Batch32,d0:usize,c0:usize,d1:usize,c1:usize,keys:&SmsKe
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn reconstruct_words<const HIGH:bool>(b:&Batch32,d0:usize,_chunk:usize,d1:usize,_keys:&SmsKeys,total:&mut Total) {
-    let interleave:[i16;32]=core::array::from_fn(|i| (i/2+16*(i%2)) as i16);
-    let interleave=_mm512_loadu_si512(interleave.as_ptr().cast());
-    // The auxiliary stream already subtracted its scaled mean before inversion.
-    let load=|m:usize| _mm512_permutexvar_epi16(interleave,_mm512_load_si512(b.v[m].as_ptr().cast()));
-    let (u0,v0)=digit_weight(d0);let (u1,v1)=digit_weight(d1);
-    let pack=|a:i32,b:i32| _mm512_set1_epi32((a as u16 as u32|((b as u16 as u32)<<16)) as i32);
-    let (wu,wv,wh)=(pack(u0,u1),pack(v0,v1),pack(u0+v0,u1+v1));
-    let high=|v:i32| (v-(v as i16 as i32))/65536;
-    let (hu,hv,hh)=(pack(high(u0),high(u1)),pack(high(v0),high(v1)),pack(high(u0+v0),high(u1+v1)));
-    for m in 0..N/2 {
-        let x=load(m);
-        let y=load(m+N/2);
-        let dl=_mm512_sub_epi32(_mm512_madd_epi16(x,wu),_mm512_madd_epi16(y,wv));
-        let dh=_mm512_add_epi32(_mm512_madd_epi16(x,wv),_mm512_madd_epi16(y,wh));
-        let(mut cl,mut ch)=(_mm512_setzero_si512(),_mm512_setzero_si512());
-        if HIGH {cl=_mm512_sub_epi32(_mm512_madd_epi16(x,hu),_mm512_madd_epi16(y,hv));ch=_mm512_add_epi32(_mm512_madd_epi16(x,hv),_mm512_madd_epi16(y,hh));}
-        let mut add=|j:usize,low:__m512i,high:__m512i| {
-            let p=total.t[j].as_mut_ptr().cast::<__m512i>();
-            if HIGH {
-                let h=total.hi[j].as_mut_ptr().cast::<__m512i>();
-                let(lo,hi)=split_add(_mm512_load_si512(p),_mm512_load_si512(h),low,high);
-                _mm512_store_si512(p,lo);_mm512_store_si512(h,hi);
-            }else{
-                _mm512_store_si512(p,_mm512_add_epi32(_mm512_load_si512(p),low));
-            }
-        };
-        add(m,dl,cl);add(m+N/2,dh,ch);
-    }
+
+ let interleave:[i16;32]=core::array::from_fn(|i|(i/2+16*(i%2))as i16);let interleave=_mm512_loadu_si512(interleave.as_ptr().cast());let load=|m:usize|_mm512_permutexvar_epi16(interleave,_mm512_load_si512(b.v[m].as_ptr().cast()));
+ let(u0,v0)=digit_weight(d0);let(u1,v1)=digit_weight(d1);let pack=|a:i32,b:i32|_mm512_set1_epi32((a as u16 as u32|((b as u16 as u32)<<16))as i32);let(wu,wv)=(pack(u0,u1),pack(v0,v1));let high=|v:i32|(v-v as i16 as i32)/65536;let(hu,hv)=(pack(high(u0),high(u1)),pack(high(v0),high(v1)));
+ for m in 0..81{
+let x0=load(m+0);let x1=load(m+81);let x2=load(m+162);let x3=load(m+243);let x4=load(m+324);let x5=load(m+405);let x6=load(m+486);let x7=load(m+567);
+
+ let mut add=|j:usize,low:__m512i,high:__m512i|{let p=total.t[j].as_mut_ptr().cast::<__m512i>();if HIGH{let h=total.hi[j].as_mut_ptr().cast::<__m512i>();let(lo,hi)=split_add(_mm512_load_si512(p),_mm512_load_si512(h),low,high);_mm512_store_si512(p,lo);_mm512_store_si512(h,hi);}else{_mm512_store_si512(p,_mm512_add_epi32(_mm512_load_si512(p),low));}};
+ macro_rules! emit{($k:expr,$a:expr,$b:expr,$op:ident)=>{{let low=$op(_mm512_madd_epi16($a,wu),_mm512_madd_epi16($b,wv));let high=if HIGH{$op(_mm512_madd_epi16($a,hu),_mm512_madd_epi16($b,hv))}else{_mm512_setzero_si512()};add(m+81*$k,low,high);}};}
+ emit!(0,x0,x7,_mm512_sub_epi32);emit!(1,x1,x0,_mm512_add_epi32);emit!(2,x2,x1,_mm512_add_epi32);emit!(3,x3,x2,_mm512_add_epi32);emit!(4,x4,_mm512_add_epi16(x3,x7),_mm512_add_epi32);emit!(5,x5,x4,_mm512_add_epi32);emit!(6,x6,x5,_mm512_add_epi32);emit!(7,x7,x6,_mm512_add_epi32);
+ }
 }
+
 
 
 #[derive(Clone,Copy)]struct RepairFlag{d:usize,m:usize,col:usize,residue:i16}
@@ -716,7 +679,7 @@ unsafe fn apply_repair_flags(flags:&mut Vec<RepairFlag>,keys:&SmsKeys,cols:&[&[B
  if flags.is_empty(){return;}let data=keys.repair.expect("repair public data required");let nc=chunk_count(keys.elements);let r=chunk_range(keys.elements/2,chunk);let(first,last)=(2*r.start,2*r.end);
  for flag in flags.drain(..){let mean=data.means[(flag.d*nc+chunk)*N+flag.m]as i64;let actual=crate::repair176_runtime::dot(data.digits,keys.elements,flag.d,flag.m,first,last,cols[flag.col].as_ptr().cast::<u64>())-mean;let delta=actual-flag.residue as i64;assert_eq!(delta%P as i64,0,"repair residue mismatch");if delta==0{continue;}#[cfg(test)]crate::repair176_runtime::DELTAS.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
   let(u,v)=digit_weight(flag.d);let mut add=|m:usize,weight:i64|{let old=total.t[m][flag.col]as i64+65536*total.hi[m][flag.col]as i64;let value=(old+(delta*weight).rem_euclid(TAIL_MODULUS as i64)).rem_euclid(TAIL_MODULUS as i64);total.t[m][flag.col]=(value&65535)as i32;total.hi[m][flag.col]=(value>>16)as i32;};
-  if flag.m<N/2{add(flag.m,u as i64);add(flag.m+N/2,v as i64);}else{add(flag.m-N/2,-(v as i64));add(flag.m,(u+v)as i64);}
+  add(flag.m,u as i64);let shifted=flag.m+81;if shifted<N{add(shifted,v as i64);}else{add(shifted-324,v as i64);add(shifted-648,-(v as i64));}
  }
 }
 #[target_feature(enable="avx512f,avx512bw,avx512vl")]
@@ -724,41 +687,22 @@ unsafe fn reconstruct_repair(b:&Batch32,d0:usize,chunk:usize,keys:&SmsKeys,total
 
 #[target_feature(enable="avx512f,avx512bw,avx512vl")]
 unsafe fn reconstruct_words_repair<const HIGH:bool>(b:&Batch32,d0:usize,chunk:usize,d1:usize,keys:&SmsKeys,total:&mut Total,g:usize,flags:&mut Vec<RepairFlag>) {
-    let interleave:[i16;32]=core::array::from_fn(|i| (i/2+16*(i%2)) as i16);
-    let interleave=_mm512_loadu_si512(interleave.as_ptr().cast());
-    // The auxiliary stream already subtracted its scaled mean before inversion.
-    let load=|m:usize| _mm512_permutexvar_epi16(interleave,_mm512_load_si512(b.v[m].as_ptr().cast()));
-    let (u0,v0)=digit_weight(d0);let (u1,v1)=digit_weight(d1);
-    let pack=|a:i32,b:i32| _mm512_set1_epi32((a as u16 as u32|((b as u16 as u32)<<16)) as i32);
-    let (wu,wv,wh)=(pack(u0,u1),pack(v0,v1),pack(u0+v0,u1+v1));
-    let high=|v:i32| (v-(v as i16 as i32))/65536;
-    let (hu,hv,hh)=(pack(high(u0),high(u1)),pack(high(v0),high(v1)),pack(high(u0+v0),high(u1+v1)));
-    let data=keys.repair.expect("repair public data required");let nc=chunk_count(keys.elements);
-    let packed=data.limits[d0*nc+chunk]as u16 as u32|((data.limits[d1*nc+chunk]as u16 as u32)<<16);let threshold=_mm512_set1_epi32(packed as i32);
-    for m in 0..N/2 {
-        let x=load(m);
-        let y=load(m+N/2);
-        let mx=_mm512_cmp_epi16_mask(_mm512_abs_epi16(x),threshold,_MM_CMPINT_NLT);
-        let my=_mm512_cmp_epi16_mask(_mm512_abs_epi16(y),threshold,_MM_CMPINT_NLT);
-        if _kortestz_mask32_u8(mx,my)==0{record_repair_flags(b,m,mx,my,d0,g,flags);}
 
-        let dl=_mm512_sub_epi32(_mm512_madd_epi16(x,wu),_mm512_madd_epi16(y,wv));
-        let dh=_mm512_add_epi32(_mm512_madd_epi16(x,wv),_mm512_madd_epi16(y,wh));
-        let(mut cl,mut ch)=(_mm512_setzero_si512(),_mm512_setzero_si512());
-        if HIGH {cl=_mm512_sub_epi32(_mm512_madd_epi16(x,hu),_mm512_madd_epi16(y,hv));ch=_mm512_add_epi32(_mm512_madd_epi16(x,hv),_mm512_madd_epi16(y,hh));}
-        let mut add=|j:usize,low:__m512i,high:__m512i| {
-            let p=total.t[j].as_mut_ptr().cast::<__m512i>();
-            if HIGH {
-                let h=total.hi[j].as_mut_ptr().cast::<__m512i>();
-                let(lo,hi)=split_add(_mm512_load_si512(p),_mm512_load_si512(h),low,high);
-                _mm512_store_si512(p,lo);_mm512_store_si512(h,hi);
-            }else{
-                _mm512_store_si512(p,_mm512_add_epi32(_mm512_load_si512(p),low));
-            }
-        };
-        add(m,dl,cl);add(m+N/2,dh,ch);
-    }
+ let interleave:[i16;32]=core::array::from_fn(|i|(i/2+16*(i%2))as i16);let interleave=_mm512_loadu_si512(interleave.as_ptr().cast());let load=|m:usize|_mm512_permutexvar_epi16(interleave,_mm512_load_si512(b.v[m].as_ptr().cast()));
+ let(u0,v0)=digit_weight(d0);let(u1,v1)=digit_weight(d1);let pack=|a:i32,b:i32|_mm512_set1_epi32((a as u16 as u32|((b as u16 as u32)<<16))as i32);let(wu,wv)=(pack(u0,u1),pack(v0,v1));let high=|v:i32|(v-v as i16 as i32)/65536;let(hu,hv)=(pack(high(u0),high(u1)),pack(high(v0),high(v1)));
+ let data=keys.repair.expect("repair public data required");let nc=chunk_count(keys.elements);let packed=data.limits[d0*nc+chunk]as u16 as u32|((data.limits[d1*nc+chunk]as u16 as u32)<<16);let threshold=_mm512_set1_epi32(packed as i32);
+ for m in 0..81{
+let x0=load(m+0);let x1=load(m+81);let x2=load(m+162);let x3=load(m+243);let x4=load(m+324);let x5=load(m+405);let x6=load(m+486);let x7=load(m+567);
+
+ macro_rules! flag{($x:expr,$y:expr,$k:expr)=>{{let mx=_mm512_cmp_epi16_mask(_mm512_abs_epi16($x),threshold,_MM_CMPINT_NLT);let my=_mm512_cmp_epi16_mask(_mm512_abs_epi16($y),threshold,_MM_CMPINT_NLT);if _kortestz_mask32_u8(mx,my)==0{record_repair_flags(b,m+81*$k,mx,my,d0,g,flags);}}};}
+ flag!(x0,x4,0);flag!(x1,x5,1);flag!(x2,x6,2);flag!(x3,x7,3);
+
+ let mut add=|j:usize,low:__m512i,high:__m512i|{let p=total.t[j].as_mut_ptr().cast::<__m512i>();if HIGH{let h=total.hi[j].as_mut_ptr().cast::<__m512i>();let(lo,hi)=split_add(_mm512_load_si512(p),_mm512_load_si512(h),low,high);_mm512_store_si512(p,lo);_mm512_store_si512(h,hi);}else{_mm512_store_si512(p,_mm512_add_epi32(_mm512_load_si512(p),low));}};
+ macro_rules! emit{($k:expr,$a:expr,$b:expr,$op:ident)=>{{let low=$op(_mm512_madd_epi16($a,wu),_mm512_madd_epi16($b,wv));let high=if HIGH{$op(_mm512_madd_epi16($a,hu),_mm512_madd_epi16($b,hv))}else{_mm512_setzero_si512()};add(m+81*$k,low,high);}};}
+ emit!(0,x0,x7,_mm512_sub_epi32);emit!(1,x1,x0,_mm512_add_epi32);emit!(2,x2,x1,_mm512_add_epi32);emit!(3,x3,x2,_mm512_add_epi32);emit!(4,x4,_mm512_add_epi16(x3,x7),_mm512_add_epi32);emit!(5,x5,x4,_mm512_add_epi32);emit!(6,x6,x5,_mm512_add_epi32);emit!(7,x7,x6,_mm512_add_epi32);
+ }
 }
+
 
 /// Per-worker scratch, allocated once and reused by every group the worker takes.
 struct SmsWorker {
@@ -1684,14 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_inverse_banks_match_scalar_reconstruction(){
-        let elements=1024;let chunks=chunk_count(elements);let mut seed=0xa2e78139ca040d65;let mur=vec![0i32;mur_len(elements)];let means=[0u32;N];let keys=SmsKeys{pairs:&[],mur:&mur,mu:&means,elements,repair:None};let mut batch=zeroed_slice::<Batch32>(1);let mut total=zeroed_slice::<Total>(1);
-        for row in &mut total[0].t{for v in row{*v=(xorshift(&mut seed)&65535)as i32;}}for row in &mut total[0].hi{for v in row{*v=(xorshift(&mut seed)%2001)as i32-1000;}}
-        for c in 0..chunks{for d in (0..DIGITS-1).step_by(2){for row in &mut batch[0].v{for v in row{*v=(xorshift(&mut seed)%P as u64)as i16-(P/2)as i16;}}let before=total[0].t.to_vec();let high=total[0].hi.to_vec();unsafe{reconstruct(&batch[0],d,c,d+1,c,&keys,&mut total[0]);}
-            for m in 0..N/2{for col in 0..16{let(mut lo,mut hi)=(before[m][col]as i64+65536*high[m][col]as i64,before[m+N/2][col]as i64+65536*high[m+N/2][col]as i64);for bank in 0..2{let digit=d+bank;let delta=|j:usize|batch[0].v[j][col+16*bank]as i64;let(x,y)=(delta(m),delta(m+N/2));let(u,v)=digit_weight(digit);lo+=x*u as i64-y*v as i64;hi+=x*v as i64+y*(u+v)as i64;}assert_eq!(total[0].t[m][col]as i64+65536*total[0].hi[m][col]as i64,lo);assert_eq!(total[0].t[m+N/2][col]as i64+65536*total[0].hi[m+N/2][col]as i64,hi);}}
-            if d==DIGITS-2 {for row in &total[0].t{for &v in row{assert!((0..65536).contains(&v));}}}
-        }}
-    }
+    fn paired_inverse_banks_match_scalar_reconstruction(){let elements=1024;let chunks=chunk_count(elements);let mut seed=0xa2e78139ca040d65;let mur=vec![0i32;mur_len(elements)];let means=[0u32;N];let keys=SmsKeys{pairs:&[],mur:&mur,mu:&means,elements,repair:None};let mut batch=zeroed_slice::<Batch32>(1);let mut total=zeroed_slice::<Total>(3);for k in[0usize,2]{for row in &mut total[k].t{row.fill(0x13572468);}for row in &mut total[k].hi{row.fill(-1234567);}}for row in &mut total[1].t{row.fill(32777);}for row in &mut total[1].hi{row.fill(-321);}for c in 0..chunks{for d in(0..DIGITS-1).step_by(2){for row in &mut batch[0].v{for v in row{*v=match c{0=>4860,1=>-4860,_=>(xorshift(&mut seed)%P as u64)as i16-(P/2)as i16};}}let before=total[1].t.to_vec();let high=total[1].hi.to_vec();unsafe{reconstruct(&batch[0],d,c,d+1,c,&keys,&mut total[1]);}for col in 0..16{let mut product=[0i64;729];for bank in 0..2{let(u,v)=digit_weight(d+bank);for m in 0..N{let x=batch[0].v[m][col+16*bank]as i64;product[m]+=x*u as i64;product[m+81]+=x*v as i64;}}for m in(N..729).rev(){product[m-324]+=product[m];product[m-648]-=product[m];}for m in 0..N{let want=before[m][col]as i64+65536*high[m][col]as i64+product[m];let got=total[1].t[m][col]as i64+65536*total[1].hi[m][col]as i64;assert_eq!(got,want,"chunk={c} digit={d} m={m} col={col}");}}}}for k in[0usize,2]{assert!(total[k].t.iter().flatten().all(|&v|v==0x13572468));assert!(total[k].hi.iter().flatten().all(|&v|v== -1234567));}}
 
     #[test]
     fn parts_cover_the_column_in_whole_chunks() {
@@ -1704,7 +1641,7 @@ mod tests {
             assert!(ps.iter().all(|r| cuts.contains(&r.start)), "{np}: {ps:?}");
             assert_eq!(ps.iter().map(|r| folds_in_range(np, r.clone())).sum::<usize>(), folds_in_range(np, 0..np));
         }
-        assert_eq!(parts(2048, END_PARTS), vec![0..1024, 1024..1728, 1728..2048]);
+        assert_eq!(parts(2048, END_PARTS), vec![0..1024, 1024..1648, 1648..2048]);
         assert_eq!(parts(2048, &[]), vec![0..1024, 1024..2048]);
     }
 
@@ -1816,12 +1753,13 @@ mod tests {
 
     #[test]fn rep176_forced_alias_matches_schoolbook(){
       let elements=1024;let mut seed=0x1765a9721u64;let a:Vec<u128>=(0..elements*N).map(|_|((xorshift(&mut seed)as u128)<<64|xorshift(&mut seed)as u128)%MODULUS).collect();let data=SmsKeyData::build(&a,elements);let keys=data.keys();let nc=chunk_count(elements);let range=chunk_range(elements/2,0);let(first,last)=(2*range.start,2*range.end);
-      for digit in 0..DIGITS{for sign in[-1i64,1]{let m=[0usize,81,323,324,486,647][digit];let bound=P as i64-data.repair.limits[digit*nc]as i64;assert!(bound>5625+64);let target=sign*(bound-64);let mean=data.repair.means[(digit*nc)*N+m]as i64;let mut actual=-mean;let mut words=vec![B128(0);4*elements];
+      for region in 0..8{for digit in 0..DIGITS{for sign in[-1i64,1]{let m=81*region+if digit%2==0{0}else{80};let bound=P as i64-data.repair.limits[digit*nc]as i64;assert!(bound>5625+64);let target=sign*(bound-64);let mean=data.repair.means[(digit*nc)*N+m]as i64;let mut actual=-mean;let mut words=vec![B128(0);4*elements];
        'choose:for i in 0..512{for e in first..last{let l=&data.repair.digits[(digit*elements+e)*N..(digit*elements+e+1)*N];let at=|x:i64|if(0..N as i64).contains(&x){l[x as usize]as i64}else{0};let x=m as i64-i as i64;let coefficient=if m<N/2{at(x)-at(x+648)-at(x+972)}else{at(x)+at(x+324)};if sign*coefficient>0{words[4*e+i%4].0|=1u128<<(i/4);actual+=coefficient;if sign*actual>=sign*target{break 'choose;}}}}
        assert!(actual.abs()>5625&&actual.abs()<=bound);let r=actual.rem_euclid(P as i64);let r=if r>P as i64/2{r-P as i64}else{r};assert!(r.abs()>=data.repair.limits[digit*nc]as i64);let scalar=unsafe{crate::repair176_runtime::dot(&data.repair.digits,elements,digit,m,first,last,words.as_ptr().cast())}-mean;assert_eq!(scalar,actual);
-       crate::repair176_runtime::reset();let got=commit_columns_rows(&keys,&[&words],1);let counts=crate::repair176_runtime::counts();assert!(counts.0>0&&counts.1>0,"forcedalias didnotrepair: {counts:?}");let got=column_coefficients(&got[0],&got[1]);let want=reference(&a,&words);assert_eq!(got,want,"digit={digit} sign={sign}");
-      }}
+       crate::repair176_runtime::reset();let got=commit_columns_rows(&keys,&[&words],1);let counts=crate::repair176_runtime::counts();assert!(counts.0>0&&counts.1>0,"forcedalias didnotrepair: {counts:?}");let got=column_coefficients(&got[0],&got[1]);let want=reference(&a,&words);assert_eq!(got,want,"region={region} digit={digit} sign={sign}");
+      }}}
     }
+
 
 }
 
@@ -1909,7 +1847,7 @@ unsafe fn reduce_hi55(x:__m512i)->__m512i {
  _mm512_mask_sub_epi32(r,_mm512_cmp_epi32_mask(r,m,_MM_CMPINT_NLT),r,m)
 }
 
-pub(crate) fn certify_relocated_pairs(pairs:&[u32]){assert_eq!(pairs.len()%LOCK,0);let max=pairs.chunks_exact(LOCK).map(|p|p.iter().map(|&x|(x as i16 as i64).abs()+((x>>16)as i16 as i64).abs()).sum::<i64>()).max().unwrap_or(0);assert!(vb::SMS_SOURCE_BOUND*max+acc_after_reduce_c(P)+32768<=bias(P),"public key exceeds relocated 8-pair step range");}
+pub(crate) fn certify_relocated_pairs(pairs:&[u32]){assert_eq!(pairs.len()%LOCK,0);for(stripe,p)in pairs.chunks_exact(LOCK).enumerate(){let coefficient=(stripe/STREAMS)%N;let bound=source_bounds::BOUNDS[coefficient];assert!(bound>0&&bound<=vb::SMS_SOURCE_BOUND);let norm=p.iter().map(|&x|(x as i16 as i64).abs()+((x>>16)as i16 as i64).abs()).sum::<i64>();assert!(bound*norm+acc_after_reduce_c(P)+32768<=bias(P),"public key exceeds relocated 8-pair step range: coefficient={coefficient} bound={bound} norm={norm}");}}
 
 #[cfg(test)]mod fold_window_tests {
  use super::*;
@@ -1920,7 +1858,7 @@ pub(crate) fn certify_relocated_pairs(pairs:&[u32]){assert_eq!(pairs.len()%LOCK,
  }
  #[test]#[should_panic(expected="public key exceeds relocated 8-pair step range")]
  fn rejects_insufficient_public_step_margin(){
-  certify_relocated_pairs(&[4860u32|(4860u32<<16);LOCK]);
+  certify_relocated_pairs(&vec![4860u32|(4860u32<<16);N*STREAMS*LOCK]);
  }
 }
 #[cfg(test)]mod wide16_guards{

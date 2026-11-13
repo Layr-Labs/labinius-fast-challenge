@@ -586,32 +586,6 @@ unsafe fn pass_words(words: &[(*const u8, usize); LANES], elements: usize, e: us
     })
 }
 
-/// Transforms ahead whose input words [`prefetch_words`] requests (into L2): four transforms span one
-/// element group, so this is `PF_T / 4` element groups (of four elements, eight columns) ahead,
-/// running into the next sweep's first elements at a sweep's end.
-const PF_T: usize = 32;
-
-/// Prefetches the input words of transform `t` of a pass starting at element `e` (the lines
-/// [`pass_words`] would address: four consecutive 64-byte elements of two columns). The table
-/// streams are eight (sixteen with paired batches) 64-byte-per-element column walks; this keeps
-/// them ahead of the transforms instead of relying on the hardware stream prefetcher. A hint:
-/// addresses past a column's end are never dereferenced. Official Graviton4 runs show the same
-/// commit lap with and without it (234-235 ms against 233-234): the table stream does not stall
-/// there, so this is neutral, kept as the measured variant.
-#[inline(always)]
-unsafe fn prefetch_words(words: &[(*const u8, usize); LANES], e: usize, t: usize) {
-    let (h, q) = (t / 4, t % 4);
-    for l in 0..2 {
-        let (w, stride) = words[2 * q + l];
-        let p = w.wrapping_add((e + 4 * h) * stride);
-        core::arch::asm!(
-            "prfm pldl2keep, [{p}]", "prfm pldl2keep, [{p}, #64]",
-            "prfm pldl2keep, [{p}, #128]", "prfm pldl2keep, [{p}, #192]",
-            p = in(reg) p, options(nostack, preserves_flags, readonly)
-        );
-    }
-}
-
 /// The centered residue of a sum below `2^41` in magnitude. Binary64 holds such a sum exactly and
 /// its quotient by 9721 to far better than half a unit, so the rounded quotient is off by at most
 /// one half step: `|result| <= 4861`.
@@ -868,7 +842,6 @@ unsafe fn sums(
             let groups = l.div_ceil(LOCK);
             for i in 0..groups * LOCK {
                 let at = pass_words(words, a.elements, e, i);
-                prefetch_words(words, e, i + PF_T);
                 indices_asm(&at, nib);
                 let x = &mut xs[i];
                 lut_pass(nib, x, kern);
@@ -933,7 +906,6 @@ unsafe fn sums2(
             for t in 0..2 {
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
-                    prefetch_words(words[t], e, i + PF_T);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
                     lut_pass(nib, x, kern);
@@ -966,7 +938,7 @@ unsafe fn sums2(
 }
 
 #[inline]
-fn crt(r: u32, t: i64) -> u128 {
+fn crt(r: u32, t: i64) -> u64 {
     const INV: u64 = {
         // 9721^-1 mod M by the extended Euclidean algorithm
         let (mut a, mut b) = (P1 as i64, TAIL as i64);
@@ -982,7 +954,7 @@ fn crt(r: u32, t: i64) -> u128 {
     const _: () = assert!(P1 as u64 * INV % TAIL as u64 == 1);
     const _: () = assert!(P1 < TAIL && MODULUS < 1 << 63);
     let k = (t - r as i64).rem_euclid(TAIL as i64) as u64 * INV % TAIL as u64;
-    (r as u64 + P1 as u64 * k) as u128
+    r as u64 + P1 as u64 * k
 }
 
 #[repr(C)]
@@ -1116,8 +1088,9 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
             for (c, column) in target.chunks_exact_mut(N * width).enumerate() {
                 let (slots, _) = column.as_chunks_mut::<W>();
                 for (k, slot) in slots.iter_mut().enumerate() {
-                    let bytes = crt(base[k][c] as u32, tail[k][c]).to_le_bytes();
-                    *slot = core::array::from_fn(|i| bytes[i]);
+                    let v = crt(base[k][c] as u32, tail[k][c]);
+                    slot[..4].copy_from_slice(&(v as u32).to_le_bytes());
+                    slot[4] = (v >> 32) as u8;
                 }
             }
         }

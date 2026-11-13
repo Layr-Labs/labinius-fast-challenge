@@ -1,14 +1,29 @@
 """pass_d (level 6, prime 9721 schedule: FIRST13 inputs 0 and 3, no reduction of d) for U groups of six."""
 import sys
 from sched import Ins, schedule, allocate
-def build(U):
-    ins = []; low = set(); cnt = [0]
+import os
+# SQVEC=1: `sqrdmulh` by vector; twiddles broadcast with `dup`, eps' from the pinned `k3` (v14).
+SQVEC = bool(os.environ.get('SQVEC'))
+def build(U, outp=False):
+    """outp: the stores go to YPTR/YPTR2 (an output buffer) instead of back to XPTR."""
+    ins = []; low = set(); cnt = [0]; dups = {}
     def v(n):
         cnt[0] += 1; return f'{n}{cnt[0]}'
+    def bcast(t, tt):
+        if t == 'k':
+            assert tt == 3
+            return 'k3'
+        if (t, tt) not in dups:
+            c = v('bc'); dups[(t, tt)] = c
+            ins.append(Ins('A', [c], [t], f'dup v{{d0}}.8h, v{{s0}}.h[{tt}]'))
+        return dups[(t, tt)]
     def mulc(a, t, w, tt):
         lo, hi, r = v('lo'), v('hi'), v('r')
         ins.append(Ins('M', [lo], [a, t], f'mul v{{d0}}.8h, v{{s0}}.8h, v{{s1}}.h[{w}]'))
-        ins.append(Ins('M', [hi], [a, t], f'sqrdmulh v{{d0}}.8h, v{{s0}}.8h, v{{s1}}.h[{tt}]'))
+        if SQVEC:
+            ins.append(Ins('M', [hi], [a, bcast(t, tt)], 'sqrdmulh v{d0}.8h, v{s0}.8h, v{s1}.8h'))
+        else:
+            ins.append(Ins('M', [hi], [a, t], f'sqrdmulh v{{d0}}.8h, v{{s0}}.8h, v{{s1}}.h[{tt}]'))
         ins.append(Ins('M', [r], [lo, hi, 'k'], 'mls v{d0}.8h, v{s1}.8h, v{s2}.h[0]', tie=0))
         return r
     def A(op, a, b):
@@ -41,6 +56,7 @@ def build(U):
         ys = bfly(red13(vin[0]), vin[1], vin[2], t, 0) + bfly(red13(vin[3]), vin[4], vin[5], t, 4)
         for p in range(3):
             ptr, off = xaddr(96*g + 32*p)
+            if outp: ptr = ptr.replace('XPTR', 'YPTR')
             ins.append(Ins('T', [], [ys[2*p], ys[2*p+1]], f'stp q{{s0}}, q{{s1}}, [{ptr}, #{off}]'))
         for x in ins[start:]:
             x.g = g

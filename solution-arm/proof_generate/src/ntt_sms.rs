@@ -910,6 +910,8 @@ unsafe fn sums2(
     dev: [&mut [int32x4_t]; 2],
 ) {
     let kern = &kernels()[PB];
+    ctx::flip();
+    let mut sc: Box<[int16x8_t; N]> = Box::new(unsafe { core::mem::zeroed() });
     let [acc0, acc1] = acc;
     let [y0, y1] = y;
     let [dev0, dev1] = dev;
@@ -929,20 +931,38 @@ unsafe fn sums2(
             let l = SWEEP.min(end - e);
             let groups = l.div_ceil(LOCK);
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            let (pc, lutv) = ctx::chosen();
+            let scr = ctx::scratch();
             for t in 0..2 {
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
-                    lut_pass(nib, x, kern);
-                    pass_c_asm(x, kern);
-                    pass_d_asm(x, kern);
+                    // the scratch side computes in `sc` (L1-resident, reused) and level 6 writes `x`
+                    let w: &mut [int16x8_t; N] = if scr { &mut *sc } else { &mut *x };
+                    let t1 = ctx::now();
+                    #[cfg(target_feature = "sve")]
+                    lutv(nib, w, kern);
+                    #[cfg(not(target_feature = "sve"))]
+                    { let _ = lutv; lut_pass(nib, w, kern); }
+                    let t2 = ctx::now();
+                    pc(w, kern);
+                    let t3 = ctx::now();
+                    if scr {
+                        super::asm_var::pass_d_out(&*sc, x, kern);
+                    } else {
+                        pass_d_asm(x, kern);
+                    }
+                    let t4 = ctx::now();
+                    ctx::add([t2 - t1, t3 - t2, t4 - t3, 0, 1]);
                 }
+                let t5 = ctx::now();
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
+                ctx::add([0, 0, 0, ctx::now() - t5, 0]);
             }
             e += l;
         }
@@ -961,6 +981,66 @@ unsafe fn sums2(
         super::inverse_folded::<PB>(ys[t]);
     }
     let _ = (&mut accs, &mut ys, &mut devs);
+}
+
+/// Diagnostic only: in-context comparison of generated-pass variants. Each commitment worker runs
+/// its own (pass_c, pass_lut) pair (by worker index, [`ctx::PLAN`]); workers 0 and 4 run the
+/// crown's passes as controls. Per-worker `cntvct` totals of the table front, levels 4-5, level 6 and
+/// the sink are printed on stderr (`ctx ...` lines), in ns per transform.
+mod ctx {
+    use super::*;
+    use crate::ntt::neon::asm_var::*;
+    use std::cell::Cell;
+    pub type PassFn = unsafe fn(&mut [int16x8_t; N], &Kernel);
+    pub type LutFn = unsafe fn(&[uint8x16_t; GROUPS], &mut [int16x8_t; N], &Kernel);
+    pub static PLAN: [(&str, PassFn, &str, LutFn); 8] = [
+        ("crown", pass_c_asm, "crown", pass_lut_asm),
+        ("scratch", pass_c_asm, "scratch", pass_lut_asm),
+        ("scratch", pass_c_asm, "scratch", pass_lut_asm),
+        ("scratch", pass_c_asm, "scratch", pass_lut_asm),
+        ("crown", pass_c_asm, "crown", pass_lut_asm),
+        ("scratch", pass_c_asm, "scratch", pass_lut_asm),
+        ("scratch", pass_c_asm, "scratch", pass_lut_asm),
+        ("scratch", pass_c_asm, "scratch", pass_lut_asm),
+    ];
+    thread_local! {
+        static SEL: Cell<usize> = const { Cell::new(0) };
+        static SIDE: Cell<usize> = const { Cell::new(1) };
+        static T: Cell<[[u64; 5]; 2]> = const { Cell::new([[0; 5]; 2]) };
+    }
+    pub fn select(worker: usize) { SEL.with(|s| s.set(worker % 8)); }
+    /// Called at the start of every batch pair: alternates the crown's passes (side 0) and the
+    /// worker's variant (side 1) on the same core.
+    pub fn flip() { SIDE.with(|s| s.set(1 - s.get())); }
+    pub fn chosen() -> (PassFn, LutFn) {
+        if SIDE.with(|s| s.get()) == 0 { return (pass_c_asm, pass_lut_asm); }
+        let p = &PLAN[SEL.with(|s| s.get())];
+        (p.1, p.3)
+    }
+    /// The variant side of a worker whose plan is "scratch": the table front and levels 4-5 work in an
+    /// L1-resident scratch buffer and level 6 writes the sweep buffer out of place.
+    pub fn scratch() -> bool { SIDE.with(|s| s.get()) == 1 && PLAN[SEL.with(|s| s.get())].0 == "scratch" }
+    #[inline(always)]
+    pub fn now() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+    #[inline(always)]
+    pub fn add(d: [u64; 5]) {
+        let side = SIDE.with(|s| s.get());
+        T.with(|c| { let mut v = c.get(); for i in 0..5 { v[side][i] += d[i]; } c.set(v); });
+    }
+    pub fn report() {
+        let f: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        let v = T.with(|c| c.get());
+        let w = SEL.with(|s| s.get());
+        let ns = |s: usize, i: usize| v[s][i] as f64 * 1e9 / f as f64 / v[s][4].max(1) as f64;
+        let d = |i: usize| 100.0 * (ns(1, i) / ns(0, i) - 1.0);
+        eprintln!("ctx w={w} c={} lut={} transforms={}/{} crown_ns: lut={:.1} c={:.1} d={:.1} sink={:.1} var_ns: lut={:.1} c={:.1} d={:.1} sink={:.1} delta%: lut={:+.2} c={:+.2} d={:+.2} sink={:+.2}",
+            PLAN[w].0, PLAN[w].2, v[0][4], v[1][4], ns(0, 0), ns(0, 1), ns(0, 2), ns(0, 3), ns(1, 0), ns(1, 1), ns(1, 2), ns(1, 3), d(0), d(1), d(2), d(3));
+    }
 }
 
 #[inline]
@@ -1040,6 +1120,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     assert_eq!(out.len(), columns * N * width);
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
+        ctx::select(first * 8 / columns);
         let Scratch { xs, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
@@ -1120,6 +1201,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 }
             }
         }
+        ctx::report();
     });
 }
 

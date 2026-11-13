@@ -810,6 +810,10 @@ mod asm;
 mod idx;
 pub use idx::indices_asm;
 pub use asm::{pass_c_asm, pass_d_asm, pass_lut_asm};
+// Diagnostic only: generated-pass variants for the in-context comparison (`sms::ctx`).
+#[path = "ntt_neon_asm_var.rs"]
+#[allow(dead_code)]
+pub mod asm_var;
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].

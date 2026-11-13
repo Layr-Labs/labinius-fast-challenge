@@ -113,8 +113,8 @@ pub(crate) unsafe fn ntt_bin_batch32_r3pair_source<
     let mut bv = bc(&t.bv);
     // Prefix blocks use the callback buffer's block-major layout. A leaf loads
     // all 27 input vectors before storing any output, so its pointers may alias.
-    let buf = |kk: usize| -> [*mut i16; H] {
-        core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk % 6) + h)))
+    let buf = |j: usize| -> [*mut i16; H] {
+        core::array::from_fn(|h| wbuf.add(32 * 27 * (H * j + h)))
     };
     let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
 
@@ -232,7 +232,7 @@ pub(crate) unsafe fn ntt_bin_batch32_r3pair_source<
         }
         for j in 0..6 {
             let kk = 6 * k + j;
-            sink.rows(kk, ro(buf(kk)), 0, 27);
+            sink.rows(kk, ro(buf(j)), 0, 27);
         }
     }
 }

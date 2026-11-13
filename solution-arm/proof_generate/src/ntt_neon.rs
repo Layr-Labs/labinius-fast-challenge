@@ -398,6 +398,7 @@ pub const fn packed_slot(s: usize) -> usize {
 /// Exchange alternating groups of `D` bits between two bit planes. After the two
 /// rounds below, each byte contains the nibbles of positions `r` and `r + 4`.
 #[inline(always)]
+#[cfg(test)]
 unsafe fn index_swap<const D: i32>(a: uint8x16_t, b: uint8x16_t, mask: u8) -> (uint8x16_t, uint8x16_t) {
     let mask = vdupq_n_u8(mask);
     (vbslq_u8(mask, a, vshlq_n_u8::<D>(b)), vbslq_u8(mask, vshrq_n_u8::<D>(a), b))
@@ -407,6 +408,7 @@ unsafe fn index_swap<const D: i32>(a: uint8x16_t, b: uint8x16_t, mask: u8) -> (u
 /// vector packs two consecutive bytes, eight columns of each. The sentinel row
 /// supplies the zero bits above the end of a word.
 #[inline(always)]
+#[cfg(test)]
 unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 2], idx: &mut [uint8x16_t; GROUPS]) {
     let a = bytes[K / 2][G];
     let other = &bytes[1 - K / 2];
@@ -451,6 +453,7 @@ unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 
 /// four-bit pattern at `j + 162 t`, with coefficients above 511 zero, packed by
 /// [`packed_slot`] (the `u16` patterns of [`nibbles`] after zero extension).
 #[inline(always)]
+#[cfg(test)]
 unsafe fn indices_pair<const P: usize>(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
     let mut bytes = [[vdupq_n_u8(0); 9]; 2];
     for (i, row) in bytes.iter_mut().enumerate() {
@@ -494,6 +497,7 @@ unsafe fn indices_pair<const P: usize>(words: &[*const u8; LANES], idx: &mut [ui
 /// Process independent word pairs separately, keeping only sixteen transposed
 /// byte rows live rather than all thirty-two rows of the four-word input.
 #[inline(always)]
+#[cfg(test)]
 unsafe fn indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
     indices_pair::<0>(words, idx);
     indices_pair::<1>(words, idx);
@@ -1209,6 +1213,7 @@ pub fn lazy_inverses() -> &'static [LazyInverse; 3] {
 }
 
 /// The factor [`inverse_lazy`]'s output carries: `3^4 2^2`, the radices it does not divide by.
+#[cfg(test)]
 pub const LAZY_SCALE: u64 = 324;
 
 /// `a - round(a / 2^13) p`: `|result| <= 0.18664 |a| + p / 2` for `p = 9721`.
@@ -1245,6 +1250,7 @@ unsafe fn ib2(y0: int16x8_t, y1: int16x8_t, t: int16x8_t, k: int16x8_t) -> (int1
 /// 10915; the radix-2 sums 21830 and 17870, outputs 8935 and 8196; the unsplit outputs 7499
 /// and 7292. The test `lazy_inverse_matches` checks the congruence and the output bound.
 #[inline(never)]
+#[cfg(test)]
 pub unsafe fn inverse_lazy(x: &mut [int16x8_t; N]) {
     let at = x.as_mut_ptr();
     inverse_lazy_io(x, |i| *at.add(i), |i, v| *at.add(i) = v);

@@ -849,6 +849,7 @@ unsafe fn sums(
     m: &mut [int16x8_t; BITS],
     nib: &mut [uint8x16_t; N / 4],
     xs: &mut [[int16x8_t; N]; SWEEP],
+    sc: &mut [int16x8_t; N],
     acc: &mut [int64x2_t],
     y: &mut [int16x8_t; N],
     dev: &mut [int32x4_t],
@@ -870,9 +871,9 @@ unsafe fn sums(
                 let at = pass_words(words, a.elements, e, i);
                 indices_asm(&at, nib);
                 let x = &mut xs[i];
-                lut_pass(nib, x, kern);
-                pass_c_asm(x, kern);
-                pass_d_asm(x, kern);
+                lut_pass(nib, sc, kern);
+                pass_c_asm(sc, kern);
+                pass_d_out(sc, x, kern);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             // the chunk's first sweep starts the digit rows' sums afresh
@@ -905,6 +906,7 @@ unsafe fn sums2(
     a: &SmsMatrix,
     nib: &mut [uint8x16_t; N / 4],
     xs: &mut [[int16x8_t; N]; SWEEP],
+    sc: &mut [int16x8_t; N],
     acc: [&mut [int64x2_t]; 2],
     y: [&mut [int16x8_t; N]; 2],
     dev: [&mut [int32x4_t]; 2],
@@ -934,9 +936,9 @@ unsafe fn sums2(
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
-                    lut_pass(nib, x, kern);
-                    pass_c_asm(x, kern);
-                    pass_d_asm(x, kern);
+                    lut_pass(nib, sc, kern);
+                    pass_c_asm(sc, kern);
+                    pass_d_out(sc, x, kern);
                 }
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
@@ -986,6 +988,9 @@ fn crt(r: u32, t: i64) -> u64 {
 #[repr(C)]
 struct Scratch {
     xs: [[int16x8_t; N]; SWEEP],
+    /// The transform scratch: the table front and levels 4-5 run here (L1-resident, reused for every
+    /// transform) and level 6 writes the sweep buffer out of place ([`pass_d_out`]).
+    sc: [int16x8_t; N],
     acc: [int64x2_t; ROWS * 4 * N],
     dev: [int32x4_t; DIGITS * 2 * N],
     acc2: [int64x2_t; ROWS * 4 * N],
@@ -1040,7 +1045,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     assert_eq!(out.len(), columns * N * width);
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
         let arena = Arena::new();
-        let Scratch { xs, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
+        let Scratch { xs, sc, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
@@ -1063,9 +1068,9 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 if b + 1 < batches {
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
-                    sums2([&w0, &w1], a, nib, xs, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]]);
+                    sums2([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]]);
                 } else {
-                    sums(&batch_words(b), a, m, nib, xs, acc, y, dev);
+                    sums(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
                 }
             } else {
                 core::mem::swap(dev, dev2);

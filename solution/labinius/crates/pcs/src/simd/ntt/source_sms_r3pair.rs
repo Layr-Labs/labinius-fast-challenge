@@ -113,8 +113,8 @@ pub(crate) unsafe fn ntt_bin_batch32_r3pair_source<
     let mut bv = bc(&t.bv);
     // Prefix blocks use the callback buffer's block-major layout. A leaf loads
     // all 27 input vectors before storing any output, so its pointers may alias.
-    let buf = |kk: usize| -> [*mut i16; H] {
-        core::array::from_fn(|h| wbuf.add(32 * 27 * (H * (kk % 6) + h)))
+    let buf = |j: usize| -> [*mut i16; H] {
+        core::array::from_fn(|h| wbuf.add(32 * 27 * (H * j + h)))
     };
     let ro = |w: [*mut i16; H]| -> [*const i16; H] { core::array::from_fn(|h| w[h] as *const i16) };
 
@@ -211,28 +211,30 @@ pub(crate) unsafe fn ntt_bin_batch32_r3pair_source<
                     t.tw6.as_ptr().add(9 * kk).cast::<u32>(),
                 )
             };
-            for h in 0..core::hint::black_box(H) {
-                let bpj = wbuf.add(32 * 27 * (H * j + h));
-                if Q == 9721 {
-                    if SPARSE512 {
-                        if j == 0 {
-                            tail27_sms_band0_leaf(bpj, bpj, t4, t5, t6, cv);
-                        } else if j == 4 {
-                            tail27_sms_band4_leaf(bpj, bpj, t4, t5, t6, cv);
-                        } else {
-                            tail27_scaled_leaf(bpj, bpj, t4, t5, t6, cv);
-                        }
-                    } else {
+            if Q == 9721 && SPARSE512 {
+                // Block j of the H lockstep batches: H consecutive in-place blocks (32 * 27 words,
+                // 1728 bytes apart), transformed by one run of the block's leaf that keeps the
+                // modulus and the rotation factor in registers instead of H leaf calls.
+                let bpj = wbuf.add(32 * 27 * H * j);
+                match j {
+                    0 => tail27_sms_band0_run(bpj, H, t5, t6, cv),
+                    4 => tail27_sms_band4_run(bpj, H, t5, t6, cv),
+                    _ => tail27_scaled_run(bpj, H, t4, t5, t6, cv),
+                }
+            } else {
+                for h in 0..core::hint::black_box(H) {
+                    let bpj = wbuf.add(32 * 27 * (H * j + h));
+                    if Q == 9721 {
                         tail27_relocated_leaf(bpj, bpj, t4, t5, t6, cv);
+                    } else {
+                        tail27_out_of_line::<Q>(bpj, bpj, t4, t5, t6, cv);
                     }
-                } else {
-                    tail27_out_of_line::<Q>(bpj, bpj, t4, t5, t6, cv);
                 }
             }
         }
         for j in 0..6 {
             let kk = 6 * k + j;
-            sink.rows(kk, ro(buf(kk)), 0, 27);
+            sink.rows(kk, ro(buf(j)), 0, 27);
         }
     }
 }
@@ -440,7 +442,7 @@ mod r3pair_tail_interval_proof {
     use crate::simd::transpose_f162::{slice_b128_cols16_r3pair_into, SmsR3PairIndex32};
     use std::collections::{BTreeSet, HashMap};
 
-    const TAIL: &str = tail27_scaled!(lut, plain);
+    const TAIL: &str = tail27_scaled_held!();
     type V = [(i64, i64); 32];
 
     fn words_seen() -> [BTreeSet<u16>; 3] {
@@ -530,6 +532,7 @@ mod r3pair_tail_interval_proof {
             Some(core::array::from_fn(|l| { let v = unsafe { *p.add(l) } as i64; (v, v) }))
         };
         regs.insert("zmm27".to_string(), mem("[{c}+0]").unwrap());
+        regs.insert("zmm31".to_string(), mem("[{c}+128]").unwrap());
         let mut i = 0;
         while i < lines.len() {
             let l = lines[i];
@@ -635,7 +638,7 @@ mod r3pair_tail_interval_proof {
                         let b = r / 9;
                         if reduced(j, b, k, r % 9) { rr[b].1[j] } else { rr[b].0[j] }
                     });
-                    let text = match j { 0 => tail27_sms_band0!(), 4 => tail27_sms_band4!(), _ => TAIL };
+                    let text = match j { 0 => tail27_sms_band0_held!(), 4 => tail27_sms_band4_held!(), _ => TAIL };
                     let (w, o) = run_leaf(text, &rows, &ptrs);
                     assert!(w <= 32767 && o <= SMS_SOURCE_BOUND, "{name} k={k} j={j}: ({w}, {o})");
                     worst = (worst.0.max(w), worst.1.max(o));

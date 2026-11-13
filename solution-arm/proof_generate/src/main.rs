@@ -216,7 +216,7 @@ fn load_table(path: &str, n: usize) -> Table {
                     // in parallel and overlap with compute. A full MADV_POPULATE_READ pass
                     // costs about 9 ms on the development Graviton4 and does not speed the
                     // commit up. MADV_HUGEPAGE is a best-effort hint for the file.
-                    // Noise draw 8 of the 6bb9ea83 tree; behaviour identical; prior draws: 298.4492; 296.7850; 296.7890; 310.6790.
+                    // Noise draw 11 of the promoted stack (populate removal + u64 CRT + prefetch removal); behaviour identical; prior draws: 310.6790; 296.3248; 299.6629; 296.9924.
                     unsafe {
                         table_sys::madvise(addr, 16 * (e - s), 14);
                     }

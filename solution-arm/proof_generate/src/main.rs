@@ -376,6 +376,7 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 /// registers, so the accumulator is read and written once per block instead of once per group.
 ///
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
+/// The commitment is written as the wire encoding straight into `out`.
 fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
@@ -973,23 +974,6 @@ fn main() {
 }
 
 #[cfg(test)]
-fn unpack(bytes: &[u8], q: u128) -> Vec<u128> {
-    let w = rq::coefficient_bytes(q);
-    bytes.chunks_exact(w).map(|s| {
-        let mut b = [0u8; 16];
-        b[..w].copy_from_slice(s);
-        u128::from_le_bytes(b)
-    }).collect()
-}
-
-#[cfg(test)]
-fn sms_packed(values: &[B128], a: &ntt::neon::sms::SmsMatrix, workers: usize, q: u128) -> Vec<u8> {
-    let mut out = vec![0u8; values.len() / (4 * a.elements) * rq::N * rq::coefficient_bytes(q)];
-    ntt::neon::sms::commit(values, a, workers, q, &mut out);
-    out
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1013,6 +997,27 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// The wire bytes of a coefficient vector, for comparing a commitment computed straight
+    /// into its wire buffer with one computed as `u128` coefficients.
+    fn packed(values: &[u128], q: u128) -> Vec<u8> {
+        let mut bytes = vec![0u8; rq::coefficient_bytes(q) * values.len()];
+        output::pack_into(values, q, &mut bytes);
+        bytes
+    }
+
+    /// The wire encoding decoded back to coefficients (test only: the codec asserts the width).
+    fn unpacked(bytes: &[u8], q: u128) -> Vec<u128> {
+        let width = rq::coefficient_bytes(q);
+        bytes
+            .chunks_exact(width)
+            .map(|slot| {
+                let mut wide = [0u8; 16];
+                wide[..width].copy_from_slice(slot);
+                u128::from_le_bytes(wide)
+            })
+            .collect()
     }
 
     #[test]
@@ -1067,8 +1072,11 @@ mod tests {
         let want = commit_reference(&values, &matrix, q);
         let a = sms::matrix(RING_ELEMENTS, 8);
         eprintln!("sms margin {}", a.margin);
+        let want = packed(&want, q);
         for workers in [1, 3] {
-            assert!(unpack(&sms_packed(&values, &a, workers, q), q) == want, "workers {workers}");
+            let mut out = vec![0u8; want.len()];
+            sms::commit(&values, &a, workers, q, &mut out);
+            assert!(out == want, "workers {workers}");
         }
         // a short last chunk and a short last lockstep group, partial batches; the last sweep of
         // the column with one to four tiles (whole and short), a column of one short tile, and a
@@ -1078,7 +1086,9 @@ mod tests {
             let matrix = rq::ajtai_matrix(q, elements);
             let want = commit_reference(&values, &matrix, q);
             let a = sms::matrix(elements, 3);
-            assert!(unpack(&sms_packed(&values, &a, 3, q), q) == want, "{elements} elements");
+            let mut out = vec![0u8; rq::coefficient_bytes(q) * want.len()];
+            sms::commit(&values, &a, 3, q, &mut out);
+            assert!(out == packed(&want, q), "{elements} elements");
         }
     }
     /// With every repair threshold at zero each chunk deviation is recomputed exactly by
@@ -1093,7 +1103,9 @@ mod tests {
             let want = commit_reference(&values, &matrix, q);
             let mut a = sms::matrix(elements, 3);
             a.threshold = std::borrow::Cow::Owned(vec![0; a.threshold.len()]);
-            assert!(unpack(&sms_packed(&values, &a, 3, q), q) == want, "{elements} elements, every coefficient repaired");
+            let mut out = vec![0u8; rq::coefficient_bytes(q) * want.len()];
+            sms::commit(&values, &a, 3, q, &mut out);
+            assert!(out == packed(&want, q), "{elements} elements, every coefficient repaired");
         }
     }
     #[test]
@@ -1153,6 +1165,35 @@ mod tests {
 
     /// The table lookup agrees with the checker's coefficient-by-coefficient commitment, at the
     /// earlier default modulus, which the four-Russians path still serves.
+    /// The three in-tree folds on the real shape and challenge distribution, for choosing the
+    /// dispatch: `cargo test --release fold_variant_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn fold_variant_timing() {
+        let mut t = Transcript::new(b"labinius-fast/test");
+        let challenges = labinius::challenge::sample_short_challenges(&mut t, COLUMNS, DEFAULT_WEIGHT, DEFAULT_BOUND);
+        let values: Vec<B128> = (0..COLUMNS as u64).flat_map(|j| column(900 + j)).collect();
+        let weight: usize = challenges.iter().map(|c| c.weight).sum();
+        println!("challenges {} weight {weight}", challenges.len());
+        for _ in 0..2 {
+            let t0 = std::time::Instant::now();
+            let a = fold_neon(&values, &challenges);
+            let neon = t0.elapsed().as_secs_f64() * 1e3;
+            let t0 = std::time::Instant::now();
+            let b = fold_scheduled(&values, &challenges);
+            let sched = t0.elapsed().as_secs_f64() * 1e3;
+            let t0 = std::time::Instant::now();
+            let c = fold_bitsliced(&values, &challenges);
+            let bits = t0.elapsed().as_secs_f64() * 1e3;
+            if let Some(b) = b {
+                assert!(b == a, "the scheduled fold matches");
+            }
+            assert!(c == a, "the bit-sliced fold matches");
+            println!("fold: neon {neon:.1} ms, scheduled {sched:.1} ms, bitsliced {bits:.1} ms");
+            core::hint::black_box(&a);
+        }
+    }
+
     #[test]
     fn grouped_commit_matches_reference() {
         let modulus = 40_772_829_184;
@@ -1166,9 +1207,9 @@ mod tests {
                 }
             })
             .collect();
-        let mut packed = vec![0u8; COLUMNS * rq::N * rq::coefficient_bytes(modulus)];
-        commit(&values, modulus, &mut packed);
-        let fast = unpack(&packed, modulus);
+        let mut bytes = vec![0u8; rq::coefficient_bytes(modulus) * COLUMNS * rq::N];
+        commit(&values, modulus, &mut bytes);
+        let fast = unpacked(&bytes, modulus);
         let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
         for j in 0..2 {
             let witness: Vec<F162> = values[j * COLUMN_LEN..][..COLUMN_LEN]

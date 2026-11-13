@@ -245,12 +245,6 @@ fn encode_vec(p: &ProofParts) -> Vec<u8> {
 
 /// Pack commitment coefficients into the buffer faulted in by idle workers. The ring math and
 /// transcript absorb stay unchanged; chunks cover disjoint, whole coefficient encodings.
-pub(super) fn pack_commitment(values: &[u128], q: u128, mut bytes: Vec<u8>) -> Vec<u8> {
-    pack_into(values, q, &mut bytes);
-    bytes
-}
-
-/// [`pack_commitment`] into an existing buffer.
 pub(super) fn pack_into(values: &[u128], q: u128, bytes: &mut [u8]) {
     let width = rq::coefficient_bytes(q);
     assert_eq!(bytes.len(), width * values.len());
@@ -343,7 +337,9 @@ mod tests {
             let q = (1u128 << (8 * width - 1)) + 17;
             let values: Vec<_> = (0..1003u128).map(|x| (x * x * 7919 + 1) % q).collect();
             let old = rq::pack_ring_elements(&values, q);
-            assert_eq!(pack_commitment(&values, q, vec![0; old.len()]), old, "width {width}");
+            let mut bytes = vec![0; old.len()];
+            pack_into(&values, q, &mut bytes);
+            assert_eq!(bytes, old, "width {width}");
         }
         assert_eq!(Layout::instance(35039150080).len(), 13958612);
     }

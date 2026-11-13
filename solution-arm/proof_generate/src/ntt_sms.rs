@@ -815,31 +815,6 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
     vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
 }
 
-/// Levels 0 to 3 of the transform from the nibble tables: the SVE2 `tbl` kernel on a host
-/// built with SVE (the official Neoverse V2 target), the equivalent NEON `pass_lut` otherwise,
-/// so that the portable path builds and runs on AArch64 hosts without SVE.
-#[cfg(target_feature = "sve")]
-#[inline(always)]
-unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    pass_lut_asm(nib, x, kern);
-}
-
-#[cfg(not(target_feature = "sve"))]
-#[inline(always)]
-unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    // `indices` writes the packed byte layout the SVE `ld1b` consumer reads; expand each
-    // slot's eight bytes to the `(2 v, 2 v + 1)` byte pairs `pass_lut`'s `vqtbl2q_u8` indexes.
-    let bytes = core::slice::from_raw_parts(nib.as_ptr() as *const u8, 16 * (N / 4));
-    let mut idx = [vdupq_n_u8(0); N / 4];
-    for (s, slot) in idx.iter_mut().enumerate() {
-        let v = vld1_u8(bytes.as_ptr().add(super::packed_slot(s)));
-        let lo = vshl_n_u8::<1>(v);
-        let hi = vorr_u8(lo, vdup_n_u8(1));
-        *slot = vzip1q_u8(vcombine_u8(lo, lo), vcombine_u8(hi, hi));
-    }
-    super::pass_lut::<PB>(&idx, x, kern);
-}
-
 /// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
 /// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients.
 #[inline(never)]
@@ -871,7 +846,7 @@ unsafe fn sums(
                 prefetch_words(words, e, i + PF_T);
                 indices_asm(&at, nib);
                 let x = &mut xs[i];
-                lut_pass(nib, x, kern);
+                pass_lut_asm(nib, x, kern);
                 pass_c_asm(x, kern);
                 pass_d_asm(x, kern);
             }
@@ -936,7 +911,7 @@ unsafe fn sums2(
                     prefetch_words(words[t], e, i + PF_T);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
-                    lut_pass(nib, x, kern);
+                    pass_lut_asm(nib, x, kern);
                     pass_c_asm(x, kern);
                     pass_d_asm(x, kern);
                 }
@@ -1472,7 +1447,6 @@ mod leap_bench {
     }
 
     #[test]
-    #[cfg(target_feature = "sve")]
     fn pass_lut_asm_matches() {
         let kern = &kernels()[PB];
         let mut st = 17u64;
@@ -1514,7 +1488,6 @@ mod leap_bench {
 
     #[test]
     #[ignore]
-    #[cfg(target_feature = "sve")]
     fn transform_timing() {
         let kern = &kernels()[PB];
         let mut st = 7u64;
@@ -1525,8 +1498,8 @@ mod leap_bench {
         let mut xs: Box<[[int16x8_t; N]; SWEEP]> = unsafe { Box::new(core::mem::zeroed()) };
         let words_buf: Vec<u8> = (0..LANES * 64 * 4096).map(|_| crate::ntt::tests::xorshift(&mut st) as u8).collect();
         let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| (unsafe { words_buf.as_ptr().add(c * 64 * 4096) }, 64));
-        let reps = 4096;
-        for _ in 0..3 {
+        let reps = 16384;
+        for _ in 0..5 {
             let t = std::time::Instant::now();
             for _ in 0..reps { unsafe { let x = &mut xs[0]; pass_lut::<PB>(&nib, x, kern); pass_c::<4>(x, kern); pass_d::<PB, false>(x, kern, &[], &mut []); } core::hint::black_box(&mut *xs); }
             let l1 = t.elapsed().as_nanos() as f64 / reps as f64;

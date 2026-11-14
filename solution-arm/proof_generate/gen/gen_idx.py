@@ -16,8 +16,10 @@ def build(only=None):
     ext8 = lambda x, y: op('A', 'ext v{d0}.16b, v{s0}.16b, v{s1}.16b, #8', x, y)
     ushr = lambda x, n: op('S', f'ushr v{{d0}}.16b, v{{s0}}.16b, #{n}', x)
     shl = lambda x, n: op('S', f'shl v{{d0}}.16b, v{{s0}}.16b, #{n}', x)
-    orr = lambda x, y: op('A', 'orr v{d0}.16b, v{s0}.16b, v{s1}.16b', x, y)
     andv = lambda x, y: op('A', 'and v{d0}.16b, v{s0}.16b, v{s1}.16b', x, y)
+    # (x >> 1) | (y << 7) per byte: ushr leaves bit 7 clear, sli #7 keeps the destination's bits
+    # 0-6 and inserts bit 0 of y as bit 7, in place (tied destination: no orr, no separate shl)
+    shr_ins = lambda x, y: op('S', 'sli v{d0}.16b, v{s1}.16b, #7', ushr(x, 1), y, tie=0)
     def swap(a, b, d, mask):
         # (bsl(mask, a, b << d), bsl(mask, a >> d, b))
         if b == 'zero':
@@ -55,10 +57,10 @@ def build(only=None):
                 a = own[G]
                 b = ext8(other[2 + G], other[3 + G])
                 if K >= 2:
-                    b = orr(ushr(b, 1), shl(other[3 + G], 7))
+                    b = shr_ins(b, other[3 + G])
                 c0 = own[5 + G]
                 c1 = ext8(c0, own[6 + G])
-                c = orr(ushr(c0, 1), shl(c1, 7))
+                c = shr_ins(c0, c1)
                 if G == 0:
                     last = ext8(other[7], 'zero')
                     dd = ushr(last, 1 if K < 2 else 2)

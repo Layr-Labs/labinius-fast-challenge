@@ -496,7 +496,7 @@ fn row_evaluate(values: &[B128], p0: &[F162]) -> Vec<F162> {
     out
 }
 
-const ROW_BATCH: usize = 4;
+const ROW_BATCH: usize = 5;
 
 /// The sumcheck coordinates split into the row point `p0` and the column point `p1`.
 fn split_point(coords: &[F162]) -> (Vec<F162>, Vec<F162>) {

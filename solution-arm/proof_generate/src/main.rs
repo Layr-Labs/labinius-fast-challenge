@@ -83,7 +83,7 @@ const PADDED: usize = BLOCK + ROW + BLOCK;
 /// Output blocks per column, covering the raw product.
 const BLOCKS: usize = RAW.div_ceil(BLOCK);
 /// How many blocks ahead [`add_block`] prefetches each group's table window; 0 disables it.
-const PREFETCH_BLOCKS: usize = 1;
+const PREFETCH_BLOCKS: usize = 2;
 
 #[cfg(test)]
 #[derive(Serialize)]

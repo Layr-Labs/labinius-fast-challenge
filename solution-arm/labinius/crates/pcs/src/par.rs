@@ -186,7 +186,7 @@ use std::time::{Duration, Instant};
 /// How long an idle worker spins for the next dispatch before it parks.
 const WORKER_SPIN: Duration = Duration::from_millis(2);
 /// How long the dispatching thread spins for the last tasks of its dispatch before it parks.
-const MAIN_SPIN: Duration = Duration::from_millis(10);
+const MAIN_SPIN: Duration = Duration::from_millis(20);
 /// Spins between two clock reads; every 16th read also yields the CPU, so that a spinning
 /// thread holds it from another runnable thread for tens of microseconds, not a time slice.
 const SPIN_CHECK: u32 = 64;

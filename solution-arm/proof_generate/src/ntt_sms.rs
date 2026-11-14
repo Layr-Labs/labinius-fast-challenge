@@ -951,7 +951,7 @@ unsafe fn sums2(
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
-                    lut_pass2(nib, sc, kern);
+                    lut_pass(nib, sc, kern);
                     pass_c_asm(sc, kern);
                     pass_d_out(sc, x, kern);
                 }

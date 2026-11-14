@@ -684,8 +684,48 @@ unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_
     });
 }
 
+/// Two digit rows' chunk ends through one paired inverse. The eight slots `j + 81 i` of a row come
+/// out together ([`super::inverse_lazy_io2g`]) and are finished as two subgroups of four (`i` in
+/// `0..4`, then `4..8`): a subgroup's four repair flags are ORed so its common no-repair case
+/// takes one horizontal test, and its deviations are summed before the next subgroup is formed. A
+/// flagged subgroup tests and repairs each of its slots with that slot's own flags exactly as
+/// [`chunk_row2_slots`] does, before that slot's deviations are summed.
 #[inline(always)]
 unsafe fn chunk_row2(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
+    let p = P1 as i16;
+    let thr = [vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r - 1]), vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r])];
+    super::inverse_lazy_io2g(y, |h, s| narrow_digit(acc, s, r + h), |h, j, w| {
+        let dv = dev[h];
+        let m = mr[h].as_ptr();
+        for q in 0..2 {
+            let v: [int16x8_t; 4] = core::array::from_fn(|i| canonical(vsubq_s16(w[4 * q + i], vld1q_dup_s16(m.add(j + 81 * (4 * q + i)))), p));
+            let flag: [uint16x8_t; 4] = core::array::from_fn(|i| vcgeq_s16(vabsq_s16(v[i]), thr[h]));
+            let any = vorrq_u16(vorrq_u16(flag[0], flag[1]), vorrq_u16(flag[2], flag[3]));
+            if vmaxvq_u16(any) != 0 {
+                for i in 0..4 {
+                    let s = j + 81 * (4 * q + i);
+                    let mut x = v[i];
+                    if vmaxvq_u16(flag[i]) != 0 {
+                        x = repair_lanes(ctx, r - 1 + h, s, x, flag[i], dv);
+                    }
+                    *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(x));
+                    *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), x);
+                }
+            } else {
+                for i in 0..4 {
+                    let s = j + 81 * (4 * q + i);
+                    *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v[i]));
+                    *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v[i]);
+                }
+            }
+        }
+    });
+}
+
+/// [`chunk_row2`] with one test per slot (the record's form): the reference of the grouped test.
+#[inline(always)]
+#[cfg_attr(not(test), allow(dead_code))]
+unsafe fn chunk_row2_slots(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
     let p = P1 as i16;
     let thr = [vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r - 1]), vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r])];
     super::inverse_lazy_io2(y, |h, s| narrow_digit(acc, s, r + h), |h, s, x| {
@@ -1354,6 +1394,49 @@ mod tests {
                 }
                 assert!(lanes(&y) == want, "case {case} row {r}");
                 assert!(want.iter().flatten().all(|&v| v as i64 >= -h && v as i64 <= h));
+            }
+        }
+    }
+
+    /// [`chunk_row2`] (grouped repair test) against [`chunk_row2_slots`] (one test per slot): the
+    /// same deviations, bit for bit, from nonzero starting deviations, on random digit sums and
+    /// random columns, with no repairs (thresholds `i16::MAX`) and, in release builds, every lane
+    /// repaired (thresholds 0) and the matrix's own thresholds; every row pair of two chunks.
+    #[test]
+    fn grouped_repair_test_matches_slot_tests() {
+        let elements = 2 * CHUNK;
+        let a0 = matrix(elements, 2);
+        let mut state = 61u64;
+        let mut next = move || crate::ntt::tests::xorshift(&mut state);
+        let cols: Vec<Vec<u8>> = (0..LANES).map(|_| (0..64 * elements).map(|_| next() as u8).collect()).collect();
+        let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| (cols[c].as_ptr(), 64));
+        let bound = (CHUNK as u64 * PRODUCT) as i64;
+        // random sums are not the transforms of these columns, so a repaired lane's exact value
+        // differs from its residue: `repair_lanes`' debug assertion would fire on both paths
+        // alike; the repairing cases run in release builds (same exact repair on both paths)
+        let cases: &[Option<i16>] = if cfg!(debug_assertions) { &[Some(i16::MAX)] } else { &[Some(i16::MAX), Some(0), None] };
+        for (case, &thr) in cases.iter().enumerate() {
+            let mut a = matrix(elements, 2);
+            if let Some(t) = thr {
+                a.threshold = std::borrow::Cow::Owned(vec![t; a0.threshold.len()]);
+            }
+            let v: Vec<i64> = (0..ROWS * 8 * N).map(|_| (next() % (2 * bound as u64 + 1)) as i64 - bound).collect();
+            let mut acc = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
+            unsafe { core::ptr::copy_nonoverlapping(v.as_ptr() as *const int64x2_t, acc.as_mut_ptr(), acc.len()) };
+            let start: Vec<int32x4_t> = (0..2 * N).map(|_| unsafe { vdupq_n_s32((next() % 20001) as i32 - 10000) }).collect();
+            let lanes = |x: &[int32x4_t]| -> Vec<[i32; 4]> { x.iter().map(|&y| unsafe { core::mem::transmute(y) }).collect() };
+            let (mut y0, mut y1) = (Box::new([unsafe { vdupq_n_s16(0) }; N]), Box::new([unsafe { vdupq_n_s16(0) }; N]));
+            for c in 0..2 {
+                let ctx = Repair { words: &words, a: &a, c };
+                for d in (0..DIGITS).step_by(2) {
+                    let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
+                    let (mut g0, mut g1, mut s0, mut s1) = (start.clone(), start.clone(), start.clone(), start.clone());
+                    unsafe {
+                        chunk_row2(&acc, 1 + d, mr, [g0.as_mut_ptr(), g1.as_mut_ptr()], [&mut *y0, &mut *y1], &ctx);
+                        chunk_row2_slots(&acc, 1 + d, mr, [s0.as_mut_ptr(), s1.as_mut_ptr()], [&mut *y0, &mut *y1], &ctx);
+                    }
+                    assert!(lanes(&g0[..]) == lanes(&s0[..]) && lanes(&g1[..]) == lanes(&s1[..]), "case {case} chunk {c} rows {}", 1 + d);
+                }
             }
         }
     }

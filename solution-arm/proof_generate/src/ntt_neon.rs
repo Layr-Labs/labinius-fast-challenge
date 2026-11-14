@@ -1335,8 +1335,24 @@ pub unsafe fn inverse_lazy_io(x: &mut [int16x8_t; N], mut input: impl FnMut(usiz
 #[inline(always)]
 pub unsafe fn inverse_lazy_io2(
     x: [&mut [int16x8_t; N]; 2],
-    mut input: impl FnMut(usize, usize) -> int16x8_t,
+    input: impl FnMut(usize, usize) -> int16x8_t,
     mut output: impl FnMut(usize, usize, int16x8_t),
+) {
+    inverse_lazy_io2g(x, input, |h, j, w| {
+        for (i, &y) in w.iter().enumerate() {
+            output(h, j + 81 * i, y);
+        }
+    });
+}
+
+/// [`inverse_lazy_io2`] with its last pass handing each row `h` one group of eight output slots
+/// at once: `output(h, j, w)` with `w[i]` the value of slot `j + 81 i`, `j < 81`. The same
+/// arithmetic in the same order; every slot of both rows is handed over exactly once.
+#[inline(always)]
+pub unsafe fn inverse_lazy_io2g(
+    x: [&mut [int16x8_t; N]; 2],
+    mut input: impl FnMut(usize, usize) -> int16x8_t,
+    mut output: impl FnMut(usize, usize, &[int16x8_t; 8]),
 ) {
     const { assert!(PRIMES[1] == 9721) };
     let k = vld1q_s16(kernels()[1].k.as_ptr());
@@ -1430,9 +1446,7 @@ pub unsafe fn inverse_lazy_io2(
             }
         }
         for (h, w) in v.iter().enumerate() {
-            for (i, &y) in w.iter().enumerate() {
-                output(h, j + 81 * i, y);
-            }
+            output(h, j, w);
         }
     }
 }

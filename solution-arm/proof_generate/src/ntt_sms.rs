@@ -946,7 +946,6 @@ unsafe fn sums2(
             let groups = l.div_ceil(LOCK);
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
-                let t0 = ctx::now();
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
@@ -955,14 +954,11 @@ unsafe fn sums2(
                     pass_c_asm(sc, kern);
                     pass_d_out(sc, x, kern);
                 }
-                ctx::add([ctx::now() - t0, 0, 0, 0, (groups * LOCK) as u64]);
-                let t1 = ctx::now();
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
-                ctx::add([0, ctx::now() - t1, 0, 0, 0]);
             }
             e += l;
         }

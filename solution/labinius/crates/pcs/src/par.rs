@@ -237,6 +237,23 @@ impl Pool {
         self.width
     }
 
+    /// Run only after reserving an exclusive parallel dispatch. A false return
+    /// means no callback ran; coupled algorithms must choose an independent path.
+    pub fn try_run_parallel<F: Fn(usize) + Sync>(&self, tasks: usize, f: F) -> bool {
+        if tasks < 2 || self.width == 1 || self.shared.busy.swap(true, Ordering::Acquire) {
+            return false;
+        }
+        let mut base = 0;
+        while base < tasks {
+            let n = (tasks - base).min(MAX_TASKS);
+            if base == 0 && n == tasks { self.dispatch(n, &f); }
+            else { self.dispatch(n, &|i: usize| f(base + i)); }
+            base += n;
+        }
+        self.shared.busy.store(false, Ordering::Release);
+        true
+    }
+
     /// Run `f(i)` for every `i` in `0 .. tasks`, each once, on the workers and the calling
     /// thread; returns once every task has finished. Tasks are handed out in order from a
     /// shared counter, so a slow task is not waited on by the others. A `run` from inside a
@@ -643,3 +660,5 @@ mod affinity_tests {
         assert_eq!(restored,original);
     }
 }
+
+#[cfg(test)]mod parallel_grant_guards{use super::*;#[test]fn busy_and_single_task_grants_never_run_inline(){let pool=Pool::new(2);let count=std::sync::atomic::AtomicUsize::new(0);pool.run(2,|_|assert!(!pool.try_run_parallel(2,|_|{count.fetch_add(1,Ordering::Relaxed);})));assert_eq!(count.load(Ordering::Relaxed),0);assert!(pool.try_run_parallel(2,|_|{count.fetch_add(1,Ordering::Relaxed);}));assert_eq!(count.load(Ordering::Relaxed),2);assert!(!pool.try_run_parallel(1,|_|{count.fetch_add(1,Ordering::Relaxed);}));assert_eq!(count.load(Ordering::Relaxed),2);}}

@@ -1557,3 +1557,5 @@ include!("source_batched.rs");
 include!("source_sms_joint.rs");
 
 include!("source_sms_r3pair.rs");
+
+include!("source_sms_phi24_bounds.rs");

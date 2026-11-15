@@ -1029,7 +1029,7 @@ static EMBEDDED_PAIRS:Aligned64<[u8;EMBEDDED_PAIRS_LEN]>=Aligned64(*include_byte
 const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")).len();
 static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
 /// The single-transform modulus's public data (`labinius::simd::commit::sms`), precomputed by
-/// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
+/// `build.rs` (empty when the build host could not run the kernels): the seven streams' keys in the
 /// lockstep layout, the digit chunks' centered mean residues and the means' total.
 const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
 static SMS_PAIRS:Aligned2M<[u8;SMS_PAIRS_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
@@ -1047,6 +1047,10 @@ static SMS_MEANS:Aligned64<[u8;SMS_MEANS_LEN]>=Aligned64(*include_bytes!(concat!
 const SMS_LIMITS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-limits.bin")).len();
 static SMS_LIMITS:Aligned64<[u8;SMS_LIMITS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-limits.bin")));
 
+// This bitmap is derived only from the fixed public matrix, never the witness table.
+const SMS_PARITY_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-parity.bin")).len();
+static SMS_PARITY:Aligned2M<[u8;SMS_PARITY_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-parity.bin")));
+
 /// The embedded single-transform keys, read in place, if the build host made them for this
 /// shape.
 fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
@@ -1055,7 +1059,8 @@ fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 4 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N
         || SMS_DIGITS_LEN != sms::DIGITS * RING_ELEMENTS * N
         || SMS_MEANS_LEN != 4 * sms::mur_len(RING_ELEMENTS)
-        || SMS_LIMITS_LEN != 2 * sms::DIGITS * sms::chunk_count(RING_ELEMENTS) {
+        || SMS_LIMITS_LEN != 2 * sms::DIGITS * sms::chunk_count(RING_ELEMENTS)
+        || SMS_PARITY_LEN != 8 * sms::DIGITS * RING_ELEMENTS * labinius::repair_class20_runtime::STRIDE {
         return None;
     }
     unsafe {
@@ -1068,6 +1073,10 @@ fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
                 digits: std::slice::from_raw_parts(SMS_DIGITS.0.as_ptr().cast::<i8>(), SMS_DIGITS_LEN),
                 means: std::slice::from_raw_parts(SMS_MEANS.0.as_ptr().cast::<i32>(), SMS_MEANS_LEN / 4),
                 limits: std::slice::from_raw_parts(SMS_LIMITS.0.as_ptr().cast::<i16>(), SMS_LIMITS_LEN / 2),
+            }),
+            parity: Some(labinius::repair_class20_runtime::ParityKey {
+                elements: RING_ELEMENTS,
+                words: std::slice::from_raw_parts(SMS_PARITY.0.as_ptr().cast::<u64>(), SMS_PARITY_LEN / 8),
             }),
         })
     }
@@ -1738,6 +1747,20 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // before doing any work, which measured as ~10 ms of the run and bought the
     // commitment ~0.5 ms back: the fault-around it takes instead maps a run of pages
     // per fault. The key image is small and is left to the commit for the same reason.
+    // Map the public parity image before workers query it concurrently. Its cost is
+    // part of the prover invocation, including kernels that use the read fallback.
+    if sms_keys.is_some() {
+        // Include the aligned object padding so both 2 MiB ranges can be promoted.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            sys::madvise(
+                SMS_PARITY.0.as_ptr() as *mut core::ffi::c_void,
+                std::mem::size_of_val(&SMS_PARITY),
+                sys::MADV_HUGEPAGE,
+            );
+        }
+        populate_part(SMS_PARITY.0.as_ptr() as usize, SMS_PARITY_LEN);
+    }
     let matrix_time = clock.elapsed();
     // The hybrid modulus commits against the embedded arranged keys when the build host made
     // them; otherwise the key (and the tail key) come from their images or are built.

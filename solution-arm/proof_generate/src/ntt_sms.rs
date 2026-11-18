@@ -946,7 +946,6 @@ unsafe fn sums2(
             let groups = l.div_ceil(LOCK);
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
-                let t0 = ctx::now();
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
@@ -955,14 +954,11 @@ unsafe fn sums2(
                     pass_c_asm(sc, kern);
                     pass_d_out(sc, x, kern);
                 }
-                ctx::add([ctx::now() - t0, 0, 0, 0, (groups * LOCK) as u64]);
-                let t1 = ctx::now();
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
-                ctx::add([0, ctx::now() - t1, 0, 0, 0]);
             }
             e += l;
         }
@@ -1144,7 +1140,6 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 }
             }
         }
-        ctx::report();
     });
 }
 
@@ -1583,40 +1578,15 @@ mod leap_bench {
         }
     }
 }
-/// Diagnostic only: same-core paired comparison inside the commitment. Every worker alternates its
-/// batch pairs between side 0 (the crown: `pass_lut_asm`, straight line) and side 1 (`pass_lut_loop`,
-/// the same code as a 4-iteration loop); workers 0 and 4 run side 0 on both (controls). Per side `cntvct` totals of the
-/// transforms (table front included) and of the sinks, and the transform count.
+/// Paired table-front experiment: alternate the straight-line and loop-shaped fronts by pair.
 mod ctx {
     use std::cell::Cell;
     thread_local! {
         static SEL: Cell<usize> = const { Cell::new(0) };
         static SIDE: Cell<usize> = const { Cell::new(1) };
-        static T: Cell<[[u64; 5]; 2]> = const { Cell::new([[0; 5]; 2]) };
     }
     pub fn select(worker: usize) { SEL.with(|s| s.set(worker % 8)); }
     pub fn flip() { SIDE.with(|s| s.set(1 - s.get())); }
     fn control() -> bool { matches!(SEL.with(|s| s.get()), 0 | 4) }
     pub fn side1() -> bool { SIDE.with(|s| s.get()) == 1 && !control() }
-    #[inline(always)]
-    pub fn now() -> u64 {
-        let v: u64;
-        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
-        v
-    }
-    #[inline(always)]
-    pub fn add(d: [u64; 5]) {
-        let side = SIDE.with(|s| s.get());
-        T.with(|c| { let mut v = c.get(); for i in 0..5 { v[side][i] += d[i]; } c.set(v); });
-    }
-    pub fn report() {
-        let f: u64;
-        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
-        let v = T.with(|c| c.get());
-        let w = SEL.with(|s| s.get());
-        let ns = |s: usize, i: usize| v[s][i] as f64 * 1e9 / f as f64 / v[s][4].max(1) as f64;
-        eprintln!("ctxf w={w} side1={} transforms={}/{} s0_tr_ns={:.0} s1_tr_ns={:.0} tr_delta%={:+.2} s0_sink_ns={:.0} s1_sink_ns={:.0} sink_delta%={:+.2}",
-            if control() { "control" } else { "lutloop" }, v[0][4], v[1][4], ns(0, 0), ns(1, 0), 100.0 * (ns(1, 0) / ns(0, 0) - 1.0),
-            ns(0, 1), ns(1, 1), 100.0 * (ns(1, 1) / ns(0, 1) - 1.0));
-    }
 }

@@ -1136,11 +1136,13 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
             }
             // a partial batch has fewer than eight columns in `target`: only those lanes are written
             for (c, column) in target.chunks_exact_mut(N * width).enumerate() {
-                let (slots, _) = column.as_chunks_mut::<W>();
-                for (k, slot) in slots.iter_mut().enumerate() {
+                let out = column.as_mut_ptr();
+                for k in 0..N {
                     let v = crt(base[k][c] as u32, tail[k][c]);
-                    slot[..4].copy_from_slice(&(v as u32).to_le_bytes());
-                    slot[4] = (v >> 32) as u8;
+                    let bytes = (v as u32).to_le_bytes();
+                    let slot = out.add(k * W);
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), slot, 4);
+                    slot.add(4).write((v >> 32) as u8);
                 }
             }
         }

@@ -401,8 +401,8 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 }
 
 /// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 12;
-/// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
+const SINK: usize = 16;
+/// Elements transformed per sweep: up to `SINK` key tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
 
@@ -875,7 +875,7 @@ unsafe fn sums(
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
         while e < end {
-            // Up to eight tiles per sweep, never across a chunk end (chunks are whole tiles). A short
+            // Up to `SINK` key tiles per sweep, never across a chunk end (chunks are whole tiles). A short
             // tile only occurs at the end of the column, where the missing elements read zero
             // words and their key lanes are zero, so those lanes contribute nothing.
             let l = SWEEP.min(end - e);

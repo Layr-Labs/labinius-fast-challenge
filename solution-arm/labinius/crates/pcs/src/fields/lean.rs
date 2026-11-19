@@ -140,6 +140,9 @@ pub struct Switch<'a> {
     half: usize,
     round: usize,
     pending: Option<[F162; 2]>,
+    // Once <=512 evaluations remain, fold their F162 images directly rather
+    // than rebuilding two 96 KiB byte maps for each smaller round.
+    tail_eq: Option<[Vec<u64>; 3]>,
 }
 
 impl<'a> Switch<'a> {
@@ -158,6 +161,7 @@ impl<'a> Switch<'a> {
             half: words.len(),
             round: 0,
             pending: None,
+            tail_eq: None,
         };
         if out.prepared.prefix == 0 { out.materialize(); }
         out
@@ -208,6 +212,17 @@ impl<'a> Switch<'a> {
     pub fn msg(&mut self) -> [F162; 2] {
         self.half /= 2;
         if let Some(m) = self.pending.take() { return m; }
+        if let Some(eq) = &self.tail_eq {
+            let half = self.half;
+            return unsafe {
+                neon::msg_range(
+                    eq.each_ref().map(|p| &p[..half]),
+                    eq.each_ref().map(|p| &p[half..2 * half]),
+                    self.planes.each_ref().map(|p| &p[..half]),
+                    self.planes.each_ref().map(|p| &p[half..2 * half]),
+                )
+            };
+        }
         if self.round < self.prepared.prefix {
             return self.prefix_message();
         }
@@ -240,6 +255,28 @@ impl<'a> Switch<'a> {
     }
 
     pub fn fold(&mut self, r: F162) {
+        if self.round >= self.prepared.prefix && self.half <= 256 {
+            let n = self.half * 2;
+            let eq = self.tail_eq.get_or_insert_with(|| {
+                let mut planes = core::array::from_fn(|_| vec![0u64; n]);
+                let mut tile = [B128::ZERO; 64];
+                for start in (0..n).step_by(tile.len()) {
+                    let len = (n - start).min(tile.len());
+                    self.prepared.eq.fill(start, &mut tile[..len]);
+                    for (i, &x) in tile[..len].iter().enumerate() {
+                        let v = self.lt.apply(x);
+                        for (p, limb) in planes.iter_mut().zip(v.0) { p[start + i] = limb; }
+                    }
+                }
+                planes
+            });
+            for p in [eq, &mut self.planes] {
+                let [(a, x), (b, y), (c, z)] = p.each_mut().map(|v| v[..n].split_at_mut(self.half));
+                unsafe { neon::fold_share([a,b,c], [x,y,z], r); }
+            }
+            self.round += 1;
+            return;
+        }
         if self.round + 1 < self.prepared.inverses.len() {
             for (l, &lp) in self.l.iter_mut().zip(&self.lp) {
                 *l += r * lp;

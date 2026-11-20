@@ -98,49 +98,95 @@ fn view<T>(image: &'static [u8], len: usize) -> Option<&'static [T]> {
     Some(unsafe { core::slice::from_raw_parts(image.as_ptr() as *const T, len) })
 }
 
-/// The key image copied out of the binary's read-only 4 KiB pages into anonymous memory, which
-/// the allocator (`hugealloc`, 4 MiB and up) maps 2 MiB-aligned with `MADV_HUGEPAGE`: about 19
-/// TLB entries for the 37 MB stream instead of 9,000, prefetch across page boundaries, and no
-/// dependence on the page cache. Started at process start by [`prefetch_key`] (the copy overlaps
-/// the table read); [`SmsMatrix::from_images`] waits for it and uses it when it matches the image.
-/// The source image (its address) and the copy.
-static KEY: std::sync::OnceLock<(usize, Vec<u8>)> = std::sync::OnceLock::new();
-static KEY_JOB: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
+/// The key image mapped a second time, straight from the executable file, so that it is read on
+/// 2 MiB pages without being copied. The ELF loader maps the image on 4 KiB pages (the file offset
+/// and the address of a load segment agree modulo 64 KiB only); the page cache, however, holds the
+/// linker's output in 2 MiB folios, and a mapping whose address agrees with its file offset modulo
+/// 2 MiB, advised `MADV_HUGEPAGE`, gets them as single entries: about 19 TLB entries for the 37 MB
+/// stream instead of 9,000, and prefetch across page boundaries. The record copied the image into
+/// anonymous huge pages for this (eight threads, about 1.3 ms before the commit could start).
+/// The source image (its address), the mapping of it and its length.
+static KEY: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
 
-/// `LABINIUS_KEY_IN_PLACE` set the key is read in place instead.
-pub fn prefetch_key(image: &'static [u8]) {
+/// Maps the key image for [`SmsMatrix::from_images`]. With `LABINIUS_KEY_IN_PLACE` set, or when
+/// the executable cannot be mapped that way, the loader's mapping is read instead.
+pub fn map_key(image: &'static [u8]) {
     if image.is_empty() || std::env::var_os("LABINIUS_KEY_IN_PLACE").is_some() {
         return;
     }
-    let job = std::thread::spawn(move || {
-        let len = image.len();
-        let mut v: Vec<u8> = Vec::with_capacity(len);
-        let dst = v.as_mut_ptr() as usize;
-        // pieces of whole 2 MiB pages, so that each thread faults in its own huge pages
-        let piece = len.div_ceil(8).next_multiple_of(2 << 20);
-        std::thread::scope(|s| {
-            for start in (0..len).step_by(piece) {
-                let n = piece.min(len - start);
-                s.spawn(move || {
-                    // SAFETY: disjoint ranges of the capacity and of the image.
-                    unsafe { core::ptr::copy_nonoverlapping(image.as_ptr().add(start), (dst as *mut u8).add(start), n) }
-                });
-            }
-        });
-        // SAFETY: every byte below `len` was written above.
-        unsafe { v.set_len(len) };
-        let _ = KEY.set((image.as_ptr() as usize, v));
-    });
-    *KEY_JOB.lock().unwrap() = Some(job);
+    if let Some(at) = map_image(image) {
+        let _ = KEY.set((image.as_ptr() as usize, at, image.len()));
+    }
 }
 
-/// The copy of [`prefetch_key`] of `image`, once it is done (waiting for it), if one was started.
-fn key_copy(image: &'static [u8]) -> Option<&'static [u8]> {
-    if let Some(job) = KEY_JOB.lock().unwrap().take() {
-        let _ = job.join();
+/// `image` (bytes of this executable's file) mapped from `/proc/self/exe` at an address congruent
+/// to its file offset modulo 2 MiB, with `MADV_HUGEPAGE`; `None` if anything is not as expected.
+#[cfg(target_os = "linux")]
+fn map_image(image: &'static [u8]) -> Option<usize> {
+    use std::os::fd::AsRawFd;
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     }
-    KEY.get().filter(|(src, v)| *src == image.as_ptr() as usize && v.len() == image.len()).map(|(_, v)| &v[..])
+    const HUGE: usize = 2 << 20;
+    let (at, len) = (image.as_ptr() as usize, image.len());
+    // the image's file offset, from the line of /proc/self/maps that holds it
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    let offset = maps.lines().find_map(|line| {
+        let mut fields = line.split_ascii_whitespace();
+        let (start, end) = fields.next()?.split_once('-')?;
+        let (start, end) = (usize::from_str_radix(start, 16).ok()?, usize::from_str_radix(end, 16).ok()?);
+        let _perms = fields.next()?;
+        let offset = usize::from_str_radix(fields.next()?, 16).ok()?;
+        (start <= at && at + len <= end).then(|| offset + (at - start))
+    })?;
+    let file = std::fs::File::open("/proc/self/exe").ok()?;
+    let size = file.metadata().ok()?.len() as usize;
+    if offset + len > size {
+        return None;
+    }
+    // whole 2 MiB units of the file around the image, as far as the file goes
+    let lo = offset / HUGE * HUGE;
+    let span = (offset + len).next_multiple_of(HUGE).min(size) - lo;
+    // SAFETY: a fresh reservation, then the file over its 2 MiB-aligned part; both checked.
+    unsafe {
+        let reserve = mmap(core::ptr::null_mut(), span + HUGE, 0, 2 | 0x20 | 0x4000, -1, 0);
+        if reserve as isize == -1 {
+            return None;
+        }
+        let base = (reserve as usize).next_multiple_of(HUGE);
+        let map = mmap(base as *mut u8, span, 1, 2 | 0x10, file.as_raw_fd(), lo as i64);
+        if map as isize == -1 {
+            munmap(reserve, span + HUGE);
+            return None;
+        }
+        madvise(map, span, 14);
+        let mapped = core::slice::from_raw_parts((base + offset - lo) as *const u8, len);
+        // the same bytes at both ends, and the same alignment as the loader's mapping
+        let edge = len.min(4096);
+        if mapped[..edge] != image[..edge] || mapped[len - edge..] != image[len - edge..] || (base + offset - lo) % 4096 != at % 4096 {
+            munmap(reserve, span + HUGE);
+            return None;
+        }
+        Some(base + offset - lo)
+    }
 }
+#[cfg(not(target_os = "linux"))]
+fn map_image(_: &'static [u8]) -> Option<usize> { None }
+
+/// [`map_key`]'s mapping of `image`, if there is one.
+fn key_copy(image: &'static [u8]) -> Option<&'static [u8]> {
+    // SAFETY: the mapping holds `len` bytes of the read-only executable and is never unmapped.
+    KEY.get().filter(|(src, _, len)| *src == image.as_ptr() as usize && *len == image.len())
+        .map(|&(_, at, len)| unsafe { core::slice::from_raw_parts(at as *const u8, len) })
+}
+
+/// Work a commit thread does between two of its batch pairs: called with the thread's index and
+/// the number of pairs it has finished. The prover's output uses it to pre-fault the proof file a
+/// piece at a time ([`commit`] keeps every core busy from its first microsecond to its last, so
+/// there is no idle core to do that on).
+pub static BETWEEN: std::sync::OnceLock<Box<dyn Fn(usize, usize) + Send + Sync>> = std::sync::OnceLock::new();
 
 impl SmsMatrix {
     /// The matrix from build-time images of [`matrix`]`(elements)`: `data`, `mean_residues`
@@ -821,14 +867,14 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    pass_lut_asm(nib, x, kern);
+    super::pass_lut_loop(nib, x, kern);
 }
 
 /// Diagnostic only: side 1 of the paired test runs the table front as a 4-iteration loop.
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    if ctx::side1() { super::pass_lut_loop(nib, x, kern) } else { pass_lut_asm(nib, x, kern) }
+    super::pass_lut_loop(nib, x, kern)
 }
 
 #[cfg(not(target_feature = "sve"))]
@@ -925,7 +971,6 @@ unsafe fn sums2(
     dev: [&mut [int32x4_t]; 2],
 ) {
     let kern = &kernels()[PB];
-    ctx::flip();
     let [acc0, acc1] = acc;
     let [y0, y1] = y;
     let [dev0, dev1] = dev;
@@ -946,7 +991,6 @@ unsafe fn sums2(
             let groups = l.div_ceil(LOCK);
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
-                let t0 = ctx::now();
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
@@ -955,14 +999,11 @@ unsafe fn sums2(
                     pass_c_asm(sc, kern);
                     pass_d_out(sc, x, kern);
                 }
-                ctx::add([ctx::now() - t0, 0, 0, 0, (groups * LOCK) as u64]);
-                let t1 = ctx::now();
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
-                ctx::add([0, ctx::now() - t1, 0, 0, 0]);
             }
             e += l;
         }
@@ -1051,6 +1092,32 @@ impl Drop for Arena {
 /// written straight into `out` as the wire encoding (`rq::coefficient_bytes(q)` little-endian
 /// bytes per coefficient, column after column), so the separate packing pass over a `u128`
 /// buffer is not needed.
+/// Pins the calling commit worker to the `w`-th CPU it may run on, so the scheduler does not move it,
+/// and its L1/L2 working set, to another core mid-commit. A hint: on any error it changes nothing.
+fn pin_worker(w: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+            fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+        }
+        let mut set = [0u64; 16];
+        if sched_getaffinity(0, core::mem::size_of_val(&set), set.as_mut_ptr()) != 0 {
+            return;
+        }
+        let cpus: Vec<usize> = (0..1024).filter(|&c| set[c / 64] >> (c % 64) & 1 == 1).collect();
+        if cpus.is_empty() {
+            return;
+        }
+        let c = cpus[w % cpus.len()];
+        let mut one = [0u64; 16];
+        one[c / 64] = 1 << (c % 64);
+        let _ = sched_setaffinity(0, core::mem::size_of_val(&one), one.as_ptr());
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = w;
+}
+
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
@@ -1062,8 +1129,8 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     let width = W;
     assert_eq!(out.len(), columns * N * width);
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
+        pin_worker(first * workers / columns);
         let arena = Arena::new();
-        ctx::select(first * 8 / columns);
         let Scratch { xs, sc, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
@@ -1143,8 +1210,12 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     slot[4] = (v >> 32) as u8;
                 }
             }
+            if b % 2 == 1 {
+                if let Some(between) = BETWEEN.get() {
+                    between(first * workers / columns, (b + 1) / 2);
+                }
+            }
         }
-        ctx::report();
     });
 }
 
@@ -1581,42 +1652,5 @@ mod leap_bench {
             println!("pass_d_asm {pda:.0} ns vs pass_d {pd:.0} ns; pass_c_asm {pca:.0} ns vs pass_c {pc:.0} ns; pass_lut_asm {la:.0} vs {lut:.0} ns");
             println!("per transform (648 vectors): L1 {l1:.0} ns ({:.2} cyc/vec), cycling xs {l2:.0} ns; indices {ix:.0}, lut {lut:.0}, pass_c {pc:.0}, pass_d {pd:.0} ns", l1 * 2.99 / N as f64);
         }
-    }
-}
-/// Diagnostic only: same-core paired comparison inside the commitment. Every worker alternates its
-/// batch pairs between side 0 (the crown: `pass_lut_asm`, straight line) and side 1 (`pass_lut_loop`,
-/// the same code as a 4-iteration loop); workers 0 and 4 run side 0 on both (controls). Per side `cntvct` totals of the
-/// transforms (table front included) and of the sinks, and the transform count.
-mod ctx {
-    use std::cell::Cell;
-    thread_local! {
-        static SEL: Cell<usize> = const { Cell::new(0) };
-        static SIDE: Cell<usize> = const { Cell::new(1) };
-        static T: Cell<[[u64; 5]; 2]> = const { Cell::new([[0; 5]; 2]) };
-    }
-    pub fn select(worker: usize) { SEL.with(|s| s.set(worker % 8)); }
-    pub fn flip() { SIDE.with(|s| s.set(1 - s.get())); }
-    fn control() -> bool { matches!(SEL.with(|s| s.get()), 0 | 4) }
-    pub fn side1() -> bool { SIDE.with(|s| s.get()) == 1 && !control() }
-    #[inline(always)]
-    pub fn now() -> u64 {
-        let v: u64;
-        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
-        v
-    }
-    #[inline(always)]
-    pub fn add(d: [u64; 5]) {
-        let side = SIDE.with(|s| s.get());
-        T.with(|c| { let mut v = c.get(); for i in 0..5 { v[side][i] += d[i]; } c.set(v); });
-    }
-    pub fn report() {
-        let f: u64;
-        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
-        let v = T.with(|c| c.get());
-        let w = SEL.with(|s| s.get());
-        let ns = |s: usize, i: usize| v[s][i] as f64 * 1e9 / f as f64 / v[s][4].max(1) as f64;
-        eprintln!("ctxf w={w} side1={} transforms={}/{} s0_tr_ns={:.0} s1_tr_ns={:.0} tr_delta%={:+.2} s0_sink_ns={:.0} s1_sink_ns={:.0} sink_delta%={:+.2}",
-            if control() { "control" } else { "lutloop" }, v[0][4], v[1][4], ns(0, 0), ns(1, 0), 100.0 * (ns(1, 0) / ns(0, 0) - 1.0),
-            ns(0, 1), ns(1, 1), 100.0 * (ns(1, 1) / ns(0, 1) - 1.0));
     }
 }

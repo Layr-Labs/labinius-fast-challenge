@@ -231,7 +231,10 @@ impl Output {
         let state = self.state.clone();
         Box::new(move |w, pairs| {
             let chunks = state.claimed.len();
-            if w < chunks && pairs == w + 1 { state.populate_once(w); }
+            // the last chunk first: the encode faults its own pages from the start of the mapping,
+            // so the tail of the file is the part still cold when the commit ends
+            let chunk = chunks - 1 - w.min(chunks - 1);
+            if w < chunks && pairs == w + 1 { state.populate_once(chunk); }
             if w == chunks && pairs == 1 { labinius::challenge::warm(); }
         })
     }

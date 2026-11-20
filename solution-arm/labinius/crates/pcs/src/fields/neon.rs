@@ -668,7 +668,9 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
             for g in 0..ws.len() {
                 let row = words.as_ptr().add((8 * group + g) * stride + start + first) as *const u8;
                 if next {
-                    prefetch_l2(row.wrapping_add(64 * PAIRS), 64 * PAIRS);
+                    // four chunks ahead rather than one: the eight rows of a group are 4 MiB apart
+                    // and each is walked at 64 bytes per pair of outputs, 56 streams at once
+                    prefetch_l2(row.wrapping_add(4 * 64 * PAIRS), 64 * PAIRS);
                 }
             }
             // Two pairs (one 64-byte line of each row) per step: the eight rows of a group sit 4 MiB

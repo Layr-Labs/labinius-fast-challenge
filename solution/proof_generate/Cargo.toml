@@ -2,6 +2,7 @@
 name = "labinius-pcs-challenge"
 version = "0.1.0"
 edition = "2021"
+default-run = "labinius-fast"
 
 # Independent workspace: the implementation can be replaced by a fresh checkout.
 [workspace]
@@ -10,6 +11,10 @@ resolver = "2"
 [[bin]]
 name = "labinius-fast"
 path = "src/main.rs"
+
+[[bin]]
+name = "labinius-rebuild-phi24-public"
+path = "../tools/rebuild_phi24_public.rs"
 
 [dependencies]
 labinius = { path = "../labinius/crates/pcs" }

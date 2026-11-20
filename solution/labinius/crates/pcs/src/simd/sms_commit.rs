@@ -1,13 +1,14 @@
 //! One-witness-NTT commitment modulo 9721 * 55 * 2^16.
-//! Six short public coefficient banks use fixed Phi_6 pair weights. Public-key
-//! encoding and exact second moments are computed without instance data.
-//! The 176-pair chunks require 36 auxiliary inverse batches per column group.
-//! Boundary residues are recomputed exactly; public moments certify a 7.75-sigma
-//! recovery window under the same independent Boolean-input model as centering.
-//! Split16 totals preserve exact integers until the final modulo 55 reduction.
+//! Six public banks use Phi24 octets with Y=X^81; the table is always read fresh.
+//! At the fixed shape,208-pair chunks use30 paired auxiliary inverse batches.
+//! Public moments retain the7.75-sigma recovery window. A guarded public parity
+//! precheck removes zero corrections; all mismatches use the original exact dot.
+//! Split16 totals preserve the integer result until reduction modulo55*2^16.
 use super::*;
 #[path="sms_lattice.rs"]mod lattice_code;
 use crate::simd::ntt::gen_small;
+#[path="sms_phi24_codec.rs"]mod phi24_codec;
+#[path="sms_phi24_source_bounds.rs"]pub(crate)mod source_bounds;
 
 pub const P: u16 = 9721;
 const RECON_BOUND:i64=P as i64/2;
@@ -37,7 +38,7 @@ const _: () = {
     }
 };
 /// Pair batches per reconstruction chunk; the build checks the public matrix's margin.
-pub const CHUNK_PAIRS: usize = 176;
+pub const CHUNK_PAIRS: usize = 208;
 const FOLD_PAIRS:usize=64;
 fn folds_in_chunk(np:usize,c:usize)->usize{let r=chunk_range(np,c);(r.end-r.start).div_ceil(FOLD_PAIRS)}
 fn folds_in_range(np:usize,r:core::ops::Range<usize>)->usize{(chunk_at(np,r.start)..chunk_at(np,r.end)).map(|c|folds_in_chunk(np,c)).sum()}
@@ -194,6 +195,7 @@ pub struct SmsKeys<'a> {
     /// Ring elements per column.
     pub elements: usize,
     pub repair:Option<RepairKeys<'a>>,
+    pub parity:Option<crate::repair_class20_runtime::ParityKey<'a>>,
 }
 
 /// Owned [`SmsKeys`] together with the statistical margin they were certified at.
@@ -207,15 +209,16 @@ pub struct SmsKeyData {
     /// The same per digit, and where each digit's minimum is (chunk, coefficient, |mean|).
     pub margins: [(f64, usize, usize, i64); DIGITS],
     pub repair:RepairPublic,
+    pub parity:crate::repair_class20_runtime::ParityData,
 }
 
 impl SmsKeyData {
     pub fn keys(&self) -> SmsKeys<'_> {
-        SmsKeys { pairs: &self.pairs, mur: &self.mur, mu: &self.mu, elements: self.elements, repair:Some(self.repair.key()) }
+        SmsKeys { pairs: &self.pairs, mur: &self.mur, mu: &self.mu, elements: self.elements, repair:Some(self.repair.key()),parity:Some(self.parity.key()) }
     }
 }
 
-/// The public lattice encoder returns two exact residue coefficient banks.
+/// Legacy Phi6 pair utility; public key construction below uses the Phi24 octet codec.
 pub fn digits_pair(x:u128,y:u128,_salt:usize)->([i8;DIGITS],[i8;DIGITS]){lattice_code::digits_pair(x,y)}
 
 /// `sum_i M(L)[m][i]^k` over the 512 witness coefficients `i` for `k = 1` and `k = 2`, where
@@ -262,16 +265,7 @@ impl SmsKeyData {
         assert!((elements / 4) % LOCK == 0 && ((elements / 4) % CHUNK_PAIRS) % LOCK == 0, "whole lockstep steps per chunk");
         let base = Modulus::ALL.into_iter().find(|m| m.prime() == P).unwrap();
         let len_f162 = 4 * elements;
-        let mut dig = vec![[0i8; DIGITS]; a.len()];
-        for (ring_index, (coefficients, out)) in
-            a.chunks_exact(N).zip(dig.chunks_exact_mut(N)).enumerate()
-        {
-            for j in 0..N / 2 {
-                let (lo, hi) = digits_pair(coefficients[j], coefficients[j + N / 2], ring_index * (N / 2) + j);
-                out[j] = lo;
-                out[j + N / 2] = hi;
-            }
-        }
+        let dig = phi24_codec::build_digits(a,elements);
         let mut keys = Vec::with_capacity(STREAMS);
         keys.push(CommitmentKey::from_coefficients(len_f162, a, MODULUS, base, &[]));
         for d in 0..DIGITS {
@@ -349,19 +343,15 @@ impl SmsKeyData {
                     mean_residues[mean_index(d, c, m, chunks)] = if r > (P as i64 - 1) / 2 { (r - P as i64) as i16 } else { r as i16 };
                     let (u,v)=digit_weight(d);
                     let mean=mean as i64;
-                    if m < N/2 {
-                        mu[m]=mu[m].wrapping_add(mean.wrapping_mul(u as i64));
-                        mu[m+N/2]=mu[m+N/2].wrapping_add(mean.wrapping_mul(v as i64));
-                    } else {
-                        mu[m-N/2]=mu[m-N/2].wrapping_sub(mean.wrapping_mul(v as i64));
-                        mu[m]=mu[m].wrapping_add(mean.wrapping_mul((u+v) as i64));
-                    }
+                    mu[m]+=mean*u as i64;
+                    let shifted=m+81;
+                    if shifted<N {mu[shifted]+=mean*v as i64;} else {mu[shifted-324]+=mean*v as i64;mu[shifted-648]-=mean*v as i64;}
                 }
             }
         }
         let mu=mu.into_iter().map(|v|v.rem_euclid(TAIL_MODULUS as i64) as u32).collect();
         let mur = initial_bias_from_means(&mean_residues, elements);
-        SmsKeyData { pairs, mur, mu, elements, margin, margins, repair }
+        {let parity=crate::repair_class20_runtime::ParityData::build(&repair.digits,elements);SmsKeyData { pairs, mur, mu, elements, margin, margins, repair,parity }}
     }
 }
 
@@ -436,7 +426,7 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 /// Whether a group step prefetches the next step's witness words into L2.
 const INPUT_PREFETCH: bool = false;
 
-const PREFETCH_SLOTS: usize = 347;
+const PREFETCH_SLOTS: usize = 10;
 
 // Quarter-scaled witnesses and reciprocal public keys preserve every product.
 // The64-pair window retains the baseline's statistical accumulation strategy;
@@ -634,18 +624,10 @@ unsafe fn finish_stream(a: &mut SAcc, s: usize, out: &mut Batch32, half: usize) 
 
 // All signed-low products of a chunk fit before its final carry. The first
 // four weights have no high words, so only the last digit pair touches high.
-const LOW_CHUNK_BOUND:i64={
-    let(mut lo,mut hi)=(0i64,0i64);let mut d=0;
-    while d<DIGITS {let(u,v)=digit_weight(d);let a=u as i16 as i64;let b=v as i16 as i64;let c=(u+v)as i16 as i64;lo+=(if a<0{-a}else{a})+(if b<0{-b}else{b});hi+=(if b<0{-b}else{b})+(if c<0{-c}else{c});d+=1;}
-    (if lo>hi{lo}else{hi})*RECON_BOUND
-};
+const LOW_CHUNK_BOUND:i64={let mut sum=0i64;let mut d=0;while d<DIGITS{let(u,v)=digit_weight(d);let a=(u as i16 as i64).abs();let b=(v as i16 as i64).abs();sum+=a+2*b;d+=1;}sum*RECON_BOUND};
 const _:()=assert!(LOW_CHUNK_BOUND+65535<i32::MAX as i64);
-const LOW_UPDATE_BOUND:i64=4*RECON_BOUND*32768;
-const HIGH_UPDATE_BOUND:i64={
-    let mut largest=0i64;let mut d=0;
-    while d<DIGITS {let(u,v)=digit_weight(d);let w=[u,v,u+v];let mut k=0;while k<3{let hi=(w[k]as i64-w[k]as i16 as i64)/65536;let hi=if hi<0{-hi}else{hi};if hi>largest{largest=hi;}k+=1;}d+=1;}
-    4*RECON_BOUND*largest+(LOW_UPDATE_BOUND+65535+65535)/65536
-};
+const LOW_UPDATE_BOUND:i64=6*RECON_BOUND*32768;
+const HIGH_UPDATE_BOUND:i64={let mut largest=0i64;let mut d=0;while d<DIGITS{let(u,v)=digit_weight(d);let w=[u,v];let mut k=0;while k<2{let hi=((w[k]as i64-w[k]as i16 as i64)/65536).abs();if hi>largest{largest=hi;}k+=1;}d+=1;}6*RECON_BOUND*largest+(LOW_UPDATE_BOUND+131070)/65536};
 const HIGH_LIMIT:i64=1<<26;
 const _:()={assert!(LOW_UPDATE_BOUND+65535<i32::MAX as i64);assert!((DIGITS/2*chunk_count(4096))as i64*HIGH_UPDATE_BOUND<HIGH_LIMIT);};
 
@@ -663,7 +645,7 @@ struct Total {
     hi: [[i32;16];N],
 }
 
-/// Recover two same-chunk digit banks and apply their fixed Phi_6 weights.
+/// Recover two same-chunk digit banks and apply their fixed Phi24 octet weights.
 /// Splitting weights into signed low words and high words keeps all products exact
 /// in signed dword arithmetic, including the final pair's high coefficients.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
@@ -675,35 +657,18 @@ unsafe fn reconstruct(b:&Batch32,d0:usize,c0:usize,d1:usize,c1:usize,keys:&SmsKe
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl")]
 unsafe fn reconstruct_words<const HIGH:bool>(b:&Batch32,d0:usize,_chunk:usize,d1:usize,_keys:&SmsKeys,total:&mut Total) {
-    let interleave:[i16;32]=core::array::from_fn(|i| (i/2+16*(i%2)) as i16);
-    let interleave=_mm512_loadu_si512(interleave.as_ptr().cast());
-    // The auxiliary stream already subtracted its scaled mean before inversion.
-    let load=|m:usize| _mm512_permutexvar_epi16(interleave,_mm512_load_si512(b.v[m].as_ptr().cast()));
-    let (u0,v0)=digit_weight(d0);let (u1,v1)=digit_weight(d1);
-    let pack=|a:i32,b:i32| _mm512_set1_epi32((a as u16 as u32|((b as u16 as u32)<<16)) as i32);
-    let (wu,wv,wh)=(pack(u0,u1),pack(v0,v1),pack(u0+v0,u1+v1));
-    let high=|v:i32| (v-(v as i16 as i32))/65536;
-    let (hu,hv,hh)=(pack(high(u0),high(u1)),pack(high(v0),high(v1)),pack(high(u0+v0),high(u1+v1)));
-    for m in 0..N/2 {
-        let x=load(m);
-        let y=load(m+N/2);
-        let dl=_mm512_sub_epi32(_mm512_madd_epi16(x,wu),_mm512_madd_epi16(y,wv));
-        let dh=_mm512_add_epi32(_mm512_madd_epi16(x,wv),_mm512_madd_epi16(y,wh));
-        let(mut cl,mut ch)=(_mm512_setzero_si512(),_mm512_setzero_si512());
-        if HIGH {cl=_mm512_sub_epi32(_mm512_madd_epi16(x,hu),_mm512_madd_epi16(y,hv));ch=_mm512_add_epi32(_mm512_madd_epi16(x,hv),_mm512_madd_epi16(y,hh));}
-        let mut add=|j:usize,low:__m512i,high:__m512i| {
-            let p=total.t[j].as_mut_ptr().cast::<__m512i>();
-            if HIGH {
-                let h=total.hi[j].as_mut_ptr().cast::<__m512i>();
-                let(lo,hi)=split_add(_mm512_load_si512(p),_mm512_load_si512(h),low,high);
-                _mm512_store_si512(p,lo);_mm512_store_si512(h,hi);
-            }else{
-                _mm512_store_si512(p,_mm512_add_epi32(_mm512_load_si512(p),low));
-            }
-        };
-        add(m,dl,cl);add(m+N/2,dh,ch);
-    }
+
+ let interleave:[i16;32]=core::array::from_fn(|i|(i/2+16*(i%2))as i16);let interleave=_mm512_loadu_si512(interleave.as_ptr().cast());let load=|m:usize|_mm512_permutexvar_epi16(interleave,_mm512_load_si512(b.v[m].as_ptr().cast()));
+ let(u0,v0)=digit_weight(d0);let(u1,v1)=digit_weight(d1);let pack=|a:i32,b:i32|_mm512_set1_epi32((a as u16 as u32|((b as u16 as u32)<<16))as i32);let(wu,wv)=(pack(u0,u1),pack(v0,v1));let high=|v:i32|(v-v as i16 as i32)/65536;let(hu,hv)=(pack(high(u0),high(u1)),pack(high(v0),high(v1)));
+ for m in 0..81{
+let x0=load(m+0);let x1=load(m+81);let x2=load(m+162);let x3=load(m+243);let x4=load(m+324);let x5=load(m+405);let x6=load(m+486);let x7=load(m+567);
+
+ let mut add=|j:usize,low:__m512i,high:__m512i|{let p=total.t[j].as_mut_ptr().cast::<__m512i>();if HIGH{let h=total.hi[j].as_mut_ptr().cast::<__m512i>();let(lo,hi)=split_add(_mm512_load_si512(p),_mm512_load_si512(h),low,high);_mm512_store_si512(p,lo);_mm512_store_si512(h,hi);}else{_mm512_store_si512(p,_mm512_add_epi32(_mm512_load_si512(p),low));}};
+ macro_rules! emit{($k:expr,$a:expr,$b:expr,$op:ident)=>{{let low=$op(_mm512_madd_epi16($a,wu),_mm512_madd_epi16($b,wv));let high=if HIGH{$op(_mm512_madd_epi16($a,hu),_mm512_madd_epi16($b,hv))}else{_mm512_setzero_si512()};add(m+81*$k,low,high);}};}
+ emit!(0,x0,x7,_mm512_sub_epi32);emit!(1,x1,x0,_mm512_add_epi32);emit!(2,x2,x1,_mm512_add_epi32);emit!(3,x3,x2,_mm512_add_epi32);emit!(4,x4,_mm512_add_epi16(x3,x7),_mm512_add_epi32);emit!(5,x5,x4,_mm512_add_epi32);emit!(6,x6,x5,_mm512_add_epi32);emit!(7,x7,x6,_mm512_add_epi32);
+ }
 }
+
 
 
 #[derive(Clone,Copy)]struct RepairFlag{d:usize,m:usize,col:usize,residue:i16}
@@ -714,9 +679,13 @@ fn record_repair_flags(b:&Batch32,m:usize,mut mx:u32,mut my:u32,d0:usize,g:usize
 #[cold]#[inline(never)]
 unsafe fn apply_repair_flags(flags:&mut Vec<RepairFlag>,keys:&SmsKeys,cols:&[&[B128]],chunk:usize,total:&mut Total){
  if flags.is_empty(){return;}let data=keys.repair.expect("repair public data required");let nc=chunk_count(keys.elements);let r=chunk_range(keys.elements/2,chunk);let(first,last)=(2*r.start,2*r.end);
- for flag in flags.drain(..){let mean=data.means[(flag.d*nc+chunk)*N+flag.m]as i64;let actual=crate::repair176_runtime::dot(data.digits,keys.elements,flag.d,flag.m,first,last,cols[flag.col].as_ptr().cast::<u64>())-mean;let delta=actual-flag.residue as i64;assert_eq!(delta%P as i64,0,"repair residue mismatch");if delta==0{continue;}#[cfg(test)]crate::repair176_runtime::DELTAS.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+ for flag in flags.drain(..){let mean=data.means[(flag.d*nc+chunk)*N+flag.m]as i64;let centered=flag.residue as i64;
+  // Inside certified B<P, odd P makes matching parity a zero correction.
+  // Low cuts, noncentered values, missing parity and mismatches retain exact dot.
+  if data.limits[flag.d*nc+chunk]>=crate::repair_class20_runtime::MIN_CUT&&centered.abs()<=P as i64/2{if let Some(parity)=keys.parity{let odd=parity.odd(flag.d,flag.m,first,last,cols[flag.col].as_ptr().cast::<u64>());if odd==((mean^centered)&1)as u8{continue;}}}
+let actual=crate::repair176_runtime::dot(data.digits,keys.elements,flag.d,flag.m,first,last,cols[flag.col].as_ptr().cast::<u64>())-mean;let delta=actual-flag.residue as i64;assert_eq!(delta%P as i64,0,"repair residue mismatch");if delta==0{continue;}#[cfg(test)]crate::repair176_runtime::DELTAS.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
   let(u,v)=digit_weight(flag.d);let mut add=|m:usize,weight:i64|{let old=total.t[m][flag.col]as i64+65536*total.hi[m][flag.col]as i64;let value=(old+(delta*weight).rem_euclid(TAIL_MODULUS as i64)).rem_euclid(TAIL_MODULUS as i64);total.t[m][flag.col]=(value&65535)as i32;total.hi[m][flag.col]=(value>>16)as i32;};
-  if flag.m<N/2{add(flag.m,u as i64);add(flag.m+N/2,v as i64);}else{add(flag.m-N/2,-(v as i64));add(flag.m,(u+v)as i64);}
+  add(flag.m,u as i64);let shifted=flag.m+81;if shifted<N{add(shifted,v as i64);}else{add(shifted-324,v as i64);add(shifted-648,-(v as i64));}
  }
 }
 #[target_feature(enable="avx512f,avx512bw,avx512vl")]
@@ -724,41 +693,22 @@ unsafe fn reconstruct_repair(b:&Batch32,d0:usize,chunk:usize,keys:&SmsKeys,total
 
 #[target_feature(enable="avx512f,avx512bw,avx512vl")]
 unsafe fn reconstruct_words_repair<const HIGH:bool>(b:&Batch32,d0:usize,chunk:usize,d1:usize,keys:&SmsKeys,total:&mut Total,g:usize,flags:&mut Vec<RepairFlag>) {
-    let interleave:[i16;32]=core::array::from_fn(|i| (i/2+16*(i%2)) as i16);
-    let interleave=_mm512_loadu_si512(interleave.as_ptr().cast());
-    // The auxiliary stream already subtracted its scaled mean before inversion.
-    let load=|m:usize| _mm512_permutexvar_epi16(interleave,_mm512_load_si512(b.v[m].as_ptr().cast()));
-    let (u0,v0)=digit_weight(d0);let (u1,v1)=digit_weight(d1);
-    let pack=|a:i32,b:i32| _mm512_set1_epi32((a as u16 as u32|((b as u16 as u32)<<16)) as i32);
-    let (wu,wv,wh)=(pack(u0,u1),pack(v0,v1),pack(u0+v0,u1+v1));
-    let high=|v:i32| (v-(v as i16 as i32))/65536;
-    let (hu,hv,hh)=(pack(high(u0),high(u1)),pack(high(v0),high(v1)),pack(high(u0+v0),high(u1+v1)));
-    let data=keys.repair.expect("repair public data required");let nc=chunk_count(keys.elements);
-    let packed=data.limits[d0*nc+chunk]as u16 as u32|((data.limits[d1*nc+chunk]as u16 as u32)<<16);let threshold=_mm512_set1_epi32(packed as i32);
-    for m in 0..N/2 {
-        let x=load(m);
-        let y=load(m+N/2);
-        let mx=_mm512_cmp_epi16_mask(_mm512_abs_epi16(x),threshold,_MM_CMPINT_NLT);
-        let my=_mm512_cmp_epi16_mask(_mm512_abs_epi16(y),threshold,_MM_CMPINT_NLT);
-        if _kortestz_mask32_u8(mx,my)==0{record_repair_flags(b,m,mx,my,d0,g,flags);}
 
-        let dl=_mm512_sub_epi32(_mm512_madd_epi16(x,wu),_mm512_madd_epi16(y,wv));
-        let dh=_mm512_add_epi32(_mm512_madd_epi16(x,wv),_mm512_madd_epi16(y,wh));
-        let(mut cl,mut ch)=(_mm512_setzero_si512(),_mm512_setzero_si512());
-        if HIGH {cl=_mm512_sub_epi32(_mm512_madd_epi16(x,hu),_mm512_madd_epi16(y,hv));ch=_mm512_add_epi32(_mm512_madd_epi16(x,hv),_mm512_madd_epi16(y,hh));}
-        let mut add=|j:usize,low:__m512i,high:__m512i| {
-            let p=total.t[j].as_mut_ptr().cast::<__m512i>();
-            if HIGH {
-                let h=total.hi[j].as_mut_ptr().cast::<__m512i>();
-                let(lo,hi)=split_add(_mm512_load_si512(p),_mm512_load_si512(h),low,high);
-                _mm512_store_si512(p,lo);_mm512_store_si512(h,hi);
-            }else{
-                _mm512_store_si512(p,_mm512_add_epi32(_mm512_load_si512(p),low));
-            }
-        };
-        add(m,dl,cl);add(m+N/2,dh,ch);
-    }
+ let interleave:[i16;32]=core::array::from_fn(|i|(i/2+16*(i%2))as i16);let interleave=_mm512_loadu_si512(interleave.as_ptr().cast());let load=|m:usize|_mm512_permutexvar_epi16(interleave,_mm512_load_si512(b.v[m].as_ptr().cast()));
+ let(u0,v0)=digit_weight(d0);let(u1,v1)=digit_weight(d1);let pack=|a:i32,b:i32|_mm512_set1_epi32((a as u16 as u32|((b as u16 as u32)<<16))as i32);let(wu,wv)=(pack(u0,u1),pack(v0,v1));let high=|v:i32|(v-v as i16 as i32)/65536;let(hu,hv)=(pack(high(u0),high(u1)),pack(high(v0),high(v1)));
+ let data=keys.repair.expect("repair public data required");let nc=chunk_count(keys.elements);let packed=data.limits[d0*nc+chunk]as u16 as u32|((data.limits[d1*nc+chunk]as u16 as u32)<<16);let threshold=_mm512_set1_epi32(packed as i32);
+ for m in 0..81{
+let x0=load(m+0);let x1=load(m+81);let x2=load(m+162);let x3=load(m+243);let x4=load(m+324);let x5=load(m+405);let x6=load(m+486);let x7=load(m+567);
+
+ macro_rules! flag{($x:expr,$y:expr,$k:expr)=>{{let mx=_mm512_cmp_epi16_mask(_mm512_abs_epi16($x),threshold,_MM_CMPINT_NLT);let my=_mm512_cmp_epi16_mask(_mm512_abs_epi16($y),threshold,_MM_CMPINT_NLT);if _kortestz_mask32_u8(mx,my)==0{record_repair_flags(b,m+81*$k,mx,my,d0,g,flags);}}};}
+ flag!(x0,x4,0);flag!(x1,x5,1);flag!(x2,x6,2);flag!(x3,x7,3);
+
+ let mut add=|j:usize,low:__m512i,high:__m512i|{let p=total.t[j].as_mut_ptr().cast::<__m512i>();if HIGH{let h=total.hi[j].as_mut_ptr().cast::<__m512i>();let(lo,hi)=split_add(_mm512_load_si512(p),_mm512_load_si512(h),low,high);_mm512_store_si512(p,lo);_mm512_store_si512(h,hi);}else{_mm512_store_si512(p,_mm512_add_epi32(_mm512_load_si512(p),low));}};
+ macro_rules! emit{($k:expr,$a:expr,$b:expr,$op:ident)=>{{let low=$op(_mm512_madd_epi16($a,wu),_mm512_madd_epi16($b,wv));let high=if HIGH{$op(_mm512_madd_epi16($a,hu),_mm512_madd_epi16($b,hv))}else{_mm512_setzero_si512()};add(m+81*$k,low,high);}};}
+ emit!(0,x0,x7,_mm512_sub_epi32);emit!(1,x1,x0,_mm512_add_epi32);emit!(2,x2,x1,_mm512_add_epi32);emit!(3,x3,x2,_mm512_add_epi32);emit!(4,x4,_mm512_add_epi16(x3,x7),_mm512_add_epi32);emit!(5,x5,x4,_mm512_add_epi32);emit!(6,x6,x5,_mm512_add_epi32);emit!(7,x7,x6,_mm512_add_epi32);
+ }
 }
+
 
 /// Per-worker scratch, allocated once and reused by every group the worker takes.
 struct SmsWorker {
@@ -995,8 +945,9 @@ unsafe fn group<F: FnMut(usize), C: FnMut(usize) -> bool>(cols: &[&[B128]], keys
         // The producer requests each h once, in order. Partial groups use
         // enough zero words for all LOCK pointer advances.
         let mut source = |_h: usize, out: *mut crate::simd::transpose_f162::SmsR3PairIndex32| {
-            // Prefetch the next pair batch while converting this batch and
-            // computing its first prefix. The final batch needs no lookahead.
+            crate::simd::transpose_f162::slice_b128_cols16_r3pair_into(&cols16, &mut *out);
+            // Prefetch the next pair batch after converting this one, while its
+            // first prefix runs. The final batch needs no lookahead.
             if _h + 1 < step {
                 for l in 0..g {
                     let p = cols16[l].wrapping_add(8).cast::<i8>();
@@ -1004,7 +955,6 @@ unsafe fn group<F: FnMut(usize), C: FnMut(usize) -> bool>(cols: &[&[B128]], keys
                     _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(64));
                 }
             }
-            crate::simd::transpose_f162::slice_b128_cols16_r3pair_into(&cols16, &mut *out);
             for p in &mut cols16 { *p = p.add(8); }
         };
         let k = kbase.add((b / LOCK) * LOCK_WORDS);
@@ -1106,6 +1056,33 @@ struct Progress(std::sync::atomic::AtomicUsize);
 const SIBLING_WAIT: std::time::Duration = std::time::Duration::from_micros(3000);
 /// Maximum lead (in pair batches) between two hyperthread siblings on one physical core.
 const PAIR_LEAD: usize = 2 * PP;
+/// Longest single `umwait` of a waiting sibling, in TSC cycles (a few microseconds): the wait
+/// re-checks its partner and its patience at least this often.
+const SIBLING_UMWAIT_TSC: u64 = 8_000;
+
+/// Whether the CPU has WAITPKG (`umonitor`/`umwait`, CPUID leaf 7, ECX bit 5).
+#[allow(unused_unsafe)]
+fn has_waitpkg() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let max = unsafe { core::arch::x86_64::__cpuid(0) }.eax;
+        max >= 7 && unsafe { core::arch::x86_64::__cpuid_count(7, 0) }.ecx & (1 << 5) != 0
+    })
+}
+
+/// Sleeps in C0.1 until `line` is written, `SIBLING_UMWAIT_TSC` cycles pass or an interrupt
+/// arrives, unless `ready()` already holds once the monitor is armed (so a write between the
+/// caller's test and the arm is not slept through). The two instructions are emitted as their
+/// encodings: `umonitor rax` (F3 0F AE F0) and `umwait ecx` (F2 0F AE F1, ecx = 1: C0.1).
+#[inline]
+unsafe fn umwait_on(line: *const u8, ready: impl Fn() -> bool) {
+    core::arch::asm!(".byte 0xf3, 0x0f, 0xae, 0xf0", in("rax") line, options(nostack, preserves_flags));
+    if ready() {
+        return;
+    }
+    let deadline = core::arch::x86_64::_rdtsc().wrapping_add(SIBLING_UMWAIT_TSC);
+    core::arch::asm!(".byte 0xf2, 0x0f, 0xae, 0xf1", in("ecx") 1u32, in("eax") deadline as u32, in("edx") (deadline >> 32) as u32, options(nostack));
+}
 
 /// Diagnostics of the last [`commit_paired`], for the profile line only: per worker, the
 /// microseconds from the commitment's start to the end of its last group, and the 16-column
@@ -1153,6 +1130,14 @@ pub static WORKER_VCSW: [std::sync::atomic::AtomicU32; 16] = [const { std::sync:
 /// [`VM_KEYS`] counters of `/proc/vmstat`. Empty where the files cannot be read.
 static SYS_DELTA: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 const VM_KEYS: [&str; 11] = ["pgscan_kswapd", "pgscan_direct", "pgsteal_kswapd", "compact_stall", "compact_daemon_wake", "thp_fault_alloc", "thp_fault_fallback", "nr_dirty", "nr_writeback", "pgpgout", "pgfault"];
+
+/// Whether the commitment collects its profile-only diagnostics (`/proc/stat`, `/proc/vmstat`,
+/// the runners' schedstat and rusage). They feed only the profile line, so they are read only
+/// when `LABINIUS_SMS_DIAG` is set; the fields are then zero (empty) in normal runs.
+fn sms_diag() -> bool {
+    static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DIAG.get_or_init(|| std::env::var_os("LABINIUS_SMS_DIAG").is_some())
+}
 
 /// The counters [`SYS_DELTA`] reports, now.
 fn sys_snapshot() -> ([[u64; 6]; 16], usize, [u64; 11]) {
@@ -1236,6 +1221,7 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
     let groups = columns.len().div_ceil(g);
     let mode = end_mode();
     let steal = mode == 0;
+    let waitpkg = has_waitpkg();
     let parts = parts(np, if mode == 1 { END_PARTS } else { &[] });
     let units = groups * parts.len();
     assert!(groups < 1 << 12 && np < 1 << 16);
@@ -1256,19 +1242,20 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
     let pending: Vec<std::sync::Mutex<Option<usize>>> = (0..pairs).map(|_| std::sync::Mutex::new(None)).collect();
     let done: Vec<Progress> = (0..2 * pairs).map(|_| Progress(AtomicUsize::new(0))).collect();
     let coupled: Vec<AtomicBool> = (0..pairs).map(|_| AtomicBool::new(true)).collect();
-    let sys0 = sys_snapshot();
+    let diag = sms_diag();
+    let sys0 = if diag { Some(sys_snapshot()) } else { None };
     let t0 = std::time::Instant::now();
     let taken: Vec<AtomicBool> = (0..2 * pairs).map(|_| AtomicBool::new(false)).collect();
     let started = AtomicUsize::new(0);
-    crate::par::pool().run(2 * pairs, |task| {
+    let dispatched = crate::par::pool().try_run_parallel(2 * pairs, |task| {
         // Slots by the CPU each runner finds itself on, so that pinning moves nothing; a runner
         // whose CPU's slot is taken takes one left over.
         let worker = placement.map_or(task, |p| p.claim(&taken));
         if worker < 16 {
             WORKER_START_US[worker].store(t0.elapsed().as_micros() as u32, Ordering::Relaxed);
         }
-        let usage0 = thread_usage();
-        let wait0 = thread_wait_ns();
+        let usage0 = if diag { thread_usage() } else { (0, 0, 0, 0) };
+        let wait0 = if diag { thread_wait_ns() } else { 0 };
         tids[worker].store(crate::par::thread_id(), Ordering::Relaxed);
         let _guard = placement.and_then(|p| p.pin(worker));
         started.fetch_add(1, Ordering::AcqRel);
@@ -1361,12 +1348,21 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
                 if other.load(Ordering::Acquire) + PAIR_LEAD >= d {
                     return;
                 }
-                let start = std::time::Instant::now();
+                // The partner's progress is on a line of its own: with WAITPKG this thread
+                // sleeps on that line (its sibling has the core to itself meanwhile) instead of
+                // spinning on it. The clock is read once a wait outlasts its first sleep or
+                // 64 spins, so short waits do not pay for it.
+                let sleep = waitpkg;
+                let mut start: Option<std::time::Instant> = None;
                 let mut spins = 0u32;
                 while other.load(Ordering::Acquire) + PAIR_LEAD < d {
-                    core::hint::spin_loop();
+                    if sleep {
+                        unsafe { umwait_on(other as *const AtomicUsize as *const u8, || other.load(Ordering::Acquire) + PAIR_LEAD >= d) };
+                    } else {
+                        core::hint::spin_loop();
+                    }
                     spins += 1;
-                    if spins % 64 == 0 && start.elapsed() > SIBLING_WAIT {
+                    if (sleep || spins % 64 == 0) && start.get_or_insert_with(std::time::Instant::now).elapsed() > SIBLING_WAIT {
                         coupled.store(false, Ordering::Relaxed);
                         let k = DECOUPLED_PAIRS.fetch_add(1, Ordering::Relaxed) as usize;
                         if k < 16 {
@@ -1454,17 +1450,32 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
         if worker < 16 {
             WORKER_END_US[worker].store(out_of_work.unwrap_or_else(|| t0.elapsed().as_micros() as u32), Ordering::Relaxed);
             WORKER_GROUPS[worker].store(ran, Ordering::Relaxed);
-            let usage = thread_usage();
-            WORKER_CPU_US[worker].store((usage.0 - usage0.0) as u32, Ordering::Relaxed);
-            WORKER_IVCSW[worker].store((usage.1 - usage0.1) as u32, Ordering::Relaxed);
-            WORKER_FAULTS[worker].store((usage.2 - usage0.2) as u32, Ordering::Relaxed);
-            WORKER_VCSW[worker].store((usage.3 - usage0.3) as u32, Ordering::Relaxed);
-            WORKER_WAIT_US[worker].store((thread_wait_ns().saturating_sub(wait0) / 1000) as u32, Ordering::Relaxed);
+            if diag {
+                let usage = thread_usage();
+                WORKER_CPU_US[worker].store((usage.0 - usage0.0) as u32, Ordering::Relaxed);
+                WORKER_IVCSW[worker].store((usage.1 - usage0.1) as u32, Ordering::Relaxed);
+                WORKER_FAULTS[worker].store((usage.2 - usage0.2) as u32, Ordering::Relaxed);
+                WORKER_VCSW[worker].store((usage.3 - usage0.3) as u32, Ordering::Relaxed);
+                WORKER_WAIT_US[worker].store((thread_wait_ns().saturating_sub(wait0) / 1000) as u32, Ordering::Relaxed);
+            }
         }
     });
-    let delta = sys_delta(&sys0, &sys_snapshot());
-    if let Ok(mut s) = SYS_DELTA.lock() {
-        *s = delta;
+    if !dispatched {
+        // A busy or single-thread pool cannot run the coupled runner state machine.
+        // The original independent full-group algorithm needs no sibling progress.
+        let mut ws = SmsWorker::new();
+        for gi in 0..groups {
+            let c0 = gi * g;
+            let gc = g.min(columns.len() - c0);
+            unsafe { group(&columns[c0..c0 + gc], keys, np, 0..np, RowsOut::Full,
+                &mut ws, (dst as *mut [u32; N]).add(2 * c0), |_| {}, |_| true) };
+        }
+    }
+    if let Some(sys0) = sys0 {
+        let delta = sys_delta(&sys0, &sys_snapshot());
+        if let Ok(mut s) = SYS_DELTA.lock() {
+            *s = delta;
+        }
     }
 }
 
@@ -1684,14 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_inverse_banks_match_scalar_reconstruction(){
-        let elements=1024;let chunks=chunk_count(elements);let mut seed=0xa2e78139ca040d65;let mur=vec![0i32;mur_len(elements)];let means=[0u32;N];let keys=SmsKeys{pairs:&[],mur:&mur,mu:&means,elements,repair:None};let mut batch=zeroed_slice::<Batch32>(1);let mut total=zeroed_slice::<Total>(1);
-        for row in &mut total[0].t{for v in row{*v=(xorshift(&mut seed)&65535)as i32;}}for row in &mut total[0].hi{for v in row{*v=(xorshift(&mut seed)%2001)as i32-1000;}}
-        for c in 0..chunks{for d in (0..DIGITS-1).step_by(2){for row in &mut batch[0].v{for v in row{*v=(xorshift(&mut seed)%P as u64)as i16-(P/2)as i16;}}let before=total[0].t.to_vec();let high=total[0].hi.to_vec();unsafe{reconstruct(&batch[0],d,c,d+1,c,&keys,&mut total[0]);}
-            for m in 0..N/2{for col in 0..16{let(mut lo,mut hi)=(before[m][col]as i64+65536*high[m][col]as i64,before[m+N/2][col]as i64+65536*high[m+N/2][col]as i64);for bank in 0..2{let digit=d+bank;let delta=|j:usize|batch[0].v[j][col+16*bank]as i64;let(x,y)=(delta(m),delta(m+N/2));let(u,v)=digit_weight(digit);lo+=x*u as i64-y*v as i64;hi+=x*v as i64+y*(u+v)as i64;}assert_eq!(total[0].t[m][col]as i64+65536*total[0].hi[m][col]as i64,lo);assert_eq!(total[0].t[m+N/2][col]as i64+65536*total[0].hi[m+N/2][col]as i64,hi);}}
-            if d==DIGITS-2 {for row in &total[0].t{for &v in row{assert!((0..65536).contains(&v));}}}
-        }}
-    }
+    fn paired_inverse_banks_match_scalar_reconstruction(){let elements=1024;let chunks=chunk_count(elements);let mut seed=0xa2e78139ca040d65;let mur=vec![0i32;mur_len(elements)];let means=[0u32;N];let keys=SmsKeys{pairs:&[],mur:&mur,mu:&means,elements,repair:None,parity:None};let mut batch=zeroed_slice::<Batch32>(1);let mut total=zeroed_slice::<Total>(3);for k in[0usize,2]{for row in &mut total[k].t{row.fill(0x13572468);}for row in &mut total[k].hi{row.fill(-1234567);}}for row in &mut total[1].t{row.fill(32777);}for row in &mut total[1].hi{row.fill(-321);}for c in 0..chunks{for d in(0..DIGITS-1).step_by(2){for row in &mut batch[0].v{for v in row{*v=match c{0=>4860,1=>-4860,_=>(xorshift(&mut seed)%P as u64)as i16-(P/2)as i16};}}let before=total[1].t.to_vec();let high=total[1].hi.to_vec();unsafe{reconstruct(&batch[0],d,c,d+1,c,&keys,&mut total[1]);}for col in 0..16{let mut product=[0i64;729];for bank in 0..2{let(u,v)=digit_weight(d+bank);for m in 0..N{let x=batch[0].v[m][col+16*bank]as i64;product[m]+=x*u as i64;product[m+81]+=x*v as i64;}}for m in(N..729).rev(){product[m-324]+=product[m];product[m-648]-=product[m];}for m in 0..N{let want=before[m][col]as i64+65536*high[m][col]as i64+product[m];let got=total[1].t[m][col]as i64+65536*total[1].hi[m][col]as i64;assert_eq!(got,want,"chunk={c} digit={d} m={m} col={col}");}}}}for k in[0usize,2]{assert!(total[k].t.iter().flatten().all(|&v|v==0x13572468));assert!(total[k].hi.iter().flatten().all(|&v|v== -1234567));}}
 
     #[test]
     fn parts_cover_the_column_in_whole_chunks() {
@@ -1704,7 +1708,7 @@ mod tests {
             assert!(ps.iter().all(|r| cuts.contains(&r.start)), "{np}: {ps:?}");
             assert_eq!(ps.iter().map(|r| folds_in_range(np, r.clone())).sum::<usize>(), folds_in_range(np, 0..np));
         }
-        assert_eq!(parts(2048, END_PARTS), vec![0..1024, 1024..1728, 1728..2048]);
+        assert_eq!(parts(2048, END_PARTS), vec![0..1024, 1024..1648, 1648..2048]);
         assert_eq!(parts(2048, &[]), vec![0..1024, 1024..2048]);
     }
 
@@ -1816,13 +1820,15 @@ mod tests {
 
     #[test]fn rep176_forced_alias_matches_schoolbook(){
       let elements=1024;let mut seed=0x1765a9721u64;let a:Vec<u128>=(0..elements*N).map(|_|((xorshift(&mut seed)as u128)<<64|xorshift(&mut seed)as u128)%MODULUS).collect();let data=SmsKeyData::build(&a,elements);let keys=data.keys();let nc=chunk_count(elements);let range=chunk_range(elements/2,0);let(first,last)=(2*range.start,2*range.end);
-      for digit in 0..DIGITS{for sign in[-1i64,1]{let m=[0usize,81,323,324,486,647][digit];let bound=P as i64-data.repair.limits[digit*nc]as i64;assert!(bound>5625+64);let target=sign*(bound-64);let mean=data.repair.means[(digit*nc)*N+m]as i64;let mut actual=-mean;let mut words=vec![B128(0);4*elements];
+      for region in 0..8{for digit in 0..DIGITS{for sign in[-1i64,1]{let m=81*region+if digit%2==0{0}else{80};let bound=P as i64-data.repair.limits[digit*nc]as i64;assert!(bound>5625+64);let target=sign*(bound-64);let mean=data.repair.means[(digit*nc)*N+m]as i64;let mut actual=-mean;let mut words=vec![B128(0);4*elements];
        'choose:for i in 0..512{for e in first..last{let l=&data.repair.digits[(digit*elements+e)*N..(digit*elements+e+1)*N];let at=|x:i64|if(0..N as i64).contains(&x){l[x as usize]as i64}else{0};let x=m as i64-i as i64;let coefficient=if m<N/2{at(x)-at(x+648)-at(x+972)}else{at(x)+at(x+324)};if sign*coefficient>0{words[4*e+i%4].0|=1u128<<(i/4);actual+=coefficient;if sign*actual>=sign*target{break 'choose;}}}}
        assert!(actual.abs()>5625&&actual.abs()<=bound);let r=actual.rem_euclid(P as i64);let r=if r>P as i64/2{r-P as i64}else{r};assert!(r.abs()>=data.repair.limits[digit*nc]as i64);let scalar=unsafe{crate::repair176_runtime::dot(&data.repair.digits,elements,digit,m,first,last,words.as_ptr().cast())}-mean;assert_eq!(scalar,actual);
-       crate::repair176_runtime::reset();let got=commit_columns_rows(&keys,&[&words],1);let counts=crate::repair176_runtime::counts();assert!(counts.0>0&&counts.1>0,"forcedalias didnotrepair: {counts:?}");let got=column_coefficients(&got[0],&got[1]);let want=reference(&a,&words);assert_eq!(got,want,"digit={digit} sign={sign}");
-      }}
+       crate::repair176_runtime::reset();let got=commit_columns_rows(&keys,&[&words],1);let counts=crate::repair176_runtime::counts();assert!(counts.0>0&&counts.1>0,"forcedalias didnotrepair: {counts:?}");let got=column_coefficients(&got[0],&got[1]);let want=reference(&a,&words);assert_eq!(got,want,"region={region} digit={digit} sign={sign}");
+      }}}
     }
 
+
+    #[test]fn nested_dispatch_matches_independent_groups(){let elements=32;let mut state=0x248648u64;let a:Vec<u128>=(0..elements*N).map(|_|((xorshift(&mut state)as u128)<<64|xorshift(&mut state)as u128)%MODULUS).collect();let data=SmsKeyData::build(&a,elements);let keys=data.keys();let words:Vec<B128>=(0..4*elements*33).map(|_|B128((xorshift(&mut state)as u128)<<64|xorshift(&mut state)as u128)).collect();for n in[1usize,17,33]{let cols:Vec<&[B128]>=words[..4*elements*n].chunks_exact(4*elements).collect();let expected=commit_columns_rows(&keys,&cols,1);for col in[0usize,n-1]{assert_eq!(column_coefficients(&expected[2*col],&expected[2*col+1]),reference(&a,cols[col]));}for workers in[1usize,8]{crate::par::pool().run(2,|outer|if outer==0{assert_eq!(commit_columns_rows(&keys,&cols,workers),expected,"nested workers={workers} ncols={n}");});}}}
 }
 
 #[cfg(test)]
@@ -1909,7 +1915,7 @@ unsafe fn reduce_hi55(x:__m512i)->__m512i {
  _mm512_mask_sub_epi32(r,_mm512_cmp_epi32_mask(r,m,_MM_CMPINT_NLT),r,m)
 }
 
-pub(crate) fn certify_relocated_pairs(pairs:&[u32]){assert_eq!(pairs.len()%LOCK,0);let max=pairs.chunks_exact(LOCK).map(|p|p.iter().map(|&x|(x as i16 as i64).abs()+((x>>16)as i16 as i64).abs()).sum::<i64>()).max().unwrap_or(0);assert!(vb::SMS_SOURCE_BOUND*max+acc_after_reduce_c(P)+32768<=bias(P),"public key exceeds relocated 8-pair step range");}
+pub(crate) fn certify_relocated_pairs(pairs:&[u32]){assert_eq!(pairs.len()%LOCK,0);for(stripe,p)in pairs.chunks_exact(LOCK).enumerate(){let coefficient=(stripe/STREAMS)%N;let bound=source_bounds::BOUNDS[coefficient];assert!(bound>0&&bound<=vb::SMS_SOURCE_BOUND);let norm=p.iter().map(|&x|(x as i16 as i64).abs()+((x>>16)as i16 as i64).abs()).sum::<i64>();assert!(bound*norm+acc_after_reduce_c(P)+32768<=bias(P),"public key exceeds relocated 8-pair step range: coefficient={coefficient} bound={bound} norm={norm}");}}
 
 #[cfg(test)]mod fold_window_tests {
  use super::*;
@@ -1920,7 +1926,7 @@ pub(crate) fn certify_relocated_pairs(pairs:&[u32]){assert_eq!(pairs.len()%LOCK,
  }
  #[test]#[should_panic(expected="public key exceeds relocated 8-pair step range")]
  fn rejects_insufficient_public_step_margin(){
-  certify_relocated_pairs(&[4860u32|(4860u32<<16);LOCK]);
+  certify_relocated_pairs(&vec![4860u32|(4860u32<<16);N*STREAMS*LOCK]);
  }
 }
 #[cfg(test)]mod wide16_guards{
@@ -1950,4 +1956,18 @@ pub(crate) fn certify_relocated_pairs(pairs:&[u32]){assert_eq!(pairs.len()%LOCK,
   let old:Vec<_>=(start..end).step_by(8).map(|b|b+8).filter(|&e|{let local=e-start;let ic=(e-8-start)%CHUNK_PAIRS+8;ic%FOLD_PAIRS==0||local%CHUNK_PAIRS==0||local==half}).collect();assert_eq!(boundaries,old);assert_eq!(chunks,(start..end).step_by(8).map(|b|b+8).filter(|&e|(e-start)%CHUNK_PAIRS==0||e==end).collect::<Vec<_>>());
   }}
  }
+}
+
+
+#[cfg(test)]mod parity_prefilter_guards{
+ use super::*;
+ fn exercise(cut:Option<i16>){let elements=32;let a=vec![0u128;elements*N];let data=SmsKeyData::build(&a,elements);let mut limits=data.repair.limits.clone();if let Some(cut)=cut{limits.fill(cut);}let mut keys=data.keys();keys.repair=Some(RepairKeys{digits:&[],means:&data.repair.means,limits:&limits});let input=vec![B128(0);4*elements];let columns=[input.as_slice()];let mut total=zeroed_slice::<Total>(1);let mut flags=vec![RepairFlag{d:0,m:0,col:0,residue:0}];unsafe{apply_repair_flags(&mut flags,&keys,&columns,0,&mut total[0]);}assert!(flags.is_empty());assert!(total[0].t.iter().flatten().all(|&x|x==0));assert!(total[0].hi.iter().flatten().all(|&x|x==0));}
+ #[test]fn matching_parity_skips_full_image(){exercise(None);}
+ #[test]#[should_panic(expected="left: 0")]fn zero_cut_keeps_full_exact_fallback(){exercise(Some(0));}
+ #[test]#[should_panic(expected="left: 0")]fn low_cut_keeps_full_exact_fallback(){exercise(Some(1023));}
+
+ #[test]fn absent_parity_keeps_full_exact_fallback(){fallback(0);}
+ #[test]fn noncentered_residue_keeps_full_exact_fallback(){fallback(1);}
+ #[test]fn mismatching_parity_keeps_full_exact_fallback(){fallback(2);}
+ fn fallback(mode:usize){let elements=32;let data=SmsKeyData::build(&vec![0u128;elements*N],elements);let mut parity=crate::repair_class20_runtime::ParityData::build(&data.repair.digits,elements);let mut input=vec![B128(0);4*elements];if mode==2{parity.words[4*((323/4)/64)+323%4]^=1u64<<((323/4)%64);input[0].0=1;assert_eq!(unsafe{parity.key().odd(0,0,0,16,input.as_ptr().cast())},1);}let mut keys=data.keys();keys.parity=if mode==0{None}else{Some(parity.key())};keys.repair=Some(RepairKeys{digits:&[],means:&data.repair.means,limits:&data.repair.limits});let columns=[input.as_slice()];let mut total=zeroed_slice::<Total>(1);let mut flags=vec![RepairFlag{d:0,m:0,col:0,residue:if mode==1{4861}else{0}}];let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||unsafe{apply_repair_flags(&mut flags,&keys,&columns,0,&mut total[0]);}));assert!(result.is_err(),"guard must enter unchanged exact dot on absent/noncentered/mismatch, which rejects deliberately empty raw image");}
 }

@@ -701,11 +701,14 @@ unsafe fn narrow_digits(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
 /// Slot `s` of [`narrow_digits`].
 #[inline(always)]
 unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
-    let c = vdupq_n_s32(C16);
-    let low = vdupq_n_s32(0xFFFF);
+    // `h = round(v / 2^16)` and `l = v - h 2^16` in `[-2^15, 2^15)`: then `l + h C16` is the low
+    // word of `v` plus `h (C16 - 2^16)` in wrapping 32-bit arithmetic (the true value fits, as
+    // asserted above for the larger unsigned `l`), so the low words need no mask: one instruction
+    // fewer per four lanes than the unsigned split. The residue's class is the same.
+    let c = vdupq_n_s32(C16 - (1 << 16));
     let half = |a: int64x2_t, b: int64x2_t| -> int32x4_t {
-        let h = vshrn_high_n_s64::<16>(vshrn_n_s64::<16>(a), b);
-        let l = vandq_s32(vmovn_high_s64(vmovn_s64(a), b), low);
+        let h = vrshrn_high_n_s64::<16>(vrshrn_n_s64::<16>(a), b);
+        let l = vmovn_high_s64(vmovn_s64(a), b);
         let t = vmlaq_s32(l, h, c);
         vmlsq_n_s32(t, vqrdmulhq_n_s32(t, V31), P1 as i32)
     };
@@ -746,6 +749,69 @@ unsafe fn chunk_row2(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut in
     });
 }
 
+
+/// Chunks whose deviations are summed in 16 bits before [`flush16`] widens them: a centered
+/// deviation is at most `(p - 1) / 2` in magnitude.
+const FLUSH: usize = 6;
+const _: () = assert!(FLUSH as i32 * ((P1 as i32 - 1) / 2) <= i16::MAX as i32);
+
+/// [`chunk_row2`] with a short last step. Per slot the reference tests the deviations against the
+/// row's repair threshold, moves the flag to a general register, branches, and adds the eight
+/// lanes into two 32-bit vectors (five more instructions and 32 bytes of load and store); a row
+/// has an ambiguous lane less than once in a hundred. Here the last step only centers, keeps the
+/// lane-wise maximum magnitude of the row and adds into one 16-bit vector (`dev16`, widened into
+/// `dev` every [`FLUSH`] chunks). A row whose maximum reaches the threshold is done again by
+/// [`chunk_row_exact`], which takes the 16-bit additions back. The sums are the same integers.
+#[inline(always)]
+unsafe fn chunk_row2_fast(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], dev16: [*mut int16x8_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
+    let p = P1 as i16;
+    let [y0, y1] = y;
+    let mut top = [vdupq_n_u16(0); 2];
+    super::inverse_lazy_io2([&mut *y0, &mut *y1], |h, s| narrow_digit(acc, s, r + h), |h, s, x| {
+        let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr[h].as_ptr().add(s))), p);
+        top[h] = vmaxq_u16(top[h], vreinterpretq_u16_s16(vabsq_s16(v)));
+        let sum = dev16[h].add(s);
+        *sum = vaddq_s16(*sum, v);
+    });
+    let ys = [y0, y1];
+    for (h, y) in ys.into_iter().enumerate() {
+        // `|v| >= threshold` in some slot and lane (a threshold of 0 flags every lane, as there)
+        if vmaxvq_u16(top[h]) as i32 >= ctx.a.threshold[ctx.c * DIGITS + r - 1 + h] as i32 {
+            chunk_row_exact(acc, r + h, mr[h], dev[h], dev16[h], y, ctx);
+        }
+    }
+}
+
+/// Row `r` of a chunk end exactly as [`chunk_row2`] does it, after [`chunk_row2_fast`] has added
+/// the row's deviations into `dev16`: each slot's deviation is taken out of `dev16` again and
+/// goes into `dev` with its ambiguous lanes recomputed ([`repair_lanes`]).
+#[cold]
+#[inline(never)]
+unsafe fn chunk_row_exact(acc: &[int64x2_t], r: usize, mr: &[i16], dev: *mut int32x4_t, dev16: *mut int16x8_t, y: &mut [int16x8_t; N], ctx: &Repair) {
+    let p = P1 as i16;
+    let thr = vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r - 1]);
+    super::inverse_lazy_io(y, |s| narrow_digit(acc, s, r), |s, x| {
+        let mut v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
+        *dev16.add(s) = vsubq_s16(*dev16.add(s), v);
+        let flag = vcgeq_s16(vabsq_s16(v), thr);
+        if vmaxvq_u16(flag) != 0 {
+            v = repair_lanes(ctx, r - 1, s, v, flag, dev);
+        }
+        *dev.add(2 * s) = vaddw_s16(*dev.add(2 * s), vget_low_s16(v));
+        *dev.add(2 * s + 1) = vaddw_high_s16(*dev.add(2 * s + 1), v);
+    });
+}
+
+/// `dev += dev16` lane by lane (two 32-bit vectors per 16-bit one), and `dev16 = 0`.
+#[inline(never)]
+unsafe fn flush16(dev: &mut [int32x4_t], dev16: &mut [int16x8_t]) {
+    debug_assert_eq!(dev.len(), 2 * dev16.len());
+    for (s, v) in dev16.iter_mut().enumerate() {
+        *dev.get_unchecked_mut(2 * s) = vaddw_s16(*dev.get_unchecked(2 * s), vget_low_s16(*v));
+        *dev.get_unchecked_mut(2 * s + 1) = vaddw_high_s16(*dev.get_unchecked(2 * s + 1), *v);
+        *v = vdupq_n_s16(0);
+    }
+}
 
 /// What [`repair`] needs at a chunk end: the batch's column words, the matrix and the chunk.
 struct Repair<'a> {
@@ -969,8 +1035,13 @@ unsafe fn sums2(
     acc: [&mut [int64x2_t]; 2],
     y: [&mut [int16x8_t; N]; 2],
     dev: [&mut [int32x4_t]; 2],
+    dev16: [&mut [int16x8_t]; 2],
 ) {
     let kern = &kernels()[PB];
+    let mut dev16 = dev16;
+    for sums in dev16.iter_mut() {
+        sums.fill(vdupq_n_s16(0));
+    }
     let [acc0, acc1] = acc;
     let [y0, y1] = y;
     let [dev0, dev1] = dev;
@@ -991,7 +1062,21 @@ unsafe fn sums2(
             let groups = l.div_ceil(LOCK);
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
-                for i in 0..groups * LOCK {
+                let count = groups * LOCK;
+                for i in 0..count {
+                    // The input words [`PF_T`] transforms on: later in this sweep, or the start of
+                    // the sweep that follows it (the other batch's, over the same elements for
+                    // the first batch and over the next ones for the second). A counter profile
+                    // on Neoverse-V2 had 30% of the table's lines arriving late (L2 refills in
+                    // the index packing, 41% of its cycles stalled).
+                    let ahead = i + PF_T;
+                    if ahead < count {
+                        prefetch_words(words[t], e, ahead);
+                    } else if t == 0 {
+                        prefetch_words(words[1], e, ahead - count);
+                    } else {
+                        prefetch_words(words[0], e + l, ahead - count);
+                    }
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
@@ -1010,10 +1095,15 @@ unsafe fn sums2(
         let c = (end - 1) / CHUNK;
         for t in 0..2 {
             let dv = devs[t].as_mut_ptr();
+            let dv16 = dev16[t].as_mut_ptr();
             for d in (0..DIGITS).step_by(2) {
                 let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
                 let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
-                chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
+                let rows16 = [dv16.add(d * N), dv16.add((d + 1) * N)];
+                chunk_row2_fast(accs[t], 1 + d, mr, rows, rows16, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
+            }
+            if (c + 1) % FLUSH == 0 || end == a.elements {
+                flush16(devs[t], dev16[t]);
             }
         }
     }
@@ -1054,6 +1144,8 @@ struct Scratch {
     dev: [int32x4_t; DIGITS * 2 * N],
     acc2: [int64x2_t; ROWS * 4 * N],
     dev2: [int32x4_t; DIGITS * 2 * N],
+    /// The 16-bit deviation sums of the two batches between [`flush16`]s.
+    dev16: [[int16x8_t; DIGITS * N]; 2],
     y2: [int16x8_t; N],
     m: [int16x8_t; BITS],
     nib: [uint8x16_t; N / 4],
@@ -1131,7 +1223,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
         pin_worker(first * workers / columns);
         let arena = Arena::new();
-        let Scratch { xs, sc, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
+        let Scratch { xs, sc, acc, dev, acc2, dev2, dev16, y2, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
@@ -1154,7 +1246,8 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 if b + 1 < batches {
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
-                    sums2([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]]);
+                    let [d16a, d16b] = dev16;
+                    sums2([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
                 } else {
                     sums(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
                 }

@@ -1267,4 +1267,3 @@ mod tests {
         }
     }
 }
-// Labelled redraw 1 of the 4e23f386 tree (behaviour identical; only this comment differs). Prior official draws of this tree: 4e23f386 prod-01 303.857.

@@ -748,6 +748,7 @@ impl Garner {
 /// lifts the residues to the single integer modulo their product; the lift is exact because
 /// `modulus` is that product. The column blocks are independent and run on `workers` threads,
 /// and each block packs directly into its own range of proof bytes.
+#[cfg(test)]
 fn commitment_bytes_rows(
     rows: &[[u32; N]],
     primes: &[u16],
@@ -756,6 +757,24 @@ fn commitment_bytes_rows(
     workers: usize,
     buffer: Option<Vec<u8>>,
 ) -> Vec<u8> {
+    let mut out = match buffer {
+        Some(b) if b.len() == columns * N * rq::coefficient_bytes(modulus) => b,
+        _ => vec![0u8; columns * N * rq::coefficient_bytes(modulus)],
+    };
+    commitment_into_rows(rows, primes, modulus, columns, workers, &mut out);
+    out
+}
+
+/// [`commitment_bytes_rows`] into `out` (`columns * N * width` bytes, any alignment), every byte
+/// of which it writes.
+fn commitment_into_rows(
+    rows: &[[u32; N]],
+    primes: &[u16],
+    modulus: u128,
+    columns: usize,
+    workers: usize,
+    out: &mut [u8],
+) {
     let limbs = primes.len();
     let hybrid=modulus==modulus_choice::HYBRID_MODULUS;
     let stride=if hybrid {3}else{limbs};
@@ -763,12 +782,9 @@ fn commitment_bytes_rows(
     let garner = Garner::of(primes);
     let width = rq::coefficient_bytes(modulus);
     assert!(!hybrid || width == 5);
-    // Every byte is written below; a buffer of the right length faulted in earlier saves the
+    // Every byte is written below; a region of the right length faulted in earlier saves the
     // lift its page faults (two huge pages that every runner would otherwise queue on).
-    let mut out = match buffer {
-        Some(b) if b.len() == columns * N * width => b,
-        _ => vec![0u8; columns * N * width],
-    };
+    assert_eq!(out.len(), columns * N * width);
     let blocks = columns.div_ceil(32);
     let runs = labinius::par::ranges(blocks, workers, 1);
     // The blocks are handed out from a shared counter rather than as fixed runs, so a runner
@@ -832,7 +848,6 @@ fn commitment_bytes_rows(
             }
         }
     });
-    out
 }
 
 /// Whether [`lift_hybrid_column`] can run here.
@@ -1029,7 +1044,7 @@ static EMBEDDED_PAIRS:Aligned64<[u8;EMBEDDED_PAIRS_LEN]>=Aligned64(*include_byte
 const EMBEDDED_HYBRID_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")).len();
 static EMBEDDED_HYBRID:Aligned64<[u8;EMBEDDED_HYBRID_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/hybrid-key.bin")));
 /// The single-transform modulus's public data (`labinius::simd::commit::sms`), precomputed by
-/// `build.rs` (empty when the build host could not run the kernels): the nine streams' keys in the
+/// `build.rs` (empty when the build host could not run the kernels): the seven streams' keys in the
 /// lockstep layout, the digit chunks' centered mean residues and the means' total.
 const SMS_PAIRS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")).len();
 static SMS_PAIRS:Aligned2M<[u8;SMS_PAIRS_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-pairs.bin")));
@@ -1047,6 +1062,10 @@ static SMS_MEANS:Aligned64<[u8;SMS_MEANS_LEN]>=Aligned64(*include_bytes!(concat!
 const SMS_LIMITS_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-limits.bin")).len();
 static SMS_LIMITS:Aligned64<[u8;SMS_LIMITS_LEN]>=Aligned64(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-limits.bin")));
 
+// This bitmap is derived only from the fixed public matrix, never the witness table.
+const SMS_PARITY_LEN:usize=include_bytes!(concat!(env!("OUT_DIR"),"/sms-parity.bin")).len();
+static SMS_PARITY:Aligned2M<[u8;SMS_PARITY_LEN]>=Aligned2M(*include_bytes!(concat!(env!("OUT_DIR"),"/sms-parity.bin")));
+
 /// The embedded single-transform keys, read in place, if the build host made them for this
 /// shape.
 fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
@@ -1055,7 +1074,8 @@ fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
     if !cfg!(target_endian = "little") || SMS_PAIRS.0.len() != 4 * words || SMS_MUR.0.len() != 4 * sms::mur_len(RING_ELEMENTS) || SMS_MU.0.len() != 4 * N
         || SMS_DIGITS_LEN != sms::DIGITS * RING_ELEMENTS * N
         || SMS_MEANS_LEN != 4 * sms::mur_len(RING_ELEMENTS)
-        || SMS_LIMITS_LEN != 2 * sms::DIGITS * sms::chunk_count(RING_ELEMENTS) {
+        || SMS_LIMITS_LEN != 2 * sms::DIGITS * sms::chunk_count(RING_ELEMENTS)
+        || SMS_PARITY_LEN != 8 * sms::DIGITS * RING_ELEMENTS * labinius::repair_class20_runtime::STRIDE {
         return None;
     }
     unsafe {
@@ -1069,6 +1089,10 @@ fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
                 means: std::slice::from_raw_parts(SMS_MEANS.0.as_ptr().cast::<i32>(), SMS_MEANS_LEN / 4),
                 limits: std::slice::from_raw_parts(SMS_LIMITS.0.as_ptr().cast::<i16>(), SMS_LIMITS_LEN / 2),
             }),
+            parity: Some(labinius::repair_class20_runtime::ParityKey {
+                elements: RING_ELEMENTS,
+                words: std::slice::from_raw_parts(SMS_PARITY.0.as_ptr().cast::<u64>(), SMS_PARITY_LEN / 8),
+            }),
         })
     }
 }
@@ -1077,15 +1101,14 @@ fn sms_embedded() -> Option<labinius::simd::commit::sms::SmsKeys<'static>> {
 /// column `c` modulo 9721 in the NTT domain, `rows[2c + 1]` its coefficients modulo TAIL_MODULUS. The
 /// first goes through the inverse transform 32 columns at a time; each coefficient is then
 /// `t + M*((r-t)*M^-1 mod9721)`, packed into its 5 wire bytes.
-fn commitment_bytes_sms(rows: &[[u32; N]], columns: usize, workers: usize, buffer: Option<Vec<u8>>) -> Vec<u8> {
+///
+/// Written into `out` (`columns * N * 5` bytes, any alignment), every byte of which it writes.
+fn commitment_into_sms(rows: &[[u32; N]], columns: usize, workers: usize, out: &mut [u8]) {
     use labinius::simd::commit::sms;
     assert_eq!(rows.len(), 2 * columns);
     let width = rq::coefficient_bytes(sms::MODULUS);
     assert_eq!(width, 5);
-    let mut out = match buffer {
-        Some(b) if b.len() == columns * N * width => b,
-        _ => vec![0u8; columns * N * width],
-    };
+    assert_eq!(out.len(), columns * N * width);
     let blocks = columns.div_ceil(32);
     let runs = labinius::par::ranges(blocks, workers, 1);
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1123,10 +1146,9 @@ fn commitment_bytes_sms(rows: &[[u32; N]], columns: usize, workers: usize, buffe
             }
         }
     });
-    out
 }
 
-/// [`commitment_bytes_sms`]'s lift of one column, eight coefficients per step in 64-bit lanes:
+/// [`commitment_into_sms`]'s lift of one column, eight coefficients per step in 64-bit lanes:
 /// `r` brought into `[0, 9721)`, `d = r - t mod 9721` in `[0, 9721)` (the `t mod 9721` and the
 /// product's reduction by Barrett's `floor(x ceil(2^45 / 9721) / 2^45)`, exact for `x < 9721^2`
 /// as in [`lift_hybrid_column`]), `value=t+M*(d*M^-1 mod9721)`, packed into 5-byte words.
@@ -1220,9 +1242,56 @@ impl FoldedData {
     }
 }
 
+/// The commitment's wire bytes: an owned buffer, or the commitment region of the mapped proof
+/// file, which the lift wrote in place (the encoding then has nothing to copy there).
+enum CommitmentData {
+    Owned(Vec<u8>),
+    Mapped(std::sync::Arc<OutputState>),
+}
+
+impl CommitmentData {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v.as_slice(),
+            Self::Mapped(state) => {
+                let mapped = state.map.get().and_then(Option::as_ref).expect("the mapped commitment owns its mapping");
+                // Only constructed by `Output::commitment_into`, whose caller writes every byte
+                // of this region before the commitment is read; the mapping outlives `state`'s
+                // last reference except in `Output::write`'s fallback, which copies it first.
+                unsafe { core::slice::from_raw_parts((mapped.addr + state.layout.commitment_at()) as *const u8, state.layout.commitment_bytes) }
+            }
+        }
+    }
+
+    /// The region to write: the caller fills every byte before reading it through [`bytes`].
+    ///
+    /// # Safety
+    /// No other reference to the mapped region may be live.
+    unsafe fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Owned(v) => v.as_mut_slice(),
+            Self::Mapped(state) => {
+                let mapped = state.map.get().and_then(Option::as_ref).expect("the mapped commitment owns its mapping");
+                core::slice::from_raw_parts_mut((mapped.addr + state.layout.commitment_at()) as *mut u8, state.layout.commitment_bytes)
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Owned(v) => v,
+            mapped @ Self::Mapped(_) => mapped.bytes().to_vec(),
+        }
+    }
+}
+
 struct ProofParts {
     modulus: u128,
-    commitment: Vec<u8>,
+    commitment: CommitmentData,
     partials: Vec<u128>,
     rounds: Vec<[[u64; 3]; 2]>,
     opened: [u64; 3],
@@ -1236,7 +1305,7 @@ impl ProofParts {
             version: 1,
             modulus: self.modulus,
             folded: self.folded.into_bytes(),
-            commitment: self.commitment,
+            commitment: self.commitment.into_vec(),
             partials: self.partials,
             rounds: self.rounds,
             opened: self.opened,
@@ -1350,9 +1419,13 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
     let encoded = parts.folded.encoded();
     if let Some(bytes) = encoded { assert_eq!(bytes.len(), layout.folded_bytes); }
     let already_written = encoded.is_some_and(|bytes| bytes.as_ptr() == out.add(layout.folded_at()));
+    // A commitment lifted straight into this region is already in place (and copying a region
+    // onto itself is not a nonoverlapping copy).
+    let commitment = parts.commitment.bytes();
+    let commitment_written = commitment.as_ptr() == out.add(layout.commitment_at()) as *const u8;
     // A few commitment slices and many folded runs, taken dynamically.
     let ctasks = 4;
-    let cruns = labinius::par::ranges(parts.commitment.len(), ctasks, 4096);
+    let cruns = if commitment_written { Vec::new() } else { labinius::par::ranges(commitment.len(), ctasks, 4096) };
     let fruns = if already_written { Vec::new() } else { labinius::par::ranges(parts.folded.len(), 4 * threads(), 1) };
     let (addr, folded_at) = (out as usize, layout.folded_at());
     #[cfg(target_arch = "x86_64")]
@@ -1381,7 +1454,7 @@ unsafe fn encode_into(parts: &ProofParts, layout: &ProofLayout, out: *mut u8) {
         if i < cruns.len() {
             let r = cruns[i].clone();
             core::ptr::copy_nonoverlapping(
-                parts.commitment.as_ptr().add(r.start),
+                commitment.as_ptr().add(r.start),
                 out.add(ProofLayout::HEAD + r.start),
                 r.len(),
             );
@@ -1428,8 +1501,6 @@ struct Output {
     state: std::sync::Arc<OutputState>,
     job: &'static labinius::par::IdleJob,
     populate: std::sync::OnceLock<&'static labinius::par::IdleJob>,
-    /// The commitment's bytes, allocated at the start and faulted in by the setup's idle work.
-    commitment: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 struct OutputState {
@@ -1529,6 +1600,19 @@ impl OutputState {
             self.populate_failed.store(true, Ordering::Relaxed);
         }
     }
+
+    /// Fault in the file's first pages through the commitment's end, in one call on one worker
+    /// (parallel pieces of one file contend on its inode). Advisory: a page left out is
+    /// faulted in by the lift's first write to it.
+    fn populate_commitment(&self) {
+        let Some(m) = self.mapped() else { return };
+        let len = self.layout.commitment_at() + self.layout.commitment_bytes;
+        #[cfg(target_os = "linux")]
+        unsafe {
+            sys::madvise(m.addr as *mut _, len, sys::MADV_POPULATE_WRITE)
+        };
+        let _ = (m, len);
+    }
 }
 
 impl Output {
@@ -1542,36 +1626,32 @@ impl Output {
         });
         // Idle work for the workers while the key is set up: create and map the file, build
         // the challenge sampler's tables (needed ~290 ms in, by the folding challenges), read
-        // the CPU topology the commitment's placement asks for, and fault in the commitment's
-        // buffer, a huge page per chunk.
-        let mut commitment = vec![0u8; layout.commitment_bytes];
-        let (addr, bytes) = (commitment.as_mut_ptr() as usize, commitment.len());
-        let pages = bytes.div_ceil(POPULATE_CHUNK);
+        // the CPU topology the commitment's placement asks for, and fault in the file's pages
+        // up to the commitment's end, which the commitment's lift writes in place (it used to
+        // fill a separate buffer of its own that the encoding then copied into the file).
         let worker_state = state.clone();
-        let job = labinius::par::pool().idle(3 + pages, move |i| match i {
+        let job = labinius::par::pool().idle(4, move |i| match i {
             0 => worker_state.chunk(0),
             1 => labinius::challenge::warm(),
             2 => labinius::par::warm_topology(),
-            // The buffer is not touched by anyone else before `write` or `commitment_buffer`
-            // quiesces this job; writing a zero where the fresh mapping already reads zero.
-            _ => unsafe {
-                let at = (i - 3) * POPULATE_CHUNK;
-                core::ptr::write_volatile((addr + at) as *mut u8, 0);
-                core::ptr::write_volatile((addr + (at + POPULATE_CHUNK).min(bytes) - 1) as *mut u8, 0);
-            },
+            _ => worker_state.populate_commitment(),
         });
         Output {
             state,
             job,
             populate: std::sync::OnceLock::new(),
-            commitment: std::sync::Mutex::new(Some(commitment)),
         }
     }
 
-    /// The commitment's buffer, once the setup's idle work is over (stopped if it is not).
-    fn commitment_buffer(&self) -> Option<Vec<u8>> {
+    /// The commitment region of the mapped proof file, once the setup's idle work is over
+    /// (stopped if it is not), when it has the expected length.
+    fn commitment_into(&self, bytes: usize) -> Option<CommitmentData> {
         labinius::par::pool().quiesce(self.job);
-        self.commitment.lock().unwrap().take()
+        if bytes != self.state.layout.commitment_bytes {
+            return None;
+        }
+        self.state.mapped()?;
+        Some(CommitmentData::Mapped(self.state.clone()))
     }
 
     /// Fault the file's pages in on the idle workers, 2 MB per chunk. Called where the main
@@ -1738,6 +1818,20 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
     // before doing any work, which measured as ~10 ms of the run and bought the
     // commitment ~0.5 ms back: the fault-around it takes instead maps a run of pages
     // per fault. The key image is small and is left to the commit for the same reason.
+    // Map the public parity image before workers query it concurrently. Its cost is
+    // part of the prover invocation, including kernels that use the read fallback.
+    if sms_keys.is_some() {
+        // Include the aligned object padding so both 2 MiB ranges can be promoted.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            sys::madvise(
+                SMS_PARITY.0.as_ptr() as *mut core::ffi::c_void,
+                std::mem::size_of_val(&SMS_PARITY),
+                sys::MADV_HUGEPAGE,
+            );
+        }
+        populate_part(SMS_PARITY.0.as_ptr() as usize, SMS_PARITY_LEN);
+    }
     let matrix_time = clock.elapsed();
     // The hybrid modulus commits against the embedded arranged keys when the build host made
     // them; otherwise the key (and the tail key) come from their images or are built.
@@ -1901,12 +1995,21 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
             );
         }
     }
-    let buffer = output.and_then(|o| o.commitment_buffer());
-    let commitment = if modulus == modulus_choice::SMS_MODULUS {
-        commitment_bytes_sms(&rows, COLUMNS, workers, buffer)
-    } else {
-        commitment_bytes_rows(&rows, &primes, modulus, COLUMNS, workers, buffer)
-    };
+    let commitment_len = COLUMNS * N * rq::coefficient_bytes(modulus);
+    let mut commitment = output
+        .and_then(|o| o.commitment_into(commitment_len))
+        .unwrap_or_else(|| CommitmentData::Owned(vec![0u8; commitment_len]));
+    {
+        // Nothing else refers to the commitment region until this exclusive borrow ends: the
+        // output's idle jobs are quiesced or not yet started, and the fold and the encoding
+        // run after it.
+        let out = unsafe { commitment.bytes_mut() };
+        if modulus == modulus_choice::SMS_MODULUS {
+            commitment_into_sms(&rows, COLUMNS, workers, out)
+        } else {
+            commitment_into_rows(&rows, &primes, modulus, COLUMNS, workers, out)
+        }
+    }
     let recombine_time = clock.elapsed();
     // Huge pages: a few page-table entries to drop. (A thread of its own to free it, as the
     // baseline did, is a ninth runnable thread beside eight busy ones.)
@@ -1924,7 +2027,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         let release = (lo..hi.max(lo)).step_by(POPULATE_CHUNK).map(|o| (o, POPULATE_CHUNK.min(hi - o)));
         output.populate(first.collect(), release.collect(), workers);
     }
-    let mut t = transcript(seed, modulus, &commitment);
+    let mut t = transcript(seed, modulus, commitment.bytes());
     let (lo, hi) = point(&mut t);
     // A coordinate equal to one (probability 2^-128 per coordinate) has no half ratio: the
     // baseline's prover over its own full workspace takes over for the whole switch.
@@ -2085,8 +2188,13 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is on disk (its pages are in the page cache) and the report is written to the
+    // unbuffered stderr: nothing the exit handlers, stdio flushes and destructors would do is
+    // observable, so the process ends with the system call directly.
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 #[cfg(test)]
@@ -2310,7 +2418,7 @@ mod tests {
         for (commitment_bytes, row_bytes, elements) in [(0usize, 0usize, 0usize), (5 * 648 * 3 + 1, 41, 19), (5 * 648 * 64, 20736, 300)] {
             let parts = ProofParts {
                 modulus: MODULUS,
-                commitment: (0..commitment_bytes).map(|_| next() as u8).collect(),
+                commitment: CommitmentData::Owned((0..commitment_bytes).map(|_| next() as u8).collect()),
                 partials: (0..128).map(|_| ((next() as u128) << 64) | next() as u128).collect(),
                 rounds: (0..24).map(|_| [[next(), next(), next()], [next(), next(), next()]]).collect(),
                 opened: [next(), next(), next()],
@@ -2345,7 +2453,7 @@ mod tests {
         }).collect();
         let folded = FoldedWitness::of(elements);
         let bytes = pack_folded(&folded);
-        let mut parts = ProofParts { modulus: MODULUS, commitment: vec![3;97], partials:vec![17;3], rounds:vec![[[1,2,3],[4,5,6]];2], opened:[7,8,9], row:vec![11;41], folded:FoldedData::Owned(folded) };
+        let mut parts = ProofParts { modulus: MODULUS, commitment: CommitmentData::Owned(vec![3;97]), partials:vec![17;3], rounds:vec![[[1,2,3],[4,5,6]];2], opened:[7,8,9], row:vec![11;41], folded:FoldedData::Owned(folded) };
         let layout = ProofLayout::of_parts(&parts);
         let mut expected = vec![0u8;layout.len()];
         unsafe { encode_into(&parts,&layout,expected.as_mut_ptr()); }
@@ -2361,6 +2469,45 @@ mod tests {
         unsafe { encode_into(&parts,&layout,addr as *mut u8); }
         assert_eq!(unsafe{core::slice::from_raw_parts(addr as *const u8,layout.len())},&expected[..]);
         assert_eq!(codec().serialize(&parts.into_proof()).unwrap(),expected);
+        drop(state);
+        unsafe { assert_eq!(sys::munmap(addr,layout.len()),0); }
+    }
+
+    /// A commitment lifted into the mapped proof's commitment region: encoding in place skips its
+    /// copy and gives the codec's bytes, encoding elsewhere copies it, and the codec fallback
+    /// reads it back out of the mapping.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_commitment_is_the_codec_encoding_and_can_copy() {
+        let elements = (0..7).map(|e| {
+            let mut v = labinius::RingElement648::zero(Representation::Coefficients);
+            for (j,c) in v.v.iter_mut().enumerate() { *c = ((e * 71 + j * 29) % 4001) as i16 - 2000; }
+            v
+        }).collect();
+        let folded = FoldedWitness::of(elements);
+        let commitment: Vec<u8> = (0..5 * 648 * 2 + 3).map(|i| (i * 131 + 7) as u8).collect();
+        let owned = ProofParts { modulus: MODULUS, commitment: CommitmentData::Owned(commitment.clone()), partials:vec![5;4], rounds:vec![[[1,2,3],[4,5,6]];3], opened:[7,8,9], row:vec![11;41], folded:FoldedData::Owned(FoldedWitness::of(folded.elements().to_vec())) };
+        let layout = ProofLayout::of_parts(&owned);
+        let expected = codec().serialize(&owned.into_proof()).unwrap();
+        assert_eq!(expected.len(), layout.len());
+        let addr = unsafe { sys::mmap(core::ptr::null_mut(),layout.len(),sys::PROT_READ|sys::PROT_WRITE,sys::MAP_PRIVATE|sys::MAP_ANONYMOUS,-1,0) };
+        assert!(addr as isize != -1 && !addr.is_null());
+        // Poison the whole mapping, then lift the commitment's bytes into its region only.
+        unsafe { core::ptr::write_bytes(addr as *mut u8, 0xA5, layout.len()); }
+        let state = std::sync::Arc::new(OutputState { path:String::new(),layout,map:std::sync::OnceLock::new(),populate_failed:std::sync::atomic::AtomicBool::new(false) });
+        assert!(state.map.set(Some(Mapped { _file:std::fs::File::open("/dev/null").unwrap(),addr:addr as usize })).is_ok());
+        let mut mapped = CommitmentData::Mapped(state.clone());
+        unsafe { mapped.bytes_mut().copy_from_slice(&commitment); }
+        assert_eq!(mapped.bytes(), &commitment[..]);
+        assert_eq!(mapped.bytes().as_ptr() as usize, addr as usize + layout.commitment_at());
+        let parts = ProofParts { modulus: MODULUS, commitment: mapped, partials:vec![5;4], rounds:vec![[[1,2,3],[4,5,6]];3], opened:[7,8,9], row:vec![11;41], folded:FoldedData::Owned(folded) };
+        assert_eq!(ProofLayout::of_parts(&parts), layout);
+        let mut copied = vec![0xA5u8; layout.len()];
+        unsafe { encode_into(&parts,&layout,copied.as_mut_ptr()); }
+        assert_eq!(copied, expected);
+        unsafe { encode_into(&parts,&layout,addr as *mut u8); }
+        assert_eq!(unsafe{core::slice::from_raw_parts(addr as *const u8,layout.len())},&expected[..]);
+        assert_eq!(codec().serialize(&parts.into_proof()).unwrap(), expected);
         drop(state);
         unsafe { assert_eq!(sys::munmap(addr,layout.len()),0); }
     }

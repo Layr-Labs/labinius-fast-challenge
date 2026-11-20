@@ -821,14 +821,14 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    pass_lut_asm(nib, x, kern);
+    super::pass_lut_loop(nib, x, kern);
 }
 
 /// Diagnostic only: side 1 of the paired test runs the table front as a 4-iteration loop.
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    if ctx::side1() { super::pass_lut_loop(nib, x, kern) } else { pass_lut_asm(nib, x, kern) }
+    super::pass_lut_loop(nib, x, kern)
 }
 
 #[cfg(not(target_feature = "sve"))]
@@ -925,7 +925,6 @@ unsafe fn sums2(
     dev: [&mut [int32x4_t]; 2],
 ) {
     let kern = &kernels()[PB];
-    ctx::flip();
     let [acc0, acc1] = acc;
     let [y0, y1] = y;
     let [dev0, dev1] = dev;
@@ -946,7 +945,7 @@ unsafe fn sums2(
             let groups = l.div_ceil(LOCK);
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
-                let t0 = ctx::now();
+                let d0 = diag::now();
                 for i in 0..groups * LOCK {
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
@@ -955,18 +954,20 @@ unsafe fn sums2(
                     pass_c_asm(sc, kern);
                     pass_d_out(sc, x, kern);
                 }
-                ctx::add([ctx::now() - t0, 0, 0, 0, (groups * LOCK) as u64]);
-                let t1 = ctx::now();
+                let d1 = diag::now();
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
                 } else {
                     sink::<false>(xs, keys, accs[t], groups);
                 }
-                ctx::add([0, ctx::now() - t1, 0, 0, 0]);
+                let d2 = diag::now();
+                diag::add(0, d1 - d0);
+                diag::add(1, d2 - d1);
             }
             e += l;
         }
         let c = (end - 1) / CHUNK;
+        let d0 = diag::now();
         for t in 0..2 {
             let dv = devs[t].as_mut_ptr();
             for d in (0..DIGITS).step_by(2) {
@@ -975,11 +976,14 @@ unsafe fn sums2(
                 chunk_row2(accs[t], 1 + d, mr, rows, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
             }
         }
+        diag::add(2, diag::now() - d0);
     }
+    let d0 = diag::now();
     for t in 0..2 {
         narrow(accs[t], 0, ys[t]);
         super::inverse_folded::<PB>(ys[t]);
     }
+    diag::add(3, diag::now() - d0);
     let _ = (&mut accs, &mut ys, &mut devs);
 }
 
@@ -1051,7 +1055,85 @@ impl Drop for Arena {
 /// written straight into `out` as the wire encoding (`rq::coefficient_bytes(q)` little-endian
 /// bytes per coefficient, column after column), so the separate packing pass over a `u128`
 /// buffer is not needed.
+/// Pins the calling commit worker to the `w`-th CPU it may run on, so the scheduler does not move it,
+/// and its L1/L2 working set, to another core mid-commit. A hint: on any error it changes nothing.
+fn pin_worker(w: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+            fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+        }
+        let mut set = [0u64; 16];
+        if sched_getaffinity(0, core::mem::size_of_val(&set), set.as_mut_ptr()) != 0 {
+            return;
+        }
+        let cpus: Vec<usize> = (0..1024).filter(|&c| set[c / 64] >> (c % 64) & 1 == 1).collect();
+        if cpus.is_empty() {
+            return;
+        }
+        let c = cpus[w % cpus.len()];
+        let mut one = [0u64; 16];
+        one[c / 64] = 1 << (c % 64);
+        let _ = sched_setaffinity(0, core::mem::size_of_val(&one), one.as_ptr());
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = w;
+}
+
+/// DIAGNOSTIC ONLY (labelled as such in the note): where a commit worker's time goes, and the
+/// thread's own scheduler and fault counters. Counter-timer stamps; no effect on the proof.
+pub mod diag {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    thread_local! { static T: Cell<[u64; 6]> = const { Cell::new([0; 6]) }; }
+    pub static T0: AtomicU64 = AtomicU64::new(0);
+    #[inline(always)]
+    pub fn now() -> u64 {
+        let v: u64;
+        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+        v
+    }
+    pub fn freq() -> u64 {
+        let f: u64;
+        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
+        f
+    }
+    #[inline(always)]
+    pub fn add(i: usize, d: u64) {
+        T.with(|c| { let mut v = c.get(); v[i] += d; c.set(v); });
+    }
+    /// This thread's `(cpu_ns, run_delay_ns, timeslices)` from `/proc/thread-self/schedstat`.
+    pub fn sched() -> [u64; 3] {
+        let mut out = [0u64; 3];
+        if let Ok(s) = std::fs::read_to_string("/proc/thread-self/schedstat") {
+            for (o, v) in out.iter_mut().zip(s.split_whitespace()) { *o = v.parse().unwrap_or(0); }
+        }
+        out
+    }
+    /// `getrusage(RUSAGE_THREAD)`: `[utime_us, stime_us, minflt, majflt, nvcsw, nivcsw]`.
+    pub fn rusage_thread() -> [i64; 6] { rusage(1) }
+    pub fn rusage(who: i32) -> [i64; 6] {
+        extern "C" { fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32; }
+        let mut r = [0i64; 18];
+        unsafe { getrusage(who, &mut r) };
+        [r[0] * 1_000_000 + r[1], r[2] * 1_000_000 + r[3], r[8], r[9], r[16], r[17]]
+    }
+    pub fn us(ticks: u64) -> u64 { (ticks as u128 * 1_000_000 / freq() as u128) as u64 }
+    pub fn report(w: usize, start: u64, s0: [u64; 3], r0: [i64; 6]) {
+        let end = now();
+        let (s1, r1) = (sched(), rusage_thread());
+        let v = T.with(|c| c.get());
+        let t0 = T0.load(Ordering::Relaxed);
+        eprintln!("diag w={w} start_us={} end_us={} tr_us={} sink_us={} chunk_us={} final_us={} pack_us={} arena_us={} cpu_us={} run_delay_us={} slices={} utime_us={} stime_us={} minflt={} majflt={} nvcsw={} nivcsw={}",
+            us(start.saturating_sub(t0)), us(end.saturating_sub(t0)), us(v[0]), us(v[1]), us(v[2]), us(v[3]), us(v[4]), us(v[5]),
+            (s1[0] - s0[0]) / 1000, (s1[1] - s0[1]) / 1000, s1[2] - s0[2],
+            r1[0] - r0[0], r1[1] - r0[1], r1[2] - r0[2], r1[3] - r0[3], r1[4] - r0[4], r1[5] - r0[5]);
+    }
+}
+
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
+    diag::T0.store(diag::now(), std::sync::atomic::Ordering::Relaxed);
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
@@ -1062,9 +1144,12 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     let width = W;
     assert_eq!(out.len(), columns * N * width);
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
+        pin_worker(first * workers / columns);
+        let dstart = diag::now();
+        let (sch0, ru0) = (diag::sched(), diag::rusage_thread());
         let arena = Arena::new();
-        ctx::select(first * 8 / columns);
         let Scratch { xs, sc, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;
+        diag::add(5, diag::now() - dstart);
         let p = P1 as i16;
         let count = block.len() / (N * width);
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
@@ -1095,6 +1180,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 core::mem::swap(dev, dev2);
                 core::mem::swap(y, y2);
             }
+            let dpack = diag::now();
             let target = &mut *targets[b];
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
@@ -1143,8 +1229,9 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     slot[4] = (v >> 32) as u8;
                 }
             }
+            diag::add(4, diag::now() - dpack);
         }
-        ctx::report();
+        diag::report(first * workers / columns, dstart, sch0, ru0);
     });
 }
 
@@ -1581,42 +1668,5 @@ mod leap_bench {
             println!("pass_d_asm {pda:.0} ns vs pass_d {pd:.0} ns; pass_c_asm {pca:.0} ns vs pass_c {pc:.0} ns; pass_lut_asm {la:.0} vs {lut:.0} ns");
             println!("per transform (648 vectors): L1 {l1:.0} ns ({:.2} cyc/vec), cycling xs {l2:.0} ns; indices {ix:.0}, lut {lut:.0}, pass_c {pc:.0}, pass_d {pd:.0} ns", l1 * 2.99 / N as f64);
         }
-    }
-}
-/// Diagnostic only: same-core paired comparison inside the commitment. Every worker alternates its
-/// batch pairs between side 0 (the crown: `pass_lut_asm`, straight line) and side 1 (`pass_lut_loop`,
-/// the same code as a 4-iteration loop); workers 0 and 4 run side 0 on both (controls). Per side `cntvct` totals of the
-/// transforms (table front included) and of the sinks, and the transform count.
-mod ctx {
-    use std::cell::Cell;
-    thread_local! {
-        static SEL: Cell<usize> = const { Cell::new(0) };
-        static SIDE: Cell<usize> = const { Cell::new(1) };
-        static T: Cell<[[u64; 5]; 2]> = const { Cell::new([[0; 5]; 2]) };
-    }
-    pub fn select(worker: usize) { SEL.with(|s| s.set(worker % 8)); }
-    pub fn flip() { SIDE.with(|s| s.set(1 - s.get())); }
-    fn control() -> bool { matches!(SEL.with(|s| s.get()), 0 | 4) }
-    pub fn side1() -> bool { SIDE.with(|s| s.get()) == 1 && !control() }
-    #[inline(always)]
-    pub fn now() -> u64 {
-        let v: u64;
-        unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack, preserves_flags)) };
-        v
-    }
-    #[inline(always)]
-    pub fn add(d: [u64; 5]) {
-        let side = SIDE.with(|s| s.get());
-        T.with(|c| { let mut v = c.get(); for i in 0..5 { v[side][i] += d[i]; } c.set(v); });
-    }
-    pub fn report() {
-        let f: u64;
-        unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) f, options(nomem, nostack, preserves_flags)) };
-        let v = T.with(|c| c.get());
-        let w = SEL.with(|s| s.get());
-        let ns = |s: usize, i: usize| v[s][i] as f64 * 1e9 / f as f64 / v[s][4].max(1) as f64;
-        eprintln!("ctxf w={w} side1={} transforms={}/{} s0_tr_ns={:.0} s1_tr_ns={:.0} tr_delta%={:+.2} s0_sink_ns={:.0} s1_sink_ns={:.0} sink_delta%={:+.2}",
-            if control() { "control" } else { "lutloop" }, v[0][4], v[1][4], ns(0, 0), ns(1, 0), 100.0 * (ns(1, 0) / ns(0, 0) - 1.0),
-            ns(0, 1), ns(1, 1), 100.0 * (ns(1, 1) / ns(0, 1) - 1.0));
     }
 }

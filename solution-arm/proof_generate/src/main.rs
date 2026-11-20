@@ -904,9 +904,13 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
+    mark("c_wait_setup");
     let mut commitment = output.commitment_buffer();
+    mark("c_buffer");
     commit(values, modulus, &mut commitment);
+    mark("c_commit");
     labinius::par::pool();
+    mark("c_pool");
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
     // round, and idle population workers measurably slowed it. The final encode faults the
@@ -917,12 +921,16 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
     let (partials, rounds, coords, opened) = switch_proof(values, &lo, &hi, &mut t);
     t.absorb_f162(&[opened]);
     timer.lap("switch");
+    mark("switch");
     let (p0, _) = split_point(&coords);
     let row = RowEvaluation::of(row_evaluate(values, &p0));
     timer.lap("row");
+    mark("row");
     let challenges = folding_challenges(&mut t, &row);
+    mark("f_challenges");
     let folded = FoldedWitness::of(fold(values, &challenges));
     timer.lap("fold");
+    mark("fold");
     ProofParts {
         modulus,
         commitment,
@@ -945,7 +953,41 @@ impl Timer {
     }
 }
 
+/// DIAGNOSTIC ONLY: microsecond marks since `main`, printed on stderr before exit.
+static MARKS: std::sync::Mutex<Vec<(&'static str, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+fn mark(name: &'static str) {
+    let us = START.get().map_or(0, |t| t.elapsed().as_micros() as u64);
+    let delay = ntt::neon::sms::diag::sched()[1] / 1000;
+    MARKS.lock().unwrap().push((name, us, delay));
+}
+fn diag_exit() {
+    use ntt::neon::sms::diag;
+    mark("exit");
+    let marks = MARKS.lock().unwrap();
+    let line: Vec<String> = marks.iter().map(|(n, us, d)| format!("{n}={us}/{d}")).collect();
+    eprintln!("diag marks(us since main / main-thread run_delay us) {}", line.join(" "));
+    let r = diag::rusage(0);
+    eprintln!("diag proc utime_us={} stime_us={} minflt={} majflt={} nvcsw={} nivcsw={}", r[0], r[1], r[2], r[3], r[4], r[5]);
+    if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
+        let pick: Vec<String> = s.lines().filter(|l| ["Rss:", "Anonymous:", "AnonHugePages:", "FilePmdMapped:", "Private_Dirty:", "Shared_Clean:"].iter().any(|k| l.starts_with(k)))
+            .map(|l| l.split_whitespace().take(2).collect::<Vec<_>>().join("")).collect();
+        eprintln!("diag mem(kB) {}", pick.join(" "));
+    }
+    if let Ok(dir) = std::fs::read_dir("/proc/self/task") {
+        let mut rows = Vec::new();
+        for e in dir.flatten() {
+            let p = e.path();
+            let s = std::fs::read_to_string(p.join("schedstat")).unwrap_or_default();
+            let v: Vec<u64> = s.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            if v.len() == 3 { rows.push(format!("{}:{}ms/{}us/{}", e.file_name().to_string_lossy(), v[0] / 1_000_000, v[1] / 1000, v[2])); }
+        }
+        eprintln!("diag threads(tid:cpu/run_delay/slices) {}", rows.join(" "));
+    }
+}
+
 fn main() {
+    let _ = START.set(std::time::Instant::now());
     let args: Vec<_> = std::env::args().collect();
     assert!(
         args.len() == 5 || args.len() == 7,
@@ -961,14 +1003,19 @@ fn main() {
         MODULUS
     };
     #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS { ntt::neon::sms::prefetch_key(&SMS_DATA.0) }
+    mark("key_started");
     let output = Output::start(&args[2], modulus);
+    mark("out_started");
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
     timer.lap("read");
+    mark("read");
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
     output.write(&proof);
     timer.lap("write");
+    mark("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
+    diag_exit();
     // The proof file is complete. Let process teardown release the large allocations and
     // mappings together, instead of walking their Rust destructors first.
     std::mem::forget((values, proof, output));

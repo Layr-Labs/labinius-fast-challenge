@@ -63,3 +63,5 @@ pub use scheme::{
 pub use ring::Modulus;
 pub use ring::PowerOfThreeRingElement as RingElement162;
 pub use ring::RingElement as RingElement648;
+
+pub mod repair_class20_runtime;

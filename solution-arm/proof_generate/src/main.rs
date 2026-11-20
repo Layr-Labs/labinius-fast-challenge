@@ -1271,3 +1271,4 @@ mod tests {
         }
     }
 }
+// Labelled redraw 1 of the 59d00888 tree (behaviour identical; only this comment differs). Prior official draws of this tree: 59d00888 297.699.

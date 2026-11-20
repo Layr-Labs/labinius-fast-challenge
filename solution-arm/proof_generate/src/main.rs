@@ -1271,3 +1271,4 @@ mod tests {
         }
     }
 }
+// Labelled redraw 4 of the 59d00888 tree (behaviour identical; only this comment differs). Prior official draws of this tree: 59d00888 297.699, 130eea66 299.043, dccdec55 297.297, 78f5bb26 305.539.

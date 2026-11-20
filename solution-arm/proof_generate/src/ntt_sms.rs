@@ -821,14 +821,14 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    pass_lut_asm(nib, x, kern);
+    super::pass_lut_loop(nib, x, kern);
 }
 
 /// Diagnostic only: side 1 of the paired test runs the table front as a 4-iteration loop.
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    if ctx::side1() { super::pass_lut_loop(nib, x, kern) } else { pass_lut_asm(nib, x, kern) }
+    super::pass_lut_loop(nib, x, kern)
 }
 
 #[cfg(not(target_feature = "sve"))]
@@ -1051,6 +1051,32 @@ impl Drop for Arena {
 /// written straight into `out` as the wire encoding (`rq::coefficient_bytes(q)` little-endian
 /// bytes per coefficient, column after column), so the separate packing pass over a `u128`
 /// buffer is not needed.
+/// Pins the calling commit worker to the `w`-th CPU it may run on, so the scheduler does not move it,
+/// and its L1/L2 working set, to another core mid-commit. A hint: on any error it changes nothing.
+fn pin_worker(w: usize) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+            fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+        }
+        let mut set = [0u64; 16];
+        if sched_getaffinity(0, core::mem::size_of_val(&set), set.as_mut_ptr()) != 0 {
+            return;
+        }
+        let cpus: Vec<usize> = (0..1024).filter(|&c| set[c / 64] >> (c % 64) & 1 == 1).collect();
+        if cpus.is_empty() {
+            return;
+        }
+        let c = cpus[w % cpus.len()];
+        let mut one = [0u64; 16];
+        one[c / 64] = 1 << (c % 64);
+        let _ = sched_setaffinity(0, core::mem::size_of_val(&one), one.as_ptr());
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = w;
+}
+
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
@@ -1062,6 +1088,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     let width = W;
     assert_eq!(out.len(), columns * N * width);
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
+        pin_worker(first * workers / columns);
         let arena = Arena::new();
         ctx::select(first * 8 / columns);
         let Scratch { xs, sc, acc, dev, acc2, dev2, y2, m, nib, y, tail } = &mut *arena.0;

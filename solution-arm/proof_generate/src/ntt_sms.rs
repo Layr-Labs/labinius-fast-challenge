@@ -821,14 +821,14 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    pass_lut_asm(nib, x, kern);
+    super::pass_lut_loop(nib, x, kern);
 }
 
 /// Diagnostic only: side 1 of the paired test runs the table front as a 4-iteration loop.
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    if ctx::side1() { super::pass_lut_loop(nib, x, kern) } else { pass_lut_asm(nib, x, kern) }
+    super::pass_lut_loop(nib, x, kern)
 }
 
 #[cfg(not(target_feature = "sve"))]

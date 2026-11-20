@@ -129,6 +129,8 @@ struct State {
     path: String,
     layout: Layout,
     map: OnceLock<Option<Mapped>>,
+    /// Per 2 MiB chunk of the mapping: its pre-fault has been taken on by some thread.
+    claimed: Vec<std::sync::atomic::AtomicBool>,
 }
 impl State {
     #[cfg(target_os = "linux")]
@@ -162,6 +164,10 @@ impl State {
         #[cfg(target_os = "linux")]
         unsafe { sys::madvise((map.addr + at) as *mut u8, len, 23); }
     }
+    /// [`State::populate`], unless some thread has already taken chunk `i` on.
+    fn populate_once(&self, i: usize) {
+        if !self.claimed[i].swap(true, std::sync::atomic::Ordering::Relaxed) { self.populate(i); }
+    }
 }
 
 pub(super) struct Output {
@@ -173,23 +179,23 @@ pub(super) struct Output {
 impl Output {
     pub fn start(path: &str, q: u128) -> Self {
         let layout = Layout::instance(q);
-        let state = Arc::new(State { path: path.to_owned(), layout, map: OnceLock::new() });
+        let claimed = (0..layout.len().div_ceil(CHUNK)).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
+        let state = Arc::new(State { path: path.to_owned(), layout, map: OnceLock::new(), claimed });
         let mut commitment = vec![0u8; layout.commitment];
         let addr = commitment.as_mut_ptr() as usize;
         let bytes = commitment.len();
         let worker = Arc::downgrade(&state);
         // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
         let setup = std::thread::spawn(move || {
+            // Only what the commit needs, while `main` maps the key and the table: the proof file
+            // (created, sized and mapped, not faulted) and the commitment buffer's pages. The
+            // record also built the challenge tables and faulted the whole proof mapping here,
+            // and the commit could not start until 2.5 to 3.4 ms after `main`; both now happen
+            // between the commit threads' batch pairs ([`Output::between`]).
             let state = worker.upgrade();
             if let Some(state) = &state { let _ = state.mapped(); }
-            labinius::challenge::warm();
             for offset in (0..bytes).step_by(4096) {
                 unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
-            }
-            // Fault the whole proof mapping while the table read still runs on the other
-            // cores: the write phase then only has to encode, not populate file pages.
-            if let Some(state) = &state {
-                for i in 0..state.layout.len().div_ceil(CHUNK) { state.populate(i); }
             }
         });
         Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
@@ -216,8 +222,22 @@ impl Output {
         });
         assert!(self.populate.set(job).is_ok(), "output populated once");
     }
+    /// The commit threads' work between batch pairs ([`crate::ntt::neon::sms::BETWEEN`]): thread
+    /// `w` faults chunk `w` of the proof mapping after its pair `w + 1`, so one chunk at a time
+    /// (alone a 2 MiB chunk takes 0.24 ms; seven at once take 0.9 ms each, the file system
+    /// serialises them), and the next thread builds the challenge tables after its first pair.
+    /// Each thread gives up at most 0.3 ms. Chunks no thread took are faulted before the encode.
+    pub fn between(&self) -> Box<dyn Fn(usize, usize) + Send + Sync> {
+        let state = self.state.clone();
+        Box::new(move |w, pairs| {
+            let chunks = state.claimed.len();
+            if w < chunks && pairs == w + 1 { state.populate_once(w); }
+            if w == chunks && pairs == 1 { labinius::challenge::warm(); }
+        })
+    }
     pub fn write(&self, p: &ProofParts) {
         self.quiesce();
+        for i in 0..self.state.claimed.len() { self.state.populate_once(i); }
         let layout = Layout::parts(p);
         if layout == self.state.layout {
             if let Some(map) = self.state.mapped() {

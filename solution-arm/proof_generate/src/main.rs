@@ -208,20 +208,12 @@ fn load_table(path: &str, n: usize) -> Table {
         if ptr as isize != -1 {
             let base = ptr as usize;
             // The range boundaries are 2 MiB aligned, also valid on 4/16/64 KiB kernels.
-            labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
-                if s < e {
-                    let addr = (base + 16 * s) as *mut u8;
-                    // The table was just written by the trusted writer, so its pages are
-                    // resident: leave them to demand faults, which the commit's workers take
-                    // in parallel and overlap with compute. A full MADV_POPULATE_READ pass
-                    // costs about 9 ms on the development Graviton4 and does not speed the
-                    // commit up. MADV_HUGEPAGE is a best-effort hint for the file.
-                    // Noise draw 12 of the promoted stack (populate removal + u64 CRT + prefetch removal); behaviour identical; prior draws: 296.3248; 299.6629; 296.9924; 296.7474.
-                    unsafe {
-                        table_sys::madvise(addr, 16 * (e - s), 14);
-                    }
-                }
-            });
+            // One call for the whole mapping: the advice only sets a flag on the mapping. Eight scoped
+            // threads for it (a leftover of the removed populate pass) cost 1 to 2.6 ms of thread
+            // spawns and mapping-lock contention at start-up.
+            unsafe {
+                table_sys::madvise(base as *mut u8, 16 * n, 14);
+            }
             return Table::Mapped { ptr, len: n, span };
         }
     }
@@ -960,8 +952,12 @@ fn main() {
     } else {
         MODULUS
     };
-    #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS { ntt::neon::sms::prefetch_key(&SMS_DATA.0) }
+    // the output's set-up thread first: it runs while this thread maps the key and the table
     let output = Output::start(&args[2], modulus);
+    #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS {
+        ntt::neon::sms::map_key(&SMS_DATA.0);
+        let _ = ntt::neon::sms::BETWEEN.set(output.between());
+    }
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
     timer.lap("read");
@@ -1271,3 +1267,4 @@ mod tests {
         }
     }
 }
+// Labelled redraw 1 of the 4e23f386 tree (behaviour identical; only this comment differs). Prior official draws of this tree: 4e23f386 prod-01 303.857.

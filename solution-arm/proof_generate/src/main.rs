@@ -952,15 +952,21 @@ fn main() {
     } else {
         MODULUS
     };
-    // the output's set-up thread first: it runs while this thread maps the key and the table
+    // The two prologue mappings are independent: the key image re-mapped from /proc/self/exe
+    // (37 MB) runs on its own thread while the output's set-up thread creates and maps the
+    // proof file and this thread maps the witness table. The key is only read when `commit`
+    // builds the SMS matrix, so the join waits for nothing but the map itself.
+    #[cfg(target_arch = "aarch64")]
+    let key = (modulus == ntt::neon::sms::MODULUS).then(|| std::thread::spawn(|| ntt::neon::sms::map_key(&SMS_DATA.0)));
     let output = Output::start(&args[2], modulus);
     #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS {
-        ntt::neon::sms::map_key(&SMS_DATA.0);
         let _ = ntt::neon::sms::BETWEEN.set(output.between());
     }
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
     timer.lap("read");
+    #[cfg(target_arch = "aarch64")]
+    if let Some(key) = key { key.join().expect("key mapping thread panicked"); }
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
     output.write(&proof);
     timer.lap("write");

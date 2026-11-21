@@ -596,7 +596,7 @@ pub(super) fn partial_evals_sets_tiled(
                 // streams than the hardware prefetchers follow.
                 let row = words.as_ptr().add(q * stride + base) as *const u8;
                 if next {
-                    prefetch_l2(row.add(16 * GROUP * PASS), 16 * GROUP * PASS);
+                    prefetch_l2(row.add(2 * 16 * GROUP * PASS), 16 * GROUP * PASS); if base == 0 { prefetch_l2(row.add(16 * GROUP * PASS), 16 * GROUP * PASS); }
                 }
                 for x in 0..count {
                     patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);

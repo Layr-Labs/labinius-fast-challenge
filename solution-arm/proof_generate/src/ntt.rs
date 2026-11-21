@@ -492,6 +492,11 @@ impl Matrix {
     }
 }
 
+/// The number of blocks, and threads, [`for_blocks`] makes of `groups` groups.
+pub fn block_count(groups: usize, align: usize, workers: usize) -> usize {
+    workers.clamp(1, groups.div_ceil(align).max(1))
+}
+
 /// Runs `f(first, block)` on `workers` scoped threads over contiguous blocks of `out`, whose
 /// items come in groups of `unit` (`first` counts groups), block edges on multiples of `align`
 /// groups.
@@ -503,7 +508,7 @@ pub fn for_blocks<T: Send>(
     f: impl Fn(usize, &mut [T]) + Sync,
 ) {
     let groups = out.len() / unit;
-    let workers = workers.clamp(1, groups.div_ceil(align).max(1));
+    let workers = block_count(groups, align, workers);
     let edges: Vec<(usize, usize)> = (0..workers)
         .map(|t| {
             let (s, e) = labinius::par::block(groups, workers, t, align);

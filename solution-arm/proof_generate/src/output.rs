@@ -181,22 +181,18 @@ impl Output {
         let layout = Layout::instance(q);
         let claimed = (0..layout.len().div_ceil(CHUNK)).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
         let state = Arc::new(State { path: path.to_owned(), layout, map: OnceLock::new(), claimed });
-        let mut commitment = vec![0u8; layout.commitment];
-        let addr = commitment.as_mut_ptr() as usize;
-        let bytes = commitment.len();
+        let commitment = vec![0u8; layout.commitment];
         let worker = Arc::downgrade(&state);
         // Kernel-owned code still uses scoped threads. Starting seven spinning workers now
         let setup = std::thread::spawn(move || {
-            // Only what the commit needs, while `main` maps the key and the table: the proof file
-            // (created, sized and mapped, not faulted) and the commitment buffer's pages. The
+            // The proof file (created, sized and mapped, not faulted) and nothing else: the
             // record also built the challenge tables and faulted the whole proof mapping here,
             // and the commit could not start until 2.5 to 3.4 ms after `main`; both now happen
-            // between the commit threads' batch pairs ([`Output::between`]).
+            // between the commit threads' batch pairs ([`Output::between`]). The commitment
+            // buffer is not pre-faulted here either: the commit writes it from its workers as
+            // each batch finishes, so faulting it before the commit only delayed its start.
             let state = worker.upgrade();
             if let Some(state) = &state { let _ = state.mapped(); }
-            for offset in (0..bytes).step_by(4096) {
-                unsafe { core::ptr::write_volatile((addr + offset) as *mut u8, 0); }
-            }
         });
         Self { state, setup: Mutex::new(Some(setup)), populate: OnceLock::new(), commitment: Mutex::new(Some(commitment)) }
     }

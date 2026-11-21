@@ -635,7 +635,7 @@ unsafe fn pass_words(words: &[(*const u8, usize); LANES], elements: usize, e: us
 /// Transforms ahead whose input words [`prefetch_words`] requests (into L2): four transforms span one
 /// element group, so this is `PF_T / 4` element groups (of four elements, eight columns) ahead,
 /// running into the next sweep's first elements at a sweep's end.
-const PF_T: usize = 32;
+const PF_T: usize = 16;
 
 /// Prefetches the input words of transform `t` of a pass starting at element `e` (the lines
 /// [`pass_words`] would address: four consecutive 64-byte elements of two columns). The table
@@ -1174,6 +1174,41 @@ impl Arena {
     }
 }
 
+/// The scratch of every commit thread in one mapping, made before the threads start and left to
+/// process exit. One mapping per thread ([`Arena`]) cost each thread calls that take the
+/// address-space lock for writing as it started and an unmapping, with its TLB shootdown on the
+/// other cores, as it finished: 0.37 to 0.41 ms per thread on an AWS c8g.2xlarge, on the commit's
+/// critical path. The pages are still first touched, and so placed, by the thread that uses them.
+struct Arenas {
+    base: *mut u8,
+    next: std::sync::atomic::AtomicUsize,
+    count: usize,
+}
+// SAFETY: `take` hands every thread a different, disjoint part of the mapping.
+unsafe impl Sync for Arenas {}
+
+impl Arenas {
+    /// A part's size: whole 2 MiB pages, so that no huge page is shared between two threads.
+    const PART: usize = (ARENA + (2 << 20) - 1) / (2 << 20) * (2 << 20);
+
+    fn new(count: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(count * Self::PART, core::mem::align_of::<Scratch>()).expect("the scratch layout");
+        // SAFETY: a nonzero size; zeroed, as every `Arena` is.
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        if base.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Arenas { base, next: std::sync::atomic::AtomicUsize::new(0), count }
+    }
+
+    /// A part no other caller has: `None` once `count` parts are out.
+    fn take(&self) -> Option<*mut Scratch> {
+        let i = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: part `i` lies inside the mapping.
+        (i < self.count).then(|| unsafe { self.base.add(i * Self::PART) } as *mut Scratch)
+    }
+}
+
 impl Drop for Arena {
     fn drop(&mut self) {
         unsafe { std::alloc::dealloc(self.0 as *mut u8, Self::layout()) }
@@ -1220,10 +1255,18 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     assert_eq!(crate::rq::coefficient_bytes(q), W);
     let width = W;
     assert_eq!(out.len(), columns * N * width);
+    let arenas = Arenas::new(crate::ntt::block_count(columns, LANES, workers));
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
         pin_worker(first * workers / columns);
-        let arena = Arena::new();
-        let Scratch { xs, sc, acc, dev, acc2, dev2, dev16, y2, m, nib, y, tail } = &mut *arena.0;
+        let own;
+        let scratch = match arenas.take() {
+            Some(part) => part,
+            None => {
+                own = Arena::new();
+                own.0
+            }
+        };
+        let Scratch { xs, sc, acc, dev, acc2, dev2, dev16, y2, m, nib, y, tail } = &mut *scratch;
         let p = P1 as i16;
         let count = block.len() / (N * width);
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {

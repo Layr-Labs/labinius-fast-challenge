@@ -433,17 +433,26 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 }
 
 /// The same sums without SVE, for development on other AArch64 hosts.
+/// Keys are centered residues mod `P1 = 9721` (`|k| <= 4860`), so four `i16 * i16` products
+/// fit in `i32` (`4 * 32768 * 4860 < 6.4e8 < i32::MAX`), letting `vpaddq_s32` + `vpadalq_s32`
+/// accumulate directly into `int64x2_t` without SIMD-to-GP transfers.
 #[cfg(not(target_feature = "sve"))]
 #[inline(always)]
-unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: int16x8_t) {
+unsafe fn dot_acc(s: &mut [int64x2_t; 4], a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: int16x8_t) {
     let (k0, k1) = (vget_low_s16(key), vget_high_s16(key));
     for q in 0..4 {
-        let pair = |v: int16x8_t, k: int16x4_t| {
-            let (lo, hi) = (vmull_s16(vget_low_s16(v), k), vmull_s16(vget_high_s16(v), k));
-            vcombine_s64(vdup_n_s64(vaddlvq_s32(lo)), vdup_n_s64(vaddlvq_s32(hi)))
-        };
-        *acc.add(q) = vaddq_s64(vaddq_s64(*acc.add(q), pair(a[q], k0)), pair(b[q], k1));
+        let lo = vmlal_s16(vmull_s16(vget_low_s16(a[q]), k0), vget_low_s16(b[q]), k1);
+        let hi = vmlal_s16(vmull_s16(vget_high_s16(a[q]), k0), vget_high_s16(b[q]), k1);
+        s[q] = vpadalq_s32(s[q], vpaddq_s32(lo, hi));
     }
+}
+
+#[cfg(all(not(target_feature = "sve"), test))]
+#[inline(always)]
+unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: int16x8_t) {
+    let mut s = [*acc, *acc.add(1), *acc.add(2), *acc.add(3)];
+    dot_acc(&mut s, a, b, key);
+    (*acc, *acc.add(1), *acc.add(2), *acc.add(3)) = (s[0], s[1], s[2], s[3]);
 }
 
 /// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
@@ -600,18 +609,55 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
         }
     }
     #[cfg(not(target_feature = "sve"))]
-    for g in 0..groups {
-        let tile = keys.add(g * N * ROWS * LOCK);
+    {
+        const KS: usize = N * ROWS * LOCK;
+        let z = xs.as_ptr() as *const int16x8_t;
+        let zero = [vdupq_n_s64(0); 4];
         for s in 0..N {
-            let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *xs[LOCK * g + i].get_unchecked(s));
-            let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
-            for r in 0..ROWS {
-                if FRESH && g == 0 && r > 0 {
-                    for q in 0..4 {
-                        *accp.add(idx(s, r) + q) = vdupq_n_s64(0);
-                    }
+            let ap = accp.add(idx(s, 0));
+            let kp0 = keys.add(s * ROWS * LOCK);
+            let zp0 = z.add(s);
+            let mut r0: [[int64x2_t; 4]; 4] = core::array::from_fn(|r| {
+                if FRESH && r > 0 {
+                    zero
+                } else {
+                    core::array::from_fn(|q| *ap.add(4 * r + q))
                 }
-                dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
+            });
+            for g in 0..groups {
+                let zp = zp0.add(LOCK * g * N);
+                let a = [*zp, *zp.add(N), *zp.add(2 * N), *zp.add(3 * N)];
+                let b = [*zp.add(4 * N), *zp.add(5 * N), *zp.add(6 * N), *zp.add(7 * N)];
+                let kp = kp0.add(g * KS);
+                for r in 0..4 {
+                    dot_acc(&mut r0[r], &a, &b, vld1q_s16(kp.add(r * LOCK)));
+                }
+            }
+            for r in 0..4 {
+                for q in 0..4 {
+                    *ap.add(4 * r + q) = r0[r][q];
+                }
+            }
+            let mut r1: [[int64x2_t; 4]; 3] = core::array::from_fn(|r| {
+                if FRESH {
+                    zero
+                } else {
+                    core::array::from_fn(|q| *ap.add(4 * (4 + r) + q))
+                }
+            });
+            for g in 0..groups {
+                let zp = zp0.add(LOCK * g * N);
+                let a = [*zp, *zp.add(N), *zp.add(2 * N), *zp.add(3 * N)];
+                let b = [*zp.add(4 * N), *zp.add(5 * N), *zp.add(6 * N), *zp.add(7 * N)];
+                let kp = kp0.add(g * KS + 4 * LOCK);
+                for r in 0..3 {
+                    dot_acc(&mut r1[r], &a, &b, vld1q_s16(kp.add(r * LOCK)));
+                }
+            }
+            for r in 0..3 {
+                for q in 0..4 {
+                    *ap.add(4 * (4 + r) + q) = r1[r][q];
+                }
             }
         }
     }

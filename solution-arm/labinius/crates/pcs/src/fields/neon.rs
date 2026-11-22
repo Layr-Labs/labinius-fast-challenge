@@ -628,23 +628,42 @@ impl ByteTables {
     #[inline(always)]
     pub(super) fn apply(&self, x: B128) -> F162 {
         unsafe {
-            let mut lo = vdupq_n_u64(0);
-            let mut top = 0u64;
-            for b in 0..16 {
-                let s = 256 * b + ((x.0 >> (8 * b)) & 255) as usize;
-                lo = veorq_u64(lo, vld1q_u64(self.lo.as_ptr().add(s) as *const u64));
-                top ^= *self.top.get_unchecked(s);
+            let bytes = x.0.to_le_bytes();
+            let lo_ptr = self.lo.as_ptr() as *const u64;
+            let top_ptr = self.top.as_ptr();
+            let mut l0 = vdupq_n_u64(0);
+            let mut l1 = vdupq_n_u64(0);
+            let mut l2 = vdupq_n_u64(0);
+            let mut l3 = vdupq_n_u64(0);
+            let (mut t0, mut t1, mut t2, mut t3) = (0u64, 0u64, 0u64, 0u64);
+            for g in (0..16).step_by(4) {
+                let s0 = 256 * g + bytes[g] as usize;
+                let s1 = 256 * (g + 1) + bytes[g + 1] as usize;
+                let s2 = 256 * (g + 2) + bytes[g + 2] as usize;
+                let s3 = 256 * (g + 3) + bytes[g + 3] as usize;
+                l0 = veorq_u64(l0, vld1q_u64(lo_ptr.add(2 * s0)));
+                l1 = veorq_u64(l1, vld1q_u64(lo_ptr.add(2 * s1)));
+                l2 = veorq_u64(l2, vld1q_u64(lo_ptr.add(2 * s2)));
+                l3 = veorq_u64(l3, vld1q_u64(lo_ptr.add(2 * s3)));
+                t0 ^= *top_ptr.add(s0);
+                t1 ^= *top_ptr.add(s1);
+                t2 ^= *top_ptr.add(s2);
+                t3 ^= *top_ptr.add(s3);
             }
+            let lo = veorq_u64(veorq_u64(l0, l1), veorq_u64(l2, l3));
+            let top = (t0 ^ t1) ^ (t2 ^ t3);
             F162([vgetq_lane_u64::<0>(lo), vgetq_lane_u64::<1>(lo), top])
         }
     }
 }
 
 /// `acc += w * (two words p)`, unreduced (limb product 2 is always zero: B128 has two limbs).
+/// Only the 5 non-zero Karatsuba terms `(0, 1, 3, 4, 5)` are kept to cut register pressure and
+/// scratch bandwidth by 17%.
 #[inline(always)]
-unsafe fn mat_step(acc: &mut [[uint64x2_t; 6]; 2], w: &[uint64x2_t; 6], p: uint64x2x2_t) {
-    let k = [p.0, p.1, vdupq_n_u64(0), x2(p.0, p.1), p.0, p.1];
-    for j in [0, 1, 3, 4, 5] {
+unsafe fn mat_step(acc: &mut [[uint64x2_t; 5]; 2], w: &[uint64x2_t; 5], p: uint64x2x2_t) {
+    let k = [p.0, p.1, x2(p.0, p.1), p.0, p.1];
+    for j in 0..5 {
         acc[0][j] = x2(acc[0][j], pmul_lo(w[j], k[j]));
         acc[1][j] = x2(acc[1][j], pmul_hi(w[j], k[j]));
     }
@@ -656,10 +675,13 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
     let [o0, o1, o2] = out;
     let len = o0.len();
     assert!(o1.len() == len && o2.len() == len && start + len <= stride && len % 2 == 0);
-    let wk: Vec<_> = weights.iter().map(|w| kara(w.0.map(|x| vdupq_n_u64(x)))).collect();
+    let wk: Vec<[uint64x2_t; 5]> = weights.iter().map(|w| {
+        let f = kara(w.0.map(|x| vdupq_n_u64(x)));
+        [f[0], f[1], f[3], f[4], f[5]]
+    }).collect();
     const PAIRS: usize = 74;
     let z = vdupq_n_u64(0);
-    let mut scratch = vec![[[z; 6]; 2]; PAIRS];
+    let mut scratch = [[[z; 5]; 2]; PAIRS];
     for first in (0..len).step_by(2 * PAIRS) {
         let pairs = ((len - first) / 2).min(PAIRS);
         let next = first + 2 * PAIRS < len;
@@ -676,8 +698,8 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
             // halves the L1 refills (a 4-way set cannot hold eight rows' lines between two pairs).
             let mut i = 0;
             while i + 2 <= pairs {
-                let mut a = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
-                let mut b = if group == 0 { [[z; 6]; 2] } else { scratch[i + 1] };
+                let mut a = if group == 0 { [[z; 5]; 2] } else { scratch[i] };
+                let mut b = if group == 0 { [[z; 5]; 2] } else { scratch[i + 1] };
                 for (g, w) in ws.iter().enumerate() {
                     let q = 8 * group + g;
                     let row = words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64;
@@ -689,7 +711,7 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
                 i += 2;
             }
             if i < pairs {
-                let mut acc = if group == 0 { [[z; 6]; 2] } else { scratch[i] };
+                let mut acc = if group == 0 { [[z; 5]; 2] } else { scratch[i] };
                 for (g, w) in ws.iter().enumerate() {
                     let q = 8 * group + g;
                     mat_step(&mut acc, w, vld2q_u64(words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64));
@@ -698,8 +720,14 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
             }
         }
         for (i, acc) in scratch[..pairs].iter().enumerate() {
-            let a = reduce(assemble(acc[0].map(|v| to_u128(v))));
-            let b = reduce(assemble(acc[1].map(|v| to_u128(v))));
+            let a = reduce(assemble([
+                to_u128(acc[0][0]), to_u128(acc[0][1]), 0,
+                to_u128(acc[0][2]), to_u128(acc[0][3]), to_u128(acc[0][4]),
+            ]));
+            let b = reduce(assemble([
+                to_u128(acc[1][0]), to_u128(acc[1][1]), 0,
+                to_u128(acc[1][2]), to_u128(acc[1][3]), to_u128(acc[1][4]),
+            ]));
             let j = first + 2 * i;
             for (dst, k) in [(&mut *o0, 0), (&mut *o1, 1), (&mut *o2, 2)] {
                 dst[j] = a.0[k]; dst[j + 1] = b.0[k];

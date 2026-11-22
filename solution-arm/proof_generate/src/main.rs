@@ -132,16 +132,17 @@ fn threads() -> usize {
 
 /// The read-only file mapping avoids a 256 MiB copy. Other platforms retain the owned path.
 enum Table {
-    #[cfg(all(target_os = "linux", target_endian = "little"))]
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), target_endian = "little"))]
     Mapped { ptr: *mut u8, len: usize, span: usize },
     Owned(Vec<B128>),
 }
 
-#[cfg(all(target_os = "linux", target_endian = "little"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), target_endian = "little"))]
 mod table_sys {
     extern "C" {
         pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
         pub fn munmap(addr: *mut u8, len: usize) -> i32;
+        #[cfg(target_os = "linux")]
         pub fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     }
 }
@@ -151,7 +152,7 @@ impl std::ops::Deref for Table {
 
     fn deref(&self) -> &[B128] {
         match self {
-            #[cfg(all(target_os = "linux", target_endian = "little"))]
+            #[cfg(all(any(target_os = "linux", target_os = "macos"), target_endian = "little"))]
             Self::Mapped { ptr, len, .. } => {
                 // SAFETY: this mapping is read-only, alive until Drop, page aligned, and contains
                 // exactly len little-endian words. B128 is transparent over u128.
@@ -164,7 +165,7 @@ impl std::ops::Deref for Table {
 
 impl Drop for Table {
     fn drop(&mut self) {
-        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        #[cfg(all(any(target_os = "linux", target_os = "macos"), target_endian = "little"))]
         if let Self::Mapped { ptr, span, .. } = self {
             unsafe { table_sys::munmap(*ptr, *span) };
         }
@@ -214,6 +215,16 @@ fn load_table(path: &str, n: usize) -> Table {
             unsafe {
                 table_sys::madvise(base as *mut u8, 16 * n, 14);
             }
+            return Table::Mapped { ptr, len: n, span };
+        }
+    }
+    #[cfg(all(target_os = "macos", target_endian = "little"))]
+    if n != 0 {
+        use std::os::fd::AsRawFd;
+        let span = 16 * n;
+        // PROT_READ (1) | MAP_PRIVATE (2): zero-copy read-only view of the witness table.
+        let ptr = unsafe { table_sys::mmap(std::ptr::null_mut(), span, 1, 2, file.as_raw_fd(), 0) };
+        if ptr as isize != -1 {
             return Table::Mapped { ptr, len: n, span };
         }
     }

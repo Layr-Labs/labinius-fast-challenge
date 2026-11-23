@@ -101,8 +101,11 @@ impl Prepared {
         let ratios = r.iter().zip(&inverses).map(|(&x, &d)| x * d).collect();
         let scale = r[..prefix].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
         let eq = EqFactors::new(&r[prefix..], scale);
-        let parts = par::workers(words.len(), 1 << 16).min(eq.len() / 8);
-        let parts = par::map_blocks(eq.len(), parts, 64.min(eq.len()), |_, start, end| {
+        let workers = par::workers(words.len(), 1 << 16).min(eq.len() / 8);
+        // The persistent pool, not `map_blocks`: a scope spawns seven threads with 2 MiB stacks
+        // and joins them per call, which costs more than the pass's own dispatch.
+        let parts = par::pool().map(workers, |t| {
+            let (start, end) = par::block(eq.len(), workers, t, 64.min(eq.len()));
             neon::partial_evals_sets_tiled(words, eq.len(), start, end, |base, tile| eq.fill(base, tile))
         });
         let mut sets = vec![vec![B128::ZERO; PACK]; 1 << prefix];
@@ -172,7 +175,9 @@ impl<'a> Switch<'a> {
         let l = &self.lt;
         let lp = ByteTables::new(&self.lp);
         let tasks = weights.len() * PACK;
-        let sums = par::map_blocks(tasks, par::workers(tasks, 16), 16, |_, start, end| {
+        let parts = par::workers(tasks, 16);
+        let sums = par::pool().map(parts, |t| {
+            let (start, end) = par::block(tasks, parts, t, 16);
             let mut msg = [F162::ZERO; 2];
             let mut task = start;
             while task < end {
@@ -219,7 +224,8 @@ impl<'a> Switch<'a> {
         let lp = ByteTables::new(&self.lp);
         let p = &self.planes;
         let parts = par::workers(half, 1 << 10);
-        let sums = par::map_blocks(half, parts, 64.min(half), |_, start, end| unsafe {
+        let sums = par::pool().map(parts, |t| unsafe {
+            let (start, end) = par::block(half, parts, t, 64.min(half));
             let mut out = [F162::ZERO; 2];
             let mut eq = [B128::ZERO; 64];
             for base in (start..end).step_by(64) {

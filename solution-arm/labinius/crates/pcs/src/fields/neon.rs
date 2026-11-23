@@ -638,6 +638,30 @@ impl ByteTables {
             F162([vgetq_lane_u64::<0>(lo), vgetq_lane_u64::<1>(lo), top])
         }
     }
+
+    /// [`ByteTables::apply`] of two tables on the same input: the byte index is extracted once,
+    /// and the two tables' independent lookups interleave (the message loops of the switch apply
+    /// `l` and `lp` to every element).
+    #[inline(always)]
+    pub(super) fn apply2(&self, other: &ByteTables, x: B128) -> (F162, F162) {
+        unsafe {
+            let (mut lo0, mut lo1) = (vdupq_n_u64(0), vdupq_n_u64(0));
+            let (mut top0, mut top1) = (0u64, 0u64);
+            let (l0, l1) = (self.lo.as_ptr(), other.lo.as_ptr());
+            let (t0, t1) = (self.top.as_ptr(), other.top.as_ptr());
+            for b in 0..16 {
+                let s = 256 * b + ((x.0 >> (8 * b)) & 255) as usize;
+                lo0 = veorq_u64(lo0, vld1q_u64(l0.add(s) as *const u64));
+                lo1 = veorq_u64(lo1, vld1q_u64(l1.add(s) as *const u64));
+                top0 ^= *t0.add(s);
+                top1 ^= *t1.add(s);
+            }
+            (
+                F162([vgetq_lane_u64::<0>(lo0), vgetq_lane_u64::<1>(lo0), top0]),
+                F162([vgetq_lane_u64::<0>(lo1), vgetq_lane_u64::<1>(lo1), top1]),
+            )
+        }
+    }
 }
 
 /// `acc += w * (two words p)`, unreduced (limb product 2 is always zero: B128 has two limbs).
@@ -716,8 +740,10 @@ pub(super) unsafe fn linear_message(eq: &[B128], lo: [&[u64]; 3], hi: [&[u64]; 3
     let mut acc0 = [vdupq_n_u64(0); 6];
     let mut acci = acc0;
     for j in (0..n / 2 * 2).step_by(2) {
-        let a = [l.apply(eq[j]), l.apply(eq[j + 1])];
-        let d = [lp.apply(eq[j]), lp.apply(eq[j + 1])];
+        let (a0, d0) = l.apply2(lp, eq[j]);
+        let (a1, d1) = l.apply2(lp, eq[j + 1]);
+        let a = [a0, a1];
+        let d = [d0, d1];
         let pack = |a: [F162; 2]| core::array::from_fn(|k| vcombine_u64(vcreate_u64(a[0].0[k]), vcreate_u64(a[1].0[k])));
         let (p0, p1) = (load2(lo, j), load2(hi, j));
         mac2(&mut acc0, pack(a), p0);
@@ -746,8 +772,10 @@ pub(super) unsafe fn fold_linear_message(
     let mut acc0 = [vdupq_n_u64(0); 6];
     let mut acci = acc0;
     for j in (0..n / 2 * 2).step_by(2) {
-        let a = [l.apply(eq[j]), l.apply(eq[j + 1])];
-        let d = [lp.apply(eq[j]), lp.apply(eq[j + 1])];
+        let (a0, d0) = l.apply2(lp, eq[j]);
+        let (a1, d1) = l.apply2(lp, eq[j + 1]);
+        let a = [a0, a1];
+        let d = [d0, d1];
         let pack = |a: [F162; 2]| core::array::from_fn(|k| vcombine_u64(vcreate_u64(a[0].0[k]), vcreate_u64(a[1].0[k])));
         let get = |q: &[&mut [u64]; 3]| core::array::from_fn(|k| vld1q_u64(q[k].as_ptr().add(j)));
         let p0 = fold2(get(&q0), load2(h0, j), rk);

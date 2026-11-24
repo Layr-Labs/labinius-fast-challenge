@@ -443,13 +443,7 @@ pub fn unpack_row_evaluation(bytes: &[u8], count: usize) -> Result<RowEvaluation
 
 /// `F162` elements at 162 bits each, contiguously: `ceil(162 n / 8)` bytes.
 pub fn pack_f162(values: &[F162]) -> Vec<u8> {
-    let mut w = BitWriter::with_capacity(f162_bytes(values.len()));
-    for x in values {
-        w.put_wide(x.0[0], 64);
-        w.put_wide(x.0[1], 64);
-        w.put_wide(x.0[2], F162_BITS - 128);
-    }
-    w.finish()
+    f162_packing::pack(values.iter().map(|value| value.0))
 }
 
 /// The inverse of [`pack_f162`] for `count` elements.
@@ -555,5 +549,6 @@ mod avx512 {
     }
 }
 
+mod f162_packing;
 mod rans;
 pub use rans::*;

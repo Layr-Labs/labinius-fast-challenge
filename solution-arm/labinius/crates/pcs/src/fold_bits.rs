@@ -1657,11 +1657,6 @@ pub mod neon {
         }
     }
 
-    #[inline(always)]
-    unsafe fn prefetch_l2(p: *const u8) {
-        core::arch::asm!("prfm pldl2keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
-    }
-
     /// The fold of block `block` (ring elements `32 block ..`), written to `out[0 .. 32]`.
     /// `claim` is called once, when the last group starts, for the block to run next (whose
     /// first slices are then prefetched); its answer is returned.
@@ -1692,16 +1687,9 @@ pub mod neon {
             for jl in 0..g.columns {
                 slice(src(g.first + jl, block), planes.add(GUARD + jl * STRIDE), tmp);
             }
-            // The next group's 2 KB slices (or the next block's first group's), 64-byte lines
-            // spread over the pairs.
-            let next = if gi + 1 < groups.len() {
-                Some((groups[gi + 1], block))
-            } else {
+            if gi + 1 == groups.len() {
                 claimed = claim();
-                claimed.map(|b| (groups[0], b))
-            };
-            let lines = next.map_or(0, |(n, _)| n.columns * 32);
-            let per = lines.div_ceil(PAIRS);
+            }
             let base = (planes as *const u8).wrapping_sub(16 * BIAS_PLANES);
             for i in 0..PAIRS {
                 let w = *g.win.get_unchecked(i);
@@ -1716,11 +1704,6 @@ pub mod neon {
                     lo.add(2 * LO * i),
                     hi.add(2 * HI * i),
                 );
-                if let Some((n, b)) = next {
-                    for l in per * i..(per * (i + 1)).min(lines) {
-                        prefetch_l2(src(n.first + l / 32, b).add(64 * (l % 32)));
-                    }
-                }
             }
         }
         // The counters as integers.

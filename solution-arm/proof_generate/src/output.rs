@@ -1,9 +1,25 @@
 //! The fixed proof wire layout, encoded directly into preallocated file pages.
 //! The layout and idle-work design follow the x86 track's Output implementation.
-use super::{rq, FoldedWitness, COLUMNS, LIMIT, LOG_PACKED, RING_ELEMENTS};
+use super::{rq, FoldedWitness, COLUMNS, COLUMN_LEN, LIMIT, LOG_PACKED, RING_ELEMENTS};
+use labinius::challenge::ShortChallenge;
+use labinius::fields::scalar::B128;
 use labinius::par;
 use labinius::ring::Representation;
 use std::sync::{Arc, Mutex, OnceLock};
+
+pub(super) enum FoldedData {
+    Witness(FoldedWitness),
+    Encoded { state: Arc<State>, elements: usize },
+}
+
+impl FoldedData {
+    fn element_count(&self) -> usize {
+        match self {
+            Self::Witness(w) => w.elements().len(),
+            Self::Encoded { elements, .. } => *elements,
+        }
+    }
+}
 
 pub(super) struct ProofParts {
     pub modulus: u128,
@@ -12,7 +28,7 @@ pub(super) struct ProofParts {
     pub rounds: Vec<[[u64; 3]; 2]>,
     pub opened: [u64; 3],
     pub row: Vec<u8>,
-    pub folded: FoldedWitness,
+    pub folded: FoldedData,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,7 +57,7 @@ impl Layout {
             partials: p.partials.len(),
             rounds: p.rounds.len(),
             row: p.row.len(),
-            folded: 4 * rq::N * p.folded.elements().len(),
+            folded: 4 * rq::N * p.folded.element_count(),
         }
     }
     fn middle_at(self) -> usize { Self::HEAD + self.commitment }
@@ -52,8 +68,9 @@ impl Layout {
 }
 
 /// # Safety
-/// `out` is writable for exactly `layout.len()` bytes and does not overlap `p`'s storage.
-/// The caller must supply Layout::parts(p). Only disjoint output ranges are sent to workers.
+/// `out` is writable for exactly `layout.len()` bytes and does not overlap `p`'s storage
+/// (except when `p.folded` is `FoldedData::Encoded` for the same mapping, whose folded range is
+/// already in place and left untouched). The caller must supply Layout::parts(p).
 unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
     assert_eq!(layout, Layout::parts(p));
     assert!(layout.len() as u64 <= LIMIT, "proof exceeds the size limit");
@@ -77,36 +94,60 @@ unsafe fn encode_into(p: &ProofParts, layout: Layout, out: *mut u8) {
     put(&mut at, &(layout.folded as u64).to_le_bytes());
     assert_eq!(at, layout.folded_at());
 
-    let elements = p.folded.elements();
-    assert!(elements.iter().all(|e| e.representation == Representation::Coefficients));
     let addr = out as usize;
-    let ctasks = if p.commitment.is_empty() { 0 } else { 4 };
-    let ftasks = if elements.is_empty() { 0 } else { 4 * par::threads() };
-    par::pool().run(ctasks + ftasks, |i| {
-        let out = addr as *mut u8;
-        if i < ctasks {
-            let (s, e) = par::block(p.commitment.len(), ctasks, i, 4096);
-            core::ptr::copy_nonoverlapping(p.commitment.as_ptr().add(s), out.add(Layout::HEAD + s), e - s);
-        } else {
-            let (s, e) = par::block(elements.len(), ftasks, i - ctasks, 1);
-            let mut dst = out.add(layout.folded_at() + 4 * rq::N * s);
-            // The widening loop vectorizes on NEON; the temporary gives it aligned i32 stores.
-            let mut wide = [0i32; rq::N];
-            for element in &elements[s..e] {
-                for (w, &c) in wide.iter_mut().zip(&element.v) { *w = (c as i32).to_le(); }
-                core::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, dst, 4 * rq::N);
-                dst = dst.add(4 * rq::N);
+    match &p.folded {
+        FoldedData::Encoded { state, .. } => {
+            let mapped_base = state.mapped().expect("encoded folded witness requires mapped state").addr;
+            if addr != mapped_base && layout.folded != 0 {
+                core::ptr::copy_nonoverlapping(
+                    (mapped_base + state.layout.folded_at()) as *const u8,
+                    out.add(layout.folded_at()),
+                    layout.folded,
+                );
+            }
+            if !p.commitment.is_empty() {
+                let ctasks = par::threads().clamp(1, 8);
+                par::pool().run(ctasks, |i| {
+                    let out = addr as *mut u8;
+                    let (s, e) = par::block(p.commitment.len(), ctasks, i, 4096);
+                    core::ptr::copy_nonoverlapping(p.commitment.as_ptr().add(s), out.add(Layout::HEAD + s), e - s);
+                });
             }
         }
-    });
+        FoldedData::Witness(folded) => {
+            let elements = folded.elements();
+            assert!(elements.iter().all(|e| e.representation == Representation::Coefficients));
+            let ctasks = if p.commitment.is_empty() { 0 } else { 4 };
+            let ftasks = if elements.is_empty() { 0 } else { 4 * par::threads() };
+            par::pool().run(ctasks + ftasks, |i| {
+                let out = addr as *mut u8;
+                if i < ctasks {
+                    let (s, e) = par::block(p.commitment.len(), ctasks, i, 4096);
+                    core::ptr::copy_nonoverlapping(p.commitment.as_ptr().add(s), out.add(Layout::HEAD + s), e - s);
+                } else {
+                    let (s, e) = par::block(elements.len(), ftasks, i - ctasks, 1);
+                    let mut dst = out.add(layout.folded_at() + 4 * rq::N * s);
+                    // The widening loop vectorizes on NEON; the temporary gives it aligned i32 stores.
+                    let mut wide = [0i32; rq::N];
+                    for element in &elements[s..e] {
+                        for (w, &c) in wide.iter_mut().zip(&element.v) { *w = (c as i32).to_le(); }
+                        core::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, dst, 4 * rq::N);
+                        dst = dst.add(4 * rq::N);
+                    }
+                }
+            });
+        }
+    }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod sys {
     unsafe extern "C" {
+        #[cfg(target_os = "linux")]
         pub fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
         pub fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
         pub fn munmap(addr: *mut u8, len: usize) -> i32;
+        #[cfg(target_os = "linux")]
         pub fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     }
 }
@@ -119,13 +160,13 @@ struct Mapped {
 }
 impl Drop for Mapped {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         unsafe { sys::munmap(self.base as *mut u8, self.span); }
     }
 }
 const CHUNK: usize = 2 << 20;
 
-struct State {
+pub(super) struct State {
     path: String,
     layout: Layout,
     map: OnceLock<Option<Mapped>>,
@@ -154,7 +195,21 @@ impl State {
         unsafe { sys::madvise(ptr, len, 14); }
         Some(Mapped { _file: file, base: base as usize, span, addr })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn create_and_map(&self) -> Option<Mapped> {
+        use std::os::fd::AsRawFd;
+        let len = self.layout.len();
+        if len == 0 { return None; }
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true)
+            .open(&self.path).ok()?;
+        file.set_len(len as u64).ok()?;
+        // PROT_READ | PROT_WRITE = 1 | 2, MAP_SHARED = 0x0001
+        let ptr = unsafe { sys::mmap(core::ptr::null_mut(), len, 1 | 2, 0x0001, file.as_raw_fd(), 0) };
+        if ptr as isize == -1 { return None; }
+        let addr = ptr as usize;
+        Some(Mapped { _file: file, base: addr, span: len, addr })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn create_and_map(&self) -> Option<Mapped> { None }
     fn mapped(&self) -> Option<&Mapped> { self.map.get_or_init(|| self.create_and_map()).as_ref() }
     fn populate(&self, i: usize) {
@@ -252,6 +307,50 @@ impl Output {
         // Ordinary write shares the harness's persistence contract: neither path calls fsync.
         std::fs::write(&self.state.path, encode_vec(p)).expect("write proof");
     }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    pub fn folded_into(&self, values: &[B128], challenges: &[ShortChallenge]) -> Option<FoldedData> {
+        use labinius::fold_bits as fb;
+        if self.state.layout.folded != 4 * rq::N * RING_ELEMENTS {
+            return None;
+        }
+        if challenges.iter().map(|c| c.weight).sum::<usize>() >= (1 << 15) {
+            return None;
+        }
+        self.quiesce();
+        let map = self.state.mapped()?;
+        for i in (self.state.layout.folded_at() / CHUNK)..self.state.claimed.len() {
+            self.state.populate_once(i);
+        }
+        let cs: Vec<fb::Challenge> = challenges
+            .iter()
+            .map(|c| fb::Challenge {
+                positions: c.positions,
+                signs: c.signs,
+                weight: c.weight,
+            })
+            .collect();
+        let words = unsafe { core::slice::from_raw_parts(values.as_ptr() as *const u128, values.len()) };
+        unsafe {
+            fb::neon::fold_into_i32_le(
+                words,
+                COLUMN_LEN,
+                &cs,
+                super::threads(),
+                (map.addr + self.state.layout.folded_at()) as *mut u8,
+            );
+        }
+        Some(FoldedData::Encoded {
+            state: self.state.clone(),
+            elements: RING_ELEMENTS,
+        })
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    pub fn folded_into(&self, _values: &[B128], _challenges: &[ShortChallenge]) -> Option<FoldedData> {
+        None
+    }
+
     fn quiesce(&self) {
         self.finish_setup();
         if let Some(job) = self.populate.get() { par::pool().quiesce(job); }
@@ -327,19 +426,23 @@ mod tests {
         if let Some(first) = elements.first_mut() {
             first.v[..5].copy_from_slice(&[i16::MIN, -1, 0, 1, i16::MAX]);
         }
-        let p = ProofParts {
-            modulus: 35039150080,
-            commitment: (0..n * 648 + 3).map(|_| next() as u8).collect(),
+        let fw = FoldedWitness::of(elements);
+        let reference = Proof {
+            version: 1, modulus: 35039150080, commitment: (0..n * 648 + 3).map(|_| next() as u8).collect(),
             partials: (0..n + 2).map(|_| (next() as u128) << 64 | next() as u128).collect(),
             rounds: (0..n + 1).map(|_| [[next(), next(), next()], [next(), next(), next()]]).collect(),
             opened: [next(), next(), next()],
             row: (0..n * 13 + 1).map(|_| next() as u8).collect(),
-            folded: FoldedWitness::of(elements),
+            folded: pack_folded(&fw),
         };
-        let reference = Proof {
-            version: 1, modulus: p.modulus, commitment: p.commitment.clone(),
-            partials: p.partials.clone(), rounds: p.rounds.clone(), opened: p.opened,
-            row: p.row.clone(), folded: pack_folded(&p.folded),
+        let p = ProofParts {
+            modulus: reference.modulus,
+            commitment: reference.commitment.clone(),
+            partials: reference.partials.clone(),
+            rounds: reference.rounds.clone(),
+            opened: reference.opened,
+            row: reference.row.clone(),
+            folded: FoldedData::Witness(fw),
         };
         let bytes = codec().serialize(&reference).unwrap();
         (p, bytes)
@@ -374,8 +477,9 @@ mod tests {
     fn test_output(path: &str, layout: Layout, force_write: bool) -> Output {
         let map = OnceLock::new();
         if force_write { assert!(map.set(None).is_ok()); }
+        let claimed = (0..layout.len().div_ceil(CHUNK)).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
         Output {
-            state: Arc::new(State { path: path.to_owned(), layout, map }),
+            state: Arc::new(State { path: path.to_owned(), layout, map, claimed }),
             setup: Mutex::new(None),
             populate: OnceLock::new(),
             commitment: Mutex::new(None),
@@ -391,7 +495,7 @@ mod tests {
                 let output = test_output(path.to_str().unwrap(), Layout::parts(&p), force_write);
                 output.populate();
                 output.write(&p);
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 if !force_write { assert!(output.state.mapped().is_some(), "test filesystem must support mapping"); }
                 assert_eq!(std::fs::read(&path).unwrap(), want, "n {n}, fallback {force_write}");
                 drop(output);

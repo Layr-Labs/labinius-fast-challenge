@@ -1830,6 +1830,168 @@ pub mod neon {
         out
     }
 
+    /// The fold of block `block` (ring elements `32 block ..`), sign-extended to 32-bit
+    /// little-endian wire coefficients at `out[0 .. 32 * 648 * 4]`.
+    ///
+    /// # Safety
+    /// Same `words` preconditions as [`fold_block`]; `out` addresses `32 * 648 * 4` writable bytes.
+    #[cfg(target_endian = "little")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fold_block_i32_le(
+        words: *const u128,
+        column_words: usize,
+        groups: &[&Group],
+        bias: &[i32; SLOTS + 1],
+        block: usize,
+        claim: &mut dyn FnMut() -> Option<usize>,
+        ws: &mut Workspace,
+        out: *mut u8,
+    ) -> Option<usize> {
+        let z = vdupq_n_u8(0);
+        ws.lo.fill(z);
+        ws.hi.fill(z);
+        let planes = ws.planes.as_mut_ptr();
+        let (lo, hi, tmp) = (ws.lo.as_mut_ptr(), ws.hi.as_mut_ptr(), ws.tmp.as_mut_ptr());
+        let src = |column: usize, block: usize| words.add(column * column_words + block * LANES) as *const u8;
+        let mut claimed = None;
+        for (gi, g) in groups.iter().enumerate() {
+            for jl in 0..g.columns {
+                slice(src(g.first + jl, block), planes.add(GUARD + jl * STRIDE), tmp);
+            }
+            let next = if gi + 1 < groups.len() {
+                Some((groups[gi + 1], block))
+            } else {
+                claimed = claim();
+                claimed.map(|b| (groups[0], b))
+            };
+            let lines = next.map_or(0, |(n, _)| n.columns * 32);
+            let per = lines.div_ceil(PAIRS);
+            let base = (planes as *const u8).wrapping_sub(16 * BIAS_PLANES);
+            for i in 0..PAIRS {
+                let w = *g.win.get_unchecked(i);
+                let be = base.wrapping_add(32 * i);
+                pass(
+                    be,
+                    g.list[0].as_ptr().add(w[0] as usize),
+                    (w[1] - w[0]) as usize / SUB,
+                    g.list[1].as_ptr().add(w[2] as usize),
+                    (w[3] - w[2]) as usize / SUB,
+                    g.tail.get_unchecked(i),
+                    lo.add(2 * LO * i),
+                    hi.add(2 * HI * i),
+                );
+                if let Some((n, b)) = next {
+                    for l in per * i..(per * (i + 1)).min(lines) {
+                        prefetch_l2(src(n.first + l / 32, b).add(64 * (l % 32)));
+                    }
+                }
+            }
+        }
+        for s in 0..SLOTS {
+            let (i, odd) = (s / 2, s % 2);
+            let l = lo.add(2 * LO * i + LO * odd);
+            let h = hi.add(2 * HI * i + HI * odd);
+            let p: [V; 16] = core::array::from_fn(|b| {
+                if b < LO {
+                    *l.add(b)
+                } else if b < LO + HI {
+                    *h.add(b - LO)
+                } else {
+                    z
+                }
+            });
+            ws.counts[s] = unslice(p);
+        }
+        let mut overflow = vdupq_n_s16(0);
+        for s in 0..Q162 {
+            let below = s < 81;
+            let t = if below { s + 162 } else { s + 81 };
+            let bs = vdupq_n_s16(bias[s] as i16);
+            let bt = vdupq_n_s16(bias[t] as i16);
+            let (cs, ct) = (&ws.counts[s], &ws.counts[t]);
+            for r in 0..16 {
+                let x = vsubq_s16(vreinterpretq_s16_u16(cs[r]), bs);
+                let y = vsubq_s16(vreinterpretq_s16_u16(ct[r]), bt);
+                let (v, sat) = if below {
+                    (vsubq_s16(x, y), vqsubq_s16(x, y))
+                } else {
+                    (vaddq_s16(x, y), vqaddq_s16(x, y))
+                };
+                overflow = vorrq_s16(overflow, veorq_s16(v, sat));
+                let w0 = vreinterpretq_u8_s32(vmovl_s16(vget_low_s16(v)));
+                let w1 = vreinterpretq_u8_s32(vmovl_high_s16(v));
+                vst1q_u8(out.add(4 * ((2 * r) * N + 4 * s)), w0);
+                vst1q_u8(out.add(4 * ((2 * r + 1) * N + 4 * s)), w1);
+            }
+        }
+        assert!(
+            vmaxvq_u16(vreinterpretq_u16_s16(overflow)) == 0,
+            "a fold coefficient does not fit the wire codec"
+        );
+        claimed
+    }
+
+    /// [`fold`], written directly as 32-bit little-endian wire coefficients into `dst`
+    /// (`(column_words / 4) * 648 * 4` bytes).
+    ///
+    /// # Safety
+    /// `dst` is uniquely writable for `(column_words / 4) * N * 4` bytes and does not alias `words`.
+    #[cfg(target_endian = "little")]
+    pub unsafe fn fold_into_i32_le(
+        words: &[u128],
+        column_words: usize,
+        challenges: &[Challenge],
+        threads: usize,
+        dst: *mut u8,
+    ) {
+        use std::sync::OnceLock;
+        assert!(column_words % LANES == 0, "a column is whole blocks");
+        assert_eq!(words.len(), challenges.len() * column_words, "one challenge per column");
+        assert!(fits(challenges), "the counters would overflow");
+        let blocks = column_words / LANES;
+        let ngroups = groups(challenges.len());
+        let built: Vec<OnceLock<Group>> = (0..ngroups).map(|_| OnceLock::new()).collect();
+        let workers = threads.clamp(1, blocks.max(1));
+        let pool = crate::par::pool();
+        pool.run(ngroups, |g| {
+            let _ = built[g].set(Group::of(challenges, g));
+        });
+        let groups: Vec<&Group> = built.iter().map(|g| g.get().expect("every group is built")).collect();
+        let bias = bias(groups.iter().copied());
+        let out_addr = dst as usize;
+        let words_addr = words.as_ptr() as usize;
+        let (groups, bias) = (&groups, &bias);
+        pool.run(workers, |w| {
+            let mut ws = Workspace::new();
+            let mut n = w * blocks / workers;
+            let end = (w + 1) * blocks / workers;
+            let mut claim = || {
+                if n < end {
+                    let b = n;
+                    n += 1;
+                    Some(b)
+                } else {
+                    None
+                }
+            };
+            let mut block = claim();
+            while let Some(b) = block {
+                block = unsafe {
+                    fold_block_i32_le(
+                        words_addr as *const u128,
+                        column_words,
+                        groups,
+                        bias,
+                        b,
+                        &mut claim,
+                        &mut ws,
+                        (out_addr as *mut u8).add(b * BLOCK_ELEMENTS * N * 4),
+                    )
+                };
+            }
+        });
+    }
+
     #[cfg(test)]
     mod tests {
         use super::super::{reference_element, tests_support::*, Challenge, WORD_BITS};

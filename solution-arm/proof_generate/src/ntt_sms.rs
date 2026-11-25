@@ -1241,7 +1241,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
         let mut targets: Vec<&mut [u8]> = block.chunks_mut(LANES * N * width).collect();
         for b in 0..batches {
             // pairs of batches share one key sweep; the second one's results wait in `*2`
-            if b % 2 == 0 {
+            let (cur_dev, cur_y): (&[int32x4_t], &[int16x8_t; N]) = if b % 2 == 0 {
                 dev.fill(vdupq_n_s32(0));
                 if b + 1 < batches {
                     dev2.fill(vdupq_n_s32(0));
@@ -1251,17 +1251,17 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                 } else {
                     sums(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
                 }
+                (&dev[..], &*y)
             } else {
-                core::mem::swap(dev, dev2);
-                core::mem::swap(y, y2);
-            }
+                (&dev2[..], &*y2)
+            };
             let target = &mut *targets[b];
             // The base row's centered residues (`|x| <= (p - 1) / 2`, [`super::inverse`]) to
             // `[0, p)` lane-wise, eight columns per vector: `+ p` where negative, as `rem_euclid`.
             let pv = vdupq_n_s16(p);
             let mut base = [[0u16; LANES]; N];
             for (k, b) in base.iter_mut().enumerate() {
-                let v = y[k];
+                let v = cur_y[k];
                 let v = vaddq_s16(v, vandq_s16(vreinterpretq_s16_u16(vcltzq_s16(v)), pv));
                 vst1q_u16(b.as_mut_ptr(), vreinterpretq_u16_s16(v));
             }
@@ -1275,8 +1275,8 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     let (u, v) = lattice::WEIGHTS[d];
                     let w = u + v;
                     for half in 0..2 {
-                        let x = dev[d * 2 * N + 2 * k + half];
-                        let y = dev[d * 2 * N + 2 * h + half];
+                        let x = cur_dev[d * 2 * N + 2 * k + half];
+                        let y = cur_dev[d * 2 * N + 2 * h + half];
                         let (xl, yl) = (vget_low_s32(x), vget_low_s32(y));
                         let (i, j) = (2 * half, 2 * half + 1);
                         lo[i] = vmlal_n_s32(lo[i], xl, u);

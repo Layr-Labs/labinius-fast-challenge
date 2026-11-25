@@ -10,7 +10,7 @@
 //! product. The field switch, row evaluation, and fold follow the checker's reference prover.
 mod hugealloc;
 mod output;
-use output::{Output, ProofParts};
+use output::{FoldedData, Output, ProofParts};
 mod ntt;
 
 #[global_allocator]
@@ -913,7 +913,9 @@ fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, out
     let row = RowEvaluation::of(row_evaluate(values, &p0));
     timer.lap("row");
     let challenges = folding_challenges(&mut t, &row);
-    let folded = FoldedWitness::of(fold(values, &challenges));
+    let folded = output
+        .folded_into(values, &challenges)
+        .unwrap_or_else(|| FoldedData::Witness(FoldedWitness::of(fold(values, &challenges))));
     timer.lap("fold");
     ProofParts {
         modulus,

@@ -1099,7 +1099,7 @@ pub mod neon {
     /// Slot pairs; the odd slot of the last pair (243) is a dummy.
     const PAIRS: usize = SLOTS.div_ceil(2);
     /// Most columns per group: the groups split the columns as evenly as they can.
-    pub const GROUP: usize = 30;
+    pub const GROUP: usize = 26;
     /// Zero planes in front of the first column (plane 1 is column 0's leading guard).
     const GUARD: usize = 2;
     /// Planes per column: 128 and the trailing zero guard (the next column's leading guard).
@@ -1775,6 +1775,7 @@ pub mod neon {
 
     /// `v = sum_j c_j W_j` for every ring element of the `columns` columns of `column_words`
     pub fn fold(words: &[u128], column_words: usize, challenges: &[Challenge], threads: usize) -> Vec<RingElement> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::OnceLock;
         assert!(column_words % LANES == 0, "a column is whole blocks");
         assert_eq!(words.len(), challenges.len() * column_words, "one challenge per column");
@@ -1793,20 +1794,13 @@ pub mod neon {
         let mut out: Vec<RingElement> = Vec::with_capacity(elements);
         let out_addr = out.as_mut_ptr() as usize;
         let words_addr = words.as_ptr() as usize;
+        let next = AtomicUsize::new(0);
         let (groups, bias) = (&groups, &bias);
-        pool.run(workers, |w| {
+        pool.run(workers, |_| {
             let mut ws = Workspace::new();
-            // Each worker folds one contiguous run of blocks, so its table reads stay sequential.
-            let mut n = w * blocks / workers;
-            let end = (w + 1) * blocks / workers;
             let mut claim = || {
-                if n < end {
-                    let b = n;
-                    n += 1;
-                    Some(b)
-                } else {
-                    None
-                }
+                let b = next.fetch_add(1, Ordering::Relaxed);
+                (b < blocks).then_some(b)
             };
             let mut block = claim();
             while let Some(b) = block {

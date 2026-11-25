@@ -133,7 +133,7 @@ fn threads() -> usize {
 /// The read-only file mapping avoids a 256 MiB copy. Other platforms retain the owned path.
 enum Table {
     #[cfg(all(target_os = "linux", target_endian = "little"))]
-    Mapped { ptr: *mut u8, len: usize, span: usize },
+    Mapped { ptr: *mut u8, len: usize },
     Owned(Vec<B128>),
 }
 
@@ -152,7 +152,7 @@ impl std::ops::Deref for Table {
     fn deref(&self) -> &[B128] {
         match self {
             #[cfg(all(target_os = "linux", target_endian = "little"))]
-            Self::Mapped { ptr, len, .. } => {
+            Self::Mapped { ptr, len } => {
                 // SAFETY: this mapping is read-only, alive until Drop, page aligned, and contains
                 // exactly len little-endian words. B128 is transparent over u128.
                 unsafe { std::slice::from_raw_parts(*ptr as *const B128, *len) }
@@ -165,8 +165,29 @@ impl std::ops::Deref for Table {
 impl Drop for Table {
     fn drop(&mut self) {
         #[cfg(all(target_os = "linux", target_endian = "little"))]
-        if let Self::Mapped { ptr, span, .. } = self {
-            unsafe { table_sys::munmap(*ptr, *span) };
+        if let Self::Mapped { ptr, len } = self {
+            unsafe { table_sys::munmap(*ptr, 16 * *len) };
+        }
+    }
+}
+
+impl Table {
+    /// MADV_DONTNEED over a mapped witness table after its last read phase: with the
+    /// pool still warm the kernel drops the 256 MiB mapping's page-table entries in
+    /// parallel, so process exit does not walk them single-threaded on the way out.
+    /// The mapping is read-only MAP_PRIVATE: the file backing is untouched, the file
+    /// bytes and every proof byte are unchanged, and a later fault would just refault.
+    /// An owned table keeps its memory (DONTNEED would zero it, and it is private).
+    pub fn release_pages(&self) {
+        #[cfg(all(target_os = "linux", target_endian = "little"))]
+        if let Self::Mapped { ptr, len } = self {
+            let addr = *ptr as usize;
+            labinius::par::map_blocks_scoped(*len, threads(), (2 << 20) / 16, |_, s, e| {
+                if s < e {
+                    // MADV_DONTNEED, the same advice the load path gives in parallel.
+                    unsafe { table_sys::madvise((addr + 16 * s) as *mut u8, 16 * (e - s), 4) };
+                }
+            });
         }
     }
 }
@@ -183,38 +204,23 @@ fn load_table(path: &str, n: usize) -> Table {
     #[cfg(all(target_os = "linux", target_endian = "little"))]
     if n != 0 {
         use std::os::fd::AsRawFd;
-        // Keep the file offset and virtual address aligned for large file-page mappings.
-        // MAP_FIXED only replaces this thread's own PROT_NONE reservation. The mapped
-        // span can extend past a short test file, but no access extends past its words.
-        const HUGE: usize = 2 << 20;
-        let span = (16 * n).next_multiple_of(HUGE);
-        let ptr = unsafe {
-            let raw = table_sys::mmap(std::ptr::null_mut(), span + HUGE, 0, 2 | 0x20, -1, 0);
-            if raw as isize == -1 {
-                raw
-            } else {
-                let start = raw as usize;
-                let aligned = (start + HUGE - 1) & !(HUGE - 1);
-                let head = aligned - start;
-                if head != 0 { table_sys::munmap(raw, head); }
-                let tail = HUGE - head;
-                if tail != 0 { table_sys::munmap((aligned + span) as *mut u8, tail); }
-                // PROT_READ | MAP_PRIVATE: the trusted input is never writable.
-                let ptr = table_sys::mmap(aligned as *mut u8, span, 1, 2 | 0x10, file.as_raw_fd(), 0);
-                if ptr as isize == -1 { table_sys::munmap(aligned as *mut u8, span); }
-                ptr
-            }
-        };
+        // PROT_READ | MAP_PRIVATE: the trusted input is never writable.
+        let ptr = unsafe { table_sys::mmap(std::ptr::null_mut(), 16 * n, 1, 2, file.as_raw_fd(), 0) };
         if ptr as isize != -1 {
             let base = ptr as usize;
             // The range boundaries are 2 MiB aligned, also valid on 4/16/64 KiB kernels.
-            // One call for the whole mapping: the advice only sets a flag on the mapping. Eight scoped
-            // threads for it (a leftover of the removed populate pass) cost 1 to 2.6 ms of thread
-            // spawns and mapping-lock contention at start-up.
-            unsafe {
-                table_sys::madvise(base as *mut u8, 16 * n, 14);
-            }
-            return Table::Mapped { ptr, len: n, span };
+            labinius::par::map_blocks_scoped(n, threads(), (2 << 20) / 16, |_, s, e| {
+                if s < e {
+                    let addr = (base + 16 * s) as *mut u8;
+                    // Linux 5.14+: install the page-cache pages in parallel. Older kernels
+                    // simply fault on access. MADV_HUGEPAGE is a best-effort hint for the file.
+                    unsafe {
+                        table_sys::madvise(addr, 16 * (e - s), 14);
+                        table_sys::madvise(addr, 16 * (e - s), 22);
+                    }
+                }
+            });
+            return Table::Mapped { ptr, len: n };
         }
     }
     let mut words = vec![0u128; n];
@@ -371,38 +377,34 @@ fn reduce(raw: &[u64], q: u64) -> Vec<u128> {
 /// registers, so the accumulator is read and written once per block instead of once per group.
 ///
 /// The default modulus [`ntt::MODULUS`] goes through the transforms of [`ntt`] instead.
-fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
+fn commit(values: &[B128], modulus: u128) -> Vec<u128> {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
         use ntt::neon::sms;
         let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
-        sms::commit(values, &matrix, threads(), modulus, out);
-        return;
+        return sms::commit(values, &matrix, threads());
     }
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::hybrid::MODULUS {
         use ntt::neon::hybrid;
         let matrix = hybrid::HybridMatrix::from_image(&HYBRID_MATRIX.0, RING_ELEMENTS)
             .unwrap_or_else(|| hybrid::matrix(RING_ELEMENTS, threads()));
-        output::pack_into(&hybrid::commit(values, &matrix, threads()), modulus, out);
-        return;
+        return hybrid::commit(values, &matrix, threads());
     }
     if modulus == ntt::MODULUS {
-        output::pack_into(&ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads()), modulus, out);
-        return;
+        return ntt::commit(values, &ntt::matrix(RING_ELEMENTS, threads()), threads());
     }
     let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
     if modulus >= FAST_MODULUS {
-        output::pack_into(&commit_reference(values, &matrix, modulus), modulus, out);
-        return;
+        return commit_reference(values, &matrix, modulus);
     }
     let matrix: Vec<u64> = matrix.iter().map(|&a| a as u64).collect();
     let q = modulus as u64;
     let per = COLUMNS.div_ceil(threads());
-    let mut coeffs = vec![0u128; COLUMNS * rq::N];
+    let mut out = vec![0u128; COLUMNS * rq::N];
     std::thread::scope(|scope| {
-        for (block, first) in coeffs.chunks_mut(per * rq::N).zip((0..).step_by(per)) {
+        for (block, first) in out.chunks_mut(per * rq::N).zip((0..).step_by(per)) {
             let matrix = &matrix;
             scope.spawn(move || {
                 let count = block.len() / rq::N;
@@ -428,7 +430,7 @@ fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
             });
         }
     });
-    output::pack_into(&coeffs, modulus, out);
+    out
 }
 
 /// The checker's schoolbook commitment, for a modulus too wide for [`commit`]'s `u64` lanes.
@@ -488,7 +490,7 @@ fn row_evaluate(values: &[B128], p0: &[F162]) -> Vec<F162> {
     out
 }
 
-const ROW_BATCH: usize = 4;
+const ROW_BATCH: usize = 32;
 
 /// The sumcheck coordinates split into the row point `p0` and the column point `p1`.
 fn split_point(coords: &[F162]) -> (Vec<F162>, Vec<F162>) {
@@ -896,8 +898,9 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
-    let mut commitment = output.commitment_buffer();
-    commit(values, modulus, &mut commitment);
+    let coefficients = commit(values, modulus);
+    let commitment = output::pack_commitment(&coefficients, modulus, output.commitment_buffer());
+    std::mem::forget(coefficients);
     labinius::par::pool();
     timer.lap("commit");
     // No output prefault here: the switch that follows runs on every core from its first
@@ -952,16 +955,15 @@ fn main() {
     } else {
         MODULUS
     };
-    // the output's set-up thread first: it runs while this thread maps the key and the table
+    #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS { ntt::neon::sms::prefetch_key(&SMS_DATA.0) }
     let output = Output::start(&args[2], modulus);
-    #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS {
-        ntt::neon::sms::map_key(&SMS_DATA.0);
-        let _ = ntt::neon::sms::BETWEEN.set(output.between());
-    }
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
     timer.lap("read");
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
+    // The fold's pass was the mapped table's last read: drop its page-table entries in
+    // parallel here so process exit does not walk them. Proof bytes are unchanged.
+    values.release_pages();
     output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));
@@ -969,23 +971,6 @@ fn main() {
     // mappings together, instead of walking their Rust destructors first.
     std::mem::forget((values, proof, output));
     std::process::exit(0);
-}
-
-#[cfg(test)]
-fn unpack(bytes: &[u8], q: u128) -> Vec<u128> {
-    let w = rq::coefficient_bytes(q);
-    bytes.chunks_exact(w).map(|s| {
-        let mut b = [0u8; 16];
-        b[..w].copy_from_slice(s);
-        u128::from_le_bytes(b)
-    }).collect()
-}
-
-#[cfg(test)]
-fn sms_packed(values: &[B128], a: &ntt::neon::sms::SmsMatrix, workers: usize, q: u128) -> Vec<u8> {
-    let mut out = vec![0u8; values.len() / (4 * a.elements) * rq::N * rq::coefficient_bytes(q)];
-    ntt::neon::sms::commit(values, a, workers, q, &mut out);
-    out
 }
 
 #[cfg(test)]
@@ -1003,12 +988,6 @@ mod tests {
             std::fs::write(&path, &bytes).unwrap();
             let table = load_table(path.to_str().unwrap(), n);
             assert_eq!(&*table, &words);
-            #[cfg(all(target_os = "linux", target_endian = "little"))]
-            if let Table::Mapped { ptr, len, span } = &table {
-                assert_eq!(*ptr as usize % (2 << 20), 0);
-                assert_eq!(*len, n);
-                assert!(*span >= 16 * n && *span % (2 << 20) == 0);
-            }
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
         std::fs::remove_file(path).unwrap();
@@ -1067,7 +1046,7 @@ mod tests {
         let a = sms::matrix(RING_ELEMENTS, 8);
         eprintln!("sms margin {}", a.margin);
         for workers in [1, 3] {
-            assert!(unpack(&sms_packed(&values, &a, workers, q), q) == want, "workers {workers}");
+            assert!(sms::commit(&values, &a, workers) == want, "workers {workers}");
         }
         // a short last chunk and a short last lockstep group, partial batches; the last sweep of
         // the column with one to four tiles (whole and short), a column of one short tile, and a
@@ -1077,7 +1056,7 @@ mod tests {
             let matrix = rq::ajtai_matrix(q, elements);
             let want = commit_reference(&values, &matrix, q);
             let a = sms::matrix(elements, 3);
-            assert!(unpack(&sms_packed(&values, &a, 3, q), q) == want, "{elements} elements");
+            assert!(sms::commit(&values, &a, 3) == want, "{elements} elements");
         }
     }
     /// With every repair threshold at zero each chunk deviation is recomputed exactly by
@@ -1092,7 +1071,7 @@ mod tests {
             let want = commit_reference(&values, &matrix, q);
             let mut a = sms::matrix(elements, 3);
             a.threshold = std::borrow::Cow::Owned(vec![0; a.threshold.len()]);
-            assert!(unpack(&sms_packed(&values, &a, 3, q), q) == want, "{elements} elements, every coefficient repaired");
+            assert!(sms::commit(&values, &a, 3) == want, "{elements} elements, every coefficient repaired");
         }
     }
     #[test]
@@ -1165,9 +1144,7 @@ mod tests {
                 }
             })
             .collect();
-        let mut packed = vec![0u8; COLUMNS * rq::N * rq::coefficient_bytes(modulus)];
-        commit(&values, modulus, &mut packed);
-        let fast = unpack(&packed, modulus);
+        let fast = commit(&values, modulus);
         let matrix = rq::ajtai_matrix(modulus, RING_ELEMENTS);
         for j in 0..2 {
             let witness: Vec<F162> = values[j * COLUMN_LEN..][..COLUMN_LEN]

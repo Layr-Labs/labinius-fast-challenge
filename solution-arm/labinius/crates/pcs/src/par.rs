@@ -225,25 +225,15 @@ impl Drop for AbortOnPanic {
 
 type Task = dyn Fn(usize) + Sync;
 
-/// Dispatch claims and completion polling have different readers. Keep their writes off
-/// each other's cache line while workers wait for the next phase.
-#[repr(align(128))]
-struct CacheLine<T>(T);
-
-impl<T> core::ops::Deref for CacheLine<T> {
-    type Target = T;
-    fn deref(&self) -> &T { &self.0 }
-}
-
 struct Shared {
-    claim: CacheLine<AtomicU64>,
+    claim: AtomicU64,
     /// The current dispatch's closure. Written by the dispatcher before it publishes the claim
     /// word, read by a runner after its `fetch_add` returned an unfinished task of that dispatch:
     /// the dispatcher does not return, and so neither replaces nor frees it, before every task
     /// is done.
     job: UnsafeCell<Option<&'static Task>>,
     /// Tasks of the current dispatch that have finished.
-    done: CacheLine<AtomicUsize>,
+    done: AtomicUsize,
     /// Workers parked on `wake`.
     sleepers: AtomicUsize,
     /// The dispatcher is parked on `finished`.
@@ -329,9 +319,9 @@ impl Pool {
         // One per pool, alive as long as any of its workers: the process's pool is never
         // dropped, and a test pool's few hundred bytes are not worth reclaiming.
         let shared: &'static Shared = Box::leak(Box::new(Shared {
-            claim: CacheLine(AtomicU64::new(0)),
+            claim: AtomicU64::new(0),
             job: UnsafeCell::new(None),
-            done: CacheLine(AtomicUsize::new(0)),
+            done: AtomicUsize::new(0),
             sleepers: AtomicUsize::new(0),
             waiting: AtomicBool::new(false),
             busy: AtomicBool::new(false),

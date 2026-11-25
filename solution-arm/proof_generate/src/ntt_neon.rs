@@ -14,7 +14,7 @@
 //!
 //! The SMS commitment ([`sms`]) runs levels 0 to 2 and the level-3 twiddles as lookups instead
 //! ([`nibbles`], [`pass_lut`]): per level-1 node, 16-entry `i16` tables indexed by the nibble of
-//! the coefficients `j + 162 g`, one SVE2 halfword `tbl` per lookup and two lookups per level-3 input,
+//! the coefficients `j + 162 g`, one `vqtbl2q_u8` per lookup and two lookups per level-3 input,
 //! within [`super::lut_transform_bound`] (the library's x86 `bin_asm` does the same).
 use super::{for_blocks, primes, schedule, Matrix, Schedule, ALL, FIRST, FIRST13, N, PRIMES, ROW, SCHEDULES};
 use core::arch::aarch64::*;
@@ -358,19 +358,12 @@ unsafe fn pass_a(m: &[int16x8_t; BITS], x: &mut [int16x8_t; N], kern: &Kernel) {
 /// Coefficient groups of the nibble tables: group `j < 162` is the coefficients `j + 162 g`.
 const GROUPS: usize = N / 4;
 
-/// `out[j]`, lane `c`: column `c`'s nibble `v` at group `j` (bit `g` set where coefficient
-/// `j + 162 g` is; coefficients from 512 on are zero), the index of entry `v` of a 16-entry
-/// `i16` table ([`look`]): the byte pair `(2 v, 2 v + 1)` for the NEON form, a `u16` for SVE2's
-/// halfword `tbl`.
+/// `out[j]`, lane `c`: the byte pair `(2 v, 2 v + 1)` of column `c`'s nibble `v` at group `j`
+/// (bit `g` set where coefficient `j + 162 g` is; coefficients from 512 on are zero), the
+/// `vqtbl2q_u8` index of entry `v` of a 16-entry `i16` table.
 #[inline(always)]
 unsafe fn nibbles(m: &[int16x8_t; BITS], out: &mut [uint8x16_t; GROUPS]) {
-    #[cfg(target_feature = "sve")]
-    let (lo, c0) = (vdupq_n_u16(0), vdupq_n_u16(1));
-    #[cfg(target_feature = "sve")]
-    let (c1, c2, c3) = (vdupq_n_u16(2), vdupq_n_u16(4), vdupq_n_u16(8));
-    #[cfg(not(target_feature = "sve"))]
     let (lo, c0) = (vdupq_n_u16(0x0100), vdupq_n_u16(0x0302));
-    #[cfg(not(target_feature = "sve"))]
     let (c1, c2, c3) = (vdupq_n_u16(0x0404), vdupq_n_u16(0x0808), vdupq_n_u16(0x1010));
     let mask = |i: usize| vreinterpretq_u16_s16(*m.get_unchecked(i));
     for j in 0..GROUPS {
@@ -382,17 +375,6 @@ unsafe fn nibbles(m: &[int16x8_t; BITS], out: &mut [uint8x16_t; GROUPS]) {
         }
         *out.get_unchecked_mut(j) = vreinterpretq_u8_u16(r);
     }
-}
-
-/// Byte offset of slot `s < GROUPS` in the packed index buffer that [`indices`] writes and
-/// `pass_lut_asm` reads: eight bytes per slot, lane `c` = column `c`'s nibble, which the
-/// consumer's SVE `ld1b {z.h}` zero-extends into the `u16` index [`nibbles`] computes (the
-/// former zip with zero). Slot `s = 4 (16 G + q) + K` sits in the 16-byte vector
-/// `2 ((4 G + q % 4) 4 + K) + (q / 4) % 2`, half `q / 8`: one plain store per nibble vector.
-pub const fn packed_slot(s: usize) -> usize {
-    let (k, t) = (s % 4, s / 4);
-    let (g, q) = (t / 16, t % 16);
-    16 * (2 * ((4 * g + q % 4) * 4 + k) + (q / 4) % 2) + 8 * (q / 8)
 }
 
 /// Exchange alternating groups of `D` bits between two bit planes. After the two
@@ -430,14 +412,25 @@ unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 
     let (c, d) = index_swap::<1>(c, d, 0x55);
     let (a, c) = index_swap::<2>(a, c, 0x33);
     let (b, d) = index_swap::<2>(b, d, 0x33);
+    macro_rules! put {
+        ($q:expr, $z:expr) => {
+            if 4 * (16 * G + $q) + K < GROUPS {
+                *idx.get_unchecked_mut(4 * (16 * G + $q) + K) = $z;
+            }
+        };
+    }
     macro_rules! emit {
         ($v:expr, $r:literal) => {{
             let v = $v;
-            // The byte nibbles of slots `q = r, r + 8` (low nibbles) and `r + 4, r + 12` (high),
-            // stored packed ([`packed_slot`]); the consumer zero-extends them on load.
-            let at = 2 * ((G * 4 + $r) * 4 + K);
-            *idx.get_unchecked_mut(at) = vandq_u8(v, vdupq_n_u8(0x0f));
-            *idx.get_unchecked_mut(at + 1) = vshrq_n_u8::<4>(v);
+            let lo = vandq_u8(vshlq_n_u8::<1>(v), vdupq_n_u8(0x1e));
+            let hi = vandq_u8(vshrq_n_u8::<3>(v), vdupq_n_u8(0x1e));
+            // Set the second byte before duplication: one OR serves both halves.
+            let lo_odd = vorrq_u8(lo, vdupq_n_u8(1));
+            let hi_odd = vorrq_u8(hi, vdupq_n_u8(1));
+            put!($r, vzip1q_u8(lo, lo_odd));
+            put!($r + 4, vzip1q_u8(hi, hi_odd));
+            put!($r + 8, vzip2q_u8(lo, lo_odd));
+            put!($r + 12, vzip2q_u8(hi, hi_odd));
         }};
     }
     emit!(a, 0);
@@ -447,9 +440,8 @@ unsafe fn index_block<const K: usize, const G: usize>(bytes: &[[uint8x16_t; 9]; 
 }
 
 /// The table indices of one element of eight columns. Coefficient `4 q + k`
-/// is bit `q` of word `k`; each slot's lane holds the byte pattern `p` for the
-/// four-bit pattern at `j + 162 t`, with coefficients above 511 zero, packed by
-/// [`packed_slot`] (the `u16` patterns of [`nibbles`] after zero extension).
+/// is bit `q` of word `k`; each result lane holds `(2 p, 2 p + 1)` for the
+/// four-bit pattern at `j + 162 t`, with coefficients above 511 zero.
 #[inline(always)]
 unsafe fn indices_pair<const P: usize>(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
     let mut bytes = [[vdupq_n_u8(0); 9]; 2];
@@ -499,7 +491,7 @@ unsafe fn indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
     indices_pair::<1>(words, idx);
 }
 
-/// The 16-entry `i16` table `t` as the two registers SVE2's two-register `tbl` reads.
+/// The 16-entry `i16` table `t` as the two registers `vqtbl2q_u8` reads.
 #[inline(always)]
 unsafe fn table(t: &[i16; 16]) -> uint8x16x2_t {
     vld1q_u8_x2(t.as_ptr() as *const u8)
@@ -508,23 +500,7 @@ unsafe fn table(t: &[i16; 16]) -> uint8x16x2_t {
 /// Entry `v` of table `t` in every lane, `v` from the lane's index pair in `i`.
 #[inline(always)]
 unsafe fn look(t: uint8x16x2_t, i: uint8x16_t) -> int16x8_t {
-    #[cfg(target_feature = "sve")]
-    {
-        // SVE2 two-register halfword `tbl` (Neoverse V2: the same throughput as NEON's byte
-        // `tbl`, measured on Axion): `u16` indices, so the nibbles need no byte-pair expansion.
-        let r: uint8x16_t;
-        core::arch::asm!(
-            "tbl z19.h, {{z16.h, z17.h}}, z18.h",
-            in("v16") t.0, in("v17") t.1, in("v18") i, lateout("v19") r,
-            options(pure, nomem, nostack, preserves_flags)
-        );
-        vreinterpretq_s16_u8(r)
-    }
-    #[cfg(not(target_feature = "sve"))]
-    {
-        // The portable form: `i` carries the `(2 v, 2 v + 1)` byte pair per lane.
-        vreinterpretq_s16_u8(vqtbl2q_u8(t, i))
-    }
+    vreinterpretq_s16_u8(vqtbl2q_u8(t, i))
 }
 
 /// The second child's radix-3 butterfly from the shared lookups. If `b` and
@@ -806,10 +782,7 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
 
 #[path = "ntt_neon_asm.rs"]
 mod asm;
-#[path = "ntt_neon_idx.rs"]
-mod idx;
-pub use idx::indices_asm;
-pub use asm::{pass_c_asm, pass_d_asm, pass_d_out, pass_lut_asm, pass_lut_loop};
+pub use asm::{pass_c_asm, pass_d_asm, pass_lut_asm};
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].
@@ -1543,20 +1516,6 @@ mod tests {
         pass_lut::<1>(idx, x, kern);
     }
 
-    /// `u16` slot indices ([`nibbles`]' format; high bytes must be zero) in the packed byte
-    /// layout of [`packed_slot`].
-    pub(crate) fn pack(idx: &[uint8x16_t; GROUPS]) -> Box<[uint8x16_t; GROUPS]> {
-        let src: &[[u16; 8]; GROUPS] = unsafe { &*(idx as *const _ as *const [[u16; 8]; GROUPS]) };
-        let mut out = [0u8; 16 * GROUPS];
-        for (s, v) in src.iter().enumerate() {
-            for (c, &x) in v.iter().enumerate() {
-                assert!(x < 256, "slot {s} lane {c}: {x} does not fit a byte");
-                out[packed_slot(s) + c] = x as u8;
-            }
-        }
-        Box::new(unsafe { core::mem::transmute(out) })
-    }
-
     #[no_mangle]
     #[inline(never)]
     unsafe fn mca_indices(words: &[*const u8; LANES], idx: &mut [uint8x16_t; GROUPS]) {
@@ -2027,23 +1986,11 @@ mod tests {
                 nibbles(&m, &mut want);
                 mca_indices(&ptrs, &mut got);
             }
-            let want = pack(&want);
-            let (got, want): ([u8; 16 * GROUPS], [u8; 16 * GROUPS]) = unsafe { (core::mem::transmute(got), core::mem::transmute(*want)) };
             for j in 0..GROUPS {
-                let at = packed_slot(j);
-                assert_eq!(got[at..at + 8], want[at..at + 8], "case {case} group {j}");
+                let got: [u8; 16] = unsafe { core::mem::transmute(got[j]) };
+                let want: [u8; 16] = unsafe { core::mem::transmute(want[j]) };
+                assert_eq!(got, want, "case {case} group {j}");
             }
-        }
-    }
-
-    /// The packed slots are disjoint eight-byte runs inside the buffer.
-    #[test]
-    fn packed_slots_are_disjoint() {
-        let mut seen = [false; 2 * GROUPS];
-        for s in 0..GROUPS {
-            let at = packed_slot(s);
-            assert!(at % 8 == 0 && at + 8 <= 16 * GROUPS);
-            assert!(!core::mem::replace(&mut seen[at / 8], true), "slot {s}");
         }
     }
 
@@ -2252,49 +2199,5 @@ mod pass_timing {
             "masks+transform<1>: old median {:.0} min {:.0} ns, lut median {:.0} min {:.0} ns ({:+.1}% median, {:+.1}% min)",
             old[7], old[0], new[7], new[0], 100.0 * (new[7] / old[7] - 1.0), 100.0 * (new[0] / old[0] - 1.0)
         );
-    }
-}
-
-#[cfg(test)]
-mod indices_asm_tests {
-    use super::*;
-
-    /// The scheduled index builder writes the Rust builder's indices, and its timing.
-    #[test]
-    fn indices_asm_matches() {
-        let mut state = 7u64;
-        for case in 0..200 {
-            let words: [[u128; 4]; LANES] = core::array::from_fn(|_| core::array::from_fn(|_| match case {
-                0 => u128::MAX,
-                1 => 0,
-                _ => (crate::ntt::tests::xorshift(&mut state) as u128) << 64 | crate::ntt::tests::xorshift(&mut state) as u128,
-            }));
-            let ptrs: [*const u8; LANES] = core::array::from_fn(|l| words[l].as_ptr() as *const u8);
-            let mut a = [unsafe { vdupq_n_u8(9) }; GROUPS];
-            let mut b = [unsafe { vdupq_n_u8(9) }; GROUPS];
-            unsafe { indices(&ptrs, &mut a); indices_asm(&ptrs, &mut b); }
-            for g in 0..GROUPS {
-                let (x, y): ([u8; 16], [u8; 16]) = unsafe { (core::mem::transmute(a[g]), core::mem::transmute(b[g])) };
-                assert_eq!(x, y, "case {case} group {g}");
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn indices_asm_timing() {
-        let mut state = 7u64;
-        let words: Vec<u128> = (0..4 * 8 * 64).map(|_| (crate::ntt::tests::xorshift(&mut state) as u128) << 64 | crate::ntt::tests::xorshift(&mut state) as u128).collect();
-        let mut nib = Box::new([unsafe { vdupq_n_u8(0) }; GROUPS]);
-        let reps = 200_000;
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            for r in 0..reps { let ptrs: [*const u8; LANES] = core::array::from_fn(|l| words[(r % 64) * 32 + 4 * l..].as_ptr() as *const u8); unsafe { indices(&ptrs, &mut nib) }; core::hint::black_box(&mut *nib); }
-            let a = t.elapsed().as_nanos() as f64 / reps as f64;
-            let t = std::time::Instant::now();
-            for r in 0..reps { let ptrs: [*const u8; LANES] = core::array::from_fn(|l| words[(r % 64) * 32 + 4 * l..].as_ptr() as *const u8); unsafe { indices_asm(&ptrs, &mut nib) }; core::hint::black_box(&mut *nib); }
-            let b = t.elapsed().as_nanos() as f64 / reps as f64;
-            println!("indices {a:.0} ns, indices_asm {b:.0} ns");
-        }
     }
 }

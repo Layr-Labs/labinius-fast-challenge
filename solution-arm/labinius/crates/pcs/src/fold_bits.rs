@@ -1796,13 +1796,14 @@ pub mod neon {
         let (groups, bias) = (&groups, &bias);
         pool.run(workers, |w| {
             let mut ws = Workspace::new();
-            // Each worker folds one contiguous run of blocks, so its table reads stay sequential.
-            let mut n = w * blocks / workers;
-            let end = (w + 1) * blocks / workers;
+            // Workers take block `w`, `w + workers`, ...: at any moment the team reads
+            // consecutive blocks of the same columns, and blocks `2 i` and `2 i + 1` share one
+            // 4 KiB page, which two workers then read at the same time.
+            let mut n = w;
             let mut claim = || {
-                if n < end {
+                if n < blocks {
                     let b = n;
-                    n += 1;
+                    n += workers;
                     Some(b)
                 } else {
                     None

@@ -551,6 +551,408 @@ macro_rules! slot_sink_body {
     };
 }
 
+/// [`slot_sink_body`] with both tile loops fully unrolled for exactly [`SINK`] tiles: diagnostic.
+#[cfg(target_feature = "sve")]
+macro_rules! slot_sink_body_u8 {
+    ($acc:expr, $z:expr, $k:expr, $groups:expr, [$($rows13:literal),*], [$($rows46:literal),*]) => {
+        core::arch::asm!(
+        "ldp q16, q17, [{a}, #0]",
+        "ldp q18, q19, [{a}, #32]",
+        $($rows13,)*
+        "mov {zp}, {z}",
+        "mov {kp}, {k}",
+                "ldp q0, q1, [{kp}]",
+        "ldp q2, q3, [{kp}, #32]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        
+        "ldp q0, q1, [{kp}]",
+        "ldp q2, q3, [{kp}, #32]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        
+        "ldp q0, q1, [{kp}]",
+        "ldp q2, q3, [{kp}, #32]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        
+        "ldp q0, q1, [{kp}]",
+        "ldp q2, q3, [{kp}, #32]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        
+        "ldp q0, q1, [{kp}]",
+        "ldp q2, q3, [{kp}, #32]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        
+        "ldp q0, q1, [{kp}]",
+        "ldp q2, q3, [{kp}, #32]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        
+        "ldp q0, q1, [{kp}]",
+        "ldp q2, q3, [{kp}, #32]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        
+        "ldp q0, q1, [{kp}]",
+        "ldp q2, q3, [{kp}, #32]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "sdot z28.d, z4.h, z3.h[0]", "sdot z29.d, z5.h, z3.h[0]", "sdot z30.d, z6.h, z3.h[0]", "sdot z31.d, z7.h, z3.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        "sdot z28.d, z4.h, z3.h[1]", "sdot z29.d, z5.h, z3.h[1]", "sdot z30.d, z6.h, z3.h[1]", "sdot z31.d, z7.h, z3.h[1]",
+        
+        "stp q16, q17, [{a}, #0]",
+        "stp q18, q19, [{a}, #32]",
+        "stp q20, q21, [{a}, #64]",
+        "stp q22, q23, [{a}, #96]",
+        "stp q24, q25, [{a}, #128]",
+        "stp q26, q27, [{a}, #160]",
+        "stp q28, q29, [{a}, #192]",
+        "stp q30, q31, [{a}, #224]",
+        $($rows46,)*
+        "mov {zp}, {z}",
+        "mov {kp}, {k}",
+                "ldp q0, q1, [{kp}, #64]",
+        "ldr q2, [{kp}, #96]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        
+        "ldp q0, q1, [{kp}, #64]",
+        "ldr q2, [{kp}, #96]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        
+        "ldp q0, q1, [{kp}, #64]",
+        "ldr q2, [{kp}, #96]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        
+        "ldp q0, q1, [{kp}, #64]",
+        "ldr q2, [{kp}, #96]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        
+        "ldp q0, q1, [{kp}, #64]",
+        "ldr q2, [{kp}, #96]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        
+        "ldp q0, q1, [{kp}, #64]",
+        "ldr q2, [{kp}, #96]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        
+        "ldp q0, q1, [{kp}, #64]",
+        "ldr q2, [{kp}, #96]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        
+        "ldp q0, q1, [{kp}, #64]",
+        "ldr q2, [{kp}, #96]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "sdot z16.d, z4.h, z0.h[0]", "sdot z17.d, z5.h, z0.h[0]", "sdot z18.d, z6.h, z0.h[0]", "sdot z19.d, z7.h, z0.h[0]",
+        "sdot z20.d, z4.h, z1.h[0]", "sdot z21.d, z5.h, z1.h[0]", "sdot z22.d, z6.h, z1.h[0]", "sdot z23.d, z7.h, z1.h[0]",
+        "sdot z24.d, z4.h, z2.h[0]", "sdot z25.d, z5.h, z2.h[0]", "sdot z26.d, z6.h, z2.h[0]", "sdot z27.d, z7.h, z2.h[0]",
+        "ldr q4, [{zp}]",
+        "ldr q5, [{zp}, #{xs1}]",
+        "ldr q6, [{zp}, #{xs2}]",
+        "ldr q7, [{zp}, #{xs3}]",
+        "add {zp}, {zp}, {xs4}",
+        "add {kp}, {kp}, {ks}",
+        "sdot z16.d, z4.h, z0.h[1]", "sdot z17.d, z5.h, z0.h[1]", "sdot z18.d, z6.h, z0.h[1]", "sdot z19.d, z7.h, z0.h[1]",
+        "sdot z20.d, z4.h, z1.h[1]", "sdot z21.d, z5.h, z1.h[1]", "sdot z22.d, z6.h, z1.h[1]", "sdot z23.d, z7.h, z1.h[1]",
+        "sdot z24.d, z4.h, z2.h[1]", "sdot z25.d, z5.h, z2.h[1]", "sdot z26.d, z6.h, z2.h[1]", "sdot z27.d, z7.h, z2.h[1]",
+        
+        "stp q16, q17, [{a}, #256]",
+        "stp q18, q19, [{a}, #288]",
+        "stp q20, q21, [{a}, #320]",
+        "stp q22, q23, [{a}, #352]",
+        "stp q24, q25, [{a}, #384]",
+        "stp q26, q27, [{a}, #416]",
+            a = in(reg) $acc,
+            z = in(reg) $z,
+            k = in(reg) $k,
+            xs4 = in(reg) 4 * XS,
+            ks = in(reg) KS,
+            xs1 = const XS,
+            xs2 = const 2 * XS,
+            xs3 = const 3 * XS,
+            zp = out(reg) _,
+            kp = out(reg) _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            options(nostack)
+        )
+    };
+}
+
+/// [`slot_sink`] for exactly [`SINK`] tiles, unrolled: diagnostic.
+#[cfg(target_feature = "sve")]
+#[inline(never)]
+unsafe fn slot_sink_u8(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t) {
+    const XS: usize = N * 16;
+    const KS: usize = N * ROWS * LOCK * 2;
+    slot_sink_body_u8!(acc, z, k, SINK, ["ldp q20, q21, [{a}, #64]", "ldp q22, q23, [{a}, #96]", "ldp q24, q25, [{a}, #128]", "ldp q26, q27, [{a}, #160]", "ldp q28, q29, [{a}, #192]", "ldp q30, q31, [{a}, #224]"], ["ldp q16, q17, [{a}, #256]", "ldp q18, q19, [{a}, #288]", "ldp q20, q21, [{a}, #320]", "ldp q22, q23, [{a}, #352]", "ldp q24, q25, [{a}, #384]", "ldp q26, q27, [{a}, #416]"]);
+}
+
+/// [`slot_sink_fresh`] for exactly [`SINK`] tiles, unrolled: diagnostic.
+#[cfg(target_feature = "sve")]
+#[inline(never)]
+unsafe fn slot_sink_fresh_u8(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t) {
+    const XS: usize = N * 16;
+    const KS: usize = N * ROWS * LOCK * 2;
+    slot_sink_body_u8!(acc, z, k, SINK, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
+}
+
 /// The register-resident sink for one slot (from 4381e86b's `sve::slot_sink`, after arm-big's
 /// `slot_chunk`): `acc(s, r) +=` the slot's products summed over `groups` key tiles (eight
 /// elements each) of transforms starting at `z` (transform stride `XS`, the [`pass_words`] lane
@@ -585,14 +987,33 @@ unsafe fn slot_sink_fresh(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_
 /// chunk's first sweep) the digit rows' sums are overwritten instead of added to, so the chunk end
 /// needs no zeroing pass; the base row always accumulates.
 #[inline(never)]
-unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+unsafe fn sink<const FRESH: bool, const V: u32>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
     debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
     let accp = acc.as_mut_ptr();
     #[cfg(target_feature = "sve")]
     {
         let z = xs.as_ptr() as *const int16x8_t;
         for s in 0..N {
-            if FRESH {
+            if V == 4 && s + 1 < N {
+                let p = accp.add(idx(s + 1, 0)) as *const u8;
+                for l in 0..7 {
+                    core::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) p.add(64 * l), options(nostack, preserves_flags, readonly));
+                }
+            }
+            if V == 9 && s % 4 == 0 && s + 4 < N {
+                // the next line group (slots s + 4 .. s + 8) of every transform of the sweep
+                let p = z.add(s + 4) as *const u8;
+                for t in 0..groups * LOCK {
+                    core::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) p.add(t * N * 16), options(nostack, preserves_flags, readonly));
+                }
+            }
+            if V == 6 && groups == SINK {
+                if FRESH {
+                    slot_sink_fresh_u8(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)));
+                } else {
+                    slot_sink_u8(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)));
+                }
+            } else if FRESH {
                 slot_sink_fresh(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
             } else {
                 slot_sink(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
@@ -635,7 +1056,7 @@ unsafe fn pass_words(words: &[(*const u8, usize); LANES], elements: usize, e: us
 /// Transforms ahead whose input words [`prefetch_words`] requests (into L2): four transforms span one
 /// element group, so this is `PF_T / 4` element groups (of four elements, eight columns) ahead,
 /// running into the next sweep's first elements at a sweep's end.
-const PF_T: usize = 32;
+const PF_T: usize = 16;
 
 /// Prefetches the input words of transform `t` of a pass starting at element `e` (the lines
 /// [`pass_words`] would address: four consecutive 64-byte elements of two columns). The table
@@ -779,6 +1200,22 @@ unsafe fn chunk_row2_fast(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*m
         if vmaxvq_u16(top[h]) as i32 >= ctx.a.threshold[ctx.c * DIGITS + r - 1 + h] as i32 {
             chunk_row_exact(acc, r + h, mr[h], dev[h], dev16[h], y, ctx);
         }
+    }
+}
+
+/// Diagnostic: [`chunk_row2_fast`] one row at a time, through the single-row [`super::inverse_lazy_io`].
+#[inline(always)]
+unsafe fn chunk_row1_fast(acc: &[int64x2_t], r: usize, mr: &[i16], dev: *mut int32x4_t, dev16: *mut int16x8_t, y: &mut [int16x8_t; N], ctx: &Repair) {
+    let p = P1 as i16;
+    let mut top = vdupq_n_u16(0);
+    super::inverse_lazy_io(&mut *y, |s| narrow_digit(acc, s, r), |s, x| {
+        let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
+        top = vmaxq_u16(top, vreinterpretq_u16_s16(vabsq_s16(v)));
+        let sum = dev16.add(s);
+        *sum = vaddq_s16(*sum, v);
+    });
+    if vmaxvq_u16(top) as i32 >= ctx.a.threshold[ctx.c * DIGITS + r - 1] as i32 {
+        chunk_row_exact(acc, r, mr, dev, dev16, y, ctx);
     }
 }
 
@@ -943,6 +1380,32 @@ unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Ke
     super::pass_lut_loop(nib, x, kern)
 }
 
+/// Diagnostic: [`lut_pass1`] rescheduled with the five freed table registers (live budget `b`).
+#[cfg(target_feature = "sve")]
+#[inline(always)]
+unsafe fn lut_pass_r(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel, b: u32) {
+    if b == 21 { super::pass_lut_loop_r21(nib, x, kern) } else { super::pass_lut_loop_r23(nib, x, kern) }
+}
+
+#[cfg(not(target_feature = "sve"))]
+#[inline(always)]
+unsafe fn lut_pass_r(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel, _b: u32) {
+    lut_pass(nib, x, kern)
+}
+
+/// Diagnostic: the table front with the one-register `tbl` where the nibble's bit 3 is clear.
+#[cfg(target_feature = "sve")]
+#[inline(always)]
+unsafe fn lut_pass1(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
+    super::pass_lut_loop1(nib, x, kern)
+}
+
+#[cfg(not(target_feature = "sve"))]
+#[inline(always)]
+unsafe fn lut_pass1(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
+    lut_pass(nib, x, kern)
+}
+
 #[cfg(not(target_feature = "sve"))]
 #[inline(always)]
 unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
@@ -1003,9 +1466,9 @@ unsafe fn sums(
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             // the chunk's first sweep starts the digit rows' sums afresh
             if e % CHUNK == 0 {
-                sink::<true>(xs, keys, acc, groups);
+                sink::<true, 0>(xs, keys, acc, groups);
             } else {
-                sink::<false>(xs, keys, acc, groups);
+                sink::<false, 0>(xs, keys, acc, groups);
             }
             e += l;
         }
@@ -1022,11 +1485,49 @@ unsafe fn sums(
     super::inverse_folded::<PB>(y);
 }
 
+/// Diagnostic: `DC ZVA` over the 162 lines of one transform's sweep-buffer slot (64-byte blocks,
+/// checked by [`zva_ok`]), so level 6's stores find the lines in L1 without reading them from L2.
+#[inline(always)]
+unsafe fn diag_zva(p: *mut u8) {
+    if !zva_ok() || p as usize % 64 != 0 {
+        return;
+    }
+    for l in 0..(N * 16 / 64) {
+        core::arch::asm!("dc zva, {p}", p = in(reg) p.add(64 * l), options(nostack, preserves_flags));
+    }
+}
+
+/// Whether `DC ZVA` is permitted and zeroes 64-byte blocks (`DCZID_EL0`).
+#[inline(always)]
+fn zva_ok() -> bool {
+    let d: u64;
+    unsafe { core::arch::asm!("mrs {d}, dczid_el0", d = out(reg) d, options(nomem, nostack, preserves_flags)) };
+    d & 0x10 == 0 && d & 0xf == 4
+}
+
+/// Diagnostic: `PRFM PLDL1KEEP` over the lines of `len` bytes at `p`.
+#[inline(always)]
+unsafe fn diag_pl1(p: *const u8, len: usize) {
+    let mut l = (p as usize & !63) as *const u8;
+    while (l as usize) < p as usize + len {
+        core::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) l, options(nostack, preserves_flags, readonly));
+        l = l.wrapping_add(64);
+    }
+}
+
+/// Diagnostic: `PRFM PSTL1KEEP` over the 162 lines of one transform's sweep-buffer slot.
+#[inline(always)]
+unsafe fn diag_pst(p: *const u8) {
+    for l in 0..(N * 16 / 64) {
+        core::arch::asm!("prfm pstl1keep, [{p}]", p = in(reg) p.add(64 * l), options(nostack, preserves_flags, readonly));
+    }
+}
+
 /// [`sums`] for two batches against one sweep of the key (after IvanLudvig's submission
 /// ce686fcc): per sweep, batch A's transforms into `xs` and their sink, then batch B's into the
 /// same `xs` and their sink against the same key lines, which are then still cached.
 #[inline(never)]
-unsafe fn sums2(
+unsafe fn sums2<const V: u32>(
     words: [&[(*const u8, usize); LANES]; 2],
     a: &SmsMatrix,
     nib: &mut [uint8x16_t; N / 4],
@@ -1063,6 +1564,12 @@ unsafe fn sums2(
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
                 let count = groups * LOCK;
+                if V == 8 {
+                    // the transform's L1 working set, evicted by the previous sink
+                    diag_pl1(sc.as_ptr() as *const u8, N * 16);
+                    diag_pl1(nib.as_ptr() as *const u8, N * 4);
+                    diag_pl1(kern as *const Kernel as *const u8, core::mem::size_of::<Kernel>());
+                }
                 for i in 0..count {
                     // The input words [`PF_T`] transforms on: later in this sweep, or the start of
                     // the sweep that follows it (the other batch's, over the same elements for
@@ -1078,16 +1585,39 @@ unsafe fn sums2(
                         prefetch_words(words[0], e + l, ahead - count);
                     }
                     let at = pass_words(words[t], a.elements, e, i);
+                    if V == 2 {
+                        diag_zva(xs[i].as_mut_ptr() as *mut u8);
+                    } else if V == 3 {
+                        diag_pst(xs[i].as_ptr() as *const u8);
+                    }
                     indices_asm(&at, nib);
+                    if V == 11 {
+                        lut_pass_r(nib, sc, kern, 21);
+                    } else if V == 12 {
+                        lut_pass_r(nib, sc, kern, 23);
+                    } else if V == 10 {
+                        lut_pass1(nib, sc, kern);
+                    } else {
+                        lut_pass2(nib, sc, kern);
+                    }
+                    if V == 7 && i + 1 < count {
+                        diag_zva(xs[i + 1].as_mut_ptr() as *mut u8);
+                    }
                     let x = &mut xs[i];
-                    lut_pass2(nib, sc, kern);
                     pass_c_asm(sc, kern);
-                    pass_d_out(sc, x, kern);
+                    if V == 1 {
+                        pass_d_out_nt(sc, x, kern);
+                    } else if V == 5 {
+                        diag_zva(x.as_mut_ptr() as *mut u8);
+                        pass_d_out(sc, x, kern);
+                    } else {
+                        pass_d_out(sc, x, kern);
+                    }
                 }
                 if e % CHUNK == 0 {
-                    sink::<true>(xs, keys, accs[t], groups);
+                    sink::<true, V>(xs, keys, accs[t], groups);
                 } else {
-                    sink::<false>(xs, keys, accs[t], groups);
+                    sink::<false, V>(xs, keys, accs[t], groups);
                 }
             }
             e += l;
@@ -1100,7 +1630,13 @@ unsafe fn sums2(
                 let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
                 let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
                 let rows16 = [dv16.add(d * N), dv16.add((d + 1) * N)];
-                chunk_row2_fast(accs[t], 1 + d, mr, rows, rows16, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
+                if V == 13 {
+                    let ctx = Repair { words: words[t], a, c };
+                    chunk_row1_fast(accs[t], 1 + d, mr[0], rows[0], rows16[0], &mut *ys[t], &ctx);
+                    chunk_row1_fast(accs[t], 2 + d, mr[1], rows[1], rows16[1], &mut xs[0], &ctx);
+                } else {
+                    chunk_row2_fast(accs[t], 1 + d, mr, rows, rows16, [&mut *ys[t], &mut xs[0]], &Repair { words: words[t], a, c });
+                }
             }
             if (c + 1) % FLUSH == 0 || end == a.elements {
                 flush16(devs[t], dev16[t]);
@@ -1211,6 +1747,11 @@ fn pin_worker(w: usize) {
 }
 
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
+    commit_v::<0>(values, a, workers, q, out, true)
+}
+
+/// [`commit`] with diagnostic variant `V` of the per-transform pipeline; `hook` runs [`BETWEEN`].
+pub fn commit_v<const V: u32>(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8], hook: bool) {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
@@ -1247,7 +1788,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
                     let [d16a, d16b] = dev16;
-                    sums2([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
+                    sums2::<V>([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
                 } else {
                     sums(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
                 }
@@ -1303,7 +1844,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     slot[4] = (v >> 32) as u8;
                 }
             }
-            if b % 2 == 1 {
+            if b % 2 == 1 && hook {
                 if let Some(between) = BETWEEN.get() {
                     between(first * workers / columns, (b + 1) / 2);
                 }
@@ -1439,8 +1980,8 @@ mod tests {
                 }
             }
             unsafe {
-                sink::<true>(&xs, keys.as_ptr(), &mut fresh, groups);
-                sink::<false>(&xs, keys.as_ptr(), &mut zeroed, groups);
+                sink::<true, 0>(&xs, keys.as_ptr(), &mut fresh, groups);
+                sink::<false, 0>(&xs, keys.as_ptr(), &mut zeroed, groups);
             }
             let words = |v: &[int64x2_t]| -> Vec<[i64; 2]> { v.iter().map(|&x| unsafe { core::mem::transmute(x) }).collect() };
             assert!(words(&fresh) == words(&zeroed), "{groups} tiles");
@@ -1501,8 +2042,8 @@ mod tests {
                     *x = unsafe { vld1q_s16(v.as_ptr()) };
                 }
                 unsafe {
-                    sink::<false>(&xs, old.as_ptr(), &mut old_acc, groups);
-                    sink::<false>(&xs, new.as_ptr(), &mut new_acc, groups);
+                    sink::<false, 0>(&xs, old.as_ptr(), &mut old_acc, groups);
+                    sink::<false, 0>(&xs, new.as_ptr(), &mut new_acc, groups);
                 }
             }
             let mut y = Box::new([unsafe { vdupq_n_s16(0) }; N]);

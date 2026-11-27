@@ -669,8 +669,70 @@ fn fold_neon(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement6
         .collect();
     // SAFETY: `B128` is `repr(transparent)` over `u128`.
     let words = unsafe { core::slice::from_raw_parts(values.as_ptr() as *const u128, values.len()) };
-    fb::neon::fold(words, COLUMN_LEN, &cs, threads())
+    if !DIAG_FOLD.load(std::sync::atomic::Ordering::Relaxed) {
+        return fb::neon::fold(words, COLUMN_LEN, &cs, threads());
+    }
+    // Diagnostic: v0 the record, v1 the compact-code pass (same output), v2 / v3 the record / the
+    // compact pass on constant plane offsets (timing controls, no fold), in rounds, v0 last again.
+    let hz = fb::neon::tick_hz() as f64;
+    let run = |v: usize| {
+        for t in fb::neon::TICKS.iter() {
+            t.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        let t = std::time::Instant::now();
+        let r = match v {
+            0 => fb::neon::fold_v::<0>(words, COLUMN_LEN, &cs, threads()),
+            1 => fb::neon::fold_v::<1>(words, COLUMN_LEN, &cs, threads()),
+            2 => fb::neon::fold_v::<2>(words, COLUMN_LEN, &cs, threads()),
+            _ => fb::neon::fold_v::<3>(words, COLUMN_LEN, &cs, threads()),
+        };
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let k: Vec<f64> = fb::neon::TICKS.iter().map(|t| t.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e3 / hz).collect();
+        (r, ms, k)
+    };
+    let once = std::env::var_os("LABINIUS_DIAG_ONCE").is_some();
+    let rounds = if once { 1 } else { 4 };
+    let mut order: Vec<usize> = (0..rounds).flat_map(|_| [0usize, 1, 2, 3]).collect();
+    order.push(0);
+    let mut want: Option<Vec<RingElement648>> = None;
+    let mut ms: [Vec<f64>; 4] = Default::default();
+    let mut ph: [Vec<String>; 4] = Default::default();
+    for &v in &order {
+        let (r, t, k) = run(v);
+        ms[v].push(t);
+        let w = threads() as f64;
+        ph[v].push(format!("{:.2}/{:.2}/{:.2}/max{:.2}", k[0] / w, k[1] / w, k[2] / w, k[3]));
+        if v & 2 != 0 {
+            continue;
+        }
+        match &want {
+            None => want = Some(r),
+            Some(w) => {
+                if *w != r {
+                    eprintln!("diag fold2 !MISMATCH v{v}");
+                }
+            }
+        }
+    }
+    let med = |x: &Vec<f64>| {
+        let mut y = x.clone();
+        y.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        y[y.len() / 2]
+    };
+    let fmt = |x: &Vec<f64>| x.iter().map(|t| format!("{t:.2}")).collect::<Vec<_>>().join(",");
+    eprintln!(
+        "diag fold2 rec=[{}] med={:.2} compact=[{}] med={:.2} rec_l1=[{}] med={:.2} compact_l1=[{}] med={:.2}",
+        fmt(&ms[0]), med(&ms[0]), fmt(&ms[1]), med(&ms[1]), fmt(&ms[2]), med(&ms[2]), fmt(&ms[3]), med(&ms[3])
+    );
+    eprintln!(
+        "diag fold2ph slice/pass/out per-thread-avg ms, max worker: rec=[{}] compact=[{}] rec_l1=[{}] compact_l1=[{}]",
+        ph[0].join(" "), ph[1].join(" "), ph[2].join(" "), ph[3].join(" ")
+    );
+    want.unwrap()
 }
+
+/// Diagnostic: set by `main` so that the fold runs its variants (never in tests).
+static DIAG_FOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The x86 track's scheduled bit-sliced fold (`fold_bits2`) on NEON, written straight into the
 /// ring elements; `None` when its counters could overflow.
@@ -958,6 +1020,7 @@ fn main() {
         ntt::neon::sms::map_key(&SMS_DATA.0);
         let _ = ntt::neon::sms::BETWEEN.set(output.between());
     }
+    DIAG_FOLD.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
     timer.lap("read");

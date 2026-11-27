@@ -1246,6 +1246,8 @@ pub mod neon {
         hi: Vec<V>,
         tmp: Vec<V>,
         counts: Vec<[uint16x8_t; 16]>,
+        /// Diagnostic: cntvct ticks in slicing, passes, output.
+        tick: [u64; 3],
     }
 
     impl Workspace {
@@ -1260,6 +1262,7 @@ pub mod neon {
                     hi: vec![vdupq_n_u8(0); PAIRS * 2 * HI],
                     tmp: vec![vdupq_n_u8(0); WORD_BITS],
                     counts: vec![[vdupq_n_u16(0); 16]; SLOTS + 1],
+                    tick: [0; 3],
                 }
             }
         }
@@ -1657,6 +1660,221 @@ pub mod neon {
         }
     }
 
+    /// Diagnostic: summed slice / pass / output ticks over workers, and the largest worker total.
+    pub static TICKS: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+    /// The virtual counter.
+    #[inline(always)]
+    pub fn ticks() -> u64 {
+        let t: u64;
+        unsafe { core::arch::asm!("mrs {t}, cntvct_el0", t = out(reg) t, options(nomem, nostack, preserves_flags)) };
+        t
+    }
+
+    /// The virtual counter's frequency.
+    pub fn tick_hz() -> u64 {
+        let f: u64;
+        unsafe { core::arch::asm!("mrs {f}, cntfrq_el0", f = out(reg) f, options(nomem, nostack, preserves_flags)) };
+        f
+    }
+
+    /// [`pass`] in compact code: one copy of the list loop serves both signs (the sign is the mask
+    /// `m`, zero for the positive list and all-ones for the negative one, applied where `pass`
+    /// writes `fix!` and `none`), and each iteration adds one 32-entry tree whose weight-32 carry
+    /// goes through a half adder into counter bit 5. The counts are those of [`pass`]; the hot
+    /// code is about a third of its size.
+    ///
+    /// # Safety
+    /// As [`pass`].
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn pass_compact(
+        be: *const u8,
+        pos: *const u16,
+        pos8: usize,
+        neg: *const u16,
+        neg8: usize,
+        tail: &[[u16; SUB]; 2],
+        lo: *mut V,
+        hi: *mut V,
+    ) {
+        let bo = be.add(16);
+        let z = vdupq_n_u8(0);
+        let mut s0: [V; LO] = core::array::from_fn(|b| *lo.add(b));
+        let mut s1: [V; LO] = core::array::from_fn(|b| *lo.add(LO + b));
+        let (mut r0, mut r1) = (z, z);
+        let mut h0 = [z; HB];
+        let mut h1 = [z; HB];
+        let mut hn = 0usize;
+        let mut t: *const u16;
+        macro_rules! add_h {
+            ($c0:expr, $c1:expr) => {{
+                let (mut c0, mut c1) = ($c0, $c1);
+                for b in 0..HB - 1 {
+                    let u0 = vandq_u8(h0[b], c0);
+                    h0[b] = veorq_u8(h0[b], c0);
+                    let u1 = vandq_u8(h1[b], c1);
+                    h1[b] = veorq_u8(h1[b], c1);
+                    (c0, c1) = (u0, u1);
+                }
+                h0[HB - 1] = veorq_u8(h0[HB - 1], c0);
+                h1[HB - 1] = veorq_u8(h1[HB - 1], c1);
+            }};
+        }
+        macro_rules! two {
+            ($off:expr) => {{
+                let w = (t.add($off & !3) as *const u64).read_unaligned();
+                let o0 = (w >> (16 * ($off % 4))) as u16 as usize;
+                let o1 = (w >> (16 * ($off % 4 + 1))) as u16 as usize;
+                let a0 = vld1q_u8(be.add(o0));
+                let a1 = vld1q_u8(bo.add(o0));
+                let b0 = vld1q_u8(be.add(o1));
+                let b1 = vld1q_u8(bo.add(o1));
+                if ($off / 2) % 2 == 0 {
+                    (fa(&mut s0[0], a0, b0), fa(&mut s1[0], a1, b1))
+                } else {
+                    (fa(&mut r0, a0, b0), fa(&mut r1, a1, b1))
+                }
+            }};
+        }
+        macro_rules! level {
+            ($bit:literal, $lower:ident, $off:expr) => {{
+                let (x0, x1) = $lower!($off);
+                let (y0, y1) = $lower!($off + (1 << $bit));
+                (fa(&mut s0[$bit], x0, y0), fa(&mut s1[$bit], x1, y1))
+            }};
+        }
+        macro_rules! four { ($off:expr) => { level!(1, two, $off) }; }
+        macro_rules! eight { ($off:expr) => { level!(2, four, $off) }; }
+        macro_rules! check_h {
+            () => {{
+                hn += 1;
+                if hn >= H_MAX - 1 {
+                    flush(hi, &h0);
+                    flush(hi.add(HI), &h1);
+                    h0 = [z; HB];
+                    h1 = [z; HB];
+                    hn = 0;
+                }
+            }};
+        }
+        let lists = [(pos, pos8), (neg, neg8)];
+        // An opaque trip count keeps the two signs in one copy of the loop.
+        let signs = core::hint::black_box(2usize);
+        for sign in 0..signs {
+            let (list, n8) = *lists.get_unchecked(sign);
+            let m = vdupq_n_u8(0u8.wrapping_sub(sign as u8));
+            // The negative list runs on complemented counter bits (see `pass`).
+            for b in 0..LO {
+                s0[b] = veorq_u8(s0[b], m);
+                s1[b] = veorq_u8(s1[b], m);
+            }
+            (r0, r1) = (veorq_u8(r0, m), veorq_u8(r1, m));
+            // A true weight-32 carry into bit 5 (held complemented under `m`), its carry into `h`.
+            macro_rules! half5 {
+                ($e0:expr, $e1:expr) => {{
+                    let (e0, e1) = ($e0, $e1);
+                    let c0 = vandq_u8(e0, veorq_u8(s0[5], m));
+                    let c1 = vandq_u8(e1, veorq_u8(s1[5], m));
+                    s0[5] = veorq_u8(s0[5], e0);
+                    s1[5] = veorq_u8(s1[5], e1);
+                    add_h!(c0, c1);
+                }};
+            }
+            let (mut p30, mut p31) = (m, m);
+            let (mut p40, mut p41) = (m, m);
+            t = list;
+            for _ in 0..n8 / 4 {
+                let (a0, a1) = eight!(0);
+                let (b0, b1) = eight!(SUB);
+                let d0 = fa(&mut s0[3], a0, b0);
+                let d1 = fa(&mut s1[3], a1, b1);
+                let (a0, a1) = eight!(2 * SUB);
+                let (b0, b1) = eight!(3 * SUB);
+                let f0 = fa(&mut s0[3], a0, b0);
+                let f1 = fa(&mut s1[3], a1, b1);
+                let e0 = fa(&mut s0[4], d0, f0);
+                let e1 = fa(&mut s1[4], d1, f1);
+                t = t.add(4 * SUB);
+                half5!(veorq_u8(e0, m), veorq_u8(e1, m));
+                check_h!();
+            }
+            let left = n8 % 4;
+            if left != 0 {
+                (p30, p31) = eight!(0);
+                t = t.add(SUB);
+                if left != 1 {
+                    let (c0, c1) = eight!(0);
+                    t = t.add(SUB);
+                    p40 = fa(&mut s0[3], p30, c0);
+                    p41 = fa(&mut s1[3], p31, c1);
+                    (p30, p31) = (m, m);
+                    if left != 2 {
+                        (p30, p31) = eight!(0);
+                    }
+                }
+            }
+            t = tail.get_unchecked(sign).as_ptr();
+            let (c0, c1) = eight!(0);
+            let d0 = fa(&mut s0[3], p30, c0);
+            let d1 = fa(&mut s1[3], p31, c1);
+            let e0 = fa(&mut s0[4], p40, d0);
+            let e1 = fa(&mut s1[4], p41, d1);
+            half5!(veorq_u8(e0, m), veorq_u8(e1, m));
+            hn += 1;
+            for b in 0..LO {
+                s0[b] = veorq_u8(s0[b], m);
+                s1[b] = veorq_u8(s1[b], m);
+            }
+            (r0, r1) = (veorq_u8(r0, m), veorq_u8(r1, m));
+        }
+        let (mut c0, mut c1) = (r0, r1);
+        for b in 0..LO {
+            let (u0, u1) = (vandq_u8(s0[b], c0), vandq_u8(s1[b], c1));
+            s0[b] = veorq_u8(s0[b], c0);
+            s1[b] = veorq_u8(s1[b], c1);
+            (c0, c1) = (u0, u1);
+        }
+        if hn >= H_MAX {
+            flush(hi, &h0);
+            flush(hi.add(HI), &h1);
+            h0 = [z; HB];
+            h1 = [z; HB];
+            hn = 0;
+        }
+        add_h!(c0, c1);
+        hn += 1;
+        debug_assert!(hn <= H_MAX);
+        flush(hi, &h0);
+        flush(hi.add(HI), &h1);
+        for b in 0..LO {
+            *lo.add(b) = s0[b];
+            *lo.add(LO + b) = s1[b];
+        }
+    }
+
+    impl Group {
+        /// Diagnostic timing control: every scheduled entry reads one plane per pair (column 0's
+        /// plane of the pair's even slot), so the passes run the record's instruction stream on
+        /// L1-resident planes. The counts are not the fold's.
+        fn constant_offsets(&self) -> Group {
+            let c = (16 * (BIAS_PLANES + GUARD)) as u16;
+            let list = [vec![c; self.list[0].len()], vec![c; self.list[1].len()]];
+            let tail = self
+                .tail
+                .iter()
+                .enumerate()
+                .map(|(i, tl)| {
+                    core::array::from_fn(|sign| {
+                        let pad = (16 * (BIAS_PLANES + [PAD_ZERO, PAD_ONES][sign]) - 32 * i) as u16;
+                        core::array::from_fn(|k| if tl[sign][k] == pad { pad } else { c })
+                    })
+                })
+                .collect();
+            Group { first: self.first, columns: self.columns, list, win: self.win.clone(), tail }
+        }
+    }
+
     /// The fold of block `block` (ring elements `32 block ..`), written to `out[0 .. 32]`.
     /// `claim` is called once, when the last group starts, for the block to run next; its answer
     /// is returned.
@@ -1666,7 +1884,7 @@ pub mod neon {
     /// `128 block + 128 <= column_words`, and so for any block `claim` returns; `out` addresses
     /// 32 writable (possibly uninitialized) ring elements.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn fold_block(
+    pub unsafe fn fold_block<const VAR: u8>(
         words: *const u128,
         column_words: usize,
         groups: &[&Group],
@@ -1683,10 +1901,14 @@ pub mod neon {
         let (lo, hi, tmp) = (ws.lo.as_mut_ptr(), ws.hi.as_mut_ptr(), ws.tmp.as_mut_ptr());
         let src = |column: usize, block: usize| words.add(column * column_words + block * LANES) as *const u8;
         let mut claimed = None;
+        let mut tk0 = ticks();
         for (gi, g) in groups.iter().enumerate() {
             for jl in 0..g.columns {
                 slice(src(g.first + jl, block), planes.add(GUARD + jl * STRIDE), tmp);
             }
+            let tk1 = ticks();
+            ws.tick[0] += tk1 - tk0;
+            tk0 = tk1;
             // No prefetch of the next group's slices: its 30 columns sit 256 KiB apart, so on 2 MiB
             // table pages their lines share L2 sets, and the hint loop measured no faster than
             // none on the grader (diagnostic ea305be5; the removal is 80c3a468's).
@@ -1697,17 +1919,33 @@ pub mod neon {
             for i in 0..PAIRS {
                 let w = *g.win.get_unchecked(i);
                 let be = base.wrapping_add(32 * i);
-                pass(
-                    be,
-                    g.list[0].as_ptr().add(w[0] as usize),
-                    (w[1] - w[0]) as usize / SUB,
-                    g.list[1].as_ptr().add(w[2] as usize),
-                    (w[3] - w[2]) as usize / SUB,
-                    g.tail.get_unchecked(i),
-                    lo.add(2 * LO * i),
-                    hi.add(2 * HI * i),
-                );
+                if VAR & 1 != 0 {
+                    pass_compact(
+                        be,
+                        g.list[0].as_ptr().add(w[0] as usize),
+                        (w[1] - w[0]) as usize / SUB,
+                        g.list[1].as_ptr().add(w[2] as usize),
+                        (w[3] - w[2]) as usize / SUB,
+                        g.tail.get_unchecked(i),
+                        lo.add(2 * LO * i),
+                        hi.add(2 * HI * i),
+                    );
+                } else {
+                    pass(
+                        be,
+                        g.list[0].as_ptr().add(w[0] as usize),
+                        (w[1] - w[0]) as usize / SUB,
+                        g.list[1].as_ptr().add(w[2] as usize),
+                        (w[3] - w[2]) as usize / SUB,
+                        g.tail.get_unchecked(i),
+                        lo.add(2 * LO * i),
+                        hi.add(2 * HI * i),
+                    );
+                }
             }
+            let tk1 = ticks();
+            ws.tick[1] += tk1 - tk0;
+            tk0 = tk1;
         }
         // The counters as integers.
         for s in 0..SLOTS {
@@ -1751,16 +1989,23 @@ pub mod neon {
                 vst1_s16(d1, vget_high_s16(v));
             }
         }
+        // The timing control (VAR & 2) computes no fold: its counts are not checked.
         assert!(
-            vmaxvq_u16(vreinterpretq_u16_s16(overflow)) == 0,
+            VAR & 2 != 0 || vmaxvq_u16(vreinterpretq_u16_s16(overflow)) == 0,
             "a fold coefficient does not fit the wire codec"
         );
         let _ = N;
+        ws.tick[2] += ticks() - tk0;
         claimed
     }
 
     /// `v = sum_j c_j W_j` for every ring element of the `columns` columns of `column_words`
     pub fn fold(words: &[u128], column_words: usize, challenges: &[Challenge], threads: usize) -> Vec<RingElement> {
+        fold_v::<0>(words, column_words, challenges, threads)
+    }
+
+    /// [`fold`] with the diagnostic variant `VAR` of [`fold_block`] (`0`: the record).
+    pub fn fold_v<const VAR: u8>(words: &[u128], column_words: usize, challenges: &[Challenge], threads: usize) -> Vec<RingElement> {
         use std::sync::OnceLock;
         assert!(column_words % LANES == 0, "a column is whole blocks");
         assert_eq!(words.len(), challenges.len() * column_words, "one challenge per column");
@@ -1776,6 +2021,8 @@ pub mod neon {
         });
         let groups: Vec<&Group> = built.iter().map(|g| g.get().expect("every group is built")).collect();
         let bias = bias(groups.iter().copied());
+        let constant: Vec<Group> = if VAR & 2 != 0 { groups.iter().map(|g| g.constant_offsets()).collect() } else { Vec::new() };
+        let groups: Vec<&Group> = if VAR & 2 != 0 { constant.iter().collect() } else { groups };
         let mut out: Vec<RingElement> = Vec::with_capacity(elements);
         let out_addr = out.as_mut_ptr() as usize;
         let words_addr = words.as_ptr() as usize;
@@ -1798,7 +2045,7 @@ pub mod neon {
             while let Some(b) = block {
                 // SAFETY: blocks are disjoint runs of 32 elements of `out`'s capacity.
                 block = unsafe {
-                    fold_block(
+                    fold_block::<VAR>(
                         words_addr as *const u128,
                         column_words,
                         groups,
@@ -1810,6 +2057,11 @@ pub mod neon {
                     )
                 };
             }
+            let total: u64 = ws.tick.iter().sum();
+            for (k, &t) in ws.tick.iter().enumerate() {
+                TICKS[k].fetch_add(t, core::sync::atomic::Ordering::Relaxed);
+            }
+            TICKS[3].fetch_max(total, core::sync::atomic::Ordering::Relaxed);
         });
         // SAFETY: every block wrote all fields of its 32 elements.
         unsafe { out.set_len(elements) };
@@ -1860,6 +2112,8 @@ pub mod neon {
             let challenges: Vec<Challenge> = (0..columns).map(|j| challenge(&mut x, weights(j))).collect();
             let got = fold(&words, column_words, &challenges, 3);
             assert_eq!(got.len(), column_words / 4);
+            // The compact-code pass writes the same elements.
+            assert!(fold_v::<1>(&words, column_words, &challenges, 3) == got, "compact pass, columns {columns}");
             for m in 0..column_words / 4 {
                 let want = reference_element(&words, columns, column_words, &challenges, m);
                 assert_eq!(got[m].v[..], want[..], "columns {columns} element {m}");

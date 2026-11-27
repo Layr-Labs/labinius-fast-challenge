@@ -26,7 +26,27 @@ fn main() {
     for f in ["build.rs", "src/ntt.rs", "src/ntt_neon.rs", "src/ntt_hybrid.rs", "src/ntt_sms.rs", "src/sms_lattice.rs", "src/ntt_neon_weighted_tables.rs", "src/rq.rs"] {
         println!("cargo:rerun-if-changed={f}");
     }
+    println!("cargo:rerun-if-changed=src/forward_mixed_asm.rs");
+    println!("cargo:rerun-if-changed=src/forward_mixed_neon.rs");
+    println!("cargo:rerun-if-changed=src/forward_mixed_ntt_neon_weighted.rs");
+    println!("cargo:rerun-if-changed=src/forward_mixed_ntt_neon_weighted_tables.rs");
+    println!("cargo:rerun-if-changed=src/forward_mixed_paired_asm.rs");
+    println!("cargo:rerun-if-changed=src/forward_mixed_paired_neon.rs");
+    println!("cargo:rerun-if-changed=src/forward_mixed_paired_ntt_neon_weighted.rs");
+    println!("cargo:rerun-if-changed=src/forward_mixed_paired_ntt_neon_weighted_tables.rs");
+    println!("cargo:rerun-if-changed=src/forward_mixed_paired_sms.rs");
+    println!("cargo:rerun-if-changed=src/forward_mixed_sms.rs");
+    println!("cargo:rerun-if-changed=src/forward_paired_asm.rs");
+    println!("cargo:rerun-if-changed=src/forward_paired_neon.rs");
+    println!("cargo:rerun-if-changed=src/forward_paired_sms.rs");
+    println!("cargo:rerun-if-changed=src/forward_selective_asm.rs");
+    println!("cargo:rerun-if-changed=src/forward_selective_neon.rs");
+    println!("cargo:rerun-if-changed=src/forward_selective_sms.rs");
+    println!("cargo:rerun-if-changed=src/forward_strict_asm.rs");
+    println!("cargo:rerun-if-changed=src/forward_strict_neon.rs");
+    println!("cargo:rerun-if-changed=src/forward_strict_sms.rs");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+    write_mixed_key(&dir);
     // The hybrid matrix is no longer the default's: its image stays empty and `--modulus` with
     // the hybrid modulus builds it at run time.
     std::fs::write(dir.join("hybrid-matrix.bin"), Vec::<u8>::new()).expect("write the matrix image");
@@ -79,4 +99,21 @@ fn image() -> Vec<u8> {
 #[cfg(not(target_arch = "aarch64"))]
 fn image() -> Vec<u8> {
     Vec::new()
+}
+
+#[cfg(target_arch = "aarch64")]
+fn write_mixed_key(dir: &std::path::Path) {
+    let packed = if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let key = ntt::forward_mixed::sms::matrix(RING_ELEMENTS, workers);
+        key.data.iter().flat_map(|word| word.to_le_bytes()).collect()
+    } else {
+        Vec::new()
+    };
+    std::fs::write(dir.join("forward-mixed-data.bin"), packed).expect("write mixed SMS key image");
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn write_mixed_key(dir: &std::path::Path) {
+    std::fs::write(dir.join("forward-mixed-data.bin"), []).expect("write empty mixed SMS key image");
 }

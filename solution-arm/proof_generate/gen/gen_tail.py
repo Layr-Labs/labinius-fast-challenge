@@ -22,7 +22,7 @@ from sched import Ins, schedule, allocate
 import gen_pc
 
 
-def build(n, rel=False, omit6=False, omit5=0):
+def build(n, rel=False, omit6=False):
     """Node n's instructions. `rel`: addresses relative to per-node base pointers (x, y = slot
     27 n, c = kern.c[n], t = kern.t6[n]) so that every node of one reduction kind runs the same
     code; else absolute offsets from the transform's base pointers."""
@@ -73,10 +73,8 @@ def build(n, rel=False, omit6=False, omit5=0):
             if q == 1 and t1 is None: t1 = tw(f'ldr q{{d0}}, [CPTR, #{cb + 16}]')
             t, o = ((t0, 4), (t1, 0), (t1, 4))[q]
             p = 9 * q + j
-            guard = (omit5 >> (3 * q + j)) & 1
-            assert not (guard and (skip >> q & 1))
-            a = x[p] if guard or (skip >> q & 1) else red13(x[p])
-            x[p], x[p + 3], x[p + 6] = bfly(a, x[p + 3], x[p + 6], t, o, guard=guard)
+            a = x[p] if (skip >> q & 1) else red13(x[p])
+            x[p], x[p + 3], x[p + 6] = bfly(a, x[p + 3], x[p + 6], t, o)
             grp[0] += 1
     # level 6
     dv = {}
@@ -91,22 +89,19 @@ def build(n, rel=False, omit6=False, omit5=0):
     return ins, low
 
 
-def node_asm(n, rel, K, B, width=6, ls=2, cap=31, reserve=1, omit6=False, omit5=0):
+def node_asm(n, rel, K, B, width=6, ls=2, cap=31, reserve=1, omit6=False):
     ins, low = build(n, rel)
     seq, cyc = schedule(ins, width=width, ls=ls, budget=B, skew=K, cap=cap, reserve=reserve)
-    if omit5 or omit6:
+    if omit6:
         # Keep the frozen order of every remaining operation. Each RED13 result
         # aliases its input. Guarded adds produce the same value when QC is clear.
-        guarded, low = build(n, rel, omit6=omit6, omit5=omit5)
-        omitted = {9 + j for j in range(9) if (omit5 >> j) & 1}
-        if omit6:
-            omitted.update(range(18, 27))
+        guarded, low = build(n, rel, omit6=True)
         wanted = iter(guarded)
         shifts = set()
         names = {'k': 'k'}
         kept = {}
         for old in ins:
-            if old.g in omitted and old.cls == 'S':
+            if old.g >= 18 and old.cls == 'S':
                 shifts.add(old.dsts[0])
             elif old.tie == 0 and old.srcs[1] in shifts:
                 names[old.dsts[0]] = names[old.srcs[0]]
@@ -116,7 +111,7 @@ def node_asm(n, rel, K, B, width=6, ls=2, cap=31, reserve=1, omit6=False, omit5=
                 assert [names[s] for s in old.srcs] == new.srcs
                 names.update(zip(old.dsts, new.dsts))
                 kept[old] = new
-        assert len(shifts) == len(omitted) and len(kept) == len(guarded) and next(wanted, None) is None
+        assert len(shifts) == 9 and len(kept) == len(guarded) and next(wanted, None) is None
         seq = [kept[op] for op in seq if op in kept]
     asm, live = allocate(seq, {'k': 15}, low)
     return asm, cyc, live
@@ -144,7 +139,7 @@ def kinds():
     return order
 
 
-def emit_calls(K=8, B=26, reserve=1, width=6, ls=2, omit6=None, omit5=None):
+def emit_calls(K=8, B=26, reserve=1, width=6, ls=2, omit6=None):
     """One body per node reduction kind, called per node with the node's base pointers."""
     ks = kinds()
     out = []
@@ -156,7 +151,7 @@ def emit_calls(K=8, B=26, reserve=1, width=6, ls=2, omit6=None, omit5=None):
     for i, k in enumerate(ks):
         n = next(m for m in range(24) if gen_pc.kind(m) == k)
         asm, _, _ = node_asm(n, True, K, B, width=width, ls=ls, reserve=reserve,
-                              omit6=omit6(n) if omit6 else False, omit5=omit5(n) if omit5 else 0)
+                              omit6=omit6(n) if omit6 else False)
         out.append(f'"{20 + i}:"')
         out += [f'"{subst(a)}"' for a in asm]
         out.append('"ret"')

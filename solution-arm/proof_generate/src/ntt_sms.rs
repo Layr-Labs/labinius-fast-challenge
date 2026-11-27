@@ -1091,27 +1091,46 @@ unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], ker
         1 => pass_tail(sc, x, kern),
         2 => pass_tail_calls(sc, x, kern),
         3 => pass_tail_calls_b(sc, x, kern),
-        17 => { guarded_tail_once(sc, x, kern); }
         _ => pass_tail_calls_c(sc, x, kern),
     }
 }
 
-// The guarded body only reads sc. Consume the captured QC before this transform
-// overwrites sc or either sink reads x.
+// Each guarded tail captures QC in the same assembly block as its saturating ops.
+// Keep the results in integer state. A later call cannot hide a captured clip.
 #[inline(always)]
-unsafe fn guarded_tail_once(sc: &[int16x8_t; N], x: &mut [int16x8_t; N], kern: &Kernel) -> bool {
-    let status = pass_tail_guarded(sc, x, kern);
-    let clipped = status & (1 << 27) != 0;
-    if clipped {
-        replay_tail(sc, x, kern);
+unsafe fn tail_status<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], kern: &Kernel) -> u64 {
+    if V == 17 {
+        pass_tail_guarded(sc, x, kern)
+    } else {
+        tail::<V>(sc, x, kern);
+        0
     }
-    clipped
+}
+
+#[inline(always)]
+unsafe fn begin_tail_guard() -> u64 {
+    let saved;
+    core::arch::asm!("mrs {saved}, fpsr", "msr fpsr, xzr", saved = out(reg) saved, options(nostack));
+    saved
+}
+
+#[inline(always)]
+unsafe fn finish_tail_guard(saved: u64) {
+    core::arch::asm!("msr fpsr, {saved}", saved = in(reg) saved, options(nostack));
 }
 
 #[cold]
 #[inline(never)]
-unsafe fn replay_tail(sc: &[int16x8_t; N], x: &mut [int16x8_t; N], kern: &Kernel) {
-    pass_tail_calls_c(sc, x, kern);
+unsafe fn replay_tail_sweep(
+    words: &[(*const u8, usize); LANES], elements: usize, start: usize,
+    nib: &mut [uint8x16_t; N / 4], sc: &mut [int16x8_t; N], xs: &mut [[int16x8_t; N]], kern: &Kernel,
+) {
+    for (i, x) in xs.iter_mut().enumerate() {
+        let at = pass_words(words, elements, start, i);
+        indices_asm(&at, nib);
+        lut_pass(nib, sc, kern);
+        pass_tail_calls_c(sc, x, kern);
+    }
 }
 
 #[inline(never)]
@@ -1137,12 +1156,20 @@ unsafe fn sums<const V: u8>(
         // The last partial tile uses zero input words and padded key lanes.
         let l = end - e;
         let groups = l.div_ceil(LOCK);
+        let saved = if V == 17 { begin_tail_guard() } else { 0 };
+        let mut status = 0;
         for i in 0..groups * LOCK {
             let at = pass_words(words, a.elements, e, i);
             indices_asm(&at, nib);
             let x = &mut xs[i];
             lut_pass(nib, sc, kern);
-            tail::<V>(sc, x, kern);
+            status |= tail_status::<V>(sc, x, kern);
+        }
+        if V == 17 {
+            finish_tail_guard(saved);
+            if status & (1 << 27) != 0 {
+                replay_tail_sweep(words, a.elements, e, nib, sc, &mut xs[..groups * LOCK], kern);
+            }
         }
         let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
         sink_terminal::<true>(xs, keys, acc, groups, narrowed);
@@ -1221,6 +1248,8 @@ unsafe fn sums2<const V: u8>(
         let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
         for t in 0..2 {
             let count = groups * LOCK;
+            let saved = if V == 17 { begin_tail_guard() } else { 0 };
+            let mut status = 0;
             for i in 0..count {
                 // The input words [`PF_T`] transforms on: later in this sweep, or the start of
                 // the sweep that follows it (the other batch's, over the same elements for
@@ -1242,7 +1271,13 @@ unsafe fn sums2<const V: u8>(
                 indices_asm(&at, nib);
                 let x = &mut xs[i];
                 lut_pass2(nib, sc, kern);
-                tail::<V>(sc, x, kern);
+                status |= tail_status::<V>(sc, x, kern);
+            }
+            if V == 17 {
+                finish_tail_guard(saved);
+                if status & (1 << 27) != 0 {
+                    replay_tail_sweep(words[t], a.elements, e, nib, sc, &mut xs[..count], kern);
+                }
             }
             sink_terminal::<true>(xs, keys, accs[t], groups, &mut narrowed[t]);
         }

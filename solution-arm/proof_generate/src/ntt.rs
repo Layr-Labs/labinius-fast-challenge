@@ -826,3 +826,18 @@ pub mod tests {
         }
     }
 }
+
+#[cfg(all(target_arch = "aarch64", not(test)))]
+#[allow(dead_code, unused_imports)]
+#[path = "r14_strict23_neon.rs"]
+pub(crate) mod r14_strict23;
+
+#[cfg(all(target_arch = "aarch64", not(test)))]
+#[allow(dead_code, unused_imports)]
+#[path = "r14_v93_23_neon.rs"]
+pub(crate) mod r14_v93_23;
+
+#[cfg(all(target_arch = "aarch64", not(test)))]
+#[allow(dead_code, unused_imports)]
+#[path = "r14_sat84_neon.rs"]
+pub(crate) mod r14_sat84;

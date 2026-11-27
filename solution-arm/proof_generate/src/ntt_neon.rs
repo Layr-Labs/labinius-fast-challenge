@@ -2321,3 +2321,16 @@ mod indices_asm_tests {
 #[cfg(any(test, target_feature = "sve"))]
 #[path = "ntt_neon_weighted.rs"]
 mod weighted;
+
+#[path = "ntt_neon_paired_tail.rs"]
+mod paired_tail;
+pub use paired_tail::tail_both;
+
+#[path = "ntt_neon_signed.rs"]
+mod signed;
+
+#[cfg(target_feature = "sve")]
+#[path = "ntt_neon_weighted_pair.rs"]
+mod weighted_pair;
+
+pub use asm::pass_tail_calls_tuned;

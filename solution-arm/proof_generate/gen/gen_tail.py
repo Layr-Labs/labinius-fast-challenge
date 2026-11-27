@@ -22,7 +22,7 @@ from sched import Ins, schedule, allocate
 import gen_pc
 
 
-def build(n, rel=False):
+def build(n, rel=False, signed_plan=None):
     """Node n's instructions. `rel`: addresses relative to per-node base pointers (x, y = slot
     27 n, c = kern.c[n], t = kern.t6[n]) so that every node of one reduction kind runs the same
     code; else absolute offsets from the transform's base pointers."""
@@ -49,6 +49,12 @@ def build(n, rel=False):
         s = A('add', b1, c1); d = A('sub', b1, c1)
         e = mulc(d, 'k', 2, 3)
         return [A('add', a, s), A('add', A('sub', a, c1), e), A('sub', A('sub', a, b1), e)]
+    def signed_bfly(a, b, c, mode):
+        if mode > 0:
+            e = mulc(A('sub', b, c), 'k', 2, 3)
+            return [A('add', a, A('add', b, c)), A('add', A('sub', a, c), e), A('sub', A('sub', a, b), e)]
+        e = mulc(A('add', b, c), 'k', 2, 3)
+        return [A('add', a, A('sub', c, b)), A('sub', A('sub', a, c), e), A('add', A('add', a, b), e)]
     xb = 0 if rel else 16 * 27 * n
     cb = 0 if rel else 32 * n
     tb = 0 if rel else 80 * n
@@ -61,8 +67,12 @@ def build(n, rel=False):
     # level 4 (twiddle in lanes 4..7 of k)
     for p in range(9):
         a = load(p); b = load(p + 9); c = load(p + 18)
-        if r4: a = red13(a)
-        x[p], x[p + 9], x[p + 18] = bfly(a, b, c, 'k', 4)
+        mode, rotate, mask = (0, 0, int(r4)) if signed_plan is None else signed_plan[4, 0, p]
+        assert mask < 8
+        a, b, c = [red13(v) if mask >> i & 1 else v for i, v in enumerate((a, b, c))]
+        result = signed_bfly(a, b, c, mode) if mode else bfly(a, b, c, 'k', 4)
+        for i, value in enumerate(result):
+            x[p + 9*((i + rotate)%3)] = value
         grp[0] += 1
     # level 5
     t0 = t1 = None
@@ -72,7 +82,8 @@ def build(n, rel=False):
             if q == 1 and t1 is None: t1 = tw(f'ldr q{{d0}}, [CPTR, #{cb + 16}]')
             t, o = ((t0, 4), (t1, 0), (t1, 4))[q]
             p = 9 * q + j
-            a = x[p] if (skip >> q & 1) else red13(x[p])
+            reduce = not (skip >> q & 1) if signed_plan is None else signed_plan[5, q, j][2]
+            a = red13(x[p]) if reduce else x[p]
             x[p], x[p + 3], x[p + 6] = bfly(a, x[p + 3], x[p + 6], t, o)
             grp[0] += 1
     # level 6
@@ -87,8 +98,8 @@ def build(n, rel=False):
     return ins, low
 
 
-def node_asm(n, rel, K, B, width=6, ls=2, cap=31, reserve=1):
-    ins, low = build(n, rel)
+def node_asm(n, rel, K, B, width=6, ls=2, cap=31, reserve=1, signed_plan=None):
+    ins, low = build(n, rel, signed_plan)
     seq, cyc = schedule(ins, width=width, ls=ls, budget=B, skew=K, cap=cap, reserve=reserve)
     asm, live = allocate(seq, {'k': 15}, low)
     return asm, cyc, live
@@ -116,7 +127,7 @@ def kinds():
     return order
 
 
-def emit_calls(K=8, B=26, reserve=1, width=6, ls=2):
+def emit_calls(K=8, B=26, reserve=1, width=6, ls=2, tuned=None):
     """One body per node reduction kind, called per node with the node's base pointers."""
     ks = kinds()
     out = []
@@ -127,7 +138,10 @@ def emit_calls(K=8, B=26, reserve=1, width=6, ls=2):
     out.append('"b 9f"')
     for i, k in enumerate(ks):
         n = next(m for m in range(24) if gen_pc.kind(m) == k)
-        asm, _, _ = node_asm(n, True, K, B, width=width, ls=ls, reserve=reserve)
+        skew, budget, issue_width, loads, reg_reserve = (
+            tuned[k] if tuned is not None else (K, B, width, ls, reserve))
+        asm, _, _ = node_asm(n, True, skew, budget, width=issue_width,
+                             ls=loads, reserve=reg_reserve)
         out.append(f'"{20 + i}:"')
         out += [f'"{subst(a)}"' for a in asm]
         out.append('"ret"')

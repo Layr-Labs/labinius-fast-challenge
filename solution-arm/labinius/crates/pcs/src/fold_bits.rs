@@ -1116,9 +1116,8 @@ pub mod neon {
     const LO: usize = 6;
     /// Counter bits above them, in memory: counts stay below `2^15`.
     const HI: usize = 9;
-    /// Planes added to every offset. This is the largest bias that keeps the padding offsets in
-    /// u16. Later columns can use every position; the first column only merges positions it fits.
-    const BIAS_PLANES: usize = 219;
+    /// Planes added to every offset so that it is non-negative (positions are below 162).
+    const BIAS_PLANES: usize = 160;
     const _: () = assert!(16 * (GUARD + (GROUP - 1) * STRIDE + BIAS_PLANES + WORD_BITS) <= u16::MAX as usize);
     const _: () = assert!(16 * (BIAS_PLANES + PLANES) <= u16::MAX as usize);
     const _: () = assert!(GUARD + BIAS_PLANES >= Q162);
@@ -1155,40 +1154,10 @@ pub mod neon {
         g * columns / groups(columns)
     }
 
-    /// Positions of the sorted entries, shifted to be non-negative: real terms `0 .. 243`,
+    /// Positions of the sorted entries, shifted to be non-negative: real terms `0 .. 162`,
     /// wrapped ones `-127 .. 0`.
     const KEY0: i32 = 127;
-    const KEYS: usize = KEY0 as usize + SLOTS;
-
-    /// In the final ring `1 - Y^81 = -Y^162`. Opposite effective signs at positions
-    /// `p` and `p+81` become one negated term at `p+162`. These positions have opposite
-    /// parity, so the stored challenge signs must match. Keep one upper term per position;
-    /// if a caller provides duplicate positions, any extra terms still enter the fold normally.
-    fn lag81_pairs(c: &Challenge, max_position: usize) -> (u32, u32) {
-        let positions = &c.positions[..c.weight];
-        let mut upper = [u8::MAX; 81];
-        for (i, &p) in positions.iter().enumerate() {
-            let p = p as usize;
-            assert!(p < Q162, "a position is below 162");
-            if p >= 81 {
-                upper[p - 81] = i as u8;
-            }
-        }
-        let mut moved = 0;
-        let mut removed = 0;
-        for (i, &p) in positions.iter().enumerate() {
-            let p = p as usize;
-            if p < 81 && p + Q162 <= max_position {
-                let j = upper[p];
-                if j != u8::MAX && ((c.signs >> i) ^ (c.signs >> j)) & 1 == 0 {
-                    moved |= 1 << i;
-                    removed |= 1 << j;
-                    upper[p] = u8::MAX;
-                }
-            }
-        }
-        (moved, removed)
-    }
+    const KEYS: usize = KEY0 as usize + Q162;
 
     impl Group {
         /// The entries of group `g` (columns `group_first(n, g) ..`) of `challenges`,
@@ -1201,21 +1170,14 @@ pub mod neon {
             // Each entry is `(key, offset)`; a term at `m` reaches pair `i` when `[2i, 2i + 1]`
             // meets `[m, m + 127]`, i.e. `2i - 127 <= m <= 2i + 1`.
             let mut start = [[0u16; KEYS + 1]; 2];
-            let mut paired = [(0, 0); GROUP];
-            for (jl, c) in cs.iter().enumerate() {
-                paired[jl] = lag81_pairs(c, GUARD + jl * STRIDE + BIAS_PLANES);
-            }
             let each = |f: &mut dyn FnMut(usize, usize, u16)| {
                 for (jl, c) in cs.iter().enumerate() {
+                    assert!(c.weight <= c.positions.len());
                     let col = (GUARD + jl * STRIDE + BIAS_PLANES) as i32;
-                    let (moved, removed) = paired[jl];
                     for t in 0..c.weight {
-                        if (removed >> t) & 1 == 1 {
-                            continue;
-                        }
-                        let moved = (moved >> t) & 1 == 1;
-                        let p = c.positions[t] as usize + usize::from(moved) * Q162;
-                        let negative = ((c.signs >> t) & 1 == 1) ^ (p % 2 == 1) ^ moved;
+                        let p = c.positions[t] as usize;
+                        assert!(p < Q162, "a position is below 162");
+                        let negative = ((c.signs >> t) & 1 == 1) ^ (p % 2 == 1);
                         let m = p as i32;
                         f(negative as usize, (m + KEY0) as usize, (16 * (col - m)) as u16);
                         // Slots `p + q >= 243` wrap to `p + q - 243` with the other sign: a
@@ -1931,25 +1893,10 @@ pub mod neon {
                         let mut got: Vec<u16> = group.list[sign][w[2 * sign] as usize..w[2 * sign + 1] as usize].to_vec();
                         let mut want = Vec::new();
                         for (jl, c) in challenges[first..end].iter().enumerate() {
-                            let col = (GUARD + jl * STRIDE + BIAS_PLANES) as i32;
-                            let mut terms = [0i32; SLOTS];
                             for t in 0..c.weight {
-                                let p = c.positions[t] as usize;
-                                terms[p] = if ((c.signs >> t) ^ p as u32) & 1 == 1 { -1 } else { 1 };
-                            }
-                            for p in 0..81 {
-                                if p + Q162 <= col as usize && terms[p] == -terms[p + 81] {
-                                    terms[p + Q162] = terms[p + 81];
-                                    terms[p] = 0;
-                                    terms[p + 81] = 0;
-                                }
-                            }
-                            for (p, s) in terms.into_iter().enumerate() {
-                                if s == 0 {
-                                    continue;
-                                }
-                                let p = p as i32;
-                                let negative = usize::from(s < 0);
+                                let p = c.positions[t] as i32;
+                                let negative = (((c.signs >> t) & 1 == 1) ^ (p % 2 == 1)) as usize;
+                                let col = (GUARD + jl * STRIDE + BIAS_PLANES) as i32;
                                 for (m, sg) in [(p, negative), (p - SLOTS as i32, 1 - negative)] {
                                     let reaches = (2 * i as i32) <= m + 127 && 2 * i as i32 + 1 >= m;
                                     if sg == sign && reaches && (m >= 0 || p as usize + WORD_BITS > SLOTS) {
@@ -1970,29 +1917,6 @@ pub mod neon {
                         assert_eq!(got, want, "group {g} pair {i} sign {sign}");
                     }
                 }
-            }
-        }
-
-        #[test]
-        fn lag81_fold_handles_the_offset_limit_and_negacyclic_wrap() {
-            let challenges: Vec<Challenge> = (0..4)
-                .map(|j| {
-                    let mut positions = [0; 32];
-                    positions[..4].copy_from_slice(&[59, 80, 140, 161]);
-                    Challenge { positions, signs: if j % 2 == 0 { 0 } else { 15 }, weight: 4 }
-                })
-                .collect();
-            assert_eq!(lag81_pairs(&challenges[0], GUARD + BIAS_PLANES), (1, 4));
-            assert_eq!(lag81_pairs(&challenges[1], GUARD + STRIDE + BIAS_PLANES), (3, 12));
-            let words: Vec<u128> = (0..challenges.len()*128).map(|i| match i % 4 {
-                0 => 1,
-                1 => u128::MAX,
-                2 => 1 << 127,
-                _ => 0,
-            }).collect();
-            let folded = fold(&words, 128, &challenges, 1);
-            for (m, actual) in folded.iter().enumerate() {
-                assert_eq!(actual.v[..], reference_element(&words, challenges.len(), 128, &challenges, m)[..]);
             }
         }
 

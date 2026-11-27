@@ -2085,8 +2085,14 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is on disk (its pages are in the page cache) and the report is written to the
+    // unbuffered stderr: nothing the exit handlers, stdio flushes and destructors would do is
+    // observable, so the process ends with the system call directly (pepedesigner 724a700e, as
+    // carried by ercumentyildirim f5ba5778).
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 #[cfg(test)]
@@ -2694,4 +2700,4 @@ mod tests {
     }
 
 }
-const _REDRAW_SALT: u64 = 0xc1730957c0d9438f;
+const _REDRAW_SALT: u64 = 0xefae66a2cb38deb9;

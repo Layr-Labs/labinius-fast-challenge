@@ -61,6 +61,7 @@ image!(SMS_META, "sms-meta.bin");
 image!(SMS_DIGITS, "sms-digits.bin");
 image!(SMS_MEAN_INT, "sms-mean-int.bin");
 image!(SMS_THRESHOLD, "sms-threshold.bin");
+image!(SMS_CORRECTIONS, "sms-corrections.bin");
 const MODULUS: u128 = ntt::neon::sms::MODULUS;
 
 /// Coefficients of a witness ring element per table lookup in [`commit`].
@@ -375,7 +376,7 @@ fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
     #[cfg(target_arch = "aarch64")]
     if modulus == ntt::neon::sms::MODULUS {
         use ntt::neon::sms;
-        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
+        let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, &SMS_CORRECTIONS.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
         sms::commit(values, &matrix, threads(), modulus, out);
         return;
@@ -1075,10 +1076,11 @@ mod tests {
         {
             use ntt::neon::sms;
             let built = sms::matrix(RING_ELEMENTS, 8);
-            let embedded = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
+            let embedded = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, &SMS_CORRECTIONS.0, RING_ELEMENTS)
                 .expect("the build embeds the SMS images");
             assert!(built.data == embedded.data && built.mean_residues == embedded.mean_residues && built.mu == embedded.mu);
             assert!(built.digits == embedded.digits && built.mean_int == embedded.mean_int && built.threshold == embedded.threshold);
+            assert!(built.corrections == embedded.corrections);
             assert_eq!(built.margin, embedded.margin);
         }
         use ntt::neon::sms;

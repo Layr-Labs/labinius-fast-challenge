@@ -30,7 +30,7 @@ fn main() {
     // The hybrid matrix is no longer the default's: its image stays empty and `--modulus` with
     // the hybrid modulus builds it at run time.
     std::fs::write(dir.join("hybrid-matrix.bin"), Vec::<u8>::new()).expect("write the matrix image");
-    let [data, means, mu, meta, digits, mean_int, threshold] = sms_images();
+    let [data, means, mu, meta, digits, mean_int, threshold, corrections] = sms_images();
     for (name, bytes) in [
         ("sms-data.bin", data),
         ("sms-means.bin", means),
@@ -39,13 +39,14 @@ fn main() {
         ("sms-digits.bin", digits),
         ("sms-mean-int.bin", mean_int),
         ("sms-threshold.bin", threshold),
+        ("sms-corrections.bin", corrections),
     ] {
         std::fs::write(dir.join(name), bytes).expect("write an SMS image");
     }
 }
 
 #[cfg(target_arch = "aarch64")]
-fn sms_images() -> [Vec<u8>; 7] {
+fn sms_images() -> [Vec<u8>; 8] {
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
         return Default::default();
     }
@@ -61,7 +62,7 @@ fn sms_images() -> [Vec<u8>; 7] {
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-fn sms_images() -> [Vec<u8>; 7] {
+fn sms_images() -> [Vec<u8>; 8] {
     Default::default()
 }
 

@@ -207,6 +207,7 @@ fn weighted_lut_signed_intervals() {
         }
     }
     assert!(final_bound <= bound, "{final_bound} > {bound}");
+    assert!(final_bound <= super::super::sms::MAX_WEIGHTED_SLOT as i32);
     println!("Weighted tail bound {final_bound}; contract {bound}");
 }
 

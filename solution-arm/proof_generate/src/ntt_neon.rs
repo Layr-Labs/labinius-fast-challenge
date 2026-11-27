@@ -825,6 +825,11 @@ unsafe fn pass_d<const S: usize, const MAC: bool>(
 
 #[path = "ntt_neon_asm.rs"]
 mod asm;
+#[cfg(target_feature = "sve")]
+#[path = "ntt_neon_paired_lut.rs"]
+mod paired_lut;
+#[cfg(target_feature = "sve")]
+pub use paired_lut::pass_lut_paired;
 #[path = "ntt_neon_idx.rs"]
 mod idx;
 pub use idx::indices_asm;

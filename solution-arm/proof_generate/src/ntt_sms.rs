@@ -951,14 +951,14 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    super::pass_lut_loop(nib, x, kern);
+    super::pass_lut_paired(nib, x, kern);
 }
 
-/// Diagnostic only: side 1 of the paired test runs the table front as a 4-iteration loop.
+/// The second batch uses the same paired table banks.
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    super::pass_lut_loop(nib, x, kern)
+    super::pass_lut_paired(nib, x, kern)
 }
 
 #[cfg(not(target_feature = "sve"))]
@@ -1725,9 +1725,16 @@ mod leap_bench {
             let packed = crate::ntt::neon::tests::pack(&idx);
             let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             let mut b = a.clone();
-            unsafe { pass_lut::<PB>(&idx, &mut a, kern); pass_lut_asm(&packed, &mut b, kern); }
+            let mut paired = a.clone();
+            unsafe {
+                pass_lut::<PB>(&idx, &mut a, kern);
+                pass_lut_asm(&packed, &mut b, kern);
+                pass_lut_paired(&packed, &mut paired, kern);
+            }
+            let pairs: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(paired.as_ptr() as *const [i16; 8], N) };
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
+            assert_eq!(x, pairs);
             assert_eq!(x, y);
         }
     }

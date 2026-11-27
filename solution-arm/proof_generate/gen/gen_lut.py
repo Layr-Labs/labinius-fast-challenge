@@ -21,7 +21,7 @@ def ld1b(s):
 # A lookup at a slot `o >= 26` takes the one-register `tbl`: coefficient `o + 486` is past the
 # element's 512 bits, so the nibble's bit 3 is zero and only the table's first eight entries (its
 # first register) are indexed. Same values; 544 of the 648 lookups per transform.
-def build_node(n, steps):
+def build_node(n, steps, tables=(16, 18, 20, 22, 24, 26)):
     ins = []; cnt = [0]
     def v(nm):
         cnt[0] += 1; return f'{nm}{cnt[0]}'
@@ -42,9 +42,9 @@ def build_node(n, steps):
             ix, val = v('ix'), v('lk')
             ins.append(Ins('L', [ix], [], ld1b(o)))
             if o >= 26:
-                ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.hRB, z{{s0}}.h'))
+                ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{tables[t]}.hRB, z{{s0}}.h'))
             else:
-                ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.h, z{17+2*t}.hRB, z{{s0}}.h'))
+                ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{tables[t]}.h, z{tables[t]+1}.hRB, z{{s0}}.h'))
             look.append(val)
         x0, y0, x1, y1, x2, y2 = look
         a0, b0 = A('add', x0, y0), A('sub', x0, y0)
@@ -93,4 +93,39 @@ def emit_loop(per=27, K=8, B=17, width=6, ls=2, cap=18):
         asm, _ = allocate(seq, {'k': 15}, set(), reserved=LOOP_RESERVED)
         out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
     out += ['"add {x}, {x}, #2592"', '"add {lut}, {lut}, #192"', '"subs {n}, {n}, #1"', '"b.ne 3b"']
+    return ',\n        '.join(out)
+
+# Table zero has 16 entries. The five other tables need only their first eight entries.
+PAIR_TABLES = ((16, 18, 19, 20, 21, 22), (23, 25, 26, 27, 28, 29))
+PAIR_RESERVED = tuple(range(15, 30))
+
+def build_pair(steps):
+    """The two nodes share each index load. Their tables, temporaries and stores are disjoint."""
+    nodes = [build_node(n, steps, tables) for n, tables in enumerate(PAIR_TABLES)]
+    def name(s):
+        return s if s == 'k' or s.startswith('ix') else 'other_' + s
+    ins = []
+    for a, b in zip(*nodes):
+        a.g *= 2
+        ins.append(a)
+        if a.cls == 'L':
+            assert a.fmt == b.fmt and a.dsts == b.dsts
+        else:
+            other = Ins(b.cls, [name(d) for d in b.dsts], [name(s) for s in b.srcs], b.fmt, b.tie)
+            other.g = 2 * b.g + 1
+            ins.append(other)
+    return ins
+
+def emit_paired():
+    """Two pairs of table banks. Each loaded index feeds both lookups in the pair."""
+    out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"', '"mov {n}, #2"', '"3:"']
+    for n, tables in enumerate(PAIR_TABLES):
+        out.append(f'"ldp q{tables[0]}, q{tables[0]+1}, [{{lut}}, #{192*n}]"')
+        for t in range(1, 6):
+            out.append(f'"ldr q{tables[t]}, [{{lut}}, #{192*n+32*t}]"')
+    ins = build_pair(list(range(27)))
+    seq, _ = schedule(ins, skew=32, budget=11, cap=17, reserve=0, width=6, ls=1)
+    asm, _ = allocate(seq, {'k': 15}, set(), reserved=PAIR_RESERVED)
+    out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
+    out += ['"add {x}, {x}, #4096"', '"add {x}, {x}, #1088"', '"add {lut}, {lut}, #384"', '"subs {n}, {n}, #1"', '"b.ne 3b"']
     return ',\n        '.join(out)

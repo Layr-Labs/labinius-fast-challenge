@@ -1996,7 +1996,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         folded,
     };
     let encode_time = clock.elapsed();
-    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}{}\n",
+    let _ = PROFILE.set(format!("labinius-profile load_us={} matrix_us={} setup_us={} commit_us={} recombine_us={} partials_us={} switch_us={} row_us={} challenges_us={} fold_us={} encode_us={} total_us={} threads={} fold_gfni={}{}{}{}\n",
         load_time.as_micros(), matrix_time.as_micros(), (setup_time-matrix_time).as_micros(),
         (commit_time-setup_time).as_micros(), (recombine_time-commit_time).as_micros(),
         (partials_time-recombine_time).as_micros(), (switch_time-partials_time).as_micros(),
@@ -2004,7 +2004,7 @@ fn prove(seed: &[u8; 32], modulus: u128, table_path: &str, output: Option<&Outpu
         (fold_time-challenge_time).as_micros(), (encode_time-fold_time).as_micros(),
         encode_time.as_micros(), workers,
         labinius::fold::FOLD_USED_GFNI.load(std::sync::atomic::Ordering::Relaxed),
-        labinius::simd::commit::sms::worker_report(workers), labinius::fold::fold_report(workers)));
+        labinius::simd::commit::sms::worker_report(workers), labinius::fold::fold_report(workers), cf::partials_report()));
     proof
 }
 
@@ -2047,8 +2047,64 @@ fn yield_to_everything_else() {
     unsafe { sched_setscheduler(0, SCHED_IDLE, &SchedParam { priority: 0 }) };
 }
 
+
+/// Diagnostic: throughput of single 512-bit instructions on this CPU, in TSC ticks per 1000
+/// instructions (12 independent chains, best of three, ~50 us in total). It tells whether the
+/// commitment kernel's 16-bit multiplies and `vpdpwssd` issue on one vector port or two, which
+/// the instruction counts alone cannot.
+#[cfg(target_arch = "x86_64")]
+fn port_probe() -> String {
+    use core::arch::asm;
+    use core::arch::x86_64::*;
+    const N: usize = 512;
+    macro_rules! probe {
+        ($name:literal, $op:literal, $imm:literal) => {{
+            let mut best = u64::MAX;
+            for _ in 0..3 {
+                unsafe {
+                    let y = _mm512_set1_epi16(core::hint::black_box(3));
+                    let (mut z0, mut z1, mut z2, mut z3, mut z4, mut z5) = (y, y, y, y, y, y);
+                    let (mut z6, mut z7, mut z8, mut z9, mut z10, mut z11) = (y, y, y, y, y, y);
+                    let t = _rdtsc();
+                    for _ in 0..N {
+                        asm!(
+                            concat!($op, " {0}, {0}, {12}", $imm, "\n", $op, " {1}, {1}, {12}", $imm, "\n", $op, " {2}, {2}, {12}", $imm, "\n", $op, " {3}, {3}, {12}", $imm, "\n", $op, " {4}, {4}, {12}", $imm, "\n", $op, " {5}, {5}, {12}", $imm, "\n", $op, " {6}, {6}, {12}", $imm, "\n", $op, " {7}, {7}, {12}", $imm, "\n", $op, " {8}, {8}, {12}", $imm, "\n", $op, " {9}, {9}, {12}", $imm, "\n", $op, " {10}, {10}, {12}", $imm, "\n", $op, " {11}, {11}, {12}", $imm, "\n"),
+                            inout(zmm_reg) z0, inout(zmm_reg) z1, inout(zmm_reg) z2, inout(zmm_reg) z3,
+                            inout(zmm_reg) z4, inout(zmm_reg) z5, inout(zmm_reg) z6, inout(zmm_reg) z7,
+                            inout(zmm_reg) z8, inout(zmm_reg) z9, inout(zmm_reg) z10, inout(zmm_reg) z11,
+                            in(zmm_reg) y, options(nomem, nostack, preserves_flags)
+                        );
+                    }
+                    let d = _rdtsc() - t;
+                    core::hint::black_box([z0, z1, z2, z3, z4, z5, z6, z7, z8, z9, z10, z11]);
+                    best = best.min(d);
+                }
+            }
+            format!("{}:{}", $name, best * 1000 / (N as u64 * 12))
+        }};
+    }
+    // Every line is `op z_k, z_k, y[, imm]`: each of the twelve chains depends only on itself.
+    let parts = [
+        probe!("paddw", "vpaddw", ""),
+        probe!("mullw", "vpmullw", ""),
+        probe!("mulhw", "vpmulhw", ""),
+        probe!("mulhrsw", "vpmulhrsw", ""),
+        probe!("maddwd", "vpmaddwd", ""),
+        probe!("dpwssd", "vpdpwssd", ""),
+        probe!("ternlog", "vpternlogq", ", 0x96"),
+        probe!("permw", "vpermw", ""),
+        probe!("shufb", "vpshufb", ""),
+        probe!("gfaffine", "vgf2p8affineqb", ", 0"),
+    ];
+    format!("port_probe={}", parts.join(","))
+}
+
 fn main() {
     let main_ns = monotonic_ns();
+    #[cfg(target_arch = "x86_64")]
+    let probe = port_probe();
+    #[cfg(not(target_arch = "x86_64"))]
+    let probe = String::new();
     #[cfg(target_os = "linux")]
     if std::env::var_os("LABINIUS_NORMAL_SCHED").is_none() {
         yield_to_everything_else();
@@ -2074,10 +2130,11 @@ fn main() {
     output.write(proof);
     let write_time = output_clock.elapsed() - prove_return;
     let report = format!(
-        "{}labinius-output prove_return_us={} write_us={}\nlabinius-clock main_ns={} exit_ns={}\n",
+        "{}labinius-output prove_return_us={} write_us={} {}\nlabinius-clock main_ns={} exit_ns={}\n",
         PROFILE.get().map_or("", |p| p.as_str()),
         prove_return.as_micros(),
         write_time.as_micros(),
+        probe,
         main_ns,
         monotonic_ns()
     );
@@ -2085,8 +2142,14 @@ fn main() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
-    // The proof is on disk; nothing the destructors would do is observable.
-    std::process::exit(0);
+    // The proof is on disk (its pages are in the page cache) and the report is written to the
+    // unbuffered stderr: nothing the exit handlers, stdio flushes and destructors would do is
+    // observable, so the process ends with the system call directly (pepedesigner 724a700e, as
+    // carried by ercumentyildirim f5ba5778).
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 #[cfg(test)]

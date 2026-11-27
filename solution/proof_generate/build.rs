@@ -30,6 +30,11 @@ fn main() {
     // 2 MiB segment alignment, so the 2 MiB-aligned key image (main.rs) can be mapped with PMD
     // entries instead of ~11.7k 4 KiB ones (e-man07, submission 721d445d).
     println!("cargo:rustc-link-arg-bins=-Wl,-z,max-page-size=0x200000");
+    // A fixed-address executable: the loader has no relative relocations to apply before `main`
+    // (the segments keep the 2 MiB alignment above). From pepedesigner 1c329b5d, as carried by
+    // ercumentyildirim f5ba5778.
+    println!("cargo:rustc-link-arg-bins=-no-pie");
+    static_link(&dir);
     println!("cargo:rerun-if-changed=../native_diagnostics");
     let (image, tail, hybrid, pairs) = images();
     std::fs::write(dir.join("pair-key.bin"), pairs).expect("write the column-pair key image");
@@ -43,6 +48,50 @@ fn main() {
     std::fs::write(dir.join("sms-digits.bin"), digits).expect("write public repair digits");
     std::fs::write(dir.join("sms-means.bin"), means).expect("write exact public means");
     std::fs::write(dir.join("sms-limits.bin"), limits).expect("write repair thresholds");
+}
+
+/// Link the prover statically on linux-gnu: no `ld.so`, no shared libc, libm and libgcc_s to map
+/// and bind before `main` (about 0.5 ms of every timed run: 0.59 against 1.07 ms per exec of a
+/// small threaded Rust program on a Zen 3 host). The harness's `RUSTFLAGS` replace any
+/// `rustflags` this tree could set, so `-C target-feature=+crt-static` is out of reach. rustc
+/// still names its libraries after `-Wl,-Bdynamic` (`-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc`);
+/// `ld` takes, per search directory in order, `libX.so` or else `libX.a`, so a directory that
+/// holds only static archives under those names, searched first, links them all statically;
+/// `-static` gives the matching startup files and no interpreter. `libc.a` there is a group of
+/// glibc's archive with libgcc's two (they refer to each other), and `libgcc_s.a` stands for
+/// libgcc's static unwinder and support library. Where an archive is missing the link stays
+/// dynamic, as before.
+fn static_link(out: &std::path::Path) {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") || env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("gnu") {
+        return;
+    }
+    let cc = env::var("RUSTC_LINKER").or_else(|_| env::var("CC")).unwrap_or_else(|_| "cc".into());
+    let find = |name: &str| -> Option<PathBuf> {
+        let out = std::process::Command::new(&cc).arg(format!("-print-file-name={name}")).output().ok()?;
+        let path = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+        // An archive the compiler does not know comes back as the bare name.
+        (path.is_absolute() && path.is_file()).then(|| path.canonicalize().unwrap_or(path))
+    };
+    let names = ["libc.a", "libm.a", "libpthread.a", "libdl.a", "librt.a", "libutil.a", "libgcc.a", "libgcc_eh.a"];
+    let found: Vec<Option<PathBuf>> = names.iter().map(|n| find(n)).collect();
+    if let Some(i) = found.iter().position(Option::is_none) {
+        println!("cargo:warning=dynamic link: {} not found", names[i]);
+        return;
+    }
+    let path = |n: &str| found[names.iter().position(|&x| x == n).unwrap()].clone().unwrap();
+    let dir = out.join("static-libs");
+    std::fs::create_dir_all(&dir).expect("create the static library directory");
+    let script = |file: &str, body: String| std::fs::write(dir.join(file), body).expect("write a linker script");
+    script("libc.a", format!("GROUP ( {} {} {} )\n", path("libc.a").display(), path("libgcc.a").display(), path("libgcc_eh.a").display()));
+    script("libgcc_s.a", format!("INPUT ( {} {} )\n", path("libgcc_eh.a").display(), path("libgcc.a").display()));
+    for n in ["libm.a", "libpthread.a", "libdl.a", "librt.a", "libutil.a"] {
+        script(n, format!("INPUT ( {} )\n", path(n).display()));
+    }
+    // Binaries only (a dynamically linked test would take the static libc too). `ld` applies
+    // `-L` to every `-l`, wherever it appears, and gcc passes it ahead of its own directories.
+    println!("cargo:rustc-link-arg-bins=-L{}", dir.display());
+    println!("cargo:rustc-link-arg-bins=-static");
+    println!("cargo:warning=static link against {}", path("libc.a").display());
 }
 
 /// For the single-transform modulus: the seven streams' keys in the lockstep layout, the digit

@@ -1329,6 +1329,13 @@ fn accumulate_streaming_positions<const Q: u16, T: WordTransform>(
 /// microseconds from the fold's dispatch to the end of its last task, and the tasks it ran.
 pub static FOLD_END_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
 pub static FOLD_TASKS: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// Per worker: microseconds spent slicing table blocks into planes, and accumulating planes.
+pub static FOLD_SLICE_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+pub static FOLD_ADD_US: [std::sync::atomic::AtomicU32; 16] = [const { std::sync::atomic::AtomicU32::new(0) }; 16];
+/// Per prefetch variant (in-process A/B): blocks run, and nanoseconds slicing and accumulating.
+pub static FOLD_VAR_TASKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub static FOLD_VAR_SLICE_NS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub static FOLD_VAR_ADD_NS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The diagnostics above as ` fold_end_us=a/b/.. fold_tasks=a/b/..`.
 pub fn fold_report(workers: usize) -> String {
@@ -1336,7 +1343,12 @@ pub fn fold_report(workers: usize) -> String {
     let w = workers.min(16);
     let ends: Vec<String> = (0..w).map(|i| FOLD_END_US[i].load(Relaxed).to_string()).collect();
     let tasks: Vec<String> = (0..w).map(|i| FOLD_TASKS[i].load(Relaxed).to_string()).collect();
-    format!(" fold_end_us={} fold_tasks={}", ends.join("/"), tasks.join("/"))
+    let slice: Vec<String> = (0..w).map(|i| FOLD_SLICE_US[i].load(Relaxed).to_string()).collect();
+    let add: Vec<String> = (0..w).map(|i| FOLD_ADD_US[i].load(Relaxed).to_string()).collect();
+    let var: Vec<String> = (0..4)
+        .map(|v| format!("{}:{}:{}", FOLD_VAR_TASKS[v].load(Relaxed), FOLD_VAR_SLICE_NS[v].load(Relaxed) / 1000, FOLD_VAR_ADD_NS[v].load(Relaxed) / 1000))
+        .collect();
+    format!(" fold_end_us={} fold_tasks={} fold_slice_us={} fold_add_us={} fold_var={}", ends.join("/"), tasks.join("/"), slice.join("/"), add.join("/"), var.join("/"))
 }
 
 pub fn fold_witness_bitsliced(
@@ -1406,6 +1418,24 @@ mod bitsliced {
     /// Schedule entries ahead of use that the accumulation prefetches the planes of: the planes
     /// (264 KB per worker) live in L2, and each entry's two vectors are otherwise demand misses.
     const PF_AHEAD: usize = 0;
+    /// How [`slice`] prefetches the next 8 KB piece: into L1, into L2, or not at all.
+    const SLICE_PF_T0: u8 = 0;
+    const SLICE_PF_T1: u8 = 1;
+    const SLICE_PF_NONE: u8 = 2;
+    /// The fold's prefetch variants: the slicer's next-piece hint, and whether a group's
+    /// accumulation requests the next group's table blocks into L2 (spread over its slot pairs).
+    /// With `FOLD_VARIANTS > 1` block `b` runs variant `b % FOLD_VARIANTS` (an in-process A/B whose
+    /// per-variant times go to the profile line); otherwise every block runs `FOLD_VARIANT`.
+    const VARIANTS: [(u8, bool); 4] = [
+        (SLICE_PF_T0, false),
+        (SLICE_PF_T0, true),
+        (SLICE_PF_NONE, true),
+        (SLICE_PF_T1, false),
+    ];
+    const FOLD_VARIANTS: usize = 4;
+    const FOLD_VARIANT: usize = 0;
+    /// Cache lines of one column's block of [`LANES`] words.
+    const LINES_PER_BLOCK: usize = LANES * 16 / 64;
     const BITS: usize = 15;
     /// Columns per group: 32 * 129 planes, about 258 KiB per worker. Larger groups
     /// amortize the schedule and partial carry-save trees. The qword offsets remain in u16:
@@ -1737,14 +1767,19 @@ mod bitsliced {
     /// time: the blocks of a group are 256 KB apart, two fresh pages each, which the hardware
     /// prefetchers only start on after the first misses, and the table comes from DRAM.
     #[inline(always)]
-    unsafe fn slice(words: *const B128, out: *mut __m512i, next: *const B128) {
+    unsafe fn slice<const MODE: u8>(words: *const B128, out: *mut __m512i, next: *const B128) {
         let mut tiles = core::mem::MaybeUninit::<[[__m512i; 8]; 16]>::uninit();
         let tiles_ptr = tiles.as_mut_ptr() as *mut __m512i;
         let perm = _mm512_load_si512(PERM.0.as_ptr() as *const __m512i);
         let ident = _mm512_set1_epi64(bitmat::GF_IDENT);
         for t in 0..8 {
             for i in 0..16 {
-                _mm_prefetch::<{ _MM_HINT_T0 }>((next as *const i8).add(1024 * t + 64 * i));
+                let p = (next as *const i8).add(1024 * t + 64 * i);
+                match MODE {
+                    SLICE_PF_T0 => _mm_prefetch::<{ _MM_HINT_T0 }>(p),
+                    SLICE_PF_T1 => _mm_prefetch::<{ _MM_HINT_T1 }>(p),
+                    _ => {}
+                }
             }
             transpose_tile(words.add(64 * t), tiles_ptr, t, perm, ident);
         }
@@ -2334,6 +2369,7 @@ mod bitsliced {
         }
         let mut acc: Vec<__m512i> = Vec::with_capacity(2 * PAIRS * BITS);
         let mut counts = if FUSED { Vec::new() } else { uninit_counts() };
+        let (mut slice_time, mut add_time) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         loop {
             let task = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if task >= tasks {
@@ -2341,6 +2377,9 @@ mod bitsliced {
             }
             ran += 1;
             let (block, part) = (tasks / parts - 1 - task / parts, task % parts);
+            let variant = if FOLD_VARIANTS > 1 { block % FOLD_VARIANTS } else { FOLD_VARIANT };
+            let (slice_mode, group_ahead) = VARIANTS[variant];
+            let (task_slice, task_add) = (slice_time, add_time);
             for p in 0..2 * PAIRS * BITS {
                 _mm512_store_si512(acc.as_mut_ptr().add(p), zero);
             }
@@ -2349,6 +2388,7 @@ mod bitsliced {
                 let group = &groups[gi];
                 #[cfg(test)]
                 let start = profile.then(std::time::Instant::now);
+                let slice_start = std::time::Instant::now();
                 for j in 0..group.columns {
                     let src = words.as_ptr().add((group.first + j) * column_words + block * LANES);
                     // What the next call slices: this group's next column, else the next
@@ -2360,13 +2400,36 @@ mod bitsliced {
                     } else {
                         src
                     };
-                    slice(src, planes.as_mut_ptr().add(GUARD + j * STRIDE), next_src);
+                    let out = planes.as_mut_ptr().add(GUARD + j * STRIDE);
+                    match slice_mode {
+                        SLICE_PF_T0 => slice::<SLICE_PF_T0>(src, out, next_src),
+                        SLICE_PF_T1 => slice::<SLICE_PF_T1>(src, out, next_src),
+                        _ => slice::<SLICE_PF_NONE>(src, out, next_src),
+                    }
                 }
                 #[cfg(test)]
                 if let Some(start) = start { times[0] += start.elapsed(); }
                 #[cfg(test)]
                 let start = profile.then(std::time::Instant::now);
+                let add_start = std::time::Instant::now();
+                slice_time += add_start - slice_start;
+                // The next group's blocks (its columns' 8 KB pieces of this block, 256 KB apart)
+                // are requested into L2 while this group accumulates out of L2, spread evenly
+                // over its slot pairs: the accumulation reads no table memory, so the DRAM
+                // traffic of the next slicing overlaps it instead of stalling the slicer.
+                let (ahead_base, ahead_lines) = if group_ahead && gi + 1 < range.end {
+                    let g = &groups[gi + 1];
+                    (words.as_ptr().add(g.first * column_words + block * LANES) as *const i8, g.columns * LINES_PER_BLOCK)
+                } else {
+                    (core::ptr::null(), 0)
+                };
                 for q in 0..PAIRS {
+                    if ahead_lines > 0 {
+                        for l in q * ahead_lines / PAIRS..(q + 1) * ahead_lines / PAIRS {
+                            let (j, i) = (l / LINES_PER_BLOCK, l % LINES_PER_BLOCK);
+                            _mm_prefetch::<{ _MM_HINT_T1 }>(ahead_base.add(j * column_words * 16 + 64 * i));
+                        }
+                    }
                     accumulate_pair(
                         planes.as_ptr(),
                         &group.terms[group.offsets[q]..group.mid[q]],
@@ -2376,6 +2439,13 @@ mod bitsliced {
                 }
                 #[cfg(test)]
                 if let Some(start) = start { times[1] += start.elapsed(); }
+                add_time += add_start.elapsed();
+            }
+            if variant < 4 {
+                use std::sync::atomic::Ordering::Relaxed;
+                super::FOLD_VAR_TASKS[variant].fetch_add(1, Relaxed);
+                super::FOLD_VAR_SLICE_NS[variant].fetch_add((slice_time - task_slice).as_nanos() as u64, Relaxed);
+                super::FOLD_VAR_ADD_NS[variant].fetch_add((add_time - task_add).as_nanos() as u64, Relaxed);
             }
             #[cfg(test)]
             let start = profile.then(std::time::Instant::now);
@@ -2424,6 +2494,11 @@ mod bitsliced {
         if profile {
             eprintln!("bitfold worker={} slice_us={} add_us={} output_us={}",
                 worker, times[0].as_micros(), times[1].as_micros(), times[2].as_micros());
+        }
+        if worker < 16 {
+            use std::sync::atomic::Ordering::Relaxed;
+            super::FOLD_SLICE_US[worker].store(slice_time.as_micros() as u32, Relaxed);
+            super::FOLD_ADD_US[worker].store(add_time.as_micros() as u32, Relaxed);
         }
         ran
     }
@@ -2557,7 +2632,7 @@ mod bitsliced {
             unsafe {
                 let zero = _mm512_setzero_si512();
                 let mut planes = vec![zero; STRIDE];
-                slice(words.as_ptr(), planes.as_mut_ptr(), words.as_ptr());
+                slice::<SLICE_PF_T0>(words.as_ptr(), planes.as_mut_ptr(), words.as_ptr());
                 for p in 0..128 {
                     let bits: [u64; 8] = core::mem::transmute(planes[p]);
                     for lane in 0..LANES {

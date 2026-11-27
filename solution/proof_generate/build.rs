@@ -30,6 +30,10 @@ fn main() {
     // 2 MiB segment alignment, so the 2 MiB-aligned key image (main.rs) can be mapped with PMD
     // entries instead of ~11.7k 4 KiB ones (e-man07, submission 721d445d).
     println!("cargo:rustc-link-arg-bins=-Wl,-z,max-page-size=0x200000");
+    // A fixed-address executable: the loader has no relative relocations to apply before `main`
+    // (the segments keep the 2 MiB alignment above). From pepedesigner 1c329b5d, as carried by
+    // ercumentyildirim f5ba5778.
+    println!("cargo:rustc-link-arg-bins=-no-pie");
     println!("cargo:rerun-if-changed=../native_diagnostics");
     let (image, tail, hybrid, pairs) = images();
     std::fs::write(dir.join("pair-key.bin"), pairs).expect("write the column-pair key image");

@@ -1190,9 +1190,18 @@ unsafe fn partials_blocks<const G: usize>(
             }
             let end = ((c + 1) * chunk).min(rows);
             for jh in c * chunk..end {
+                let row_start = std::time::Instant::now();
                 scale_b128_row(&low, high[jh], row.as_mut_ptr());
                 let next_row = if jh + 1 < end { pi0.add((jh + 1) << h) } else { core::ptr::null() };
-                partials_row(&mut acc, pi0.add(jh << h), block_len, row.as_ptr(), groups, &mut scratch, next_row);
+                let variant = if PARTIALS_VARIANTS > 1 { jh % PARTIALS_VARIANTS } else { PARTIALS_VARIANT };
+                if variant == 1 {
+                    partials_row::<2>(&mut acc, pi0.add(jh << h), block_len, row.as_ptr(), groups, &mut scratch, next_row);
+                } else {
+                    partials_row::<1>(&mut acc, pi0.add(jh << h), block_len, row.as_ptr(), groups, &mut scratch, next_row);
+                }
+                use std::sync::atomic::Ordering::Relaxed;
+                PARTIALS_VAR_ROWS[variant].fetch_add(1, Relaxed);
+                PARTIALS_VAR_NS[variant].fetch_add(row_start.elapsed().as_nanos() as u64, Relaxed);
             }
         }
         acc
@@ -1209,6 +1218,22 @@ unsafe fn partials_blocks<const G: usize>(
     }
     let v = core::array::from_fn(|q| finish_raw(&total[q]));
     (v, EqFactors { high, low, h })
+}
+
+/// In-process A/B of the partials' look-ahead: row `jh` prefetches the block after next
+/// (variant 1) or the next block (variant 0) when `PARTIALS_VARIANTS > 1`; otherwise every row
+/// runs `PARTIALS_VARIANT`. Rows run and nanoseconds per variant go to the profile line.
+const PARTIALS_VARIANTS: usize = 2;
+const PARTIALS_VARIANT: usize = 0;
+pub static PARTIALS_VAR_ROWS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub static PARTIALS_VAR_NS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub fn partials_report() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v: Vec<String> = (0..2)
+        .map(|i| format!("{}:{}", PARTIALS_VAR_ROWS[i].load(Relaxed), PARTIALS_VAR_NS[i].load(Relaxed) / 1000))
+        .collect();
+    format!(" partials_var={}", v.join("/"))
 }
 
 /// One partial set's accumulator in the layout of [`PartialAcc`]: `acc[h][k].qword[i].byte[t]
@@ -1274,7 +1299,7 @@ impl RowScratch {
 /// memory latency: the words then arrive while the GFNI port is busy instead of after it.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
-unsafe fn partials_row(
+unsafe fn partials_row<const AHEAD: usize>(
     acc: &mut [RawAcc], words: *const B128, stride: usize, eq: *const B128, groups: usize,
     scratch: &mut RowScratch, next_row: *const B128,
 ) {
@@ -1296,7 +1321,14 @@ unsafe fn partials_row(
         for g in 0..groups {
             *aps.add(g) = slice_group(w.add(8 * g), &idx, ident);
         }
-        let next = if q + 1 < blocks { w.add(stride) } else { next_row };
+        // The block `AHEAD` after this one: in this row, else in the next row (if any).
+        let next = if q + AHEAD < blocks {
+            w.add(AHEAD * stride)
+        } else if !next_row.is_null() {
+            next_row.add((q + AHEAD - blocks) * stride)
+        } else {
+            core::ptr::null()
+        };
         for bank in 0..16/K {
             let base = bank * K;
             let mut a0 = [
@@ -1614,8 +1646,6 @@ unsafe fn stream_p(dst: [*mut u64; 3], j: usize, v: [__m512i; 3]) {
 /// Fold outputs of at least this many elements (per plane) are written non-temporally: at
 /// 24 bytes per element this is 50 MB, past what stays in the cache between two rounds.
 const STREAM_FROM: usize = 1 << 21;
-/// Words ahead of the current tile that [`fold_message_range`] prefetches in each stream.
-const FOLD_AHEAD: usize = 128;
 
 unsafe fn get_p(src: Src, j: usize) -> F162 {
     match src {
@@ -1908,16 +1938,21 @@ unsafe fn materialize_prefix_range(
     let mut j0 = range.start;
     while j0 < range.end {
         let j1 = (j0 + BIND_STRETCH).min(range.end);
+        // The look-ahead stays inside the stretch: past its end it would request the next
+        // stretch's first lines of the same blocks, which are read only after every other sweep
+        // of this stretch has streamed its blocks (and are evicted by then).
+        let last = j1.saturating_sub(8);
         for (s, ws) in weights.chunks(BIND_WAYS).enumerate() {
             let q0 = s * BIND_WAYS;
             for j in (j0..j1).step_by(8) {
-                let a0 = words.wrapping_add(j + MATERIALIZE_AHEAD + q0 * len) as *const i8;
+                let ahead = (j + MATERIALIZE_AHEAD).min(last);
+                let a0 = words.wrapping_add(ahead + q0 * len) as *const i8;
                 _mm_prefetch::<_MM_HINT_T0>(a0);
                 _mm_prefetch::<_MM_HINT_T0>(a0.wrapping_add(64));
                 let mut acc = prods_word10(ws[0], split_words(words.add(j + q0 * len)));
                 for (i, &weight) in ws.iter().enumerate().skip(1) {
                     let q = q0 + i;
-                    let a = words.wrapping_add(j + MATERIALIZE_AHEAD + q * len) as *const i8;
+                    let a = words.wrapping_add(ahead + q * len) as *const i8;
                     _mm_prefetch::<_MM_HINT_T0>(a);
                     _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64));
                     mac_word10(&mut acc, weight, split_words(words.add(j + q * len)));
@@ -2009,19 +2044,9 @@ unsafe fn fold_message_range(
     let mut q01_tile = [[_mm512_setzero_si512(); 3]; 8];
     let mut buf = EqTile([B128::ZERO; TILE]);
     let stream = hh >= STREAM_FROM;
+    // The twelve source streams (four rows, three planes) are sequential, 512 bytes per tile,
+    // and come from L2/L3 (the previous round wrote them): left to the hardware prefetchers.
     for j0 in range.step_by(TILE) {
-        // The four source rows of the next tiles, all three planes, a tile ahead of the
-        // hardware prefetcher; a prefetch past a plane's end is harmless.
-        if let Src::Planes(p) = src {
-            for k in 0..3 {
-                for o in [j0, j0 + half, j0 + hh, j0 + hh + half] {
-                    let a = p[k].wrapping_add(o + FOLD_AHEAD) as *const i8;
-                    for l in 0..(TILE * 8 / 64) {
-                        _mm_prefetch::<_MM_HINT_T0>(a.wrapping_add(64 * l));
-                    }
-                }
-            }
-        }
         map_tile2(eq.tile(j0, &mut buf), ml, mlp, &mut av, &mut apv);
         for g in 0..8 {
             let j = j0 + 8 * g;
@@ -2914,7 +2939,7 @@ use super::*;
   let mut b=a.clone();let mut sa=RowScratch::new(groups);let mut sb=RowScratch::new(groups);
   for lookahead in [false,true] {
    let next=if lookahead{words.as_ptr().add(stride*blocks)}else{core::ptr::null()};
-   partials_row(&mut a,words.as_ptr(),stride,eq.as_ptr(),groups,&mut sa,next);
+   partials_row::<1>(&mut a,words.as_ptr(),stride,eq.as_ptr(),groups,&mut sa,next);
    partials_row_reference(&mut b,words.as_ptr(),stride,eq.as_ptr(),groups,&mut sb,next);
    for q in 0..blocks {for h in 0..2 {for k in 0..16 {
     assert_eq!(_mm512_cmpeq_epi64_mask(a[q][h][k],b[q][h][k]),255,"groups={groups} blocks={blocks} q={q} h={h} k={k} lookahead={lookahead}");

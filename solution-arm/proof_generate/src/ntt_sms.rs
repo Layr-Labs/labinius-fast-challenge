@@ -2020,3 +2020,26 @@ mod leap_bench {
         }
     }
 }
+
+#[path = "compare_v0.rs"]
+mod compare_v0;
+#[path = "compare_v41.rs"]
+mod compare_v41;
+#[path = "compare_v42.rs"]
+mod compare_v42;
+#[path = "compare_v43.rs"]
+mod compare_v43;
+#[path = "compare_v44.rs"]
+mod compare_v44;
+
+pub fn compare_v128(v: u8, values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
+    match v {
+        4 => commit_v::<17>(values, a, workers, q, out, false),
+        0 => compare_v0::commit_v::<17>(values, a, workers, q, out, false),
+        41 => compare_v41::commit_v::<17>(values, a, workers, q, out, false),
+        42 => compare_v42::commit_v::<17>(values, a, workers, q, out, false),
+        43 => compare_v43::commit_v::<17>(values, a, workers, q, out, false),
+        44 => compare_v44::commit_v::<17>(values, a, workers, q, out, false),
+        _ => unreachable!("unknown timing variant"),
+    }
+}

@@ -448,7 +448,7 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 }
 
 /// Key groups (tiles of [`LOCK`] elements) per sweep of [`sink`] over the accumulators.
-const SINK: usize = 8;
+const SINK: usize = CHUNK / LOCK;
 /// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
@@ -693,19 +693,6 @@ unsafe fn sink_terminal<const FRESH: bool>(
 
 /// Keep the base row in wide storage across chunks. Convert the digit rows
 /// at the terminal sweep. A later chunk initializes those rows afresh.
-#[inline(always)]
-unsafe fn finish_sweep(
-    xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
-    narrowed: &mut NarrowedDigits, fresh: bool, terminal: bool,
-) {
-    match (fresh, terminal) {
-        (true, true) => sink_terminal::<true>(xs, keys, acc, groups, narrowed),
-        (false, true) => sink_terminal::<false>(xs, keys, acc, groups, narrowed),
-        (true, false) => sink::<true>(xs, keys, acc, groups),
-        (false, false) => sink::<false>(xs, keys, acc, groups),
-    }
-}
-
 /// The same products for development on AArch64 hosts without SVE.
 #[cfg(not(target_feature = "sve"))]
 #[inline(never)]
@@ -1134,23 +1121,19 @@ unsafe fn sums<const V: u8>(
     let mut e = 0usize;
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
-        while e < end {
-            // Up to eight tiles per sweep, never across a chunk end (chunks are whole tiles). A short
-            // tile only occurs at the end of the column, where the missing elements read zero
-            // words and their key lanes are zero, so those lanes contribute nothing.
-            let l = SWEEP.min(end - e);
-            let groups = l.div_ceil(LOCK);
-            for i in 0..groups * LOCK {
-                let at = pass_words(words, a.elements, e, i);
-                indices_asm(&at, nib);
-                let x = &mut xs[i];
-                lut_pass(nib, sc, kern);
-                tail::<V>(sc, x, kern);
-            }
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-            finish_sweep(xs, keys, acc, groups, narrowed, e % CHUNK == 0, e + l == end);
-            e += l;
+        // The last partial tile uses zero input words and padded key lanes.
+        let l = end - e;
+        let groups = l.div_ceil(LOCK);
+        for i in 0..groups * LOCK {
+            let at = pass_words(words, a.elements, e, i);
+            indices_asm(&at, nib);
+            let x = &mut xs[i];
+            lut_pass(nib, sc, kern);
+            tail::<V>(sc, x, kern);
         }
+        let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+        sink_terminal::<true>(xs, keys, acc, groups, narrowed);
+        e = end;
         let c = (end - 1) / CHUNK;
         const _: () = assert!(DIGITS == 5);
         let ctx = &Repair { words, a, c };
@@ -1221,39 +1204,37 @@ unsafe fn sums2<const V: u8>(
     let mut e = 0usize;
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
-        while e < end {
-            let l = SWEEP.min(end - e);
-            let groups = l.div_ceil(LOCK);
-            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-            for t in 0..2 {
-                let count = groups * LOCK;
-                for i in 0..count {
-                    // The input words [`PF_T`] transforms on: later in this sweep, or the start of
-                    // the sweep that follows it (the other batch's, over the same elements for
-                    // the first batch and over the next ones for the second). A counter profile
-                    // on Neoverse-V2 had 30% of the table's lines arriving late (L2 refills in
-                    // the index packing, 41% of its cycles stalled).
-                    if i + PF_L1 < count {
-                        prefetch_words_l1(words[t], e, i + PF_L1);
-                    }
-                    let ahead = i + PF_T;
-                    if ahead < count {
-                        prefetch_words(words[t], e, ahead);
-                    } else if t == 0 {
-                        prefetch_words(words[1], e, ahead - count);
-                    } else {
-                        prefetch_words(words[0], e + l, ahead - count);
-                    }
-                    let at = pass_words(words[t], a.elements, e, i);
-                    indices_asm(&at, nib);
-                    let x = &mut xs[i];
-                    lut_pass2(nib, sc, kern);
-                    tail::<V>(sc, x, kern);
+        let l = end - e;
+        let groups = l.div_ceil(LOCK);
+        let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+        for t in 0..2 {
+            let count = groups * LOCK;
+            for i in 0..count {
+                // The input words [`PF_T`] transforms on: later in this sweep, or the start of
+                // the sweep that follows it (the other batch's, over the same elements for
+                // the first batch and over the next ones for the second). A counter profile
+                // on Neoverse-V2 had 30% of the table's lines arriving late (L2 refills in
+                // the index packing, 41% of its cycles stalled).
+                if i + PF_L1 < count {
+                    prefetch_words_l1(words[t], e, i + PF_L1);
                 }
-                finish_sweep(xs, keys, accs[t], groups, &mut narrowed[t], e % CHUNK == 0, e + l == end);
+                let ahead = i + PF_T;
+                if ahead < count {
+                    prefetch_words(words[t], e, ahead);
+                } else if t == 0 {
+                    prefetch_words(words[1], e, ahead - count);
+                } else {
+                    prefetch_words(words[0], e + l, ahead - count);
+                }
+                let at = pass_words(words[t], a.elements, e, i);
+                indices_asm(&at, nib);
+                let x = &mut xs[i];
+                lut_pass2(nib, sc, kern);
+                tail::<V>(sc, x, kern);
             }
-            e += l;
+            sink_terminal::<true>(xs, keys, accs[t], groups, &mut narrowed[t]);
         }
+        e = end;
         let c = (end - 1) / CHUNK;
         let ctx = [Repair { words: words[0], a, c }, Repair { words: words[1], a, c }];
         for t in 0..2 {

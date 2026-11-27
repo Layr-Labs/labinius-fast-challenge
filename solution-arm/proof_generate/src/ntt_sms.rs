@@ -973,14 +973,16 @@ unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Ker
 /// [`pass_tail_calls_b`] for `V = 3`). The same values.
 #[inline(always)]
 unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], kern: &Kernel) {
-    match V {
+    match V & 7 {
         0 => {
             pass_c_asm(sc, kern);
             pass_d_out(sc, x, kern);
         }
         1 => pass_tail(sc, x, kern),
         2 => pass_tail_calls(sc, x, kern),
-        _ => pass_tail_calls_b(sc, x, kern),
+        3 => pass_tail_calls_b(sc, x, kern),
+        4 => pass_tail_calls_c(sc, x, kern),
+        _ => pass_tail_calls_d(sc, x, kern),
     }
 }
 
@@ -1046,6 +1048,7 @@ unsafe fn sums2<const V: u8>(
     words: [&[(*const u8, usize); LANES]; 2],
     a: &SmsMatrix,
     nib: &mut [uint8x16_t; N / 4],
+    nib2: &mut [uint8x16_t; N / 4],
     xs: &mut [[int16x8_t; N]; SWEEP],
     sc: &mut [int16x8_t; N],
     acc: [&mut [int64x2_t]; 2],
@@ -1079,6 +1082,14 @@ unsafe fn sums2<const V: u8>(
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
                 let count = groups * LOCK;
+                // With `V & 8` the indices run one transform ahead, into the other of two
+                // buffers: the table front then reads indices stored a transform earlier, and the
+                // index packing's loads of the input words overlap the previous front.
+                let nibs: [*mut [uint8x16_t; N / 4]; 2] = [&mut *nib, &mut *nib2];
+                if V & 8 != 0 {
+                    let at = pass_words(words[t], a.elements, e, 0);
+                    indices_asm(&at, &mut *nibs[0]);
+                }
                 for i in 0..count {
                     // The input words [`PF_T`] transforms on: later in this sweep, or the start of
                     // the sweep that follows it (the other batch's, over the same elements for
@@ -1093,10 +1104,19 @@ unsafe fn sums2<const V: u8>(
                     } else {
                         prefetch_words(words[0], e + l, ahead - count);
                     }
-                    let at = pass_words(words[t], a.elements, e, i);
-                    indices_asm(&at, nib);
+                    let cur: &mut [uint8x16_t; N / 4] = if V & 8 != 0 {
+                        if i + 1 < count {
+                            let at = pass_words(words[t], a.elements, e, i + 1);
+                            indices_asm(&at, &mut *nibs[(i + 1) & 1]);
+                        }
+                        &mut *nibs[i & 1]
+                    } else {
+                        let at = pass_words(words[t], a.elements, e, i);
+                        indices_asm(&at, &mut *nibs[0]);
+                        &mut *nibs[0]
+                    };
                     let x = &mut xs[i];
-                    lut_pass2(nib, sc, kern);
+                    lut_pass2(cur, sc, kern);
                     tail::<V>(sc, x, kern);
                 }
                 if e % CHUNK == 0 {
@@ -1166,6 +1186,9 @@ struct Scratch {
     nib: [uint8x16_t; N / 4],
     y: [int16x8_t; N],
     tail: [[i64; LANES]; N],
+    /// The second index buffer of the indices-ahead variant (last, so the other fields keep their
+    /// addresses).
+    nib2: [uint8x16_t; N / 4],
 }
 
 const ARENA: usize = 4 << 20;
@@ -1247,7 +1270,7 @@ pub fn commit_v<const V: u8>(values: &[B128], a: &SmsMatrix, workers: usize, q: 
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
         pin_worker(first * workers / columns);
         let arena = Arena::new();
-        let Scratch { xs, sc, acc, dev, acc2, dev2, dev16, y2, m, nib, y, tail } = &mut *arena.0;
+        let Scratch { xs, sc, acc, dev, acc2, dev2, dev16, y2, m, nib, y, tail, nib2 } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
@@ -1271,7 +1294,7 @@ pub fn commit_v<const V: u8>(values: &[B128], a: &SmsMatrix, workers: usize, q: 
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
                     let [d16a, d16b] = dev16;
-                    sums2::<V>([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
+                    sums2::<V>([&w0, &w1], a, nib, nib2, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
                 } else {
                     sums::<V>(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
                 }
@@ -1741,7 +1764,7 @@ mod leap_bench {
             let x0 = a.clone();
             let mut want: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             unsafe { pass_c_asm(&mut a, kern); pass_d_out(&a, &mut want, kern); }
-            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b] {
+            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c, pass_tail_calls_d] {
                 let mut got: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
                 unsafe { f(&x0, &mut got, kern); }
                 let w: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(want.as_ptr() as *const [i16; 8], N) };

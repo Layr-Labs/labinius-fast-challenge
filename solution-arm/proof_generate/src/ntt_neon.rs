@@ -1335,7 +1335,7 @@ pub unsafe fn inverse_lazy_io(x: &mut [int16x8_t; N], mut input: impl FnMut(usiz
 #[inline(always)]
 pub unsafe fn inverse_lazy_io2(
     x: [&mut [int16x8_t; N]; 2],
-    mut input: impl FnMut(usize, usize) -> int16x8_t,
+    mut input: impl FnMut(usize) -> [int16x8_t; 2],
     mut output: impl FnMut(usize, usize, int16x8_t),
 ) {
     const { assert!(PRIMES[1] == 9721) };
@@ -1347,7 +1347,8 @@ pub unsafe fn inverse_lazy_io2(
     // levels 6 and 5, per level-4 node m (slots 9 m..9 m + 9)
     for m in 0..72 {
         let base = 9 * m;
-        let mut v: [[int16x8_t; 9]; 2] = core::array::from_fn(|h| core::array::from_fn(|i| input(h, base + i)));
+        let pairs: [[int16x8_t; 2]; 9] = core::array::from_fn(|i| input(base + i));
+        let mut v: [[int16x8_t; 9]; 2] = core::array::from_fn(|h| core::array::from_fn(|i| pairs[i][h]));
         for g in 0..3 {
             let t = vld1q_s16(r3.get_unchecked(3 * m + g).as_ptr());
             for w in v.iter_mut() {

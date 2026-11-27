@@ -454,6 +454,19 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 const SINK: usize = CHUNK / LOCK;
 /// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
+const SLOT_GROUP: usize = 4;
+const _: () = assert!(LOCK % SLOT_GROUP == 0);
+
+/// Index in the entire sweep allocation. Four adjacent transforms fill one
+/// cache line at a slot. Older comparison routes keep their original layout.
+#[inline(always)]
+fn witness_index<const V: u8>(transform: usize, slot: usize) -> usize {
+    if V >= 4 {
+        (transform / SLOT_GROUP * N + slot) * SLOT_GROUP + transform % SLOT_GROUP
+    } else {
+        transform * N + slot
+    }
+}
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
 
 type NarrowedDigits = [[int16x8_t; N]; DIGITS];
@@ -491,7 +504,7 @@ macro_rules! narrow_terminal_row {
 /// Keep the slot loop inside the assembler so the callee saves occur once per sweep.
 #[cfg(target_feature = "sve")]
 #[inline(never)]
-unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
+unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool, const V: u8>(
     xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
     compact: *mut int16x8_t,
 ) {
@@ -513,8 +526,12 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "ldp q0, q1, [{kp}]",
                 "ldp q2, q3, [{kp}, #32]",
                 "ldp q4, q5, [{kp}, #64]",
+                ".if {grouped}",
+                "ldp q6, q7, [{zp}]",
+                ".else",
                 "ldr q6, [{zp}]",
                 "ldr q7, [{zp}, #{xs1}]",
+                ".endif",
                 "sdot z8.d, z6.h, z0.h[0]",
                 "sdot z9.d, z7.h, z0.h[0]",
                 "sdot z12.d, z6.h, z1.h[0]",
@@ -527,8 +544,12 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "sdot z25.d, z7.h, z4.h[0]",
                 "sdot z28.d, z6.h, z5.h[0]",
                 "sdot z29.d, z7.h, z5.h[0]",
+                ".if {grouped}",
+                "ldp q6, q7, [{zp}, #32]",
+                ".else",
                 "ldr q6, [{zp}, #{xs2}]",
                 "ldr q7, [{zp}, #{xs3}]",
+                ".endif",
                 "add {zp}, {zp}, {xs4}",
                 "sdot z10.d, z6.h, z0.h[0]",
                 "sdot z11.d, z7.h, z0.h[0]",
@@ -542,8 +563,12 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "sdot z27.d, z7.h, z4.h[0]",
                 "sdot z30.d, z6.h, z5.h[0]",
                 "sdot z31.d, z7.h, z5.h[0]",
+                ".if {grouped}",
+                "ldp q6, q7, [{zp}]",
+                ".else",
                 "ldr q6, [{zp}]",
                 "ldr q7, [{zp}, #{xs1}]",
+                ".endif",
                 "sdot z8.d, z6.h, z0.h[1]",
                 "sdot z9.d, z7.h, z0.h[1]",
                 "sdot z12.d, z6.h, z1.h[1]",
@@ -556,8 +581,12 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "sdot z25.d, z7.h, z4.h[1]",
                 "sdot z28.d, z6.h, z5.h[1]",
                 "sdot z29.d, z7.h, z5.h[1]",
+                ".if {grouped}",
+                "ldp q6, q7, [{zp}, #32]",
+                ".else",
                 "ldr q6, [{zp}, #{xs2}]",
                 "ldr q7, [{zp}, #{xs3}]",
+                ".endif",
                 "add {zp}, {zp}, {xs4}",
                 "add {kp}, {kp}, {ks}",
                 "sdot z10.d, z6.h, z0.h[1]",
@@ -578,7 +607,7 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "stp q10, q11, [{a}, #32]",
                 $($post,)*
                 "add {a}, {a}, #384",
-                "add {z}, {z}, #16",
+                "add {z}, {z}, #{slot_stride}",
                 "add {k}, {k}, #96",
                 "subs {slots}, {slots}, #1",
                 "b.ne 2b",
@@ -589,6 +618,8 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 groups = in(reg) groups,
                 xs4 = in(reg) 4 * XS,
                 ks = in(reg) KS,
+                grouped = const (V >= 4) as u8,
+                slot_stride = const if V >= 4 { 16 * SLOT_GROUP } else { 16 },
                 xs1 = const XS,
                 xs2 = const 2 * XS,
                 xs3 = const 3 * XS,
@@ -666,26 +697,26 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
 
 #[cfg(target_feature = "sve")]
 #[inline(always)]
-unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
-    sink_sve::<FRESH, false>(xs, keys, acc, groups, core::ptr::null_mut());
+unsafe fn sink<const FRESH: bool, const V: u8>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+    sink_sve::<FRESH, false, V>(xs, keys, acc, groups, core::ptr::null_mut());
 }
 
 #[cfg(target_feature = "sve")]
 #[inline(always)]
-unsafe fn sink_terminal<const FRESH: bool>(
+unsafe fn sink_terminal<const FRESH: bool, const V: u8>(
     xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
     narrowed: &mut NarrowedDigits,
 ) {
-    sink_sve::<FRESH, true>(xs, keys, acc, groups, narrowed.as_mut_ptr().cast());
+    sink_sve::<FRESH, true, V>(xs, keys, acc, groups, narrowed.as_mut_ptr().cast());
 }
 
 #[cfg(not(target_feature = "sve"))]
 #[inline(never)]
-unsafe fn sink_terminal<const FRESH: bool>(
+unsafe fn sink_terminal<const FRESH: bool, const V: u8>(
     xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
     narrowed: &mut NarrowedDigits,
 ) {
-    sink::<FRESH>(xs, keys, acc, groups);
+    sink::<FRESH, V>(xs, keys, acc, groups);
     for (d, row) in narrowed.iter_mut().enumerate() {
         narrow_digits(acc, d + 1, row);
     }
@@ -696,13 +727,13 @@ unsafe fn sink_terminal<const FRESH: bool>(
 /// The same products for development on AArch64 hosts without SVE.
 #[cfg(not(target_feature = "sve"))]
 #[inline(never)]
-unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+unsafe fn sink<const FRESH: bool, const V: u8>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
     debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
     let accp = acc.as_mut_ptr();
     for g in 0..groups {
         let tile = keys.add(g * N * ROWS * LOCK);
         for s in 0..N {
-            let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *xs[LOCK * g + i].get_unchecked(s));
+            let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *xs.as_ptr().cast::<int16x8_t>().add(witness_index::<V>(LOCK * g + i, s)));
             let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
             for r in 0..ROWS {
                 if FRESH && g == 0 && r > 0 {
@@ -1087,6 +1118,20 @@ unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], ker
     }
 }
 
+#[inline(always)]
+unsafe fn sweep_tail<const V: u8>(
+    sc: &mut [int16x8_t; N], xs: &mut [[int16x8_t; N]; SWEEP], i: usize, kern: &Kernel,
+) {
+    if V >= 4 {
+        // Pointer derives from the whole allocation. The strided stores stay
+        // within its one quartet, with no overlapping live subarray borrow.
+        let out = xs.as_mut_ptr().cast::<int16x8_t>().add(witness_index::<V>(i, 0));
+        pass_tail_calls_c4(sc, out, kern);
+    } else {
+        tail::<V>(sc, &mut xs[i], kern);
+    }
+}
+
 #[inline(never)]
 unsafe fn sums<const V: u8>(
     words: &[(*const u8, usize); LANES],
@@ -1113,12 +1158,11 @@ unsafe fn sums<const V: u8>(
         for i in 0..groups * LOCK {
             let at = pass_words(words, a.elements, e, i);
             indices_asm(&at, nib);
-            let x = &mut xs[i];
             lut_pass(nib, sc, kern);
-            tail::<V>(sc, x, kern);
+            sweep_tail::<V>(sc, xs, i, kern);
         }
         let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-        sink_terminal::<true>(xs, keys, acc, groups, narrowed);
+        sink_terminal::<true, V>(xs, keys, acc, groups, narrowed);
         e = end;
         let c = (end - 1) / CHUNK;
         const _: () = assert!(DIGITS == 5);
@@ -1213,11 +1257,10 @@ unsafe fn sums2<const V: u8>(
                 }
                 let at = pass_words(words[t], a.elements, e, i);
                 indices_asm(&at, nib);
-                let x = &mut xs[i];
                 lut_pass2(nib, sc, kern);
-                tail::<V>(sc, x, kern);
+                sweep_tail::<V>(sc, xs, i, kern);
             }
-            sink_terminal::<true>(xs, keys, accs[t], groups, &mut narrowed[t]);
+            sink_terminal::<true, V>(xs, keys, accs[t], groups, &mut narrowed[t]);
         }
         e = end;
         let c = (end - 1) / CHUNK;
@@ -1275,7 +1318,7 @@ fn crt(r: u32, t: i64) -> u64 {
     r as u64 + P1 as u64 * k
 }
 
-#[repr(C)]
+#[repr(C, align(64))]
 struct Scratch {
     xs: [[int16x8_t; N]; SWEEP],
     /// The transform scratch: the table front and levels 4-5 run here (L1-resident, reused for every
@@ -1617,13 +1660,14 @@ mod tests {
     #[test]
     fn terminal_sink_matches_wide() {
         unsafe fn check<const FRESH: bool>(
-            xs: &[[int16x8_t; N]; SWEEP], keys: &[i16], initial: &[int64x2_t], groups: usize,
+            xs: &[[int16x8_t; N]; SWEEP], grouped: &[[int16x8_t; N]; SWEEP],
+            keys: &[i16], initial: &[int64x2_t], groups: usize,
         ) {
             let mut want = initial.to_vec();
             let mut got = initial.to_vec();
             let mut compact = Box::new([[vdupq_n_s16(0); N]; DIGITS]);
-            sink::<FRESH>(xs, keys.as_ptr(), &mut want, groups);
-            sink_terminal::<FRESH>(xs, keys.as_ptr(), &mut got, groups, &mut compact);
+            sink::<FRESH, 0>(xs, keys.as_ptr(), &mut want, groups);
+            sink_terminal::<FRESH, 4>(grouped, keys.as_ptr(), &mut got, groups, &mut compact);
             for s in 0..N {
                 let at = idx(s, 0);
                 for q in 0..4 {
@@ -1643,6 +1687,13 @@ mod tests {
             let lanes: [i16; 8] = core::array::from_fn(|_| next() as i16 % 28000);
             *x = unsafe { vld1q_s16(lanes.as_ptr()) };
         }
+        let mut grouped = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
+        for (i, transform) in xs.iter().enumerate() {
+            for (s, &value) in transform.iter().enumerate() {
+                let at = witness_index::<4>(i, s);
+                grouped[at / N][at % N] = value;
+            }
+        }
         let initial: Vec<_> = (0..ROWS * 4 * N).map(|_| {
             let lanes: [i64; 2] = core::array::from_fn(|_| next() as i64 >> 33);
             unsafe { vld1q_s64(lanes.as_ptr()) }
@@ -1650,8 +1701,8 @@ mod tests {
         for groups in 1..=SINK {
             let keys: Vec<i16> = (0..groups * N * ROWS * LOCK).map(|_| (next() % 9721) as i16 - 4860).collect();
             unsafe {
-                check::<true>(&xs, &keys, &initial, groups);
-                check::<false>(&xs, &keys, &initial, groups);
+                check::<true>(&xs, &grouped, &keys, &initial, groups);
+                check::<false>(&xs, &grouped, &keys, &initial, groups);
             }
         }
     }
@@ -1681,8 +1732,8 @@ mod tests {
                 }
             }
             unsafe {
-                sink::<true>(&xs, keys.as_ptr(), &mut fresh, groups);
-                sink::<false>(&xs, keys.as_ptr(), &mut zeroed, groups);
+                sink::<true, 0>(&xs, keys.as_ptr(), &mut fresh, groups);
+                sink::<false, 0>(&xs, keys.as_ptr(), &mut zeroed, groups);
             }
             let words = |v: &[int64x2_t]| -> Vec<[i64; 2]> { v.iter().map(|&x| unsafe { core::mem::transmute(x) }).collect() };
             assert!(words(&fresh) == words(&zeroed), "{groups} tiles");
@@ -1743,8 +1794,8 @@ mod tests {
                     *x = unsafe { vld1q_s16(v.as_ptr()) };
                 }
                 unsafe {
-                    sink::<false>(&xs, old.as_ptr(), &mut old_acc, groups);
-                    sink::<false>(&xs, new.as_ptr(), &mut new_acc, groups);
+                    sink::<false, 0>(&xs, old.as_ptr(), &mut old_acc, groups);
+                    sink::<false, 0>(&xs, new.as_ptr(), &mut new_acc, groups);
                 }
             }
             let mut y = Box::new([unsafe { vdupq_n_s16(0) }; N]);

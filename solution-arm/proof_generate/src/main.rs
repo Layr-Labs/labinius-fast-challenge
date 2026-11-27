@@ -1108,13 +1108,13 @@ mod tests {
     fn sms_forced_repairs_match_reference() {
         use ntt::neon::sms;
         let q = sms::MODULUS;
-        for (elements, cols) in [(800usize, 9usize), (385, 3), (130, 2)] {
+        for (elements, cols, workers) in [(800usize, 9usize, 3usize), (385, 3, 3), (130, 2, 3), (131, 17, 1)] {
             let values: Vec<B128> = (0..cols).flat_map(|s| column(300 + s as u64)).take(cols * 4 * elements).collect();
             let matrix = rq::ajtai_matrix(q, elements);
             let want = commit_reference(&values, &matrix, q);
             let mut a = sms::matrix(elements, 3);
             a.threshold = std::borrow::Cow::Owned(vec![0; a.threshold.len()]);
-            assert!(unpack(&sms_packed(&values, &a, 3, q), q) == want, "{elements} elements, every coefficient repaired");
+            assert!(unpack(&sms_packed(&values, &a, workers, q), q) == want, "{elements} elements, every coefficient repaired");
         }
     }
     #[test]

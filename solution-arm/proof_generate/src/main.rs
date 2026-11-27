@@ -952,6 +952,9 @@ fn main() {
     } else {
         MODULUS
     };
+    // DIAGNOSTIC: sink micro-benchmarks on stderr before anything is timed by the prover itself
+    #[cfg(target_arch = "aarch64")]
+    ntt::neon::sms::diag::bench(threads());
     // the output's set-up thread first: it runs while this thread maps the key and the table
     let output = Output::start(&args[2], modulus);
     #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS {

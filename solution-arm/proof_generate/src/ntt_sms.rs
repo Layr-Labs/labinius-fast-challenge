@@ -981,7 +981,11 @@ unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], ker
         1 => pass_tail(sc, x, kern),
         2 => pass_tail_calls(sc, x, kern),
         3 => pass_tail_calls_b(sc, x, kern),
-        _ => pass_tail_calls_c(sc, x, kern),
+        4 => pass_tail_calls_c(sc, x, kern),
+        5 => pass_tail_calls_e(sc, x, kern),
+        6 => pass_tail_calls_f(sc, x, kern),
+        7 => pass_tail_calls_g(sc, x, kern),
+        _ => pass_tail_calls_h(sc, x, kern),
     }
 }
 
@@ -1744,7 +1748,7 @@ mod leap_bench {
             let x0 = a.clone();
             let mut want: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             unsafe { pass_c_asm(&mut a, kern); pass_d_out(&a, &mut want, kern); }
-            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c] {
+            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c, pass_tail_calls_e, pass_tail_calls_f, pass_tail_calls_g, pass_tail_calls_h] {
                 let mut got: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
                 unsafe { f(&x0, &mut got, kern); }
                 let w: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(want.as_ptr() as *const [i16; 8], N) };

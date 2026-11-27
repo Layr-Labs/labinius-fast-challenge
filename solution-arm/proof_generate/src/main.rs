@@ -12,6 +12,8 @@ mod hugealloc;
 mod output;
 use output::{Output, ProofParts};
 mod ntt;
+#[cfg(target_arch = "aarch64")]
+mod commit_diagnostic;
 
 #[global_allocator]
 static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
@@ -377,6 +379,7 @@ fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
         use ntt::neon::sms;
         let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+        commit_diagnostic::run(values, &matrix, threads(), modulus, out.len());
         sms::commit(values, &matrix, threads(), modulus, out);
         return;
     }
@@ -1069,6 +1072,44 @@ mod tests {
 
     /// The SMS commitment agrees with the schoolbook commitment at full size on random columns
     /// (its digit recombination is statistical: random witnesses), one and three workers.
+    /// Every isolated candidate and the duplicate-driver control matches the literal leader.
+    #[test]
+    fn diagnostic_candidates_match_leader() {
+        use ntt::neon::sms;
+        for (elements, cols) in [(301usize, 11usize), (5, 3), (229, 9), (241, 9), (256, 9), (385, 9), (800, 9)] {
+            let values: Vec<B128> = (0..cols).flat_map(|s| column(300 + s as u64)).take(cols * 4 * elements).collect();
+            let a = sms::matrix(elements, 3);
+            let mut want = vec![0u8; cols * ntt::N * 5];
+            sms::commit_v::<4>(&values, &a, 3, sms::MODULUS, &mut want, false);
+            let mut got = vec![0u8; want.len()];
+            macro_rules! check { ($($v:literal),*) => { $(
+                got.fill(1);
+                sms::commit_candidate::<$v>(&values, &a, 3, sms::MODULUS, &mut got, false);
+                assert!(got == want, "candidate {} at {elements} elements", $v);
+            )* } }
+            check!(4, 5, 6, 7, 8, 9, 10);
+        }
+    }
+
+    #[test]
+    fn diagnostic_candidates_forced_repairs_match_leader() {
+        use ntt::neon::sms;
+        for (elements, cols) in [(800usize, 9usize), (385, 3), (130, 2)] {
+            let values: Vec<B128> = (0..cols).flat_map(|s| column(300 + s as u64)).take(cols * 4 * elements).collect();
+            let mut a = sms::matrix(elements, 3);
+            a.threshold = std::borrow::Cow::Owned(vec![0; a.threshold.len()]);
+            let mut want = vec![0u8; cols * ntt::N * 5];
+            sms::commit_v::<4>(&values, &a, 3, sms::MODULUS, &mut want, false);
+            let mut got = vec![0u8; want.len()];
+            macro_rules! check { ($($v:literal),*) => { $(
+                got.fill(1);
+                sms::commit_candidate::<$v>(&values, &a, 3, sms::MODULUS, &mut got, false);
+                assert!(got == want, "candidate {} forced repairs at {elements} elements", $v);
+            )* } }
+            check!(4, 5, 6, 7, 8, 9, 10);
+        }
+    }
+
     #[test]
     fn sms_commit_matches_reference() {
         // the embedded images are the runtime matrix, byte for byte

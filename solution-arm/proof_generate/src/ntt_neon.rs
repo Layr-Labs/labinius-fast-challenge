@@ -2317,3 +2317,112 @@ mod indices_asm_tests {
         }
     }
 }
+
+// Paired inverse levels 4+3 candidate, isolated from the original inverse.
+#[inline(always)]
+pub unsafe fn inverse_lazy_io2_chunk_candidate(
+    x: [&mut [int16x8_t; N]; 2],
+    mut input: impl FnMut(usize, usize) -> int16x8_t,
+    mut output: impl FnMut(usize, usize, int16x8_t),
+) {
+    const { assert!(PRIMES[1] == 9721) };
+    let k = vld1q_s16(kernels()[1].k.as_ptr());
+    let inv = &lazy_inverses()[1];
+    let (r3, r2) = (&inv.r3[..], &inv.r2[..]);
+    let [x0, x1] = x;
+    let xs: [*mut int16x8_t; 2] = [x0.as_mut_ptr(), x1.as_mut_ptr()];
+    // levels 6 and 5, per level-4 node m (slots 9 m..9 m + 9)
+    for m in 0..72 {
+        let base = 9 * m;
+        let mut v: [[int16x8_t; 9]; 2] = core::array::from_fn(|h| core::array::from_fn(|i| input(h, base + i)));
+        for g in 0..3 {
+            let t = vld1q_s16(r3.get_unchecked(3 * m + g).as_ptr());
+            for w in v.iter_mut() {
+                (w[3 * g], w[3 * g + 1], w[3 * g + 2]) = ib3(w[3 * g], w[3 * g + 1], w[3 * g + 2], t, k);
+            }
+        }
+        let t = vld1q_s16(r3.get_unchecked(216 + m).as_ptr());
+        for j in 0..3 {
+            for w in v.iter_mut() {
+                (w[j], w[j + 3], w[j + 6]) = ib3(w[j], w[j + 3], w[j + 6], t, k);
+            }
+        }
+        for (h, w) in v.iter().enumerate() {
+            for (i, &y) in w.iter().enumerate() {
+                *xs[h].add(base + i) = y;
+            }
+        }
+    }
+    // Levels 4 and 3 together: nine slots j + 9 i in one 81-slot node.
+    // Keep the level-4 outputs in registers instead of storing and loading all 648 slots.
+    for n in 0..8 {
+        let base = 81 * n;
+        let t4: [int16x8_t; 3] = core::array::from_fn(|g| vld1q_s16(r3.get_unchecked(288 + 3 * n + g).as_ptr()));
+        let t3 = vld1q_s16(r3.get_unchecked(312 + n).as_ptr());
+        for j in 0..9 {
+            let mut v: [[int16x8_t; 9]; 2] = core::array::from_fn(|h| core::array::from_fn(|i| *xs[h].add(base + j + 9 * i)));
+            for g in 0..3 {
+                for w in v.iter_mut() {
+                    (w[3 * g], w[3 * g + 1], w[3 * g + 2]) = ib3(w[3 * g], w[3 * g + 1], w[3 * g + 2], t4[g], k);
+                }
+            }
+            for q in 0..3 {
+                for w in v.iter_mut() {
+                    (w[q], w[q + 3], w[q + 6]) = ib3(w[q], w[q + 3], w[q + 6], t3, k);
+                }
+            }
+            for (h, w) in v.iter().enumerate() {
+                for (i, &y) in w.iter().enumerate() {
+                    *xs[h].add(base + j + 9 * i) = y;
+                }
+            }
+        }
+    }
+    // levels 2 and 1 and the unsplit, per j < 81: slots j + 81 i, i < 8
+    let t2: [int16x8_t; 4] = core::array::from_fn(|n| vld1q_s16(r2.get_unchecked(n).as_ptr()));
+    let t1: [int16x8_t; 2] = core::array::from_fn(|n| vld1q_s16(r2.get_unchecked(4 + n).as_ptr()));
+    let uv = vld1q_s16(inv.u.as_ptr());
+    for j in 0..81 {
+        let mut v: [[int16x8_t; 8]; 2] = core::array::from_fn(|h| core::array::from_fn(|i| *xs[h].add(j + 81 * i)));
+        for w in v.iter_mut() {
+            // level 2: node n pairs slots 162 n + j and 162 n + j + 81
+            for n in 0..4 {
+                (w[2 * n], w[2 * n + 1]) = ib2(w[2 * n], w[2 * n + 1], t2[n], k);
+            }
+        }
+        for w in v.iter_mut() {
+            // level 1: node n pairs 324 n + i and 324 n + i + 162, i = j, j + 81
+            for n in 0..2 {
+                for h in 0..2 {
+                    (w[4 * n + h], w[4 * n + h + 2]) = ib2(w[4 * n + h], w[4 * n + h + 2], t1[n], k);
+                }
+            }
+        }
+        for w in v.iter_mut() {
+            // the unsplit: b = (u - v) inv_split, a = u - zeta^324 b, pairs i and i + 324
+            for i in 0..4 {
+                let (u, z) = (w[i], w[i + 4]);
+                let b = mulc::<0, 1>(vsubq_s16(u, z), uv, k);
+                let a = r13(vsubq_s16(u, mulc::<2, 3>(b, uv, k)), k);
+                (w[i], w[i + 4]) = (a, b);
+            }
+        }
+        for (h, w) in v.iter().enumerate() {
+            for (i, &y) in w.iter().enumerate() {
+                output(h, j + 81 * i, y);
+            }
+        }
+    }
+}
+
+#[path = "ntt_diagnostic_tail.rs"]
+mod diagnostic_tail;
+pub use diagnostic_tail::{pass_tail_calls_c_strided, tail_both};
+#[path = "ntt_front_tail.rs"]
+mod front_tail;
+#[cfg(target_feature = "sve")]
+pub use front_tail::pass_front_tail;
+#[path = "ntt_neon_paired_lut.rs"]
+mod paired_lut;
+#[cfg(target_feature = "sve")]
+pub use paired_lut::pass_lut_paired;

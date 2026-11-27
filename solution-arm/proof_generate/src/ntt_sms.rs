@@ -1822,3 +1822,7 @@ mod leap_bench {
         }
     }
 }
+
+#[path = "commit_variants.rs"]
+mod diagnostic;
+pub use diagnostic::commit_candidate;

@@ -1026,7 +1026,7 @@ unsafe fn sums(
 /// ce686fcc): per sweep, batch A's transforms into `xs` and their sink, then batch B's into the
 /// same `xs` and their sink against the same key lines, which are then still cached.
 #[inline(never)]
-unsafe fn sums2(
+unsafe fn sums2<const PF: usize>(
     words: [&[(*const u8, usize); LANES]; 2],
     a: &SmsMatrix,
     nib: &mut [uint8x16_t; N / 4],
@@ -1069,7 +1069,7 @@ unsafe fn sums2(
                     // the first batch and over the next ones for the second). A counter profile
                     // on Neoverse-V2 had 30% of the table's lines arriving late (L2 refills in
                     // the index packing, 41% of its cycles stalled).
-                    let ahead = i + PF_T;
+                    let ahead = i + PF;
                     if ahead < count {
                         prefetch_words(words[t], e, ahead);
                     } else if t == 0 {
@@ -1211,6 +1211,12 @@ fn pin_worker(w: usize) {
 }
 
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
+    commit_pf::<PF_T>(values, a, workers, q, out, true)
+}
+
+/// DIAGNOSTIC: [`commit`] with the witness-word prefetch `PF` transforms ahead; `hook` runs the
+/// output's between-pairs work ([`BETWEEN`]), which the timed diagnostic copies skip.
+pub fn commit_pf<const PF: usize>(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8], hook: bool) {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
@@ -1247,7 +1253,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
                     let [d16a, d16b] = dev16;
-                    sums2([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
+                    sums2::<PF>([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
                 } else {
                     sums(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
                 }
@@ -1303,7 +1309,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     slot[4] = (v >> 32) as u8;
                 }
             }
-            if b % 2 == 1 {
+            if hook && b % 2 == 1 {
                 if let Some(between) = BETWEEN.get() {
                     between(first * workers / columns, (b + 1) / 2);
                 }

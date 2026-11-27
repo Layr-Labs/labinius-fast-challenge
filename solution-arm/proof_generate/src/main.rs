@@ -377,6 +377,25 @@ fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
         use ntt::neon::sms;
         let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+        // DIAGNOSTIC: the commit with each witness-word prefetch lead, timed in turn into a scratch
+        // buffer (the record's 32 first and last); every output is asserted equal to the first.
+        {
+            let mut scratch = vec![1u8; out.len()];
+            let mut first: Option<Vec<u8>> = None;
+            let mut line = String::from("diag commit_pf");
+            for pf in [32usize, 16, 8, 24, 32] {
+                let t = std::time::Instant::now();
+                match pf {
+                    16 => sms::commit_pf::<16>(values, &matrix, threads(), modulus, &mut scratch, false),
+                    8 => sms::commit_pf::<8>(values, &matrix, threads(), modulus, &mut scratch, false),
+                    24 => sms::commit_pf::<24>(values, &matrix, threads(), modulus, &mut scratch, false),
+                    _ => sms::commit_pf::<32>(values, &matrix, threads(), modulus, &mut scratch, false),
+                }
+                line += &format!(" pf{pf}={:.3}", t.elapsed().as_secs_f64() * 1e3);
+                match &first { None => first = Some(scratch.clone()), Some(f) => assert!(*f == scratch, "commit pf {pf}") }
+            }
+            eprintln!("{line}");
+        }
         sms::commit(values, &matrix, threads(), modulus, out);
         return;
     }
@@ -848,7 +867,48 @@ impl Proof {
     }
 }
 
+/// The lean switch with `prefix` prefix rounds (the transcript and every message are the same for
+/// any prefix); `None` where the lean switch does not apply.
+#[cfg(target_arch = "aarch64")]
+fn lean_switch(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript, prefix: usize) -> Option<(Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162)> {
+    let prepared = labinius::fields::lean::Prepared::with_prefix(values, hi, prefix)?;
+    let partials = prepared.partials();
+    let value = partials.iter().zip(cf::eq_expand_b128(lo))
+        .fold(B128::ZERO, |a, (&v, e)| a + v * e);
+    t.absorb_b128(&[value]);
+    t.absorb_b128(&partials);
+    let batch = cf::eq_expand_f162(&t.sample_f162(b"switch-batch", 7));
+    let mut switch = labinius::fields::lean::Switch::new(values, prepared, &batch);
+    let mut rounds = Vec::with_capacity(LOG_PACKED);
+    let mut coords = Vec::with_capacity(LOG_PACKED);
+    for _ in 0..LOG_PACKED {
+        let msg = switch.msg();
+        t.absorb_f162(&msg);
+        let r = t.sample_f162(b"switch-round", 1)[0];
+        rounds.push(msg.map(|v| v.0));
+        coords.push(r);
+        switch.fold(r);
+    }
+    Some((partials, rounds, coords, switch.final_eval()))
+}
+
 fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -> (Vec<B128>, Vec<[[u64; 3]; 2]>, Vec<F162>, F162) {
+    // DIAGNOSTIC: the whole lean switch with each prefix length, timed in turn on copies of the
+    // transcript (the record's 7 first and last); every proof part is asserted equal to the first.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut line = String::from("diag switch_prefix");
+        let mut first = None;
+        for prefix in [7usize, 6, 8, 5, 7] {
+            let mut tc = t.clone();
+            let st = std::time::Instant::now();
+            let got = lean_switch(values, lo, hi, &mut tc, prefix);
+            line += &format!(" p{prefix}={:.3}", st.elapsed().as_secs_f64() * 1e3);
+            let key = got.map(|(p, r, c, f)| (p, r, c.into_iter().map(|v| v.0).collect::<Vec<_>>(), f.0));
+            match &first { None => first = Some(key), Some(f) => assert!(*f == key, "switch prefix {prefix}") }
+        }
+        eprintln!("{line}");
+    }
     #[cfg(target_arch = "aarch64")]
     if let Some(prepared) = labinius::fields::lean::Prepared::new(values, hi) {
         let partials = prepared.partials();

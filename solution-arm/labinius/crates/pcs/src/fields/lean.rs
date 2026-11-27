@@ -90,7 +90,7 @@ impl Prepared {
         Self::with_prefix(words, r, PREFIX)
     }
 
-    fn with_prefix(words: &[B128], r: &[B128], requested: usize) -> Option<Self> {
+    pub fn with_prefix(words: &[B128], r: &[B128], requested: usize) -> Option<Self> {
         assert_eq!(words.len(), 1usize << r.len());
         if !neon::pmull() || r.len() < 3 || r.contains(&B128::ONE) {
             return None;

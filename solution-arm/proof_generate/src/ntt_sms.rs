@@ -466,20 +466,17 @@ macro_rules! narrow_terminal_row {
         concat!(
             "rshrn v1.2s, v", $a, ".2d, #16\n",
             "rshrn2 v1.4s, v", $b, ".2d, #16\n",
-            "xtn v2.2s, v", $a, ".2d\n",
-            "xtn2 v2.4s, v", $b, ".2d\n",
+            "uzp1 v2.4s, v", $a, ".4s, v", $b, ".4s\n",
             "mla v2.4s, v1.4s, v0.s[0]\n",
             "sqrdmulh v4.4s, v2.4s, v0.s[1]\n",
             "mls v2.4s, v4.4s, v0.s[2]\n",
-            "xtn v3.4h, v2.4s\n",
             "rshrn v1.2s, v", $c, ".2d, #16\n",
             "rshrn2 v1.4s, v", $d, ".2d, #16\n",
-            "xtn v2.2s, v", $c, ".2d\n",
-            "xtn2 v2.4s, v", $d, ".2d\n",
-            "mla v2.4s, v1.4s, v0.s[0]\n",
-            "sqrdmulh v4.4s, v2.4s, v0.s[1]\n",
-            "mls v2.4s, v4.4s, v0.s[2]\n",
-            "xtn2 v3.8h, v2.4s\n",
+            "uzp1 v3.4s, v", $c, ".4s, v", $d, ".4s\n",
+            "mla v3.4s, v1.4s, v0.s[0]\n",
+            "sqrdmulh v4.4s, v3.4s, v0.s[1]\n",
+            "mls v3.4s, v4.4s, v0.s[2]\n",
+            "uzp1 v3.8h, v2.8h, v3.8h\n",
             "str q3, [{compact}, #", $offset, "]"
         )
     };
@@ -841,10 +838,9 @@ unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
 #[inline(always)]
 #[cfg_attr(not(test), allow(dead_code))]
 unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_t], y: &mut [int16x8_t; N]) {
-    let p = P1 as i16;
     let dv = dev.as_mut_ptr();
-    super::inverse_lazy_io(y, |s| narrow_digit(acc, s, r), |s, x| {
-        let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
+    super::inverse_lazy_io_mode::<true>(y, |s| narrow_digit(acc, s, r), |s, x| {
+        let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))));
         *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
         *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
     });
@@ -852,10 +848,9 @@ unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_
 
 #[inline(always)]
 unsafe fn chunk_row2(narrowed: [&[int16x8_t; N]; 2], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
-    let p = P1 as i16;
     let thr = [vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r - 1]), vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r])];
-    super::inverse_lazy_io2(y, |h, s| *narrowed[h].get_unchecked(s), |h, s, x| {
-        let mut v = canonical(vsubq_s16(x, vld1q_dup_s16(mr[h].as_ptr().add(s))), p);
+    super::inverse_lazy_io2_mode::<true>(y, |h, s| *narrowed[h].get_unchecked(s), |h, s, x| {
+        let mut v = canonical(vsubq_s16(x, vld1q_dup_s16(mr[h].as_ptr().add(s))));
         let dv = dev[h];
         let flag = vcgeq_s16(vabsq_s16(v), thr[h]);
         if vmaxvq_u16(flag) != 0 {
@@ -881,11 +876,10 @@ const _: () = assert!(FLUSH as i32 * ((P1 as i32 - 1) / 2) <= i16::MAX as i32);
 /// [`chunk_row_exact`], which takes the 16-bit additions back. The sums are the same integers.
 #[inline(always)]
 unsafe fn chunk_row2_fast(narrowed: [&[int16x8_t; N]; 2], r: [usize; 2], mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], dev16: [*mut int16x8_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: [&Repair; 2]) {
-    let p = P1 as i16;
     let [y0, y1] = y;
     let mut top = [vdupq_n_u16(0); 2];
-    super::inverse_lazy_io2([&mut *y0, &mut *y1], |h, s| *narrowed[h].get_unchecked(s), |h, s, x| {
-        let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr[h].as_ptr().add(s))), p);
+    super::inverse_lazy_io2_mode::<true>([&mut *y0, &mut *y1], |h, s| *narrowed[h].get_unchecked(s), |h, s, x| {
+        let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr[h].as_ptr().add(s))));
         top[h] = vmaxq_u16(top[h], vreinterpretq_u16_s16(vabsq_s16(v)));
         let sum = dev16[h].add(s);
         *sum = vaddq_s16(*sum, v);
@@ -905,10 +899,9 @@ unsafe fn chunk_row2_fast(narrowed: [&[int16x8_t; N]; 2], r: [usize; 2], mr: [&[
 #[cold]
 #[inline(never)]
 unsafe fn chunk_row_exact(narrowed: &[int16x8_t; N], r: usize, mr: &[i16], dev: *mut int32x4_t, dev16: *mut int16x8_t, y: &mut [int16x8_t; N], ctx: &Repair) {
-    let p = P1 as i16;
     let thr = vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r - 1]);
-    super::inverse_lazy_io(y, |s| *narrowed.get_unchecked(s), |s, x| {
-        let mut v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
+    super::inverse_lazy_io_mode::<true>(y, |s| *narrowed.get_unchecked(s), |s, x| {
+        let mut v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))));
         *dev16.add(s) = vsubq_s16(*dev16.add(s), v);
         let flag = vcgeq_s16(vabsq_s16(v), thr);
         if vmaxvq_u16(flag) != 0 {
@@ -1033,15 +1026,15 @@ pub unsafe fn repair(col: (*const u8, usize), a: &SmsMatrix, c: usize, d: usize,
     -(vaddlvq_s32(acc)) - a.mean_int[(c * DIGITS + d) * N + k] as i64
 }
 
-/// `x` in `[-(p-1)/2, (p-1)/2]` for `|x| <= p + p/2`.
+/// Center every signed word modulo 9721 into [-4860, 4860].
 #[inline(always)]
-unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
-    let h = vdupq_n_s16((p - 1) / 2);
-    let pv = vdupq_n_s16(p);
-    let over = vcgtq_s16(x, h);
-    let under = vcltq_s16(x, vnegq_s16(h));
-    let x = vsubq_s16(x, vandq_s16(vreinterpretq_s16_u16(over), pv));
-    vaddq_s16(x, vandq_s16(vreinterpretq_s16_u16(under), pv))
+unsafe fn canonical(x: int16x8_t) -> int16x8_t {
+    const _: () = assert!(P1 == 9721);
+    // 13807 * 9721 = 2^27 + 119. The quotient approximation has error at most
+    // 119 * 32768 / (9721 * 2^27) < 1 / (2 * 9721), the distance to a half-integer.
+    // Multiply-high and rounding shift together round x * 13807 / 2^27.
+    let q = vrshrq_n_s16::<12>(vqdmulhq_n_s16(x, 13_807));
+    vmlsq_n_s16(x, q, P1 as i16)
 }
 
 /// Levels 0 to 3 of the transform from the nibble tables: the SVE2 `tbl` kernel on a host
@@ -1153,11 +1146,10 @@ unsafe fn sums<const V: u8>(
 #[inline(always)]
 unsafe fn chunk_last_row(narrowed: &[int16x8_t; N], dv: *mut int32x4_t, y: &mut [int16x8_t; N], ctx: &Repair) {
     let d = DIGITS - 1;
-    let p = P1 as i16;
     let mr = ctx.a.mean_residues(ctx.c, d);
     let thr = vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + d]);
-    super::inverse_lazy_io(y, |s| *narrowed.get_unchecked(s), |s, x| {
-        let mut v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
+    super::inverse_lazy_io_mode::<true>(y, |s| *narrowed.get_unchecked(s), |s, x| {
+        let mut v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))));
         let slot = dv.add(2 * s);
         let flag = vcgeq_s16(vabsq_s16(v), thr);
         if vmaxvq_u16(flag) != 0 {
@@ -1497,7 +1489,7 @@ mod chunk_bench {
             narrow_digits(&acc, 1, &mut y);
             super::super::inverse_folded::<PB>(&mut y);
             for s in 0..N {
-                let v = canonical(vsubq_s16(y[s], vdupq_n_s16(mr[s])), P1 as i16);
+                let v = canonical(vsubq_s16(y[s], vdupq_n_s16(mr[s])));
                 dev[2 * s] = vaddw_s16(dev[2 * s], vget_low_s16(v));
                 dev[2 * s + 1] = vaddw_high_s16(dev[2 * s + 1], v);
             }
@@ -1514,7 +1506,7 @@ mod chunk_bench {
                     narrow_digits(&acc, 1, &mut y);
                     super::super::inverse_folded::<PB>(&mut y);
                     for s in 0..N {
-                        let v = canonical(vsubq_s16(y[s], vdupq_n_s16(mr[s])), P1 as i16);
+                        let v = canonical(vsubq_s16(y[s], vdupq_n_s16(mr[s])));
                         dev[2 * s] = vaddw_s16(dev[2 * s], vget_low_s16(v));
                         dev[2 * s + 1] = vaddw_high_s16(dev[2 * s + 1], v);
                     }
@@ -1548,6 +1540,17 @@ mod chunk_bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_matches_centered_for_all_words() {
+        for first in (i16::MIN as i32..=i16::MAX as i32).step_by(8) {
+            let words: [i16; 8] = core::array::from_fn(|lane| (first + lane as i32) as i16);
+            unsafe {
+                let actual: [i16; 8] = core::mem::transmute(canonical(vld1q_s16(words.as_ptr())));
+                assert_eq!(actual, words.map(|word| centered(word as i64, P1)), "{words:?}");
+            }
+        }
+    }
 
     /// [`narrow_digits`] is congruent to the sum and within `p`, on the extremes of a chunk's sums
     /// (`+-CHUNK PRODUCT`), small and boundary values, and random values in range.

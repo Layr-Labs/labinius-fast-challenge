@@ -1185,7 +1185,7 @@ pub unsafe fn inverse_folded<const P: usize>(x: &mut [int16x8_t; N]) {
 /// [`InverseKernel`]'s twiddles without the `1 / r` factors, for [`inverse_lazy`]: per radix-3
 /// node, levels 6 down to 3 (216, 72, 24, 8 nodes), `[tau^-1, tau^-2, eps^-1]` as pairs; per
 /// radix-2 node, levels 2 and 1 (4, 2 nodes), `[tau^-1]`; and the trinomial unsplit's
-/// `[inv_split, zeta^324]`.
+/// `[inv_split, zeta^324, inv_split * zeta^324]`.
 pub struct LazyInverse {
     r3: Vec<[i16; 8]>,
     r2: Vec<[i16; 8]>,
@@ -1217,7 +1217,9 @@ impl LazyInverse {
         assert!(r3.len() == 216 + 72 + 24 + 8 && r2.len() == 4 + 2);
         let mut u = [0i16; 8];
         u[..2].copy_from_slice(&twiddle(p, plan.inv_split as u64));
-        u[2..4].copy_from_slice(&twiddle(p, plan.root(super::HALF)));
+        let w = plan.root(super::HALF);
+        u[2..4].copy_from_slice(&twiddle(p, w));
+        u[4..6].copy_from_slice(&twiddle(p, plan.inv_split as u64 * w % p as u64));
         LazyInverse { r3, r2, u }
     }
 }
@@ -1255,6 +1257,27 @@ unsafe fn ib2(y0: int16x8_t, y1: int16x8_t, t: int16x8_t, k: int16x8_t) -> (int1
     (r13(vaddq_s16(y0, y1), k), mulc::<0, 1>(vsubq_s16(y0, y1), t, k))
 }
 
+/// The digit route lets the caller subtract its centered mean before the final
+/// reduction. At this step the two inputs have magnitude at most 8196. For
+/// `d = u - z`, the mapped signed bounds are `|a| <= 13054`, `|b| <= 25048`.
+/// After subtracting any centered mean they still fit i16.
+#[inline(always)]
+unsafe fn lazy_unsplit<const DIGIT: bool>(
+    u: int16x8_t, z: int16x8_t, uv: int16x8_t, k: int16x8_t,
+) -> (int16x8_t, int16x8_t) {
+    let d = vsubq_s16(u, z);
+    if DIGIT {
+        // w has order six and w^5 = 1 - w. For D = w - w^5,
+        // (2w - D)/D = 1/D, so 2t - d is the second coefficient.
+        let t = mulc::<4, 5>(d, uv, k);
+        (vsubq_s16(u, t), vsubq_s16(vaddq_s16(t, t), d))
+    } else {
+        let b = mulc::<0, 1>(d, uv, k);
+        let a = r13(vsubq_s16(u, mulc::<2, 3>(b, uv, k)), k);
+        (a, b)
+    }
+}
+
 /// The inverse transform times [`LAZY_SCALE`] for the prime 9721, on eight lanes: inputs
 /// `|x| <= p`, outputs congruent to `324` times [`inverse`]'s with `|x| <= p` (not centered).
 /// Four passes: levels 6 and 5 per level-4 node, level 4, level 3, then levels 2, 1 and the
@@ -1273,7 +1296,17 @@ pub unsafe fn inverse_lazy(x: &mut [int16x8_t; N]) {
 /// last pass handing slot `i` to `output(i, value)` instead of storing it: `x` is the scratch of
 /// the middle passes. `input` must return values `|x| <= p`; `output` sees every slot once.
 #[inline(always)]
-pub unsafe fn inverse_lazy_io(x: &mut [int16x8_t; N], mut input: impl FnMut(usize) -> int16x8_t, mut output: impl FnMut(usize, int16x8_t)) {
+pub unsafe fn inverse_lazy_io(x: &mut [int16x8_t; N], input: impl FnMut(usize) -> int16x8_t, output: impl FnMut(usize, int16x8_t)) {
+    inverse_lazy_io_mode::<false>(x, input, output);
+}
+
+/// With DIGIT, the callback must reduce the raw output after subtracting its
+/// centered mean. The input bound is unchanged.
+#[inline(always)]
+pub(super) unsafe fn inverse_lazy_io_mode<const DIGIT: bool>(
+    x: &mut [int16x8_t; N], mut input: impl FnMut(usize) -> int16x8_t,
+    mut output: impl FnMut(usize, int16x8_t),
+) {
     const { assert!(PRIMES[1] == 9721) };
     let k = vld1q_s16(kernels()[1].k.as_ptr());
     let inv = &lazy_inverses()[1];
@@ -1341,9 +1374,7 @@ pub unsafe fn inverse_lazy_io(x: &mut [int16x8_t; N], mut input: impl FnMut(usiz
         // the unsplit: b = (u - v) inv_split, a = u - zeta^324 b, pairs i and i + 324
         for i in 0..4 {
             let (u, w) = (v[i], v[i + 4]);
-            let b = mulc::<0, 1>(vsubq_s16(u, w), uv, k);
-            let a = r13(vsubq_s16(u, mulc::<2, 3>(b, uv, k)), k);
-            (v[i], v[i + 4]) = (a, b);
+            (v[i], v[i + 4]) = lazy_unsplit::<DIGIT>(u, w, uv, k);
         }
         for (i, &y) in v.iter().enumerate() {
             output(j + 81 * i, y);
@@ -1353,6 +1384,16 @@ pub unsafe fn inverse_lazy_io(x: &mut [int16x8_t; N], mut input: impl FnMut(usiz
 
 #[inline(always)]
 pub unsafe fn inverse_lazy_io2(
+    x: [&mut [int16x8_t; N]; 2],
+    input: impl FnMut(usize, usize) -> int16x8_t,
+    output: impl FnMut(usize, usize, int16x8_t),
+) {
+    inverse_lazy_io2_mode::<false>(x, input, output);
+}
+
+/// Paired form of [`inverse_lazy_io_mode`].
+#[inline(always)]
+pub(super) unsafe fn inverse_lazy_io2_mode<const DIGIT: bool>(
     x: [&mut [int16x8_t; N]; 2],
     mut input: impl FnMut(usize, usize) -> int16x8_t,
     mut output: impl FnMut(usize, usize, int16x8_t),
@@ -1443,9 +1484,7 @@ pub unsafe fn inverse_lazy_io2(
             // the unsplit: b = (u - v) inv_split, a = u - zeta^324 b, pairs i and i + 324
             for i in 0..4 {
                 let (u, z) = (w[i], w[i + 4]);
-                let b = mulc::<0, 1>(vsubq_s16(u, z), uv, k);
-                let a = r13(vsubq_s16(u, mulc::<2, 3>(b, uv, k)), k);
-                (w[i], w[i + 4]) = (a, b);
+                (w[i], w[i + 4]) = lazy_unsplit::<DIGIT>(u, z, uv, k);
             }
         }
         for (h, w) in v.iter().enumerate() {
@@ -1811,6 +1850,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Map the complete final input box by differences. For each difference the
+    /// two endpoints of its feasible u interval also bound the first output.
+    #[test]
+    fn digit_unsplit_bounds_and_residues() {
+        const P: i32 = 9721;
+        let b0 = 8196;
+        let mut a_max = 0;
+        let mut b_max = 0;
+        unsafe {
+            let uv_words = &lazy_inverses()[1].u;
+            assert_eq!(&uv_words[4..6], &[642, 2164]);
+            let uv = vld1q_s16(uv_words.as_ptr());
+            let k = vld1q_s16(kernels()[1].k.as_ptr());
+            for d in -2 * b0..=2 * b0 {
+                let lo = (-b0).max(d - b0);
+                let hi = b0.min(d + b0);
+                let u = vcombine_s16(vdup_n_s16(lo as i16), vdup_n_s16(hi as i16));
+                let z = vsubq_s16(u, vdupq_n_s16(d as i16));
+                let (a, b) = lazy_unsplit::<true>(u, z, uv, k);
+                let (ap, bp) = lazy_unsplit::<false>(u, z, uv, k);
+                for (i, ((a, b), (ap, bp))) in lanes_of(a).into_iter().zip(lanes_of(b))
+                    .zip(lanes_of(ap).into_iter().zip(lanes_of(bp))).enumerate()
+                {
+                    let (a, b) = (a as i32, b as i32);
+                    let t = 642 * d - P * ((2164 * d + 16384) >> 15);
+                    assert_eq!(a, (if i < 4 { lo } else { hi }) - t);
+                    assert_eq!(b, 2 * t - d);
+                    assert_eq!((a - ap as i32).rem_euclid(P), 0);
+                    assert_eq!((b - bp as i32).rem_euclid(P), 0);
+                    a_max = a_max.max(a.abs());
+                    b_max = b_max.max(b.abs());
+                }
+            }
+        }
+        assert_eq!((a_max, b_max), (13054, 25048));
+        assert!(b_max + (P - 1) / 2 <= i16::MAX as i32);
     }
 
     fn lanes_of(v: int16x8_t) -> [i16; 8] {

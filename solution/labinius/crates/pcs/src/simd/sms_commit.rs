@@ -437,6 +437,8 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 const INPUT_PREFETCH: bool = false;
 
 const PREFETCH_SLOTS: usize = 347;
+// [`WideSink`]'s look-ahead wraps into the next step's tiles at most once.
+const _: () = assert!(PREFETCH_SLOTS < N);
 
 // Quarter-scaled witnesses and reciprocal public keys preserve every product.
 // The64-pair window retains the baseline's statistical accumulation strategy;
@@ -570,12 +572,28 @@ impl<const RED: bool, const FIRST: bool> WideSink<RED, FIRST> {
             let k = self.k.add(j * STREAMS * LOCK);
             let a = self.acc.add(j * STREAMS * 16);
             if PREFETCH_SLOTS > 0 {
-                let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
-                let hi = lo + STREAMS * LOCK * 4;
-                let mut p = (lo + 63) & !63;
-                while p < hi {
-                    _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
-                    p += 64;
+                // A sixteen-batch step reads two key tiles, `k` and `k + LOCK_WORDS` (the slot's
+                // second eight pair batches, 145 KB on): two sequential streams. Look ahead
+                // `PREFETCH_SLOTS` slots in both. Past the tiles' last slot the look-ahead goes on
+                // in the next step's two tiles, `2 LOCK_WORDS` on: `k + PREFETCH_SLOTS` slots then
+                // lands one `LOCK_WORDS` further than in this step's tiles. (A single stream at
+                // `k`, the eight-batch sink's look-ahead, only ever reached the first tile's tail
+                // and, past it, lines of the second tile that this step had already read.)
+                //
+                // Into L2 only (`prefetcht1`): the look-ahead is 2 x 347 x 224 = 155 KB per thread,
+                // three times the 48 KB L1D the two hyperthreads share, which the transform's
+                // staged blocks, tables and the accumulators turn over every few dozen slots. A
+                // line requested into L1 that far ahead leaves it long before its slot comes up
+                // and only displaces that working set; L2 (2 MB) keeps it until it is read.
+                let wrap = if j + PREFETCH_SLOTS >= N { LOCK_WORDS } else { 0 };
+                let first = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK + wrap) as usize;
+                for lo in [first, first + LOCK_WORDS * 4] {
+                    let hi = lo + STREAMS * LOCK * 4;
+                    let mut p = (lo + 63) & !63;
+                    while p < hi {
+                        _mm_prefetch::<_MM_HINT_T1>(p as *const i8);
+                        p += 64;
+                    }
                 }
             }
             macro_rules! call {

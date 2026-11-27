@@ -116,7 +116,7 @@ def kinds():
     return order
 
 
-def emit_calls(K=8, B=26, reserve=1):
+def emit_calls(K=8, B=26, reserve=1, width=6, ls=2):
     """One body per node reduction kind, called per node with the node's base pointers."""
     ks = kinds()
     out = []
@@ -127,7 +127,7 @@ def emit_calls(K=8, B=26, reserve=1):
     out.append('"b 9f"')
     for i, k in enumerate(ks):
         n = next(m for m in range(24) if gen_pc.kind(m) == k)
-        asm, _, _ = node_asm(n, True, K, B, reserve=reserve)
+        asm, _, _ = node_asm(n, True, K, B, width=width, ls=ls, reserve=reserve)
         out.append(f'"{20 + i}:"')
         out += [f'"{subst(a)}"' for a in asm]
         out.append('"ret"')

@@ -1228,7 +1228,7 @@ fn pin_worker(w: usize) {
 
 /// Levels 4 to 6 run as [`pass_tail_calls_c`] (`V = 4`). In this lane's in-process A/B on the
 /// official runner, the fused kernel measured about 3.9 ms per commitment under the two passes
-/// (`V = 0`, diagnostic `7074ae15`). This schedule (skew 24, live budget 29, register reserve 0)
+/// (`V = 0`, diagnostic `7074ae15`). This schedule (skew 20, live budget 29, register reserve 0, width 5, one load-store per cycle)
 /// measured another 1.0-2.8 ms under `pass_tail_calls_b` (`V = 3`, diagnostic `5ea44bbf`), with
 /// byte-identical output.
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {

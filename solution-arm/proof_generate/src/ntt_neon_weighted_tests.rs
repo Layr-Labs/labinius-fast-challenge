@@ -1,4 +1,4 @@
-use super::{super::*, LUT};
+use super::{super::*, LUT, QUARTER_SCALE};
 
 const P: i32 = 9721;
 const OFFSETS: [usize; 6] = [0, 81, 27, 108, 54, 135];
@@ -86,11 +86,12 @@ fn weighted_lut_signed_intervals() {
     let mut x = [EMPTY; N];
     let mut seen = [false; GROUPS];
     for (n, table) in LUT.iter().enumerate() {
+        let scale = QUARTER_SCALE[n];
         for t in 0..6 {
             for pat in 0..if t == 0 { 16 } else { 8 } {
                 assert_eq!(
                     (table[(t + usize::from(t != 0)) + pat / 8][pat % 8] as i32
-                        - kern.lut[n][t][pat] as i32)
+                        - scale * kern.lut[n][t][pat] as i32)
                         .rem_euclid(P),
                     0
                 );
@@ -103,7 +104,7 @@ fn weighted_lut_signed_intervals() {
                 };
                 for pat in 0..8 {
                     assert_eq!(
-                        (table[t + 5][pat] as i32 - root * kern.lut[n][t][pat] as i32)
+                        (table[t + 5][pat] as i32 - scale * (root * kern.lut[n][t][pat] as i32).rem_euclid(P))
                             .rem_euclid(P),
                         0
                     );
@@ -145,7 +146,7 @@ fn weighted_lut_signed_intervals() {
                 b0 - b2 - odd,
             ];
             for i in 0..6 {
-                assert_eq!((out[i] - want[i]).rem_euclid(P), 0);
+                assert_eq!((out[i] - scale * want[i].rem_euclid(P)).rem_euclid(P), 0);
                 range[0][i] = include(range[0][i], out[i]);
                 if indices[0] < 8 {
                     range[1][i] = include(range[1][i], out[i]);
@@ -172,7 +173,7 @@ fn weighted_lut_signed_intervals() {
     for n in 0..24 {
         for j in 0..9 {
             let at = 27 * n + j;
-            let a = if lut_node_kind(n).0 {
+            let a = if n == 10 {
                 red13(x[at])
             } else {
                 x[at]
@@ -188,7 +189,7 @@ fn weighted_lut_signed_intervals() {
     for n in 0..72 {
         for j in 0..3 {
             let at = 9 * n + j;
-            let a = if skip_lut5(n) { x[at] } else { red13(x[at]) };
+            let a = if n / 3 == 10 { x[at] } else { red13(x[at]) };
             let t = &kern.c[n / 3][4 + 4 * (n % 3)..];
             for (i, bounds) in radix3(a, x[at + 3], x[at + 6], t, kern)
                 .into_iter()
@@ -252,12 +253,12 @@ fn weighted_lut_matches_scalar() {
                     }
                 }
             }
-            #[cfg(not(target_feature = "sve"))]
-            let x = expected.each_ref().map(|s| vld1q_s16(s.as_ptr()));
-            #[cfg(target_feature = "sve")]
             let x = {
                 let mut x = [vdupq_n_s16(i16::MIN); N];
+                #[cfg(target_feature = "sve")]
                 super::pass_lut_weighted(&indices, &mut x);
+                #[cfg(not(target_feature = "sve"))]
+                super::pass_lut_weighted_neon(&indices, &mut x);
                 let got: &[[i16; LANES]; N] = core::mem::transmute(&x);
                 assert_eq!(*got, expected);
                 x
@@ -271,7 +272,7 @@ fn weighted_lut_matches_scalar() {
                 plan.forward(&mut want);
                 for (slot, a) in got.iter().enumerate() {
                     assert_eq!(
-                        (a[lane] as i32 + want[slot] as i32).rem_euclid(P),
+                        (a[lane] as i32 + QUARTER_SCALE[slot / 162] * want[slot] as i32).rem_euclid(P),
                         0,
                         "case {case}, lane {lane}, slot {slot}"
                     );

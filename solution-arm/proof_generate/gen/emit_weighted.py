@@ -93,18 +93,11 @@ pub(super) unsafe fn pass_lut_weighted(idx: &[uint8x16_t; GROUPS], x: &mut [int1
     );
 }}
 
+#[cfg(any(test, target_feature = "sve"))]
 #[path = "ntt_neon_weighted_tables.rs"]
 mod tables;
-pub(super) use tables::{{LUT, QUARTER_INVERSE}};
-
-#[cfg(test)]
-use tables::QUARTER_SCALE;
-
-#[cfg(not(target_feature = "sve"))]
-#[path = "ntt_neon_weighted_neon.rs"]
-mod portable;
-#[cfg(not(target_feature = "sve"))]
-pub(super) use portable::pass_lut_weighted_neon;
+#[cfg(any(test, target_feature = "sve"))]
+pub(super) use tables::LUT;
 
 #[cfg(test)]
 #[path = "ntt_neon_weighted_tests.rs"]

@@ -1822,3 +1822,11 @@ mod leap_bench {
         }
     }
 }
+
+#[path = "commit_variants.rs"]
+mod diagnostic;
+pub use diagnostic::commit_candidate;
+
+#[path = "commit_node_stream.rs"]
+mod node_stream;
+pub use node_stream::commit_node_stream;

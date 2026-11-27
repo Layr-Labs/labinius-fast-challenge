@@ -2317,3 +2317,84 @@ mod indices_asm_tests {
         }
     }
 }
+
+#[path = "ntt_paired_tail.rs"]
+mod paired_tail;
+pub use paired_tail::tail_both;
+
+#[cfg(target_feature = "sve")]
+#[path = "ntt_neon_paired_lut.rs"]
+mod paired_lut;
+#[cfg(target_feature = "sve")]
+pub use paired_lut::pass_lut_paired;
+
+#[path = "ntt_neon_front_nodes.rs"]
+mod front_nodes;
+use front_nodes::pass_front_nodes;
+
+#[path = "ntt_neon_stream_indices.rs"]
+mod stream_indices;
+use stream_indices::indices_packed_asm;
+
+// Each block of 64 slots takes 32 vectors in the packed layout.
+type PackedIndices = [uint8x16_t; GROUPS.div_ceil(64) * 32];
+
+#[inline(always)]
+unsafe fn pass_lut_node<const S: usize>(
+    ix: impl Fn(usize) -> uint8x16_t, x: &mut [int16x8_t; GROUPS], kern: &Kernel, n: usize,
+) {
+    let s: Schedule = schedule(S);
+    const { assert!(S < 3 && super::lut_transform_bound(PRIMES[S], SCHEDULES[S]) <= i16::MAX as u32) };
+    let k = vld1q_s16(kern.k.as_ptr());
+    let l = &kern.lut[n];
+    let t: [uint8x16x2_t; 6] = core::array::from_fn(|i| table(&l[i]));
+    let mut step = |j: usize| {
+        let (x0, y0) = (look(t[0], ix(j)), look(t[1], ix(j + 81)));
+        let (x1, y1) = (look(t[2], ix(j + 27)), look(t[3], ix(j + 108)));
+        let (x2, y2) = (look(t[4], ix(j + 54)), look(t[5], ix(j + 135)));
+        let (a0, b0) = (vaddq_s16(x0, y0), vsubq_s16(x0, y0));
+        let (a1, b1) = (vaddq_s16(x1, y1), vsubq_s16(x1, y1));
+        let (a2, b2) = (vaddq_s16(x2, y2), vsubq_s16(x2, y2));
+        let (u, v) = match (s.reduce_d, s.cheap) {
+            (false, _) => (radix3_twiddled::<0>(a0, a1, a2, k), radix3_sixth::<0>(b0, b1, b2, k)),
+            (true, false) => (radix3_twiddled::<1>(a0, a1, a2, k), radix3_sixth::<1>(b0, b1, b2, k)),
+            (true, true) => (radix3_twiddled::<2>(a0, a1, a2, k), radix3_sixth::<2>(b0, b1, b2, k)),
+        };
+        *x.get_unchecked_mut(j) = u.0;
+        *x.get_unchecked_mut(j + 27) = u.1;
+        *x.get_unchecked_mut(j + 54) = u.2;
+        *x.get_unchecked_mut(j + 81) = v.0;
+        *x.get_unchecked_mut(j + 108) = v.1;
+        *x.get_unchecked_mut(j + 135) = v.2;
+    };
+    // nine `j` per block, so that the scheduler interleaves their lookups and butterflies
+    for j in (0..27).step_by(9) {
+        step(j);
+        step(j + 1);
+        step(j + 2);
+        step(j + 3);
+        step(j + 4);
+        step(j + 5);
+        step(j + 6);
+        step(j + 7);
+        step(j + 8);
+    }
+}
+
+/// Eight packed nibble bytes to NEON's eight pairs of byte indices.
+#[cfg(not(target_feature = "sve"))]
+#[inline(always)]
+unsafe fn expand_index(bytes: *const u8, s: usize) -> uint8x16_t {
+    let v = vld1_u8(bytes.add(packed_slot(s)));
+    let lo = vshl_n_u8::<1>(v);
+    let hi = vorr_u8(lo, vdup_n_u8(1));
+    vzip1q_u8(vcombine_u8(lo, lo), vcombine_u8(hi, hi))
+}
+
+#[path = "ntt_neon_compact_indices.rs"]
+mod compact_indices;
+use compact_indices::indices_asm as indices_compact_asm;
+
+#[cfg(any(test, target_feature = "sve"))]
+#[path = "ntt_neon_weighted.rs"]
+mod weighted;

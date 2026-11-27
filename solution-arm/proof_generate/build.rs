@@ -23,10 +23,15 @@ const RING_ELEMENTS: usize = 4096;
 
 fn main() {
     let dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    for f in ["build.rs", "src/ntt.rs", "src/ntt_neon.rs", "src/ntt_hybrid.rs", "src/ntt_sms.rs", "src/sms_lattice.rs", "src/ntt_neon_weighted_tables.rs", "src/rq.rs"] {
+    for f in ["build.rs", "src/ntt.rs", "src/ntt_neon.rs", "src/ntt_hybrid.rs", "src/ntt_sms.rs", "src/sms_lattice.rs", "src/rq.rs"] {
         println!("cargo:rerun-if-changed={f}");
     }
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_ARCH");
+    println!("cargo:rerun-if-changed=src/keydiag_c128_fixed.rs");
+    println!("cargo:rerun-if-changed=src/keydiag_c144_exact.rs");
+    println!("cargo:rerun-if-changed=src/keydiag_c144_cold.rs");
+    println!("cargo:rerun-if-changed=src/keydiag_fixed_lattice.rs");
+    keydiag_write_images(&dir);
     // The hybrid matrix is no longer the default's: its image stays empty and `--modulus` with
     // the hybrid modulus builds it at run time.
     std::fs::write(dir.join("hybrid-matrix.bin"), Vec::<u8>::new()).expect("write the matrix image");
@@ -80,3 +85,36 @@ fn image() -> Vec<u8> {
 fn image() -> Vec<u8> {
     Vec::new()
 }
+
+//@ key comparison image emitter
+const KEYDIAG_SUFFIXES: [&str; 5] = ["means", "mu", "meta", "mean-int", "threshold"];
+
+fn keydiag_write_images(dir: &std::path::Path) {
+    let mut fixture = keydiag_images();
+    let [hot, digits] = [std::mem::take(&mut fixture[0][0]), std::mem::take(&mut fixture[1][4])];
+    std::fs::write(dir.join("keydiag-data.bin"), hot).expect("write shared fixed hot key");
+    std::fs::write(dir.join("keydiag-digits.bin"), digits).expect("write shared fixed digits and parity");
+    for (i, image) in fixture.iter().enumerate() {
+        let chunk = [128, 144][i];
+        for (name, index) in KEYDIAG_SUFFIXES.into_iter().zip([1, 2, 3, 5, 6]) {
+            std::fs::write(dir.join(format!("keydiag-c{chunk}-{name}.bin")), &image[index])
+                .expect("write chunk-specific diagnostic key metadata");
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn keydiag_images() -> [[Vec<u8>; 7]; 2] {
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
+        return Default::default();
+    }
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let fixed128 = ntt::neon::keydiag_c128_fixed::matrix(RING_ELEMENTS, workers).images();
+    let fixed144 = ntt::neon::keydiag_c144_cold::matrix(RING_ELEMENTS, workers).images();
+    assert_eq!(fixed128[0], fixed144[0], "fixed hot key varies with chunk");
+    assert!(fixed144[4].starts_with(&fixed128[4]), "fixed digits vary with chunk");
+    [fixed128, fixed144]
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn keydiag_images() -> [[Vec<u8>; 7]; 2] { Default::default() }

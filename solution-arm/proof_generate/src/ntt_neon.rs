@@ -2395,5 +2395,16 @@ mod indices_asm_tests {
     }
 }
 
+#[cfg(any(test, target_feature = "sve"))]
 #[path = "ntt_neon_weighted.rs"]
 mod weighted;
+
+#[allow(dead_code, unused_imports)]
+#[path = "keydiag_c128_fixed.rs"]
+pub(crate) mod keydiag_c128_fixed;
+#[allow(dead_code, unused_imports)]
+#[path = "keydiag_c144_exact.rs"]
+pub(crate) mod keydiag_c144_exact;
+#[allow(dead_code, unused_imports)]
+#[path = "keydiag_c144_cold.rs"]
+pub(crate) mod keydiag_c144_cold;

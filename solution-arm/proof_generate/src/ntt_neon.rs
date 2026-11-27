@@ -14,7 +14,8 @@
 //!
 //! The SMS commitment ([`sms`]) runs levels 0 to 2 and the level-3 twiddles as lookups instead
 //! ([`nibbles`], [`pass_lut`]): per level-1 node, 16-entry `i16` tables indexed by the nibble of
-//! the coefficients `j + 162 g`, one SVE2 halfword `tbl` per lookup and two lookups per level-3 input,
+//! the coefficients `j + 162 g`, one SVE halfword `tbl` per lookup (one table register where the
+//! nibble's bit 3, coefficient `j + 486`, is always clear: `j >= 26`) and two lookups per level-3 input,
 //! within [`super::lut_transform_bound`] (the library's x86 `bin_asm` does the same).
 use super::{for_blocks, primes, schedule, Matrix, Schedule, ALL, FIRST, FIRST13, N, PRIMES, ROW, SCHEDULES};
 use core::arch::aarch64::*;

@@ -18,6 +18,9 @@ def ld1b(s):
     assert -8 <= imm <= 7
     BASES.add(m)
     return f'ld1b LBz{{d0}}.hRB, p7/z, [IB{m}X, #{imm}, mul vl]'
+# A lookup at a slot `o >= 26` takes the one-register `tbl`: coefficient `o + 486` is past the
+# element's 512 bits, so the nibble's bit 3 is zero and only the table's first eight entries (its
+# first register) are indexed. Same values; 544 of the 648 lookups per transform.
 def build_node(n, steps):
     ins = []; cnt = [0]
     def v(nm):
@@ -38,7 +41,10 @@ def build_node(n, steps):
         for t, o in enumerate(offs):
             ix, val = v('ix'), v('lk')
             ins.append(Ins('L', [ix], [], ld1b(o)))
-            ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.h, z{17+2*t}.hRB, z{{s0}}.h'))
+            if o >= 26:
+                ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.hRB, z{{s0}}.h'))
+            else:
+                ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.h, z{17+2*t}.hRB, z{{s0}}.h'))
             look.append(val)
         x0, y0, x1, y1, x2, y2 = look
         a0, b0 = A('add', x0, y0), A('sub', x0, y0)
@@ -71,16 +77,20 @@ def emit(per=27, K=8, B=17, width=6, ls=2):
             asm, _ = allocate(seq, {'k': 15}, set(), reserved=RESERVED)
             out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
     return ',\n        '.join(out)
-def emit_loop(per=27, K=8, B=17, width=6, ls=2):
+# Tables 1-5 are only indexed at slots `o >= 26` (one-register `tbl`), so their second registers
+# (z19, z21, z23, z25, z27) are never read: the loop loads only their first halves and gives the
+# five registers to the scheduler. Table 0 keeps both (slots `o = j < 26`).
+LOOP_RESERVED = (15, 16, 17, 18, 20, 22, 24, 26)
+def emit_loop(per=27, K=8, B=17, width=6, ls=2, cap=18):
     """The same per-node code as `emit` as a 4-iteration loop: nodes differ only in the table base
     (lut + 192 n) and the output base (x + 2592 n); the ld1b index offsets depend on j only."""
-    out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"', '"mov {n}, #4"', '"3:"']
-    for t in range(6):
-        out.append(f'"ldp q{16+2*t}, q{17+2*t}, [{{lut}}, #{32*t}]"')
+    out = ['"ldr q15, [{kp}]"', '"ptrue p7.h"', '"mov {n}, #4"', '"3:"', '"ldp q16, q17, [{lut}, #0]"']
+    for t in range(1, 6):
+        out.append(f'"ldr q{16+2*t}, [{{lut}}, #{32*t}]"')
     for c in range(0, 27, per):
         ins = build_node(0, list(range(c, min(27, c + per))))
-        seq, _ = schedule(ins, skew=K, budget=B, cap=18, width=width, ls=ls)
-        asm, _ = allocate(seq, {'k': 15}, set(), reserved=RESERVED)
+        seq, _ = schedule(ins, skew=K, budget=B, cap=cap, width=width, ls=ls)
+        asm, _ = allocate(seq, {'k': 15}, set(), reserved=LOOP_RESERVED)
         out += [f'"{base_names(a).replace("XPTR", "{x}").replace("LB", "{{").replace("RB", "}}")}"' for a in asm]
     out += ['"add {x}, {x}, #2592"', '"add {lut}, {lut}, #192"', '"subs {n}, {n}, #1"', '"b.ne 3b"']
     return ',\n        '.join(out)

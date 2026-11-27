@@ -669,7 +669,24 @@ fn fold_neon(values: &[B128], challenges: &[ShortChallenge]) -> Vec<RingElement6
         .collect();
     // SAFETY: `B128` is `repr(transparent)` over `u128`.
     let words = unsafe { core::slice::from_raw_parts(values.as_ptr() as *const u128, values.len()) };
-    fb::neon::fold(words, COLUMN_LEN, &cs, threads())
+    // DIAGNOSTIC: each slice-prefetch mode of the fold, timed in turn (the record's first and last);
+    // all give the same elements, the last run's are used.
+    let mut line = String::from("diag fold");
+    let mut first: Option<Vec<Vec<i16>>> = None;
+    let mut out = Vec::new();
+    for mode in [0usize, 1, 2, 0] {
+        let t = std::time::Instant::now();
+        out = match mode {
+            1 => fb::neon::fold_mode::<1>(words, COLUMN_LEN, &cs, threads()),
+            2 => fb::neon::fold_mode::<2>(words, COLUMN_LEN, &cs, threads()),
+            _ => fb::neon::fold_mode::<0>(words, COLUMN_LEN, &cs, threads()),
+        };
+        line += &format!(" m{mode}={:.3}", t.elapsed().as_secs_f64() * 1e3);
+        let v: Vec<Vec<i16>> = out.iter().map(|e| e.v.to_vec()).collect();
+        match &first { None => first = Some(v), Some(f) => assert!(*f == v, "fold mode {mode}") }
+    }
+    eprintln!("{line}");
+    out
 }
 
 /// The x86 track's scheduled bit-sliced fold (`fold_bits2`) on NEON, written straight into the

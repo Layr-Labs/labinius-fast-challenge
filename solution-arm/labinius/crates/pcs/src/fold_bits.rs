@@ -1681,6 +1681,24 @@ pub mod neon {
         ws: &mut Workspace,
         out: *mut RingElement,
     ) -> Option<usize> {
+        fold_block_mode::<0>(words, column_words, groups, bias, block, claim, ws, out)
+    }
+
+    /// DIAGNOSTIC: [`fold_block`] with the slice prefetch chosen by `MODE`: 0 the record's (the
+    /// next group's slices, spread over the pairs), 1 none, 2 column `jl + 2`'s slice while column
+    /// `jl` is sliced (into the next group's, or the next block's first group's, first columns at
+    /// a group's end). The same output in every mode.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn fold_block_mode<const MODE: usize>(
+        words: *const u128,
+        column_words: usize,
+        groups: &[&Group],
+        bias: &[i32; SLOTS + 1],
+        block: usize,
+        claim: &mut dyn FnMut() -> Option<usize>,
+        ws: &mut Workspace,
+        out: *mut RingElement,
+    ) -> Option<usize> {
         let z = vdupq_n_u8(0);
         ws.lo.fill(z);
         ws.hi.fill(z);
@@ -1689,7 +1707,25 @@ pub mod neon {
         let src = |column: usize, block: usize| words.add(column * column_words + block * LANES) as *const u8;
         let mut claimed = None;
         for (gi, g) in groups.iter().enumerate() {
+            if MODE == 2 && gi + 1 == groups.len() {
+                claimed = claim();
+            }
             for jl in 0..g.columns {
+                if MODE == 2 {
+                    let ahead = if jl + 2 < g.columns {
+                        Some(src(g.first + jl + 2, block))
+                    } else if gi + 1 < groups.len() {
+                        let n = groups[gi + 1];
+                        (jl + 2 - g.columns < n.columns).then(|| src(n.first + jl + 2 - g.columns, block))
+                    } else {
+                        claimed.and_then(|b| (jl + 2 - g.columns < groups[0].columns).then(|| src(groups[0].first + jl + 2 - g.columns, b)))
+                    };
+                    if let Some(p) = ahead {
+                        for l in 0..32 {
+                            prefetch_l2(p.add(64 * l));
+                        }
+                    }
+                }
                 slice(src(g.first + jl, block), planes.add(GUARD + jl * STRIDE), tmp);
             }
             // The next group's 2 KB slices (or the next block's first group's), 64-byte lines
@@ -1697,9 +1733,12 @@ pub mod neon {
             let next = if gi + 1 < groups.len() {
                 Some((groups[gi + 1], block))
             } else {
-                claimed = claim();
+                if MODE != 2 {
+                    claimed = claim();
+                }
                 claimed.map(|b| (groups[0], b))
             };
+            let next = if MODE == 0 { next } else { None };
             let lines = next.map_or(0, |(n, _)| n.columns * 32);
             let per = lines.div_ceil(PAIRS);
             let base = (planes as *const u8).wrapping_sub(16 * BIAS_PLANES);
@@ -1775,6 +1814,11 @@ pub mod neon {
 
     /// `v = sum_j c_j W_j` for every ring element of the `columns` columns of `column_words`
     pub fn fold(words: &[u128], column_words: usize, challenges: &[Challenge], threads: usize) -> Vec<RingElement> {
+        fold_mode::<0>(words, column_words, challenges, threads)
+    }
+
+    /// DIAGNOSTIC: [`fold`] through [`fold_block_mode`]`::<MODE>`.
+    pub fn fold_mode<const MODE: usize>(words: &[u128], column_words: usize, challenges: &[Challenge], threads: usize) -> Vec<RingElement> {
         use std::sync::OnceLock;
         assert!(column_words % LANES == 0, "a column is whole blocks");
         assert_eq!(words.len(), challenges.len() * column_words, "one challenge per column");
@@ -1812,7 +1856,7 @@ pub mod neon {
             while let Some(b) = block {
                 // SAFETY: blocks are disjoint runs of 32 elements of `out`'s capacity.
                 block = unsafe {
-                    fold_block(
+                    fold_block_mode::<MODE>(
                         words_addr as *const u128,
                         column_words,
                         groups,

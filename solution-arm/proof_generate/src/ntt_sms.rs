@@ -775,7 +775,7 @@ unsafe fn prefetch_words(words: &[(*const u8, usize); LANES], e: usize, t: usize
     }
 }
 
-/// The centered residue of a sum below `2^41` in magnitude. Binary64 holds such a sum exactly and
+/// The centered residue of a sum below `2^42` in magnitude. Binary64 holds such a sum exactly and
 /// its quotient by 9721 to far better than half a unit, so the rounded quotient is off by at most
 /// one half step: `|result| <= 4861`.
 #[inline(always)]
@@ -796,14 +796,22 @@ unsafe fn narrow(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
     }
 }
 
-/// The largest product of a key slot (a centered residue) and a transform slot.
-const PRODUCT: u64 = (P1 as u64 - 1) / 2 * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64;
+/// A key slot is centered. The guarded tail can return any signed halfword.
+const PRODUCT: u64 = (P1 as u64 - 1) / 2 * i16::MIN.unsigned_abs() as u64;
+const _: () = assert!(PRODUCT * (crate::RING_ELEMENTS as u64) < 1 << 42);
+// Preserve the previous base reduction's certified element counts.
+const _: () = assert!(PRODUCT < (P1 as u64 - 1) * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64);
 /// `2^16 mod p`, centered.
 const C16: i32 = centered(1 << 16, P1) as i32;
 /// `round(2^31 / p)`.
 const V31: i32 = ((1u64 << 32) / P1 as u64).div_ceil(2) as i32;
 // a chunk's digit sums `v` (|v| <= CHUNK PRODUCT): `(v >> 16) C16 + (v mod 2^16)` fits i32
-const _: () = assert!(((CHUNK as u64 * PRODUCT >> 16) + 1) * C16.unsigned_abs() as u64 + 65535 < i32::MAX as u64);
+const _: () = {
+    let fold = ((CHUNK as u64 * PRODUCT >> 16) + 1) * C16.unsigned_abs() as u64 + 65535;
+    let error = (P1 as i64 * V31 as i64 - (1i64 << 31)).unsigned_abs();
+    assert!(fold < i32::MAX as u64);
+    assert!(P1 as u64 * (1 << 30) + fold * error <= P1 as u64 * (1 << 31));
+};
 
 /// [`narrow`] for a chunk's digit rows, in integers: `v = h 2^16 + l`, `l = v mod 2^16`, so
 /// `v = h (2^16 mod p) + l (mod p)` within `i32`, then a 32-bit Barrett reduction to
@@ -1087,6 +1095,44 @@ unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], ker
     }
 }
 
+// Each guarded tail captures QC in the same assembly block as its saturating ops.
+// Keep the results in integer state. A later call cannot hide a captured clip.
+#[inline(always)]
+unsafe fn tail_status<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], kern: &Kernel) -> u64 {
+    if V == 17 {
+        pass_tail_guarded(sc, x, kern)
+    } else {
+        tail::<V>(sc, x, kern);
+        0
+    }
+}
+
+#[inline(always)]
+unsafe fn begin_tail_guard() -> u64 {
+    let saved;
+    core::arch::asm!("mrs {saved}, fpsr", "msr fpsr, xzr", saved = out(reg) saved, options(nostack));
+    saved
+}
+
+#[inline(always)]
+unsafe fn finish_tail_guard(saved: u64) {
+    core::arch::asm!("msr fpsr, {saved}", saved = in(reg) saved, options(nostack));
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn replay_tail_sweep(
+    words: &[(*const u8, usize); LANES], elements: usize, start: usize,
+    nib: &mut [uint8x16_t; N / 4], sc: &mut [int16x8_t; N], xs: &mut [[int16x8_t; N]], kern: &Kernel,
+) {
+    for (i, x) in xs.iter_mut().enumerate() {
+        let at = pass_words(words, elements, start, i);
+        indices_asm(&at, nib);
+        lut_pass(nib, sc, kern);
+        pass_tail_calls_c(sc, x, kern);
+    }
+}
+
 #[inline(never)]
 unsafe fn sums<const V: u8>(
     words: &[(*const u8, usize); LANES],
@@ -1110,12 +1156,20 @@ unsafe fn sums<const V: u8>(
         // The last partial tile uses zero input words and padded key lanes.
         let l = end - e;
         let groups = l.div_ceil(LOCK);
+        let saved = if V == 17 { begin_tail_guard() } else { 0 };
+        let mut status = 0;
         for i in 0..groups * LOCK {
             let at = pass_words(words, a.elements, e, i);
             indices_asm(&at, nib);
             let x = &mut xs[i];
             lut_pass(nib, sc, kern);
-            tail::<V>(sc, x, kern);
+            status |= tail_status::<V>(sc, x, kern);
+        }
+        if V == 17 {
+            finish_tail_guard(saved);
+            if status & (1 << 27) != 0 {
+                replay_tail_sweep(words, a.elements, e, nib, sc, &mut xs[..groups * LOCK], kern);
+            }
         }
         let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
         sink_terminal::<true>(xs, keys, acc, groups, narrowed);
@@ -1194,6 +1248,8 @@ unsafe fn sums2<const V: u8>(
         let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
         for t in 0..2 {
             let count = groups * LOCK;
+            let saved = if V == 17 { begin_tail_guard() } else { 0 };
+            let mut status = 0;
             for i in 0..count {
                 // The input words [`PF_T`] transforms on: later in this sweep, or the start of
                 // the sweep that follows it (the other batch's, over the same elements for
@@ -1215,7 +1271,13 @@ unsafe fn sums2<const V: u8>(
                 indices_asm(&at, nib);
                 let x = &mut xs[i];
                 lut_pass2(nib, sc, kern);
-                tail::<V>(sc, x, kern);
+                status |= tail_status::<V>(sc, x, kern);
+            }
+            if V == 17 {
+                finish_tail_guard(saved);
+                if status & (1 << 27) != 0 {
+                    replay_tail_sweep(words[t], a.elements, e, nib, sc, &mut xs[..count], kern);
+                }
             }
             sink_terminal::<true>(xs, keys, accs[t], groups, &mut narrowed[t]);
         }

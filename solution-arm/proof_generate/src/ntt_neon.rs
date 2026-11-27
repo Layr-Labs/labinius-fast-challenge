@@ -2397,3 +2397,31 @@ mod indices_asm_tests {
 
 #[path = "ntt_neon_weighted.rs"]
 mod weighted;
+
+#[allow(dead_code, unused_imports)]
+#[path = "balanced_exact.rs"]
+pub(crate) mod balanced_exact;
+
+#[allow(dead_code, unused_imports)]
+#[path = "published_sat84.rs"]
+pub(crate) mod published_sat84;
+
+#[allow(dead_code, unused_imports)]
+#[path = "balanced_sat84.rs"]
+pub(crate) mod balanced_sat84;
+
+#[allow(dead_code, unused_imports)]
+#[path = "count_published_exact.rs"]
+pub(crate) mod count_published_exact;
+
+#[allow(dead_code, unused_imports)]
+#[path = "count_balanced_exact.rs"]
+pub(crate) mod count_balanced_exact;
+
+#[allow(dead_code, unused_imports)]
+#[path = "count_published_sat84.rs"]
+pub(crate) mod count_published_sat84;
+
+#[allow(dead_code, unused_imports)]
+#[path = "count_balanced_sat84.rs"]
+pub(crate) mod count_balanced_sat84;

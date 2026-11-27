@@ -30,6 +30,24 @@ fn main() {
     // The hybrid matrix is no longer the default's: its image stays empty and `--modulus` with
     // the hybrid modulus builds it at run time.
     std::fs::write(dir.join("hybrid-matrix.bin"), Vec::<u8>::new()).expect("write the matrix image");
+
+    #[cfg(target_arch = "aarch64")]
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let matrix = ntt::neon::balanced_exact::matrix(RING_ELEMENTS, workers);
+        println!("cargo:warning=balanced margin={}, column failure={}", matrix.margin, matrix.column_failure);
+        for (suffix, bytes) in ["data", "means", "mu", "meta", "digits", "mean-int", "threshold"]
+            .into_iter().zip(matrix.images()) {
+            std::fs::write(dir.join(format!("balanced-{suffix}.bin")), bytes).unwrap();
+        }
+    }
+    for file in ["balanced_exact.rs", "balanced_sat84.rs", "published_sat84.rs", "r16_lattice.rs"] {
+        println!("cargo:rerun-if-changed=src/{file}");
+    }
+    println!("cargo:rerun-if-changed=src/count_published_exact.rs");
+    println!("cargo:rerun-if-changed=src/count_balanced_exact.rs");
+    println!("cargo:rerun-if-changed=src/count_published_sat84.rs");
+    println!("cargo:rerun-if-changed=src/count_balanced_sat84.rs");
     let [data, means, mu, meta, digits, mean_int, threshold] = sms_images();
     for (name, bytes) in [
         ("sms-data.bin", data),

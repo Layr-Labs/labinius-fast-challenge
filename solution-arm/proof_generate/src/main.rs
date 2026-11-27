@@ -12,6 +12,8 @@ mod hugealloc;
 mod output;
 use output::{Output, ProofParts};
 mod ntt;
+#[cfg(target_arch = "aarch64")]
+mod r16_diag;
 
 #[global_allocator]
 static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
@@ -377,6 +379,9 @@ fn commit(values: &[B128], modulus: u128, out: &mut [u8]) {
         use ntt::neon::sms;
         let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
             .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+
+        #[cfg(not(test))]
+        r16_diag::run(values, &matrix, threads(), modulus, out.len());
         sms::commit(values, &matrix, threads(), modulus, out);
         return;
     }
@@ -956,6 +961,8 @@ fn main() {
     let output = Output::start(&args[2], modulus);
     #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS {
         ntt::neon::sms::map_key(&SMS_DATA.0);
+        #[cfg(not(test))]
+        r16_diag::map_balanced_key();
         let _ = ntt::neon::sms::BETWEEN.set(output.between());
     }
     let mut timer = Timer(std::time::Instant::now(), Vec::new());

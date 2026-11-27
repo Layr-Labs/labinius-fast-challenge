@@ -2043,3 +2043,5 @@ mod leap_bench {
         }
     }
 }
+
+pub(crate) fn r16_key_image(image: &'static [u8]) -> &'static [u8] { key_copy(image).unwrap_or(image) }

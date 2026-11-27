@@ -102,9 +102,27 @@ impl Prepared {
         let scale = r[..prefix].iter().fold(B128::ONE, |a, &x| a * (B128::ONE + x));
         let eq = EqFactors::new(&r[prefix..], scale);
         let parts = par::workers(words.len(), 1 << 16).min(eq.len() / 8);
-        let parts = par::map_blocks(eq.len(), parts, 64.min(eq.len()), |_, start, end| {
-            neon::partial_evals_sets_tiled(words, eq.len(), start, end, |base, tile| eq.fill(base, tile))
-        });
+        // DIAGNOSTIC: every prefetch mode of the partial pass, timed in turn (the record's first and
+        // last); all give the same sums, the last run's are used.
+        let run = |mode: usize| {
+            par::map_blocks(eq.len(), parts, 64.min(eq.len()), |_, start, end| match mode {
+                1 => neon::partial_evals_sets_tiled_mode::<1>(words, eq.len(), start, end, |base, tile| eq.fill(base, tile)),
+                2 => neon::partial_evals_sets_tiled_mode::<2>(words, eq.len(), start, end, |base, tile| eq.fill(base, tile)),
+                3 => neon::partial_evals_sets_tiled_mode::<3>(words, eq.len(), start, end, |base, tile| eq.fill(base, tile)),
+                4 => neon::partial_evals_sets_tiled_mode::<4>(words, eq.len(), start, end, |base, tile| eq.fill(base, tile)),
+                _ => neon::partial_evals_sets_tiled_mode::<0>(words, eq.len(), start, end, |base, tile| eq.fill(base, tile)),
+            })
+        };
+        let mut line = String::from("diag partials");
+        let mut first: Option<Vec<Vec<Vec<B128>>>> = None;
+        let mut parts = Vec::new();
+        for mode in [0usize, 1, 2, 3, 4, 0] {
+            let t = neon::diag_tick();
+            parts = run(mode);
+            line += &format!(" m{mode}={:.3}", (neon::diag_tick() - t) as f64 / 1e6);
+            match &first { None => first = Some(parts.clone()), Some(f) => assert!(*f == parts, "mode {mode} sums") }
+        }
+        eprintln!("{line}");
         let mut sets = vec![vec![B128::ZERO; PACK]; 1 << prefix];
         for part in parts {
             for (dst, src) in sets.iter_mut().zip(part) {
@@ -326,13 +344,30 @@ impl<'a> Switch<'a> {
         let words = self.words;
         let parts = par::workers(n, 1 << 12);
         let edges: Vec<_> = (0..parts).map(|t| par::block(n, parts, t, 2)).collect();
-        let [p0, p1, p2] = &mut self.planes;
-        let chunks = par::split_mut(p0, &edges).into_iter()
-            .zip(par::split_mut(p1, &edges)).zip(par::split_mut(p2, &edges));
         let weights = &weights;
-        par::for_each(chunks.zip(&edges), |(((a, b), c), &(start, _))| unsafe {
-            neon::materialize_prefix(words, weights, start, [a, b, c])
-        });
+        // DIAGNOSTIC: each prefetch mode of the materialization, timed in turn (the record's first
+        // and last); all write the same planes.
+        let mut line = String::from("diag materialize");
+        let mut first: Option<[Vec<u64>; 3]> = None;
+        for mode in [0usize, 1, 2, 0] {
+            let t = neon::diag_tick();
+            {
+                let [p0, p1, p2] = &mut self.planes;
+                let chunks = par::split_mut(p0, &edges).into_iter()
+                    .zip(par::split_mut(p1, &edges)).zip(par::split_mut(p2, &edges));
+                par::for_each(chunks.zip(&edges), |(((a, b), c), &(start, _))| unsafe {
+                    match mode {
+                        1 => neon::materialize_prefix_mode::<1>(words, weights, start, [a, b, c]),
+                        2 => neon::materialize_prefix_mode::<2>(words, weights, start, [a, b, c]),
+                        _ => neon::materialize_prefix_mode::<0>(words, weights, start, [a, b, c]),
+                    }
+                });
+            }
+            line += &format!(" m{mode}={:.3}", (neon::diag_tick() - t) as f64 / 1e6);
+            let now = self.planes.clone();
+            match &first { None => first = Some(now), Some(f) => assert!(*f == now, "mode {mode} planes") }
+        }
+        eprintln!("{line}");
     }
 
     pub fn final_eval(&self) -> F162 {

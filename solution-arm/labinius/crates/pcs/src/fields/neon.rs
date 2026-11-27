@@ -574,6 +574,25 @@ pub(super) fn partial_evals_sets(words: &[B128], eq: &[B128], start: usize, end:
 
 pub(super) fn partial_evals_sets_tiled(
     words: &[B128], stride: usize, start: usize, end: usize,
+    fill: impl FnMut(usize, &mut [B128]),
+) -> Vec<Vec<B128>> {
+    partial_evals_sets_tiled_mode::<0>(words, stride, start, end, fill)
+}
+
+/// DIAGNOSTIC: the counter of the generic timer, for in-process timing of the switch's passes.
+#[inline(always)]
+pub(super) fn diag_tick() -> u64 {
+    let t: u64;
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) t, options(nomem, nostack, preserves_flags)) };
+    t
+}
+
+/// DIAGNOSTIC: [`partial_evals_sets_tiled`] with the prefetch chosen by `MODE`: 0 the record's
+/// (block `q`'s next tile, issued before block `q`), 1 none, 2/3/4 block `q + D`'s current tile
+/// (`D` = 2, 4, 8; past the last block, the next tile of block `q + D - blocks`). The sums are the
+/// same in every mode.
+pub(super) fn partial_evals_sets_tiled_mode<const MODE: usize>(
+    words: &[B128], stride: usize, start: usize, end: usize,
     mut fill: impl FnMut(usize, &mut [B128]),
 ) -> Vec<Vec<B128>> {
     assert_eq!(words.len() % stride, 0);
@@ -595,8 +614,16 @@ pub(super) fn partial_evals_sets_tiled(
                 // This block's next tile into L2: 64 blocks 4 MiB apart, 1 KiB each per tile, are more
                 // streams than the hardware prefetchers follow.
                 let row = words.as_ptr().add(q * stride + base) as *const u8;
-                if next {
+                if MODE == 0 && next {
                     prefetch_l2(row.add(16 * GROUP * PASS), 16 * GROUP * PASS);
+                }
+                if MODE >= 2 {
+                    const DS: [usize; 5] = [0, 0, 2, 4, 8];
+                    let d = DS[MODE];
+                    let (qq, b) = if q + d < blocks { (q + d, base) } else { (q + d - blocks, base + GROUP * PASS) };
+                    if b + GROUP * PASS <= end {
+                        prefetch_l2(words.as_ptr().add(qq * stride + b) as *const u8, 16 * GROUP * PASS);
+                    }
                 }
                 for x in 0..count {
                     patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);
@@ -652,6 +679,14 @@ unsafe fn mat_step(acc: &mut [[uint64x2_t; 6]; 2], w: &[uint64x2_t; 6], p: uint6
 
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start: usize, out: [&mut [u64]; 3]) {
+    materialize_prefix_mode::<0>(words, weights, start, out)
+}
+
+/// DIAGNOSTIC: [`materialize_prefix`] with the prefetch chosen by `MODE`: 0 the record's (each
+/// group's rows of the next chunk), 1 none, 2 eight lines ahead within the group's own rows (and
+/// the first eight lines of each row as the group starts). Same output in every mode.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn materialize_prefix_mode<const MODE: usize>(words: &[B128], weights: &[F162], start: usize, out: [&mut [u64]; 3]) {
     let stride = words.len() / weights.len();
     let [o0, o1, o2] = out;
     let len = o0.len();
@@ -667,8 +702,11 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
             // This group's rows of the next chunk into L2.
             for g in 0..ws.len() {
                 let row = words.as_ptr().add((8 * group + g) * stride + start + first) as *const u8;
-                if next {
+                if MODE == 0 && next {
                     prefetch_l2(row.wrapping_add(64 * PAIRS), 64 * PAIRS);
+                }
+                if MODE == 2 {
+                    prefetch_l2(row, 64 * 8.min(pairs.div_ceil(2)));
                 }
             }
             // Two pairs (one 64-byte line of each row) per step: the eight rows of a group sit 4 MiB
@@ -681,6 +719,9 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
                 for (g, w) in ws.iter().enumerate() {
                     let q = 8 * group + g;
                     let row = words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64;
+                    if MODE == 2 && i + 2 * 8 + 2 <= pairs {
+                        core::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) (row as *const u8).wrapping_add(64 * 8), options(nostack, preserves_flags, readonly));
+                    }
                     mat_step(&mut a, w, vld2q_u64(row));
                     mat_step(&mut b, w, vld2q_u64(row.add(4)));
                 }

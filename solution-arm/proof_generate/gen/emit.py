@@ -134,12 +134,14 @@ pub unsafe fn pass_tail(x: &[int16x8_t; N], y: &mut [int16x8_t; N], kern: &Kerne
     );
 }}
 """
-def pass_tail_calls(K=8, B=26, name="pass_tail_calls", reserve=1, width=6, ls=2, mfirst=True):
+def pass_tail_calls(K=8, B=26, name="pass_tail_calls", reserve=1, width=6, ls=2, mfirst=True, even_late=False):
     # the scheduler reads MFIRST per call: off selects its load-first priority order
     saved = os.environ.pop('MFIRST', None)
     if mfirst: os.environ['MFIRST'] = saved or '1'
-    body = ',\n        '.join(gen_tail.emit_calls(K, B, reserve, width, ls))
+    body = ',\n        '.join(gen_tail.emit_calls(K, B, reserve, width, ls, even_late))
     if saved is not None: os.environ['MFIRST'] = saved
+    c_table = "even_c" if even_late else "c"
+    t_table = "even_t6" if even_late else "t6"
     return f"""/// [`pass_tail`] with one body per node reduction kind ({len(gen_tail.kinds())} kinds), called per node
 /// with the node's base pointers: about a third of the straight-line code (schedule skew {K},
 /// live budget {B}, register reserve {reserve}).
@@ -149,8 +151,8 @@ pub unsafe fn {name}(x: &[int16x8_t; N], y: &mut [int16x8_t; N], kern: &Kernel) 
         {body},
         x = inout(reg) x.as_ptr() => _,
         y = inout(reg) y.as_mut_ptr() => _,
-        c = inout(reg) kern.c.as_ptr() => _,
-        t = inout(reg) kern.t6.as_ptr() => _,
+        c = inout(reg) kern.{c_table}.as_ptr() => _,
+        t = inout(reg) kern.{t_table}.as_ptr() => _,
         kc = in(reg) kern.kc.as_ptr(),
         out("x30") _,
         {CLOB},
@@ -164,7 +166,7 @@ def pass_quarter_tail():
     previous = gen_pc.kind
     gen_pc.kind = lambda n: (n == 10, 7 if n == 10 else 0)
     try:
-        return pass_tail_calls(20, 30, "pass_tail_calls_c", 0, 6, 1, True)
+        return pass_tail_calls(22, 29, "pass_tail_calls_c", 0, 6, 1, True, even_late=True)
     finally:
         gen_pc.kind = previous
 

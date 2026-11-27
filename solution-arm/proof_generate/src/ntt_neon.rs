@@ -51,6 +51,10 @@ pub struct Kernel {
     /// [`pass_tail`]'s level-6 pairs per level-3 node: those of its nine level-5 children
     /// `9 n + m` at `t6[n][m / 2]`, lanes `4 (m % 2)..`, the pairs of `d` laid out per node.
     t6: [[[i16; 8]; 5]; 24],
+    // Same layout as c and t6, with exact-even twiddles only for the
+    // common body's L5 and selected L6 butterflies.
+    even_c: [[i16; 16]; 24],
+    even_t6: [[[i16; 8]; 5]; 24],
     /// `round(2^31 / p)` for the reduction of the `i32` sums.
     v32: i32,
     /// Levels 0 to 2 and the level-3 twiddles of the binary transform as nibble tables
@@ -68,6 +72,17 @@ fn twiddle(p: u32, w: u64) -> [i16; 2] {
     let twisted = (2 * c * 32768 + p as i64).div_euclid(2 * p as i64);
     assert!(twisted.abs() <= 1 << 14);
     [c as i16, twisted as i16]
+}
+
+/// Coefficients for SQRDMULH, MLA, SQRDMULH. Their result is
+/// exactly twice the centered residue of (-w/2) times any signed halfword.
+fn even_twiddle(p: u32, w: u64) -> [i16; 2] {
+    let p64 = p as i64;
+    let v = super::centered(-(w as i64) * ((p64 + 1) / 2), p) as i64;
+    const R: i64 = 1 << 16;
+    let k = 2 * (v * R * R + p64).div_euclid(2 * p64);
+    let low = k as i16 as i64;
+    [(k - low).div_euclid(R) as i16, (low / 2) as i16]
 }
 
 impl Kernel {
@@ -118,6 +133,29 @@ impl Kernel {
                 t6[n][m / 2][4 * (m % 2)..4 * (m % 2) + 4].copy_from_slice(&d[q / 2][4 * (q % 2)..4 * (q % 2) + 4]);
             }
         }
+        let mut even_c = cc;
+        let mut even_t6 = t6;
+        if p == 9721 {
+            let even_r3 = |e: u32| {
+                let t = e as usize / 3;
+                let b = even_twiddle(p, plan.root(t));
+                let c = even_twiddle(p, plan.root(2 * t));
+                [b[0], b[1], c[0], c[1]]
+            };
+            let odd = twiddle(p, (2 * plan.root(648) + 1) % p as u64);
+            for n in 0..24 {
+                if n == 10 { continue; }
+                for j in 0..3 {
+                    even_c[n][4 + 4*j..8 + 4*j].copy_from_slice(&even_r3(plan.exps[4][3*n+j]));
+                }
+                for m in 0..9 {
+                    if m % 3 == 0 { continue; }
+                    let at = 4 * (m % 2);
+                    even_t6[n][m / 2][at..at+4].copy_from_slice(&even_r3(plan.exps[5][9*n+m]));
+                }
+                even_t6[n][4][4..6].copy_from_slice(&odd);
+            }
+        }
         let mut lut = [[[0i16; 16]; 6]; 4];
         for (n, tables) in lut.iter_mut().enumerate() {
             let tau = plan.root(plan.exps[1][n] as usize / 2);
@@ -153,6 +191,8 @@ impl Kernel {
             d,
             kc,
             t6,
+            even_c,
+            even_t6,
             v32: ((1u64 << 32) / p as u64).div_ceil(2) as i32,
             lut,
         }

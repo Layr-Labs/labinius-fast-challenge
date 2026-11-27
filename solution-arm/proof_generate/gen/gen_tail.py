@@ -22,10 +22,11 @@ from sched import Ins, schedule, allocate
 import gen_pc
 
 
-def build(n, rel=False):
+def build(n, rel=False, even_late=False):
     """Node n's instructions. `rel`: addresses relative to per-node base pointers (x, y = slot
     27 n, c = kern.c[n], t = kern.t6[n]) so that every node of one reduction kind runs the same
     code; else absolute offsets from the transform's base pointers."""
+    even = even_late and n != 10
     ins = []; low = set(); cnt = [0]; grp = [0]
     def v(nm):
         cnt[0] += 1; return f'{nm}{cnt[0]}'
@@ -39,6 +40,24 @@ def build(n, rel=False):
         return r
     def A(op, a, b):
         d = v(op); emit(Ins('A', [d], [a, b], f'{op} v{{d0}}.8h, v{{s0}}.8h, v{{s1}}.8h')); return d
+    def muleven(a,t,h,l):
+        q,u,r=v('q'),v('u'),v('er')
+        emit(Ins('M',[q],[a,t],f'sqrdmulh v{{d0}}.8h, v{{s0}}.8h, v{{s1}}.h[{l}]'))
+        emit(Ins('M',[u],[q,a,t],f'mla v{{d0}}.8h, v{{s1}}.8h, v{{s2}}.h[{h}]',tie=0))
+        emit(Ins('M',[r],[u,'k'],'sqrdmulh v{d0}.8h, v{s0}.8h, v{s1}.h[0]'))
+        return r
+    def even_bfly(a,b,c,t,off):
+        bh=muleven(b,t,off,off+1)
+        ch=muleven(c,t,off+2,off+3)
+        s=A('add',bh,ch)
+        d=v('sd')
+        emit(Ins('S',[d],[ch,bh],'shsub v{d0}.8h, v{s0}.8h, v{s1}.8h'))
+        e=mulc(d,odd,4,5)
+        z0=A('sub',a,s)
+        m=v('sum')
+        # Dummy z0 operand preserves the destructive SSRA's anti-dependency.
+        emit(Ins('S',[m],[a,s,z0],'ssra v{d0}.8h, v{s1}.8h, #1',tie=0))
+        return [z0,A('add',m,e),A('sub',m,e)]
     def red13(a):
         sh, r = v('sh'), v('red')
         emit(Ins('S', [sh], [a], 'srshr v{d0}.8h, v{s0}.8h, #13'))
@@ -66,6 +85,7 @@ def build(n, rel=False):
         grp[0] += 1
     # level 5
     t0 = t1 = None
+    if even: odd = tw(f'ldr q{{d0}}, [DPTR, #{tb + 64}]')
     for q in range(3):
         for j in range(3):
             if q == 0 and t0 is None: t0 = tw(f'ldr q{{d0}}, [CPTR, #{cb}]')
@@ -73,22 +93,24 @@ def build(n, rel=False):
             t, o = ((t0, 4), (t1, 0), (t1, 4))[q]
             p = 9 * q + j
             a = x[p] if (skip >> q & 1) else red13(x[p])
-            x[p], x[p + 3], x[p + 6] = bfly(a, x[p + 3], x[p + 6], t, o)
+            x[p], x[p + 3], x[p + 6] = (even_bfly if even else bfly)(a, x[p + 3], x[p + 6], t, o)
             grp[0] += 1
     # level 6
     dv = {}
+    if even:
+        dv[4] = odd
     for m in range(9):
         if m // 2 not in dv:
             dv[m // 2] = tw(f'ldr q{{d0}}, [DPTR, #{tb + 16*(m//2)}]')
-        ys = bfly(red13(x[3 * m]), x[3 * m + 1], x[3 * m + 2], dv[m // 2], 4 * (m % 2))
+        ys = (even_bfly if even and m % 3 != 0 else bfly)(red13(x[3 * m]), x[3 * m + 1], x[3 * m + 2], dv[m // 2], 4 * (m % 2))
         for i in range(3):
             emit(Ins('T', [], [ys[i]], f'str q{{s0}}, [YPTR, #{xb + 16*(3*m+i)}]'))
         grp[0] += 1
     return ins, low
 
 
-def node_asm(n, rel, K, B, width=6, ls=2, cap=31, reserve=1):
-    ins, low = build(n, rel)
+def node_asm(n, rel, K, B, width=6, ls=2, cap=31, reserve=1, even_late=False):
+    ins, low = build(n, rel, even_late)
     seq, cyc = schedule(ins, width=width, ls=ls, budget=B, skew=K, cap=cap, reserve=reserve)
     asm, live = allocate(seq, {'k': 15}, low)
     return asm, cyc, live
@@ -116,7 +138,7 @@ def kinds():
     return order
 
 
-def emit_calls(K=8, B=26, reserve=1, width=6, ls=2):
+def emit_calls(K=8, B=26, reserve=1, width=6, ls=2, even_late=False):
     """One body per node reduction kind, called per node with the node's base pointers."""
     ks = kinds()
     out = []
@@ -127,7 +149,10 @@ def emit_calls(K=8, B=26, reserve=1, width=6, ls=2):
     out.append('"b 9f"')
     for i, k in enumerate(ks):
         n = next(m for m in range(24) if gen_pc.kind(m) == k)
-        asm, _, _ = node_asm(n, True, K, B, width=width, ls=ls, reserve=reserve)
+        if even_late and n == 10:
+            asm, _, _ = node_asm(n, True, 20, 30, width=6, ls=1, reserve=0)
+        else:
+            asm, _, _ = node_asm(n, True, K, B, width=width, ls=ls, reserve=reserve, even_late=even_late)
         out.append(f'"{20 + i}:"')
         out += [f'"{subst(a)}"' for a in asm]
         out.append('"ret"')

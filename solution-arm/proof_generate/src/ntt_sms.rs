@@ -405,10 +405,24 @@ const LOCK: usize = 8;
 const PASS: usize = 2 * LOCK;
 const _: () = assert!(CHUNK % PASS == 0);
 
-/// The accumulators of slot `s`, row `r`: `acc[idx..idx + 4]`, two columns per `i64` pair.
+const BASE_ACC: usize = 4 * N;
+const WIDE_ACC: usize = ROWS * BASE_ACC;
+// A fresh terminal SVE sweep keeps the digit rows in registers. NEON uses the
+// remainder of the buffer for the digit rows and narrows them after the sweep.
+const TERMINAL_ACC: usize = if cfg!(target_feature = "sve") { BASE_ACC } else { WIDE_ACC };
+type TerminalAcc = [int64x2_t; TERMINAL_ACC];
+
+/// Four vectors per slot, with two columns per vector. In a fresh terminal sweep
+/// the base row occupies a continuous prefix, followed by the NEON digit rows.
 #[inline(always)]
-const fn idx(s: usize, r: usize) -> usize {
-    (s * ROWS + r) * 4
+const fn idx<const PACKED: bool>(s: usize, r: usize) -> usize {
+    if !PACKED {
+        (s * ROWS + r) * 4
+    } else if r == 0 {
+        s * 4
+    } else {
+        BASE_ACC + (s * DIGITS + r - 1) * 4
+    }
 }
 
 /// `acc[q] += ` the four-term dot product per `i64` lane of `a[q]` with the low half of `key`, and
@@ -498,7 +512,8 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
     const XS: usize = N * 16;
     const KS: usize = N * ROWS * LOCK * 2;
     const _: () = assert!(ROWS == 6 && LOCK == 8);
-    debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
+    let len = if FRESH && TERMINAL { BASE_ACC } else { WIDE_ACC };
+    debug_assert!(acc.len() == len && (1..=SINK).contains(&groups));
     macro_rules! run {
         ([$($init:literal),* $(,)?], [$($post:expr),* $(,)?], $($extra:tt)*) => {
             core::arch::asm!(
@@ -577,11 +592,12 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "stp q8, q9, [{a}, #0]",
                 "stp q10, q11, [{a}, #32]",
                 $($post,)*
-                "add {a}, {a}, #384",
+                "add {a}, {a}, #{acc_stride}",
                 "add {z}, {z}, #16",
                 "add {k}, {k}, #96",
                 "subs {slots}, {slots}, #1",
                 "b.ne 2b",
+                acc_stride = const if FRESH && TERMINAL { 64 } else { ROWS * 64 },
                 a = inout(reg) acc.as_mut_ptr() => _,
                 z = inout(reg) xs.as_ptr() => _,
                 k = inout(reg) keys => _,
@@ -664,7 +680,7 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
     }
 }
 
-#[cfg(target_feature = "sve")]
+#[cfg(all(target_feature = "sve", test))]
 #[inline(always)]
 unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
     sink_sve::<FRESH, false>(xs, keys, acc, groups, core::ptr::null_mut());
@@ -685,9 +701,9 @@ unsafe fn sink_terminal<const FRESH: bool>(
     xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
     narrowed: &mut NarrowedDigits,
 ) {
-    sink::<FRESH>(xs, keys, acc, groups);
+    sink_neon::<FRESH, FRESH>(xs, keys, acc, groups);
     for (d, row) in narrowed.iter_mut().enumerate() {
-        narrow_digits(acc, d + 1, row);
+        narrow_digits::<FRESH>(acc, d + 1, row);
     }
 }
 
@@ -696,8 +712,8 @@ unsafe fn sink_terminal<const FRESH: bool>(
 /// The same products for development on AArch64 hosts without SVE.
 #[cfg(not(target_feature = "sve"))]
 #[inline(never)]
-unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
-    debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
+unsafe fn sink_neon<const FRESH: bool, const PACKED: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+    debug_assert!(acc.len() == WIDE_ACC && (1..=SINK).contains(&groups));
     let accp = acc.as_mut_ptr();
     for g in 0..groups {
         let tile = keys.add(g * N * ROWS * LOCK);
@@ -707,13 +723,19 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
             for r in 0..ROWS {
                 if FRESH && g == 0 && r > 0 {
                     for q in 0..4 {
-                        *accp.add(idx(s, r) + q) = vdupq_n_s64(0);
+                        *accp.add(idx::<PACKED>(s, r) + q) = vdupq_n_s64(0);
                     }
                 }
-                dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
+                dot(accp.add(idx::<PACKED>(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
             }
         }
     }
+}
+
+#[cfg(all(not(target_feature = "sve"), test))]
+#[inline(always)]
+unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+    sink_neon::<FRESH, false>(xs, keys, acc, groups);
 }
 
 /// The eight witness pointers of transform `t` of a pass starting at element `e`, in dot-product
@@ -787,9 +809,9 @@ unsafe fn narrow_sum(v: int64x2_t) -> int32x2_t {
 
 /// Row `r`'s sums as residues, one `i16` vector per slot, lane = column.
 #[inline(always)]
-unsafe fn narrow(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
+unsafe fn narrow<const PACKED: bool>(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
     for (s, o) in out.iter_mut().enumerate() {
-        let at = idx(s, r);
+        let at = idx::<PACKED>(s, r);
         let lo = vcombine_s32(narrow_sum(acc[at]), narrow_sum(acc[at + 1]));
         let hi = vcombine_s32(narrow_sum(acc[at + 2]), narrow_sum(acc[at + 3]));
         *o = vcombine_s16(vmovn_s32(lo), vmovn_s32(hi));
@@ -809,15 +831,15 @@ const _: () = assert!(((CHUNK as u64 * PRODUCT >> 16) + 1) * C16.unsigned_abs() 
 /// `v = h (2^16 mod p) + l (mod p)` within `i32`, then a 32-bit Barrett reduction to
 /// `|r| <= 0.65 p` (the inverse takes `|x| <= p`). After the k6 chunk end (dadon line).
 #[inline(always)]
-unsafe fn narrow_digits(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
+unsafe fn narrow_digits<const PACKED: bool>(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
     for (s, o) in out.iter_mut().enumerate() {
-        *o = narrow_digit(acc, s, r);
+        *o = narrow_digit::<PACKED>(acc, s, r);
     }
 }
 
 /// Slot `s` of [`narrow_digits`].
 #[inline(always)]
-unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
+unsafe fn narrow_digit<const PACKED: bool>(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
     // `h = round(v / 2^16)` and `l = v - h 2^16` in `[-2^15, 2^15)`: then `l + h C16` is the low
     // word of `v` plus `h (C16 - 2^16)` in wrapping 32-bit arithmetic (the true value fits, as
     // asserted above for the larger unsigned `l`), so the low words need no mask: one instruction
@@ -829,7 +851,7 @@ unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
         let t = vmlaq_s32(l, h, c);
         vmlsq_n_s32(t, vqrdmulhq_n_s32(t, V31), P1 as i32)
     };
-    let at = idx(s, r);
+    let at = idx::<PACKED>(s, r);
     let lo = half(*acc.get_unchecked(at), *acc.get_unchecked(at + 1));
     let hi = half(*acc.get_unchecked(at + 2), *acc.get_unchecked(at + 3));
     vmovn_high_s32(vmovn_s32(lo), hi)
@@ -843,7 +865,7 @@ unsafe fn narrow_digit(acc: &[int64x2_t], s: usize, r: usize) -> int16x8_t {
 unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_t], y: &mut [int16x8_t; N]) {
     let p = P1 as i16;
     let dv = dev.as_mut_ptr();
-    super::inverse_lazy_io(y, |s| narrow_digit(acc, s, r), |s, x| {
+    super::inverse_lazy_io(y, |s| narrow_digit::<false>(acc, s, r), |s, x| {
         let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
         *dv.add(2 * s) = vaddw_s16(*dv.add(2 * s), vget_low_s16(v));
         *dv.add(2 * s + 1) = vaddw_high_s16(*dv.add(2 * s + 1), v);
@@ -1109,15 +1131,13 @@ unsafe fn sums<const V: u8>(
     nib: &mut [uint8x16_t; N / 4],
     xs: &mut [[int16x8_t; N]; SWEEP],
     sc: &mut [int16x8_t; N],
-    acc: &mut [int64x2_t],
+    acc: &mut TerminalAcc,
     narrowed: &mut NarrowedDigits,
     y: &mut [int16x8_t; N],
     dev: &mut [int32x4_t],
 ) {
     let kern = &kernels()[PB];
-    for s in 0..N {
-        acc[idx(s, 0)..][..4].fill(vdupq_n_s64(0));
-    }
+    acc[..BASE_ACC].fill(vdupq_n_s64(0));
     let mut e = 0usize;
     while e < a.elements {
         let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
@@ -1145,7 +1165,7 @@ unsafe fn sums<const V: u8>(
         }
         chunk_last_row(&narrowed[DIGITS - 1], dv.add((DIGITS - 1) * 2 * N), y, ctx);
     }
-    narrow(acc, 0, y);
+    narrow::<true>(acc, 0, y);
     super::inverse_folded::<PB>(y);
 }
 
@@ -1178,7 +1198,7 @@ unsafe fn sums2<const V: u8>(
     nib: &mut [uint8x16_t; N / 4],
     xs: &mut [[int16x8_t; N]; SWEEP],
     sc: &mut [int16x8_t; N],
-    acc: [&mut [int64x2_t]; 2],
+    acc: [&mut TerminalAcc; 2],
     narrowed: &mut [NarrowedDigits; 2],
     y: [&mut [int16x8_t; N]; 2],
     dev: [&mut [int32x4_t]; 2],
@@ -1192,14 +1212,12 @@ unsafe fn sums2<const V: u8>(
     let [acc0, acc1] = acc;
     let [y0, y1] = y;
     let [dev0, dev1] = dev;
-    let accs: [&mut [int64x2_t]; 2] = [acc0, acc1];
+    let accs = [acc0, acc1];
     let ys: [&mut [int16x8_t; N]; 2] = [y0, y1];
     let devs: [&mut [int32x4_t]; 2] = [dev0, dev1];
     let (mut accs, mut ys, mut devs) = (accs, ys, devs);
-    for t in 0..2 {
-        for s in 0..N {
-            accs[t][idx(s, 0)..][..4].fill(vdupq_n_s64(0));
-        }
+    for acc in &mut accs {
+        acc[..BASE_ACC].fill(vdupq_n_s64(0));
     }
     let mut e = 0usize;
     while e < a.elements {
@@ -1264,7 +1282,7 @@ unsafe fn sums2<const V: u8>(
         }
     }
     for t in 0..2 {
-        narrow(accs[t], 0, ys[t]);
+        narrow::<true>(accs[t], 0, ys[t]);
         super::inverse_folded::<PB>(ys[t]);
     }
     let _ = (&mut accs, &mut ys, &mut devs);
@@ -1296,9 +1314,9 @@ struct Scratch {
     /// The transform scratch: the table front and levels 4-5 run here (L1-resident, reused for every
     /// transform) and level 6 writes the sweep buffer out of place ([`pass_d_out`]).
     sc: [int16x8_t; N],
-    acc: [int64x2_t; ROWS * 4 * N],
+    acc: TerminalAcc,
     dev: [int32x4_t; DIGITS * 2 * N],
-    acc2: [int64x2_t; ROWS * 4 * N],
+    acc2: TerminalAcc,
     narrowed: [NarrowedDigits; 2],
     dev2: [int32x4_t; DIGITS * 2 * N],
     /// The 16-bit deviation sums of the two batches between [`flush16`]s.
@@ -1411,7 +1429,7 @@ pub fn commit_v<const V: u8>(values: &[B128], a: &SmsMatrix, workers: usize, q: 
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
                     let [d16a, d16b] = dev16;
-                    sums2::<V>([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], narrowed, [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
+                    sums2::<V>([&w0, &w1], a, nib, xs, sc, [&mut *acc, &mut *acc2], narrowed, [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
                 } else {
                     sums::<V>(&batch_words(b), a, m, nib, xs, sc, acc, &mut narrowed[0], y, dev);
                 }
@@ -1494,7 +1512,7 @@ mod chunk_bench {
         let mut y = Box::new([unsafe { vdupq_n_s16(0) }; N]);
         // same deviations both ways
         unsafe {
-            narrow_digits(&acc, 1, &mut y);
+            narrow_digits::<false>(&acc, 1, &mut y);
             super::super::inverse_folded::<PB>(&mut y);
             for s in 0..N {
                 let v = canonical(vsubq_s16(y[s], vdupq_n_s16(mr[s])), P1 as i16);
@@ -1511,7 +1529,7 @@ mod chunk_bench {
             let t = std::time::Instant::now();
             for _ in 0..reps {
                 unsafe {
-                    narrow_digits(&acc, 1, &mut y);
+                    narrow_digits::<false>(&acc, 1, &mut y);
                     super::super::inverse_folded::<PB>(&mut y);
                     for s in 0..N {
                         let v = canonical(vsubq_s16(y[s], vdupq_n_s16(mr[s])), P1 as i16);
@@ -1565,11 +1583,11 @@ mod tests {
             core::ptr::copy_nonoverlapping(want.as_ptr() as *const int64x2_t, acc.as_mut_ptr(), acc.len());
             for r in 0..ROWS {
                 let mut out = [vdupq_n_s16(0); N];
-                narrow_digits(&acc, r, &mut out);
+                narrow_digits::<false>(&acc, r, &mut out);
                 for s in 0..N {
                     let o: [i16; 8] = core::mem::transmute(out[s]);
                     for c in 0..8 {
-                        let v = want[2 * idx(s, r) + c];
+                        let v = want[2 * idx::<false>(s, r) + c];
                         assert_eq!((o[c] as i64 - v).rem_euclid(P1 as i64), 0, "{v}");
                         assert!((o[c] as i64).abs() <= P1 as i64);
                     }
@@ -1593,7 +1611,7 @@ mod tests {
                 }
                 (crate::ntt::tests::xorshift(&mut seed) % (2 * limit as u64 + 1)) as i64 - limit
             });
-            let begin = idx(0, 1);
+            let begin = idx::<false>(0, 1);
             let mut got = unsafe { vdupq_n_s16(0) };
             unsafe {
                 for q in 0..4 {
@@ -1612,7 +1630,7 @@ mod tests {
                     options(nostack, preserves_flags)
                 );
                 assert_eq!(core::mem::transmute::<_, [i16; 8]>(got),
-                           core::mem::transmute::<_, [i16; 8]>(narrow_digit(&acc, 0, 1)));
+                           core::mem::transmute::<_, [i16; 8]>(narrow_digit::<false>(&acc, 0, 1)));
             }
         }
     }
@@ -1624,19 +1642,28 @@ mod tests {
             xs: &[[int16x8_t; N]; SWEEP], keys: &[i16], initial: &[int64x2_t], groups: usize,
         ) {
             let mut want = initial.to_vec();
-            let mut got = initial.to_vec();
+            let mut got = if FRESH {
+                let mut acc = vec![vdupq_n_s64(0); TERMINAL_ACC];
+                for s in 0..N {
+                    let at = idx::<false>(s, 0);
+                    acc[s * 4..s * 4 + 4].copy_from_slice(&initial[at..at + 4]);
+                }
+                acc
+            } else {
+                initial.to_vec()
+            };
             let mut compact = Box::new([[vdupq_n_s16(0); N]; DIGITS]);
             sink::<FRESH>(xs, keys.as_ptr(), &mut want, groups);
             sink_terminal::<FRESH>(xs, keys.as_ptr(), &mut got, groups, &mut compact);
             for s in 0..N {
-                let at = idx(s, 0);
+                let (got_at, want_at) = (idx::<FRESH>(s, 0), idx::<false>(s, 0));
                 for q in 0..4 {
-                    assert_eq!(core::mem::transmute::<_, [i64; 2]>(got[at + q]),
-                               core::mem::transmute::<_, [i64; 2]>(want[at + q]));
+                    assert_eq!(core::mem::transmute::<_, [i64; 2]>(got[got_at + q]),
+                               core::mem::transmute::<_, [i64; 2]>(want[want_at + q]));
                 }
                 for (d, row) in compact.iter().enumerate() {
                     assert_eq!(core::mem::transmute::<_, [i16; 8]>(row[s]),
-                               core::mem::transmute::<_, [i16; 8]>(narrow_digit(&want, s, d + 1)));
+                               core::mem::transmute::<_, [i16; 8]>(narrow_digit::<false>(&want, s, d + 1)));
                 }
             }
         }
@@ -1681,7 +1708,7 @@ mod tests {
             let mut zeroed = fresh.clone();
             for s in 0..N {
                 for r in 1..ROWS {
-                    zeroed[idx(s, r)..idx(s, r) + 4].fill(unsafe { vdupq_n_s64(0) });
+                    zeroed[idx::<false>(s, r)..idx::<false>(s, r) + 4].fill(unsafe { vdupq_n_s64(0) });
                 }
             }
             unsafe {
@@ -1754,12 +1781,12 @@ mod tests {
             let mut y = Box::new([unsafe { vdupq_n_s16(0) }; N]);
             for r in 0..ROWS {
                 unsafe {
-                    narrow(&old_acc, r, &mut y);
+                    narrow::<false>(&old_acc, r, &mut y);
                     super::super::inverse::<PB>(&mut y);
                 }
                 let want = lanes(&y);
                 unsafe {
-                    narrow(&new_acc, r, &mut y);
+                    narrow::<false>(&new_acc, r, &mut y);
                     super::super::inverse_folded::<PB>(&mut y);
                 }
                 assert!(lanes(&y) == want, "case {case} row {r}");

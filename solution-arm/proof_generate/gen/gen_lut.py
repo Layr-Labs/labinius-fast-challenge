@@ -18,6 +18,10 @@ def ld1b(s):
     assert -8 <= imm <= 7
     BASES.add(m)
     return f'ld1b LBz{{d0}}.hRB, p7/z, [IB{m}X, #{imm}, mul vl]'
+# Lookups at a slot `o >= 26` take the one-register `tbl`: coefficient `o + 486` is past the
+# element's 512 bits, so the nibble's bit 3 is zero and only the table's first eight entries (its
+# first register) are indexed. Same values, same schedule.
+ONE = False
 def build_node(n, steps):
     ins = []; cnt = [0]
     def v(nm):
@@ -38,7 +42,10 @@ def build_node(n, steps):
         for t, o in enumerate(offs):
             ix, val = v('ix'), v('lk')
             ins.append(Ins('L', [ix], [], ld1b(o)))
-            ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.h, z{17+2*t}.hRB, z{{s0}}.h'))
+            if ONE and o >= 26:
+                ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.hRB, z{{s0}}.h'))
+            else:
+                ins.append(Ins('A', [val], [ix], f'tbl z{{d0}}.h, LBz{16+2*t}.h, z{17+2*t}.hRB, z{{s0}}.h'))
             look.append(val)
         x0, y0, x1, y1, x2, y2 = look
         a0, b0 = A('add', x0, y0), A('sub', x0, y0)

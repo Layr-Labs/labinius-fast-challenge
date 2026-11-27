@@ -453,19 +453,54 @@ const SINK: usize = 8;
 const SWEEP: usize = SINK * LOCK;
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
 
+type NarrowedDigits = [[int16x8_t; N]; DIGITS];
+
+#[cfg(any(target_feature = "sve", test))]
+static NARROW_COEFFICIENTS: [i32; 4] = [C16 - (1 << 16), V31, P1 as i32, 0];
+
+/// The two four-lane halves of [`narrow_digit`]. v0 holds its three constants.
+/// The caller supplies four consecutive accumulator vectors in column order.
+#[cfg(any(target_feature = "sve", test))]
+macro_rules! narrow_terminal_row {
+    ($a:literal, $b:literal, $c:literal, $d:literal, $offset:literal) => {
+        concat!(
+            "rshrn v1.2s, v", $a, ".2d, #16\n",
+            "rshrn2 v1.4s, v", $b, ".2d, #16\n",
+            "xtn v2.2s, v", $a, ".2d\n",
+            "xtn2 v2.4s, v", $b, ".2d\n",
+            "mla v2.4s, v1.4s, v0.s[0]\n",
+            "sqrdmulh v4.4s, v2.4s, v0.s[1]\n",
+            "mls v2.4s, v4.4s, v0.s[2]\n",
+            "xtn v3.4h, v2.4s\n",
+            "rshrn v1.2s, v", $c, ".2d, #16\n",
+            "rshrn2 v1.4s, v", $d, ".2d, #16\n",
+            "xtn v2.2s, v", $c, ".2d\n",
+            "xtn2 v2.4s, v", $d, ".2d\n",
+            "mla v2.4s, v1.4s, v0.s[0]\n",
+            "sqrdmulh v4.4s, v2.4s, v0.s[1]\n",
+            "mls v2.4s, v4.4s, v0.s[2]\n",
+            "xtn2 v3.8h, v2.4s\n",
+            "str q3, [{compact}, #", $offset, "]"
+        )
+    };
+}
+
 /// Accumulate all six rows of each slot together. Registers z8-z31 hold the
 /// four column pairs of each row. z0-z5 hold the six indexed key operands.
 /// Load each witness once and use it for all six rows before loading the next.
 /// Keep the slot loop inside the assembler so the callee saves occur once per sweep.
 #[cfg(target_feature = "sve")]
 #[inline(never)]
-unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
+    xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
+    compact: *mut int16x8_t,
+) {
     const XS: usize = N * 16;
     const KS: usize = N * ROWS * LOCK * 2;
     const _: () = assert!(ROWS == 6 && LOCK == 8);
     debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
     macro_rules! run {
-        ($($init:literal),* $(,)?) => {
+        ([$($init:literal),* $(,)?], [$($post:expr),* $(,)?], $($extra:tt)*) => {
             core::arch::asm!(
                 "2:",
                 "ldp q8, q9, [{a}, #0]",
@@ -541,16 +576,7 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
                 "b.ne 3b",
                 "stp q8, q9, [{a}, #0]",
                 "stp q10, q11, [{a}, #32]",
-                "stp q12, q13, [{a}, #64]",
-                "stp q14, q15, [{a}, #96]",
-                "stp q16, q17, [{a}, #128]",
-                "stp q18, q19, [{a}, #160]",
-                "stp q20, q21, [{a}, #192]",
-                "stp q22, q23, [{a}, #224]",
-                "stp q24, q25, [{a}, #256]",
-                "stp q26, q27, [{a}, #288]",
-                "stp q28, q29, [{a}, #320]",
-                "stp q30, q31, [{a}, #352]",
+                $($post,)*
                 "add {a}, {a}, #384",
                 "add {z}, {z}, #16",
                 "add {k}, {k}, #96",
@@ -569,6 +595,7 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
                 zp = out(reg) _,
                 kp = out(reg) _,
                 n = out(reg) _,
+                $($extra)*
                 out("v0") _, out("v1") _, out("v2") _, out("v3") _,
                 out("v4") _, out("v5") _, out("v6") _, out("v7") _,
                 out("v8") _, out("v9") _, out("v10") _, out("v11") _,
@@ -581,27 +608,101 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
             )
         };
     }
-    if FRESH {
-        run!(
-            "movi v12.16b, #0", "movi v13.16b, #0",
-            "movi v14.16b, #0", "movi v15.16b, #0",
-            "movi v16.16b, #0", "movi v17.16b, #0",
-            "movi v18.16b, #0", "movi v19.16b, #0",
-            "movi v20.16b, #0", "movi v21.16b, #0",
-            "movi v22.16b, #0", "movi v23.16b, #0",
-            "movi v24.16b, #0", "movi v25.16b, #0",
-            "movi v26.16b, #0", "movi v27.16b, #0",
-            "movi v28.16b, #0", "movi v29.16b, #0",
-            "movi v30.16b, #0", "movi v31.16b, #0",
+    macro_rules! run_with_init {
+        ([$($post:expr),* $(,)?], $($extra:tt)*) => {{
+            if FRESH {
+                run!([
+                    "movi v12.16b, #0", "movi v13.16b, #0",
+                    "movi v14.16b, #0", "movi v15.16b, #0",
+                    "movi v16.16b, #0", "movi v17.16b, #0",
+                    "movi v18.16b, #0", "movi v19.16b, #0",
+                    "movi v20.16b, #0", "movi v21.16b, #0",
+                    "movi v22.16b, #0", "movi v23.16b, #0",
+                    "movi v24.16b, #0", "movi v25.16b, #0",
+                    "movi v26.16b, #0", "movi v27.16b, #0",
+                    "movi v28.16b, #0", "movi v29.16b, #0",
+                    "movi v30.16b, #0", "movi v31.16b, #0",
+                ], [$($post),*], $($extra)*);
+            } else {
+                run!([
+                    "ldp q12, q13, [{a}, #64]", "ldp q14, q15, [{a}, #96]",
+                    "ldp q16, q17, [{a}, #128]", "ldp q18, q19, [{a}, #160]",
+                    "ldp q20, q21, [{a}, #192]", "ldp q22, q23, [{a}, #224]",
+                    "ldp q24, q25, [{a}, #256]", "ldp q26, q27, [{a}, #288]",
+                    "ldp q28, q29, [{a}, #320]", "ldp q30, q31, [{a}, #352]",
+                ], [$($post),*], $($extra)*);
+            }
+        }};
+    }
+    if TERMINAL {
+        run_with_init!([
+            "ldr q0, [{coefficients}]",
+            narrow_terminal_row!(12, 13, 14, 15, "0"),
+            narrow_terminal_row!(16, 17, 18, 19, "{row1}"),
+            narrow_terminal_row!(20, 21, 22, 23, "{row2}"),
+            narrow_terminal_row!(24, 25, 26, 27, "{row3}"),
+            narrow_terminal_row!(28, 29, 30, 31, "{row4}"),
+            "add {compact}, {compact}, #16",
+        ],
+            coefficients = in(reg) NARROW_COEFFICIENTS.as_ptr(),
+            compact = inout(reg) compact => _,
+            row1 = const 16 * N, row2 = const 32 * N, row3 = const 48 * N, row4 = const 64 * N,
         );
     } else {
-        run!(
-            "ldp q12, q13, [{a}, #64]", "ldp q14, q15, [{a}, #96]",
-            "ldp q16, q17, [{a}, #128]", "ldp q18, q19, [{a}, #160]",
-            "ldp q20, q21, [{a}, #192]", "ldp q22, q23, [{a}, #224]",
-            "ldp q24, q25, [{a}, #256]", "ldp q26, q27, [{a}, #288]",
-            "ldp q28, q29, [{a}, #320]", "ldp q30, q31, [{a}, #352]",
-        );
+        run_with_init!([
+            "stp q12, q13, [{a}, #64]",
+            "stp q14, q15, [{a}, #96]",
+            "stp q16, q17, [{a}, #128]",
+            "stp q18, q19, [{a}, #160]",
+            "stp q20, q21, [{a}, #192]",
+            "stp q22, q23, [{a}, #224]",
+            "stp q24, q25, [{a}, #256]",
+            "stp q26, q27, [{a}, #288]",
+            "stp q28, q29, [{a}, #320]",
+            "stp q30, q31, [{a}, #352]",
+        ],);
+    }
+}
+
+#[cfg(target_feature = "sve")]
+#[inline(always)]
+unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+    sink_sve::<FRESH, false>(xs, keys, acc, groups, core::ptr::null_mut());
+}
+
+#[cfg(target_feature = "sve")]
+#[inline(always)]
+unsafe fn sink_terminal<const FRESH: bool>(
+    xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
+    narrowed: &mut NarrowedDigits,
+) {
+    sink_sve::<FRESH, true>(xs, keys, acc, groups, narrowed.as_mut_ptr().cast());
+}
+
+#[cfg(not(target_feature = "sve"))]
+#[inline(never)]
+unsafe fn sink_terminal<const FRESH: bool>(
+    xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
+    narrowed: &mut NarrowedDigits,
+) {
+    sink::<FRESH>(xs, keys, acc, groups);
+    for (d, row) in narrowed.iter_mut().enumerate() {
+        narrow_digits(acc, d + 1, row);
+    }
+}
+
+/// Keep the base row in wide storage across chunks. Convert the digit rows
+/// at the terminal sweep. A later chunk initializes those rows afresh.
+#[inline(always)]
+unsafe fn finish_sweep(
+    xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
+    narrowed: &mut NarrowedDigits, fresh: bool, terminal: bool,
+) {
+    match (fresh, terminal) {
+        (true, true) => sink_terminal::<true>(xs, keys, acc, groups, narrowed),
+        (false, true) => sink_terminal::<false>(xs, keys, acc, groups, narrowed),
+        (true, false) => sink::<true>(xs, keys, acc, groups),
+        (false, false) => sink::<false>(xs, keys, acc, groups),
     }
 }
 
@@ -763,10 +864,10 @@ unsafe fn chunk_row(acc: &[int64x2_t], r: usize, mr: &[i16], dev: &mut [int32x4_
 }
 
 #[inline(always)]
-unsafe fn chunk_row2(acc: &[int64x2_t], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
+unsafe fn chunk_row2(narrowed: [&[int16x8_t; N]; 2], r: usize, mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: &Repair) {
     let p = P1 as i16;
     let thr = [vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r - 1]), vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r])];
-    super::inverse_lazy_io2(y, |h, s| narrow_digit(acc, s, r + h), |h, s, x| {
+    super::inverse_lazy_io2(y, |h, s| *narrowed[h].get_unchecked(s), |h, s, x| {
         let mut v = canonical(vsubq_s16(x, vld1q_dup_s16(mr[h].as_ptr().add(s))), p);
         let dv = dev[h];
         let flag = vcgeq_s16(vabsq_s16(v), thr[h]);
@@ -792,11 +893,11 @@ const _: () = assert!(FLUSH as i32 * ((P1 as i32 - 1) / 2) <= i16::MAX as i32);
 /// `dev` every [`FLUSH`] chunks). A row whose maximum reaches the threshold is done again by
 /// [`chunk_row_exact`], which takes the 16-bit additions back. The sums are the same integers.
 #[inline(always)]
-unsafe fn chunk_row2_fast(acc: [&[int64x2_t]; 2], r: [usize; 2], mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], dev16: [*mut int16x8_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: [&Repair; 2]) {
+unsafe fn chunk_row2_fast(narrowed: [&[int16x8_t; N]; 2], r: [usize; 2], mr: [&[i16]; 2], dev: [*mut int32x4_t; 2], dev16: [*mut int16x8_t; 2], y: [&mut [int16x8_t; N]; 2], ctx: [&Repair; 2]) {
     let p = P1 as i16;
     let [y0, y1] = y;
     let mut top = [vdupq_n_u16(0); 2];
-    super::inverse_lazy_io2([&mut *y0, &mut *y1], |h, s| narrow_digit(acc[h], s, r[h]), |h, s, x| {
+    super::inverse_lazy_io2([&mut *y0, &mut *y1], |h, s| *narrowed[h].get_unchecked(s), |h, s, x| {
         let v = canonical(vsubq_s16(x, vld1q_dup_s16(mr[h].as_ptr().add(s))), p);
         top[h] = vmaxq_u16(top[h], vreinterpretq_u16_s16(vabsq_s16(v)));
         let sum = dev16[h].add(s);
@@ -806,7 +907,7 @@ unsafe fn chunk_row2_fast(acc: [&[int64x2_t]; 2], r: [usize; 2], mr: [&[i16]; 2]
     for (h, y) in ys.into_iter().enumerate() {
         // `|v| >= threshold` in some slot and lane (a threshold of 0 flags every lane, as there)
         if vmaxvq_u16(top[h]) as i32 >= ctx[h].a.threshold[ctx[h].c * DIGITS + r[h] - 1] as i32 {
-            chunk_row_exact(acc[h], r[h], mr[h], dev[h], dev16[h], y, ctx[h]);
+            chunk_row_exact(narrowed[h], r[h], mr[h], dev[h], dev16[h], y, ctx[h]);
         }
     }
 }
@@ -816,10 +917,10 @@ unsafe fn chunk_row2_fast(acc: [&[int64x2_t]; 2], r: [usize; 2], mr: [&[i16]; 2]
 /// goes into `dev` with its ambiguous lanes recomputed ([`repair_lanes`]).
 #[cold]
 #[inline(never)]
-unsafe fn chunk_row_exact(acc: &[int64x2_t], r: usize, mr: &[i16], dev: *mut int32x4_t, dev16: *mut int16x8_t, y: &mut [int16x8_t; N], ctx: &Repair) {
+unsafe fn chunk_row_exact(narrowed: &[int16x8_t; N], r: usize, mr: &[i16], dev: *mut int32x4_t, dev16: *mut int16x8_t, y: &mut [int16x8_t; N], ctx: &Repair) {
     let p = P1 as i16;
     let thr = vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + r - 1]);
-    super::inverse_lazy_io(y, |s| narrow_digit(acc, s, r), |s, x| {
+    super::inverse_lazy_io(y, |s| *narrowed.get_unchecked(s), |s, x| {
         let mut v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
         *dev16.add(s) = vsubq_s16(*dev16.add(s), v);
         let flag = vcgeq_s16(vabsq_s16(v), thr);
@@ -1022,6 +1123,7 @@ unsafe fn sums<const V: u8>(
     xs: &mut [[int16x8_t; N]; SWEEP],
     sc: &mut [int16x8_t; N],
     acc: &mut [int64x2_t],
+    narrowed: &mut NarrowedDigits,
     y: &mut [int16x8_t; N],
     dev: &mut [int32x4_t],
 ) {
@@ -1046,12 +1148,7 @@ unsafe fn sums<const V: u8>(
                 tail::<V>(sc, x, kern);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-            // the chunk's first sweep starts the digit rows' sums afresh
-            if e % CHUNK == 0 {
-                sink::<true>(xs, keys, acc, groups);
-            } else {
-                sink::<false>(xs, keys, acc, groups);
-            }
+            finish_sweep(xs, keys, acc, groups, narrowed, e % CHUNK == 0, e + l == end);
             e += l;
         }
         let c = (end - 1) / CHUNK;
@@ -1061,9 +1158,9 @@ unsafe fn sums<const V: u8>(
         for d in (0..DIGITS - 1).step_by(2) {
             let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
             let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
-            chunk_row2(acc, 1 + d, mr, rows, [&mut *y, &mut xs[0]], ctx);
+            chunk_row2([&narrowed[d], &narrowed[d + 1]], 1 + d, mr, rows, [&mut *y, &mut xs[0]], ctx);
         }
-        chunk_last_row(acc, dv.add((DIGITS - 1) * 2 * N), y, ctx);
+        chunk_last_row(&narrowed[DIGITS - 1], dv.add((DIGITS - 1) * 2 * N), y, ctx);
     }
     narrow(acc, 0, y);
     super::inverse_folded::<PB>(y);
@@ -1071,12 +1168,12 @@ unsafe fn sums<const V: u8>(
 
 /// Process the fifth digit when there is no second batch to pair it with.
 #[inline(always)]
-unsafe fn chunk_last_row(acc: &[int64x2_t], dv: *mut int32x4_t, y: &mut [int16x8_t; N], ctx: &Repair) {
+unsafe fn chunk_last_row(narrowed: &[int16x8_t; N], dv: *mut int32x4_t, y: &mut [int16x8_t; N], ctx: &Repair) {
     let d = DIGITS - 1;
     let p = P1 as i16;
     let mr = ctx.a.mean_residues(ctx.c, d);
     let thr = vdupq_n_s16(ctx.a.threshold[ctx.c * DIGITS + d]);
-    super::inverse_lazy_io(y, |s| narrow_digit(acc, s, d + 1), |s, x| {
+    super::inverse_lazy_io(y, |s| *narrowed.get_unchecked(s), |s, x| {
         let mut v = canonical(vsubq_s16(x, vld1q_dup_s16(mr.as_ptr().add(s))), p);
         let slot = dv.add(2 * s);
         let flag = vcgeq_s16(vabsq_s16(v), thr);
@@ -1099,6 +1196,7 @@ unsafe fn sums2<const V: u8>(
     xs: &mut [[int16x8_t; N]; SWEEP],
     sc: &mut [int16x8_t; N],
     acc: [&mut [int64x2_t]; 2],
+    narrowed: &mut [NarrowedDigits; 2],
     y: [&mut [int16x8_t; N]; 2],
     dev: [&mut [int32x4_t]; 2],
     dev16: [&mut [int16x8_t]; 2],
@@ -1152,11 +1250,7 @@ unsafe fn sums2<const V: u8>(
                     lut_pass2(nib, sc, kern);
                     tail::<V>(sc, x, kern);
                 }
-                if e % CHUNK == 0 {
-                    sink::<true>(xs, keys, accs[t], groups);
-                } else {
-                    sink::<false>(xs, keys, accs[t], groups);
-                }
+                finish_sweep(xs, keys, accs[t], groups, &mut narrowed[t], e % CHUNK == 0, e + l == end);
             }
             e += l;
         }
@@ -1169,7 +1263,7 @@ unsafe fn sums2<const V: u8>(
                 let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
                 let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
                 let rows16 = [dv16.add(d * N), dv16.add((d + 1) * N)];
-                chunk_row2_fast([accs[t], accs[t]], [1 + d, 2 + d], mr, rows, rows16,
+                chunk_row2_fast([&narrowed[t][d], &narrowed[t][d + 1]], [1 + d, 2 + d], mr, rows, rows16,
                     [&mut *ys[t], &mut xs[0]], [&ctx[t], &ctx[t]]);
             }
         }
@@ -1180,7 +1274,7 @@ unsafe fn sums2<const V: u8>(
         let [d16a, d16b] = &mut dev16;
         let rows16 = [d16a.as_mut_ptr().add(d * N), d16b.as_mut_ptr().add(d * N)];
         let [y0, y1] = &mut ys;
-        chunk_row2_fast([accs[0], accs[1]], [d + 1, d + 1], [mr, mr], rows, rows16,
+        chunk_row2_fast([&narrowed[0][d], &narrowed[1][d]], [d + 1, d + 1], [mr, mr], rows, rows16,
             [&mut **y0, &mut **y1], [&ctx[0], &ctx[1]]);
         if (c + 1) % FLUSH == 0 || end == a.elements {
             for t in 0..2 {
@@ -1224,6 +1318,7 @@ struct Scratch {
     acc: [int64x2_t; ROWS * 4 * N],
     dev: [int32x4_t; DIGITS * 2 * N],
     acc2: [int64x2_t; ROWS * 4 * N],
+    narrowed: [NarrowedDigits; 2],
     dev2: [int32x4_t; DIGITS * 2 * N],
     /// The 16-bit deviation sums of the two batches between [`flush16`]s.
     dev16: [[int16x8_t; DIGITS * N]; 2],
@@ -1311,7 +1406,7 @@ pub fn commit_v<const V: u8>(values: &[B128], a: &SmsMatrix, workers: usize, q: 
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
         pin_worker(first * workers / columns);
         let arena = Arena::new();
-        let Scratch { xs, sc, acc, dev, acc2, dev2, dev16, y2, m, nib, y, tail } = &mut *arena.0;
+        let Scratch { xs, sc, acc, dev, acc2, dev2, dev16, narrowed, y2, m, nib, y, tail } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
@@ -1335,9 +1430,9 @@ pub fn commit_v<const V: u8>(values: &[B128], a: &SmsMatrix, workers: usize, q: 
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
                     let [d16a, d16b] = dev16;
-                    sums2::<V>([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
+                    sums2::<V>([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], narrowed, [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
                 } else {
-                    sums::<V>(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
+                    sums::<V>(&batch_words(b), a, m, nib, xs, sc, acc, &mut narrowed[0], y, dev);
                 }
             } else {
                 core::mem::swap(dev, dev2);
@@ -1498,6 +1593,88 @@ mod tests {
                         assert!((o[c] as i64).abs() <= P1 as i64);
                     }
                 }
+            }
+        }
+    }
+
+    /// The actual terminal instruction sequence returns the same signed
+    /// representative as the intrinsics for each of the eight lanes.
+    #[test]
+    fn terminal_narrowing_matches_intrinsics() {
+        let mut seed = 7u64;
+        let limit = CHUNK as i64 * PRODUCT as i64;
+        let mut acc = vec![unsafe { vdupq_n_s64(0) }; ROWS * 4 * N];
+        for case in 0..2054 {
+            let raw: [i64; 8] = core::array::from_fn(|lane| {
+                if case < 6 {
+                    let edge = [-limit, limit, -32768, 32767, -65536, 65536][case];
+                    return (edge + lane as i64 - 3).clamp(-limit, limit);
+                }
+                (crate::ntt::tests::xorshift(&mut seed) % (2 * limit as u64 + 1)) as i64 - limit
+            });
+            let begin = idx(0, 1);
+            let mut got = unsafe { vdupq_n_s16(0) };
+            unsafe {
+                for q in 0..4 {
+                    acc[begin + q] = vld1q_s64(raw.as_ptr().add(2 * q));
+                }
+                core::arch::asm!(
+                    "ldp q12, q13, [{raw}]",
+                    "ldp q14, q15, [{raw}, #32]",
+                    "ldr q0, [{coefficients}]",
+                    narrow_terminal_row!(12, 13, 14, 15, "0"),
+                    raw = in(reg) raw.as_ptr(),
+                    coefficients = in(reg) NARROW_COEFFICIENTS.as_ptr(),
+                    compact = in(reg) &mut got,
+                    out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _,
+                    out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+                    options(nostack, preserves_flags)
+                );
+                assert_eq!(core::mem::transmute::<_, [i16; 8]>(got),
+                           core::mem::transmute::<_, [i16; 8]>(narrow_digit(&acc, 0, 1)));
+            }
+        }
+    }
+
+    /// Exercise all group counts with fresh and continuing terminal sweeps.
+    #[test]
+    fn terminal_sink_matches_wide() {
+        unsafe fn check<const FRESH: bool>(
+            xs: &[[int16x8_t; N]; SWEEP], keys: &[i16], initial: &[int64x2_t], groups: usize,
+        ) {
+            let mut want = initial.to_vec();
+            let mut got = initial.to_vec();
+            let mut compact = Box::new([[vdupq_n_s16(0); N]; DIGITS]);
+            sink::<FRESH>(xs, keys.as_ptr(), &mut want, groups);
+            sink_terminal::<FRESH>(xs, keys.as_ptr(), &mut got, groups, &mut compact);
+            for s in 0..N {
+                let at = idx(s, 0);
+                for q in 0..4 {
+                    assert_eq!(core::mem::transmute::<_, [i64; 2]>(got[at + q]),
+                               core::mem::transmute::<_, [i64; 2]>(want[at + q]));
+                }
+                for (d, row) in compact.iter().enumerate() {
+                    assert_eq!(core::mem::transmute::<_, [i16; 8]>(row[s]),
+                               core::mem::transmute::<_, [i16; 8]>(narrow_digit(&want, s, d + 1)));
+                }
+            }
+        }
+        let mut state = 17u64;
+        let mut next = || crate::ntt::tests::xorshift(&mut state);
+        let mut xs = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
+        for x in xs.iter_mut().flatten() {
+            let lanes: [i16; 8] = core::array::from_fn(|_| next() as i16 % 28000);
+            *x = unsafe { vld1q_s16(lanes.as_ptr()) };
+        }
+        let initial: Vec<_> = (0..ROWS * 4 * N).map(|_| {
+            let lanes: [i64; 2] = core::array::from_fn(|_| next() as i64 >> 33);
+            unsafe { vld1q_s64(lanes.as_ptr()) }
+        }).collect();
+        for groups in 1..=SINK {
+            let keys: Vec<i16> = (0..groups * N * ROWS * LOCK).map(|_| (next() % 9721) as i16 - 4860).collect();
+            unsafe {
+                check::<true>(&xs, &keys, &initial, groups);
+                check::<false>(&xs, &keys, &initial, groups);
             }
         }
     }

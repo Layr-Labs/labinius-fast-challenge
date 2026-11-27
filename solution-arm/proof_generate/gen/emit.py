@@ -159,10 +159,9 @@ pub unsafe fn {name}(x: &[int16x8_t; N], y: &mut [int16x8_t; N], kern: &Kernel) 
 }}
 """
 def pass_quarter_tail():
-    # Each node omits nine first-input reductions. Node 10 omits them at
-    # level 5, while the other nodes omit them at level 4.
+    # All 24 nodes omit nine first-input reductions at level 4.
     previous = gen_pc.kind
-    gen_pc.kind = lambda n: (n == 10, 7 if n == 10 else 0)
+    gen_pc.kind = lambda n: (False, 0)
     try:
         return pass_tail_calls(20, 30, "pass_tail_calls_c", 0, 6, 1, True)
     finally:

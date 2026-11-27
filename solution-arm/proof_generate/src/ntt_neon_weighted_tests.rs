@@ -173,11 +173,7 @@ fn weighted_lut_signed_intervals() {
     for n in 0..24 {
         for j in 0..9 {
             let at = 27 * n + j;
-            let a = if n == 10 {
-                red13(x[at])
-            } else {
-                x[at]
-            };
+            let a = x[at];
             for (i, bounds) in radix3(a, x[at + 9], x[at + 18], &kern.c[n], kern)
                 .into_iter()
                 .enumerate()
@@ -189,7 +185,7 @@ fn weighted_lut_signed_intervals() {
     for n in 0..72 {
         for j in 0..3 {
             let at = 9 * n + j;
-            let a = if n / 3 == 10 { x[at] } else { red13(x[at]) };
+            let a = red13(x[at]);
             let t = &kern.c[n / 3][4 + 4 * (n % 3)..];
             for (i, bounds) in radix3(a, x[at + 3], x[at + 6], t, kern)
                 .into_iter()

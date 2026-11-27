@@ -1114,6 +1114,291 @@ unsafe fn sums2(
     let _ = (&mut accs, &mut ys, &mut devs);
 }
 
+/// A sweep's sink that has not run yet: the products of the `groups` tiles of the sweep buffer at
+/// `xs` with the key tiles at `keys`, into `acc` (digit rows started afresh with `fresh`).
+#[derive(Clone, Copy)]
+struct Pending {
+    xs: *const [int16x8_t; N],
+    keys: *const i16,
+    acc: *mut int64x2_t,
+    groups: usize,
+    fresh: bool,
+}
+
+/// [`sink`] restricted to the slots `s0..s1`; the slots are independent, so any split of `0..N`
+/// into ranges, run in any order, gives exactly [`sink`]'s sums.
+#[inline(never)]
+unsafe fn sink_slots(p: &Pending, s0: usize, s1: usize) {
+    let accp = p.acc;
+    #[cfg(target_feature = "sve")]
+    {
+        let z = p.xs as *const int16x8_t;
+        for s in s0..s1 {
+            if p.fresh {
+                slot_sink_fresh(z.add(s), p.keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), p.groups);
+            } else {
+                slot_sink(z.add(s), p.keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), p.groups);
+            }
+        }
+    }
+    #[cfg(not(target_feature = "sve"))]
+    for s in s0..s1 {
+        for g in 0..p.groups {
+            let tile = p.keys.add(g * N * ROWS * LOCK);
+            let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *(*p.xs.add(LOCK * g + i)).get_unchecked(s));
+            let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
+            for r in 0..ROWS {
+                if p.fresh && g == 0 && r > 0 {
+                    for q in 0..4 {
+                        *accp.add(idx(s, r) + q) = vdupq_n_s64(0);
+                    }
+                }
+                dot(accp.add(idx(s, r)), a, b, vld1q_s16(tile.add((s * ROWS + r) * LOCK)));
+            }
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn prfm_l1(p: *const u8) {
+    core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+}
+
+/// Requests into L1 the lines [`sink_slots`]`(p, s0, s1)` reads: the slots' 16-byte columns of every
+/// transform of the sweep buffer, their key entries in every tile and their accumulators. Hints:
+/// nothing is dereferenced.
+#[inline(always)]
+unsafe fn prefetch_slots(p: &Pending, s0: usize, s1: usize) {
+    if s1 <= s0 {
+        return;
+    }
+    let lines = |from: *const u8, len: usize| {
+        let mut a = from as usize & !63;
+        let end = from as usize + len;
+        while a < end {
+            prfm_l1(a as *const u8);
+            a += 64;
+        }
+    };
+    let z = p.xs as *const u8;
+    for t in 0..p.groups * LOCK {
+        lines(z.wrapping_add(t * N * 16 + s0 * 16), (s1 - s0) * 16);
+    }
+    let k = p.keys as *const u8;
+    for g in 0..p.groups {
+        lines(k.wrapping_add(2 * (g * N * ROWS * LOCK + s0 * ROWS * LOCK)), (s1 - s0) * ROWS * LOCK * 2);
+    }
+    lines((p.acc as *const u8).wrapping_add(16 * idx(s0, 0)), (s1 - s0) * ROWS * 4 * 16);
+}
+
+#[inline(always)]
+unsafe fn prfm_l2(p: *const u8) {
+    core::arch::asm!("prfm pldl2keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+}
+
+/// [`prefetch_slots`] split by stream: with `XS` the sweep-buffer lines into L1, otherwise the key
+/// and accumulator lines into L2.
+#[inline(always)]
+unsafe fn prefetch_slots_split<const XS: bool>(p: &Pending, s0: usize, s1: usize) {
+    if s1 <= s0 {
+        return;
+    }
+    let lines = |from: *const u8, len: usize| {
+        let mut a = from as usize & !63;
+        let end = from as usize + len;
+        while a < end {
+            if XS { prfm_l1(a as *const u8) } else { prfm_l2(a as *const u8) }
+            a += 64;
+        }
+    };
+    if XS {
+        let z = p.xs as *const u8;
+        for t in 0..p.groups * LOCK {
+            lines(z.wrapping_add(t * N * 16 + s0 * 16), (s1 - s0) * 16);
+        }
+    } else {
+        let k = p.keys as *const u8;
+        for g in 0..p.groups {
+            lines(k.wrapping_add(2 * (g * N * ROWS * LOCK + s0 * ROWS * LOCK)), (s1 - s0) * ROWS * LOCK * 2);
+        }
+        lines((p.acc as *const u8).wrapping_add(16 * idx(s0, 0)), (s1 - s0) * ROWS * 4 * 16);
+    }
+}
+
+/// Diagnostic: [`sums2`] with two sweep buffers, so that each half sweep's sink (batch A's, then
+/// batch B's, ...) runs while the next half sweep's transforms are computed into the other buffer:
+/// - `V = 1`: one piece of about `N / 64` slots after each transform;
+/// - `V = 2`: as 1, the piece's lines requested into L1 in four parts between the transform's passes;
+/// - `V = 3`: four sub-pieces per transform, one after each pass;
+/// - `V = 4`: as 3, each sub-piece's lines requested into L1 before the pass it follows;
+/// - `V = 5`: control, both buffers but the whole sink at the end of its half sweep (no overlap);
+/// - `V = 6`, `7`: as 1 and 3 on half sweeps of four tiles, the two buffers being the halves of the
+///   one sweep buffer (the record's footprint; each accumulator read and written twice as often);
+/// - `V = 8`: as 1, the next piece's key and accumulator lines into L2 (half before the indices,
+///   half before levels 4-5) and this piece's sweep-buffer lines into L1 before level 6.
+/// A chunk's last sink runs before its chunk ends. Bit-identical to [`sums2`].
+#[inline(never)]
+unsafe fn sums2_i<const V: u32>(
+    words: [&[(*const u8, usize); LANES]; 2],
+    a: &SmsMatrix,
+    nib: &mut [uint8x16_t; N / 4],
+    bufs: [&mut [[int16x8_t; N]; SWEEP]; 2],
+    sc: &mut [int16x8_t; N],
+    acc: [&mut [int64x2_t]; 2],
+    y: [&mut [int16x8_t; N]; 2],
+    dev: [&mut [int32x4_t]; 2],
+    dev16: [&mut [int16x8_t]; 2],
+) {
+    let kern = &kernels()[PB];
+    let mut dev16 = dev16;
+    for sums in dev16.iter_mut() {
+        sums.fill(vdupq_n_s16(0));
+    }
+    let [acc0, acc1] = acc;
+    let [y0, y1] = y;
+    let [dev0, dev1] = dev;
+    let [b0, b1] = bufs;
+    let _ = &b1;
+    // `V >= 6`: half sweeps of four tiles, both buffers halves of the one sweep buffer
+    let half = V == 6 || V == 7;
+    let span = if half { SWEEP / 2 } else { SWEEP };
+    let bp: [*mut [int16x8_t; N]; 2] = if half { [b0.as_mut_ptr(), b0.as_mut_ptr().add(SWEEP / 2)] } else { [b0.as_mut_ptr(), b1.as_mut_ptr()] };
+    let mut accs: [&mut [int64x2_t]; 2] = [acc0, acc1];
+    let mut ys: [&mut [int16x8_t; N]; 2] = [y0, y1];
+    let mut devs: [&mut [int32x4_t]; 2] = [dev0, dev1];
+    for t in 0..2 {
+        for s in 0..N {
+            accs[t][idx(s, 0)..][..4].fill(vdupq_n_s64(0));
+        }
+    }
+    let ap: [*mut int64x2_t; 2] = [accs[0].as_mut_ptr(), accs[1].as_mut_ptr()];
+    let mut phase = 0usize;
+    let mut e = 0usize;
+    while e < a.elements {
+        let end = ((e / CHUNK + 1) * CHUNK).min(a.elements);
+        let mut pending: Option<Pending> = None;
+        while e < end {
+            let l = span.min(end - e);
+            let groups = l.div_ceil(LOCK);
+            let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
+            for t in 0..2 {
+                let count = groups * LOCK;
+                let buf = bp[phase % 2];
+                for i in 0..count {
+                    let ahead = i + PF_T;
+                    if ahead < count {
+                        prefetch_words(words[t], e, ahead);
+                    } else if t == 0 {
+                        prefetch_words(words[1], e, ahead - count);
+                    } else {
+                        prefetch_words(words[0], e + l, ahead - count);
+                    }
+                    let (s0, s1) = (i * N / count, (i + 1) * N / count);
+                    let q = |k: usize| s0 + (s1 - s0) * k / 4;
+                    let at = pass_words(words[t], a.elements, e, i);
+                    let x = &mut *buf.add(i);
+                    let p = if V == 5 { None } else { pending.as_ref() };
+                    let fine = V == 3 || V == 4 || V == 7;
+                    if V == 2 || V == 4 {
+                        if let Some(p) = p {
+                            prefetch_slots(p, q(0), q(1));
+                        }
+                    }
+                    if V == 8 && i + 1 < count {
+                        // the next piece's key and accumulator lines into L2, half now, half before pass_c
+                        if let Some(p) = p {
+                            let (n0, n1) = (s1, (i + 2) * N / count);
+                            prefetch_slots_split::<false>(p, n0, (n0 + n1) / 2);
+                        }
+                    }
+                    indices_asm(&at, nib);
+                    if fine {
+                        if let Some(p) = p {
+                            sink_slots(p, q(0), q(1));
+                        }
+                    }
+                    if V == 2 || V == 4 {
+                        if let Some(p) = p {
+                            prefetch_slots(p, q(1), q(2));
+                        }
+                    }
+                    lut_pass2(nib, sc, kern);
+                    if fine {
+                        if let Some(p) = p {
+                            sink_slots(p, q(1), q(2));
+                        }
+                    }
+                    if V == 2 || V == 4 {
+                        if let Some(p) = p {
+                            prefetch_slots(p, q(2), q(3));
+                        }
+                    }
+                    if V == 8 && i + 1 < count {
+                        if let Some(p) = p {
+                            let (n0, n1) = (s1, (i + 2) * N / count);
+                            prefetch_slots_split::<false>(p, (n0 + n1) / 2, n1);
+                        }
+                    }
+                    pass_c_asm(sc, kern);
+                    if fine {
+                        if let Some(p) = p {
+                            sink_slots(p, q(2), q(3));
+                        }
+                    }
+                    if V == 2 || V == 4 {
+                        if let Some(p) = p {
+                            prefetch_slots(p, q(3), q(4));
+                        }
+                    }
+                    if V == 8 {
+                        if let Some(p) = p {
+                            prefetch_slots_split::<true>(p, s0, s1);
+                        }
+                    }
+                    pass_d_out(sc, x, kern);
+                    if fine {
+                        if let Some(p) = p {
+                            sink_slots(p, q(3), q(4));
+                        }
+                    } else if let Some(p) = p {
+                        sink_slots(p, s0, s1);
+                    }
+                }
+                if V == 5 {
+                    if let Some(p) = pending.as_ref() {
+                        sink_slots(p, 0, N);
+                    }
+                }
+                pending = Some(Pending { xs: buf, keys, acc: ap[t], groups, fresh: e % CHUNK == 0 });
+                phase += 1;
+            }
+            e += l;
+        }
+        if let Some(p) = pending.take() {
+            sink_slots(&p, 0, N);
+        }
+        let c = (end - 1) / CHUNK;
+        for t in 0..2 {
+            let dv = devs[t].as_mut_ptr();
+            let dv16 = dev16[t].as_mut_ptr();
+            for d in (0..DIGITS).step_by(2) {
+                let mr = [a.mean_residues(c, d), a.mean_residues(c, d + 1)];
+                let rows = [dv.add(d * 2 * N), dv.add((d + 1) * 2 * N)];
+                let rows16 = [dv16.add(d * N), dv16.add((d + 1) * N)];
+                chunk_row2_fast(accs[t], 1 + d, mr, rows, rows16, [&mut *ys[t], &mut *bp[0]], &Repair { words: words[t], a, c });
+            }
+            if (c + 1) % FLUSH == 0 || end == a.elements {
+                flush16(devs[t], dev16[t]);
+            }
+        }
+    }
+    for t in 0..2 {
+        narrow(accs[t], 0, ys[t]);
+        super::inverse_folded::<PB>(ys[t]);
+    }
+    let _ = (&mut accs, &mut ys, &mut devs);
+}
+
 #[inline]
 fn crt(r: u32, t: i64) -> u64 {
     const INV: u64 = {
@@ -1151,6 +1436,8 @@ struct Scratch {
     nib: [uint8x16_t; N / 4],
     y: [int16x8_t; N],
     tail: [[i64; LANES]; N],
+    /// Diagnostic only: the second sweep buffer of the interleaved variants.
+    xs2: [[int16x8_t; N]; SWEEP],
 }
 
 const ARENA: usize = 4 << 20;
@@ -1211,6 +1498,12 @@ fn pin_worker(w: usize) {
 }
 
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
+    commit_v::<0>(values, a, workers, q, out, true)
+}
+
+/// Diagnostic: [`commit`] with the sweep loop of variant `V` (0: the record's [`sums2`]; 1-5:
+/// [`sums2_i`]); `hook` runs [`BETWEEN`] as the record does.
+pub fn commit_v<const V: u32>(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8], hook: bool) {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
@@ -1223,7 +1516,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
     for_blocks(out, N * width, LANES, workers, |first, block| unsafe {
         pin_worker(first * workers / columns);
         let arena = Arena::new();
-        let Scratch { xs, sc, acc, dev, acc2, dev2, dev16, y2, m, nib, y, tail } = &mut *arena.0;
+        let Scratch { xs, sc, acc, dev, acc2, dev2, dev16, y2, m, nib, y, tail, xs2 } = &mut *arena.0;
         let p = P1 as i16;
         let count = block.len() / (N * width);
         let batch_words = |b: usize| -> [(*const u8, usize); LANES] {
@@ -1247,7 +1540,11 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
                     let [d16a, d16b] = dev16;
-                    sums2([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
+                    if V == 0 {
+                        sums2([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
+                    } else {
+                        sums2_i::<V>([&w0, &w1], a, nib, [&mut *xs, &mut *xs2], sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
+                    }
                 } else {
                     sums(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
                 }
@@ -1303,7 +1600,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     slot[4] = (v >> 32) as u8;
                 }
             }
-            if b % 2 == 1 {
+            if hook && b % 2 == 1 {
                 if let Some(between) = BETWEEN.get() {
                     between(first * workers / columns, (b + 1) / 2);
                 }

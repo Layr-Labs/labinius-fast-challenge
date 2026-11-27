@@ -2397,3 +2397,6 @@ mod indices_asm_tests {
 
 #[path = "ntt_neon_weighted.rs"]
 mod weighted;
+
+#[path = "commit_profile.rs"]
+pub(crate) mod commit_profile;

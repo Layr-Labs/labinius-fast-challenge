@@ -894,9 +894,55 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
     (partials, rounds, coords, opened)
 }
 
+#[cfg(target_arch = "aarch64")]
+fn compare_sink_orders(values: &[B128], modulus: u128, out: &mut [u8], seed: u8) {
+    use ntt::neon::sms;
+    let matrix = sms::SmsMatrix::from_images(
+        &SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0,
+        &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS,
+    ).unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+    let mut scratch = vec![0u8; out.len()];
+    let mut test = |route: usize, phase: &str, round: usize, pos: usize| {
+        let start = std::time::Instant::now();
+        match route {
+            0 => sms::commit_ordered::<17, 0>(values, &matrix, threads(), modulus, &mut scratch, false),
+            1 => sms::commit_ordered::<17, 1>(values, &matrix, threads(), modulus, &mut scratch, false),
+            2 => sms::commit_ordered::<17, 2>(values, &matrix, threads(), modulus, &mut scratch, false),
+            _ => unreachable!(),
+        }
+        let ns = start.elapsed().as_nanos();
+        if phase == "first" && route == 0 {
+            out.copy_from_slice(&scratch);
+        } else {
+            assert!(scratch == out, "sink route {route} commitment differs");
+        }
+        eprintln!("diag_sink_order phase={phase} round={round} pos={pos} route={route} ns={ns}");
+    };
+    for route in 0..3 {
+        test(route, "first", 0, route);
+    }
+    // All six orders. The seed rotates the order of the six rounds only.
+    const ORDER: [[usize; 3]; 6] = [
+        [0, 1, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0], [0, 2, 1], [1, 0, 2],
+    ];
+    for round in 0..6 {
+        for (slot, route) in ORDER[(round + seed as usize) % 6].into_iter().enumerate() {
+            test(route, "warm", round, slot);
+        }
+    }
+    test(0, "closing", 6, 0);
+}
+
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
     let mut commitment = output.commitment_buffer();
+    #[cfg(target_arch = "aarch64")]
+    if modulus == ntt::neon::sms::MODULUS {
+        compare_sink_orders(values, modulus, &mut commitment, seed[0]);
+    } else {
+        commit(values, modulus, &mut commitment);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     commit(values, modulus, &mut commitment);
     labinius::par::pool();
     timer.lap("commit");

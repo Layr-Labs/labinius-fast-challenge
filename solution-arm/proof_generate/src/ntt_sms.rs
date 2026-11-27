@@ -454,6 +454,8 @@ unsafe fn dot(acc: *mut int64x2_t, a: &[int16x8_t; 4], b: &[int16x8_t; 4], key: 
 const SINK: usize = CHUNK / LOCK;
 /// Elements transformed per sweep: up to eight tiles, each accumulator read and written once.
 const SWEEP: usize = SINK * LOCK;
+const REVERSE_BLOCK: usize = 108;
+const _: () = assert!(N % REVERSE_BLOCK == 0 && REVERSE_BLOCK % 4 == 0);
 const _: () = assert!(CHUNK % SWEEP == 0 && SWEEP % PASS == 0);
 
 type NarrowedDigits = [[int16x8_t; N]; DIGITS];
@@ -491,7 +493,7 @@ macro_rules! narrow_terminal_row {
 /// Keep the slot loop inside the assembler so the callee saves occur once per sweep.
 #[cfg(target_feature = "sve")]
 #[inline(never)]
-unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
+unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool, const ORDER: u8>(
     xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
     compact: *mut int16x8_t,
 ) {
@@ -499,9 +501,16 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
     const KS: usize = N * ROWS * LOCK * 2;
     const _: () = assert!(ROWS == 6 && LOCK == 8);
     debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
+    let first = match ORDER { 1 => N - 1, 2 => N - REVERSE_BLOCK, _ => 0 };
+    let acc = acc.as_mut_ptr().add(first * ROWS * 4);
+    let xs = xs.as_ptr().cast::<int16x8_t>().add(first);
+    let keys = keys.add(first * ROWS * LOCK);
+    let compact = if TERMINAL { compact.add(first) } else { compact };
     macro_rules! run {
-        ([$($init:literal),* $(,)?], [$($post:expr),* $(,)?], $($extra:tt)*) => {
+        ([$($init:literal),* $(,)?], [$($post:expr),* $(,)?],
+         [$($prefix:literal),*], [$($footer:literal),*], $($extra:tt)*) => {
             core::arch::asm!(
+                $($prefix,)*
                 "2:",
                 "ldp q8, q9, [{a}, #0]",
                 "ldp q10, q11, [{a}, #32]",
@@ -577,15 +586,18 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "stp q8, q9, [{a}, #0]",
                 "stp q10, q11, [{a}, #32]",
                 $($post,)*
-                "add {a}, {a}, #384",
-                "add {z}, {z}, #16",
-                "add {k}, {k}, #96",
+                "add {a}, {a}, #{as_}",
+                "add {z}, {z}, #{zs}",
+                "add {k}, {k}, #{kslot}",
                 "subs {slots}, {slots}, #1",
                 "b.ne 2b",
-                a = inout(reg) acc.as_mut_ptr() => _,
-                z = inout(reg) xs.as_ptr() => _,
+                $($footer,)*
+                a = inout(reg) acc => _,
+                z = inout(reg) xs => _,
                 k = inout(reg) keys => _,
-                slots = inout(reg) N => _,
+                as_ = const if ORDER == 1 { -384 } else { 384 },
+                zs = const if ORDER == 1 { -16 } else { 16 },
+                kslot = const if ORDER == 1 { -96 } else { 96 },
                 groups = in(reg) groups,
                 xs4 = in(reg) 4 * XS,
                 ks = in(reg) KS,
@@ -608,10 +620,40 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
             )
         };
     }
+    macro_rules! run_in_order {
+        ([$($init:literal),* $(,)?], [$($post:expr),* $(,)?],
+         [$($compact_jump:literal),*], $($extra:tt)*) => {{
+            if ORDER == 2 {
+                // Visit the six cache-line-aligned blocks in descending order.
+                // At the end of an ascending block, go back two block lengths.
+                run!([$($init),*], [$($post),*], [
+                    "4:", "mov {slots}, #{block_slots}"
+                ], [
+                    "subs {blocks}, {blocks}, #1", "b.eq 5f",
+                    "sub {a}, {a}, #{a_lo}", "sub {a}, {a}, #{a_hi}, lsl #12",
+                    "sub {z}, {z}, #{x_jump}",
+                    "sub {k}, {k}, #{k_lo}", "sub {k}, {k}, #{k_hi}, lsl #12",
+                    $($compact_jump,)*
+                    "b 4b", "5:"
+                ],
+                    slots = out(reg) _,
+                    blocks = inout(reg) N / REVERSE_BLOCK => _,
+                    block_slots = const REVERSE_BLOCK,
+                    a_lo = const 2 * REVERSE_BLOCK * 384 % 4096,
+                    a_hi = const 2 * REVERSE_BLOCK * 384 / 4096,
+                    x_jump = const 2 * REVERSE_BLOCK * 16,
+                    k_lo = const 2 * REVERSE_BLOCK * 96 % 4096,
+                    k_hi = const 2 * REVERSE_BLOCK * 96 / 4096,
+                    $($extra)*);
+            } else {
+                run!([$($init),*], [$($post),*], [], [], slots = inout(reg) N => _, $($extra)*);
+            }
+        }};
+    }
     macro_rules! run_with_init {
-        ([$($post:expr),* $(,)?], $($extra:tt)*) => {{
+        ([$($post:expr),* $(,)?], [$($compact_jump:literal),*], $($extra:tt)*) => {{
             if FRESH {
-                run!([
+                run_in_order!([
                     "movi v12.16b, #0", "movi v13.16b, #0",
                     "movi v14.16b, #0", "movi v15.16b, #0",
                     "movi v16.16b, #0", "movi v17.16b, #0",
@@ -622,15 +664,15 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                     "movi v26.16b, #0", "movi v27.16b, #0",
                     "movi v28.16b, #0", "movi v29.16b, #0",
                     "movi v30.16b, #0", "movi v31.16b, #0",
-                ], [$($post),*], $($extra)*);
+                ], [$($post),*], [$($compact_jump),*], $($extra)*);
             } else {
-                run!([
+                run_in_order!([
                     "ldp q12, q13, [{a}, #64]", "ldp q14, q15, [{a}, #96]",
                     "ldp q16, q17, [{a}, #128]", "ldp q18, q19, [{a}, #160]",
                     "ldp q20, q21, [{a}, #192]", "ldp q22, q23, [{a}, #224]",
                     "ldp q24, q25, [{a}, #256]", "ldp q26, q27, [{a}, #288]",
                     "ldp q28, q29, [{a}, #320]", "ldp q30, q31, [{a}, #352]",
-                ], [$($post),*], $($extra)*);
+                ], [$($post),*], [$($compact_jump),*], $($extra)*);
             }
         }};
     }
@@ -642,8 +684,9 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
             narrow_terminal_row!(20, 21, 22, 23, "{row2}"),
             narrow_terminal_row!(24, 25, 26, 27, "{row3}"),
             narrow_terminal_row!(28, 29, 30, 31, "{row4}"),
-            "add {compact}, {compact}, #16",
-        ],
+            "add {compact}, {compact}, #{compact_step}",
+        ], ["sub {compact}, {compact}, #{x_jump}"],
+            compact_step = const if ORDER == 1 { -16 } else { 16 },
             coefficients = in(reg) NARROW_COEFFICIENTS.as_ptr(),
             compact = inout(reg) compact => _,
             row1 = const 16 * N, row2 = const 32 * N, row3 = const 48 * N, row4 = const 64 * N,
@@ -660,32 +703,32 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
             "stp q26, q27, [{a}, #288]",
             "stp q28, q29, [{a}, #320]",
             "stp q30, q31, [{a}, #352]",
-        ],);
+        ], [],);
     }
 }
 
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
-    sink_sve::<FRESH, false>(xs, keys, acc, groups, core::ptr::null_mut());
+    sink_sve::<FRESH, false, 0>(xs, keys, acc, groups, core::ptr::null_mut());
 }
 
 #[cfg(target_feature = "sve")]
 #[inline(always)]
-unsafe fn sink_terminal<const FRESH: bool>(
+unsafe fn sink_terminal<const FRESH: bool, const ORDER: u8>(
     xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
     narrowed: &mut NarrowedDigits,
 ) {
-    sink_sve::<FRESH, true>(xs, keys, acc, groups, narrowed.as_mut_ptr().cast());
+    sink_sve::<FRESH, true, ORDER>(xs, keys, acc, groups, narrowed.as_mut_ptr().cast());
 }
 
 #[cfg(not(target_feature = "sve"))]
 #[inline(never)]
-unsafe fn sink_terminal<const FRESH: bool>(
+unsafe fn sink_terminal<const FRESH: bool, const ORDER: u8>(
     xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
     narrowed: &mut NarrowedDigits,
 ) {
-    sink::<FRESH>(xs, keys, acc, groups);
+    sink_neon::<FRESH, ORDER>(xs, keys, acc, groups);
     for (d, row) in narrowed.iter_mut().enumerate() {
         narrow_digits(acc, d + 1, row);
     }
@@ -694,14 +737,24 @@ unsafe fn sink_terminal<const FRESH: bool>(
 /// Keep the base row in wide storage across chunks. Convert the digit rows
 /// at the terminal sweep. A later chunk initializes those rows afresh.
 /// The same products for development on AArch64 hosts without SVE.
+#[cfg(all(not(target_feature = "sve"), test))]
+unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+    sink_neon::<FRESH, 0>(xs, keys, acc, groups);
+}
+
 #[cfg(not(target_feature = "sve"))]
 #[inline(never)]
-unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
+unsafe fn sink_neon<const FRESH: bool, const ORDER: u8>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
     debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
     let accp = acc.as_mut_ptr();
     for g in 0..groups {
         let tile = keys.add(g * N * ROWS * LOCK);
-        for s in 0..N {
+        for step in 0..N {
+            let s = match ORDER {
+                1 => N - 1 - step,
+                2 => N - REVERSE_BLOCK - (step / REVERSE_BLOCK) * REVERSE_BLOCK + step % REVERSE_BLOCK,
+                _ => step,
+            };
             let y: [int16x8_t; LOCK] = core::array::from_fn(|i| *xs[LOCK * g + i].get_unchecked(s));
             let (a, b): (&[int16x8_t; 4], &[int16x8_t; 4]) = (&*(y.as_ptr() as *const _), &*(y.as_ptr().add(4) as *const _));
             for r in 0..ROWS {
@@ -1145,7 +1198,7 @@ unsafe fn sums<const V: u8>(
             tail::<V>(sc, x, kern);
         }
         let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
-        sink_terminal::<true>(xs, keys, acc, groups, narrowed);
+        sink_terminal::<true, 0>(xs, keys, acc, groups, narrowed);
         e = end;
         let c = (end - 1) / CHUNK;
         const _: () = assert!(DIGITS == 5);
@@ -1184,7 +1237,7 @@ unsafe fn chunk_last_row(narrowed: &[int16x8_t; N], dv: *mut int32x4_t, y: &mut 
 /// ce686fcc): per sweep, batch A's transforms into `xs` and their sink, then batch B's into the
 /// same `xs` and their sink against the same key lines, which are then still cached.
 #[inline(never)]
-unsafe fn sums2<const V: u8>(
+unsafe fn sums2<const V: u8, const ORDER: u8>(
     words: [&[(*const u8, usize); LANES]; 2],
     a: &SmsMatrix,
     nib: &mut [uint8x16_t; N / 4],
@@ -1244,7 +1297,12 @@ unsafe fn sums2<const V: u8>(
                 lut_pass2(nib, sc, kern);
                 tail::<V>(sc, x, kern);
             }
-            sink_terminal::<true>(xs, keys, accs[t], groups, &mut narrowed[t]);
+            // A and short sweeps keep the ordinary forward order.
+            if ORDER != 0 && t == 1 && groups == SINK {
+                sink_terminal::<true, ORDER>(xs, keys, accs[t], groups, &mut narrowed[t]);
+            } else {
+                sink_terminal::<true, 0>(xs, keys, accs[t], groups, &mut narrowed[t]);
+            }
         }
         e = end;
         let c = (end - 1) / CHUNK;
@@ -1387,6 +1445,12 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
 /// [`commit`] with levels 4 to 6 by [`tail`]`::<V>` (the same output for every `V`); `hook`
 /// runs [`BETWEEN`] between batch pairs.
 pub fn commit_v<const V: u8>(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8], hook: bool) {
+    commit_ordered::<V, 0>(values, a, workers, q, out, hook)
+}
+
+pub fn commit_ordered<const V: u8, const ORDER: u8>(
+    values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8], hook: bool,
+) {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
@@ -1423,7 +1487,7 @@ pub fn commit_v<const V: u8>(values: &[B128], a: &SmsMatrix, workers: usize, q: 
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
                     let [d16a, d16b] = dev16;
-                    sums2::<V>([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], narrowed, [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
+                    sums2::<V, ORDER>([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], narrowed, [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
                 } else {
                     sums::<V>(&batch_words(b), a, m, nib, xs, sc, acc, &mut narrowed[0], y, dev);
                 }
@@ -1643,14 +1707,14 @@ mod tests {
     /// Exercise all group counts with fresh and continuing terminal sweeps.
     #[test]
     fn terminal_sink_matches_wide() {
-        unsafe fn check<const FRESH: bool>(
+        unsafe fn check<const FRESH: bool, const ORDER: u8>(
             xs: &[[int16x8_t; N]; SWEEP], keys: &[i16], initial: &[int64x2_t], groups: usize,
         ) {
             let mut want = initial.to_vec();
             let mut got = initial.to_vec();
             let mut compact = Box::new([[vdupq_n_s16(0); N]; DIGITS]);
             sink::<FRESH>(xs, keys.as_ptr(), &mut want, groups);
-            sink_terminal::<FRESH>(xs, keys.as_ptr(), &mut got, groups, &mut compact);
+            sink_terminal::<FRESH, ORDER>(xs, keys.as_ptr(), &mut got, groups, &mut compact);
             for s in 0..N {
                 let at = idx(s, 0);
                 for q in 0..4 {
@@ -1665,7 +1729,8 @@ mod tests {
         }
         let mut state = 17u64;
         let mut next = || crate::ntt::tests::xorshift(&mut state);
-        let mut xs = Box::new([[unsafe { vdupq_n_s16(0) }; N]; SWEEP]);
+        let mut xs = vec![[unsafe { vdupq_n_s16(0) }; N]; SWEEP];
+        let xs: &mut [[int16x8_t; N]; SWEEP] = xs.as_mut_slice().try_into().unwrap();
         for x in xs.iter_mut().flatten() {
             let lanes: [i16; 8] = core::array::from_fn(|_| next() as i16 % 28000);
             *x = unsafe { vld1q_s16(lanes.as_ptr()) };
@@ -1677,9 +1742,34 @@ mod tests {
         for groups in 1..=SINK {
             let keys: Vec<i16> = (0..groups * N * ROWS * LOCK).map(|_| (next() % 9721) as i16 - 4860).collect();
             unsafe {
-                check::<true>(&xs, &keys, &initial, groups);
-                check::<false>(&xs, &keys, &initial, groups);
+                check::<true, 0>(&xs, &keys, &initial, groups);
+                check::<false, 0>(&xs, &keys, &initial, groups);
+                check::<true, 1>(&xs, &keys, &initial, groups);
+                check::<false, 1>(&xs, &keys, &initial, groups);
+                check::<true, 2>(&xs, &keys, &initial, groups);
+                check::<false, 2>(&xs, &keys, &initial, groups);
             }
+        }
+    }
+
+    #[test]
+    fn ordered_commit_matches_short_and_trailing() {
+        for (elements, columns) in [(3, 16), (127, 16), (128, 7), (129, 17), (250, 19), (255, 8)] {
+            let key = matrix(elements, 1);
+            let mut state = 0x8add_55e1_1374_2373;
+            let sample = (0..4 * elements * columns).map(|_| {
+                let a = crate::ntt::tests::xorshift(&mut state) as u128;
+                let b = crate::ntt::tests::xorshift(&mut state) as u128;
+                B128((a << 64) | b)
+            }).collect::<Vec<_>>();
+            let mut forward = vec![0; columns * N * 5];
+            let mut reverse = forward.clone();
+            let mut blocks = forward.clone();
+            commit_ordered::<17, 0>(&sample, &key, 1, MODULUS, &mut forward, false);
+            commit_ordered::<17, 1>(&sample, &key, 1, MODULUS, &mut reverse, false);
+            commit_ordered::<17, 2>(&sample, &key, 1, MODULUS, &mut blocks, false);
+            assert_eq!(forward, reverse, "elements {elements}, columns {columns}");
+            assert_eq!(forward, blocks, "elements {elements}, columns {columns}");
         }
     }
 

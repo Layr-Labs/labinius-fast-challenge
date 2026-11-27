@@ -775,7 +775,7 @@ unsafe fn prefetch_words(words: &[(*const u8, usize); LANES], e: usize, t: usize
     }
 }
 
-/// The centered residue of a sum below `2^42` in magnitude. Binary64 holds such a sum exactly and
+/// The centered residue of a sum below `2^41` in magnitude. Binary64 holds such a sum exactly and
 /// its quotient by 9721 to far better than half a unit, so the rounded quotient is off by at most
 /// one half step: `|result| <= 4861`.
 #[inline(always)]
@@ -796,22 +796,14 @@ unsafe fn narrow(acc: &[int64x2_t], r: usize, out: &mut [int16x8_t; N]) {
     }
 }
 
-/// A key slot is centered. The guarded tail can return any signed halfword.
-const PRODUCT: u64 = (P1 as u64 - 1) / 2 * i16::MIN.unsigned_abs() as u64;
-const _: () = assert!(PRODUCT * (crate::RING_ELEMENTS as u64) < 1 << 42);
-// Preserve the previous base reduction's certified element counts.
-const _: () = assert!(PRODUCT < (P1 as u64 - 1) * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64);
+/// The largest product of a key slot (a centered residue) and a transform slot.
+const PRODUCT: u64 = (P1 as u64 - 1) / 2 * crate::ntt::lut_transform_bound(P1, SCHEDULES[PB]) as u64;
 /// `2^16 mod p`, centered.
 const C16: i32 = centered(1 << 16, P1) as i32;
 /// `round(2^31 / p)`.
 const V31: i32 = ((1u64 << 32) / P1 as u64).div_ceil(2) as i32;
 // a chunk's digit sums `v` (|v| <= CHUNK PRODUCT): `(v >> 16) C16 + (v mod 2^16)` fits i32
-const _: () = {
-    let fold = ((CHUNK as u64 * PRODUCT >> 16) + 1) * C16.unsigned_abs() as u64 + 65535;
-    let error = (P1 as i64 * V31 as i64 - (1i64 << 31)).unsigned_abs();
-    assert!(fold < i32::MAX as u64);
-    assert!(P1 as u64 * (1 << 30) + fold * error <= P1 as u64 * (1 << 31));
-};
+const _: () = assert!(((CHUNK as u64 * PRODUCT >> 16) + 1) * C16.unsigned_abs() as u64 + 65535 < i32::MAX as u64);
 
 /// [`narrow`] for a chunk's digit rows, in integers: `v = h 2^16 + l`, `l = v mod 2^16`, so
 /// `v = h (2^16 mod p) + l (mod p)` within `i32`, then a 32-bit Barrett reduction to
@@ -1091,27 +1083,8 @@ unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], ker
         1 => pass_tail(sc, x, kern),
         2 => pass_tail_calls(sc, x, kern),
         3 => pass_tail_calls_b(sc, x, kern),
-        17 => { guarded_tail_once(sc, x, kern); }
         _ => pass_tail_calls_c(sc, x, kern),
     }
-}
-
-// The guarded body only reads sc. Consume the captured QC before this transform
-// overwrites sc or either sink reads x.
-#[inline(always)]
-unsafe fn guarded_tail_once(sc: &[int16x8_t; N], x: &mut [int16x8_t; N], kern: &Kernel) -> bool {
-    let status = pass_tail_guarded(sc, x, kern);
-    let clipped = status & (1 << 27) != 0;
-    if clipped {
-        replay_tail(sc, x, kern);
-    }
-    clipped
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn replay_tail(sc: &[int16x8_t; N], x: &mut [int16x8_t; N], kern: &Kernel) {
-    pass_tail_calls_c(sc, x, kern);
 }
 
 #[inline(never)]

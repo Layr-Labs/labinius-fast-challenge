@@ -826,3 +826,8 @@ pub mod tests {
         }
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code, unused_imports)]
+#[path = "phase_keep10_neon.rs"]
+pub(crate) mod phase_keep10;

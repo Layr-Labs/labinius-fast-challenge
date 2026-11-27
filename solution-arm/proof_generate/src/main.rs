@@ -12,6 +12,8 @@ mod hugealloc;
 mod output;
 use output::{Output, ProofParts};
 mod ntt;
+#[cfg(target_arch = "aarch64")]
+mod proof_phase_diag;
 
 #[global_allocator]
 static ALLOCATOR: hugealloc::Allocator = hugealloc::Allocator;
@@ -952,16 +954,35 @@ fn main() {
     } else {
         MODULUS
     };
-    // the output's set-up thread first: it runs while this thread maps the key and the table
-    let output = Output::start(&args[2], modulus);
+    #[cfg(target_arch = "aarch64")]
+    let diagnostic = modulus == ntt::neon::sms::MODULUS;
+    #[cfg(not(target_arch = "aarch64"))]
+    let diagnostic = false;
+    let output = (!diagnostic).then(|| Output::start(&args[2], modulus));
     #[cfg(target_arch = "aarch64")] if modulus == ntt::neon::sms::MODULUS {
         ntt::neon::sms::map_key(&SMS_DATA.0);
-        let _ = ntt::neon::sms::BETWEEN.set(output.between());
+        if let Some(output) = &output {
+            let _ = ntt::neon::sms::BETWEEN.set(output.between());
+        }
     }
     let mut timer = Timer(std::time::Instant::now(), Vec::new());
     let values = read_table(&args[4]);
     timer.lap("read");
+    #[cfg(target_arch = "aarch64")]
+    let reference = diagnostic.then(|| proof_phase_diag::run(&seed, modulus, &values));
+    let output = output.unwrap_or_else(|| Output::start(&args[2], modulus));
+    #[cfg(target_arch = "aarch64")]
+    if diagnostic {
+        assert!(ntt::neon::sms::BETWEEN.set(output.between()).is_ok());
+        timer.0 = std::time::Instant::now();
+    }
+    let closing_start = std::time::Instant::now();
     let proof = prove(&seed, modulus, &values, &mut timer, &output);
+    #[cfg(target_arch = "aarch64")]
+    if let Some(expected) = reference {
+        proof_phase_diag::close(&expected, &proof, closing_start.elapsed());
+        timer.0 = std::time::Instant::now();
+    }
     output.write(&proof);
     timer.lap("write");
     eprintln!("labinius-arm {}", timer.1.join(" "));

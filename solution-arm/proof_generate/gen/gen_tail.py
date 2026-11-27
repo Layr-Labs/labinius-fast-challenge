@@ -17,6 +17,7 @@ Node n holds slots 27 n .. 27 n + 26 (p = slot - 27 n):
 Registers: `k` (v15) holds kern.kc[n] = [p, v, eps, eps', the level-4 twiddle pair]: level 4
 multiplies by lanes 4..7 of `k`, so only one twiddle register is live next to the 27 values.
 """
+import re
 import sys
 from sched import Ins, schedule, allocate
 import gen_pc
@@ -91,6 +92,42 @@ def build(n, rel=False, omit6=False, omit5=0):
     return ins, low
 
 
+def pair_memory(asm, op, base):
+    """Fuse adjacent vectors without changing arithmetic or physical registers. Loads move
+    earlier only; stores move only across instructions that do not overwrite their values."""
+    asm = list(asm)
+    sites = {}
+    for i, a in enumerate(asm):
+        m = re.fullmatch(rf'{op} q(\d+), \[{base}, #(\d+)\]', a)
+        if m: sites[int(m[2])] = (i, int(m[1]))
+    def writes(a, r):
+        if not a or a.startswith(('str ', 'stp ')): return False
+        dest = a.split(', [')[0] if a.startswith('ldp ') else a.split(',')[0]
+        return re.search(rf'(?:v|q){r}(?:[.,]|$)', dest) is not None
+    def touches(a, r):
+        return a and re.search(rf'(?:v|q){r}(?:[.,]|$)', a) is not None
+    used = set()
+    for off in sorted(sites):
+        if off + 16 not in sites: continue
+        i, r = sites[off]; j, t = sites[off + 16]
+        if i in used or j in used or r == t: continue
+        early, late = sorted((i, j))
+        er, lr = (r, t) if i < j else (t, r)
+        between = asm[early + 1:late]
+        hazard = touches if op == 'ldr' else writes
+        if not any(hazard(a, lr) for a in between):
+            at = early
+        elif op == 'str' and not any(writes(a, er) for a in between):
+            at = late
+        else:
+            continue
+        used.update((i, j))
+        asm[early] = asm[late] = None
+        pair = 'ldp' if op == 'ldr' else 'stp'
+        asm[at] = f'{pair} q{r}, q{t}, [{base}, #{off}]'
+    return [a for a in asm if a is not None]
+
+
 def node_asm(n, rel, K, B, width=6, ls=2, cap=31, reserve=1, omit6=False, omit5=0):
     ins, low = build(n, rel)
     seq, cyc = schedule(ins, width=width, ls=ls, budget=B, skew=K, cap=cap, reserve=reserve)
@@ -144,7 +181,7 @@ def kinds():
     return order
 
 
-def emit_calls(K=8, B=26, reserve=1, width=6, ls=2, omit6=None, omit5=None):
+def emit_calls(K=8, B=26, reserve=1, width=6, ls=2, omit6=None, omit5=None, memory_pairs=None):
     """One body per node reduction kind, called per node with the node's base pointers."""
     ks = kinds()
     out = []
@@ -157,6 +194,10 @@ def emit_calls(K=8, B=26, reserve=1, width=6, ls=2, omit6=None, omit5=None):
         n = next(m for m in range(24) if gen_pc.kind(m) == k)
         asm, _, _ = node_asm(n, True, K, B, width=width, ls=ls, reserve=reserve,
                               omit6=omit6(n) if omit6 else False, omit5=omit5(n) if omit5 else 0)
+        if memory_pairs == 'both':
+            asm = pair_memory(asm, 'ldr', 'XPTR')
+        if memory_pairs:
+            asm = pair_memory(asm, 'str', 'YPTR')
         out.append(f'"{20 + i}:"')
         out += [f'"{subst(a)}"' for a in asm]
         out.append('"ret"')

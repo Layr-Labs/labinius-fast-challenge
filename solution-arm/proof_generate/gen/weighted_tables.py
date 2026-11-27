@@ -14,7 +14,7 @@ def centered(value):
 # Bit masks for subtracting and adding one P from each centered table entry.
 # Order: X0 (16 entries), Y0, X1, Y1, X2, Y2, eps*X1, eps*Y1, eps²*X2, eps²*Y2.
 # Choose the representatives so the original tail's sparse reduction schedule stays in range.
-QUARTER_SCALE = (2381, 384, 1605, 1727)
+QUARTER_SCALE = (2381, 148, 2201, 2736)
 SHIFTS = (
     (
         (0x0000, 0x0000),
@@ -31,14 +31,14 @@ SHIFTS = (
     (
         (0x0000, 0x0000),
         (0x0000, 0x0000),
-        (0x0000, 0x0000),
-        (0x0000, 0x0088),
-        (0x0008, 0x0020),
-        (0x0000, 0x0000),
-        (0x0008, 0x0000),
+        (0x00c8, 0x0000),
         (0x0000, 0x0000),
         (0x0000, 0x0000),
         (0x0000, 0x0000),
+        (0x0000, 0x0040),
+        (0x0000, 0x0000),
+        (0x0088, 0x0000),
+        (0x00c8, 0x0000),
     ),
     (
         (0x0000, 0x0000),
@@ -49,20 +49,20 @@ SHIFTS = (
         (0x0000, 0x0000),
         (0x0000, 0x0000),
         (0x0000, 0x0000),
-        (0x0000, 0x0000),
+        (0x0080, 0x0000),
         (0x0000, 0x0000),
     ),
     (
         (0x0000, 0x0000),
         (0x0000, 0x0000),
         (0x0000, 0x0000),
-        (0x0020, 0x0000),
         (0x0000, 0x0004),
         (0x0000, 0x0000),
         (0x0000, 0x0000),
         (0x0000, 0x0000),
         (0x0000, 0x0000),
-        (0x0000, 0x0020),
+        (0x0000, 0x0000),
+        (0x0000, 0x0000),
     ),
 )
 

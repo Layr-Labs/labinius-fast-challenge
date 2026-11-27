@@ -1,6 +1,7 @@
 // Packed-binary SMS index only: 32 ring lanes, each with512 Boolean coefficients.
 // Rows0..27 encode x bits0..3, byte selector bit4 and y bits5..7; both
-// byte selectors share one word. Rows27..81 contain six-bit pair indices.
+// byte selectors share one word. Rows27..81 contain six-bit pair indices
+// (the r3pair emitter writes each index into both bytes of its word).
 // All81 rows are written before a producer reads them. The general F162 and
 // full648-bit constructors retain their original representation and paths.
 #[repr(C,align(64))]pub(crate)struct SmsBinaryIndex32{pub(crate)rows:[[u16;32];81]}
@@ -18,6 +19,28 @@ struct SmsWork {
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
 pub(crate) unsafe fn slice_b128_cols16_sms_into(
+    cols: &[*const crate::fields::scalar::B128; 16],
+    out: &mut SmsBinaryIndex32,
+) {
+    slice_b128_cols16_sms_body::<false>(cols, out);
+}
+
+/// [`slice_b128_cols16_sms_into`] with the r3pair row pairing applied at emission: for each
+/// pair of rows `27 + i` and `54 + i` (`i < 27`) the row emitted first is stored as usual, and the
+/// emitter of the second loads it back once and stores both paired rows (the same expressions
+/// as the former separate pass in `slice_b128_cols16_r3pair_into`), with every index in both
+/// bytes of its word (`n * 0x101`) for the r3pair prefix's byte lookups. Rows 0..27 are unchanged.
+#[inline(never)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,gfni")]
+pub(crate) unsafe fn slice_b128_cols16_sms_r3pair_rows_into(
+    cols: &[*const crate::fields::scalar::B128; 16],
+    out: &mut SmsBinaryIndex32,
+) {
+    slice_b128_cols16_sms_body::<true>(cols, out);
+}
+
+#[inline(always)]
+unsafe fn slice_b128_cols16_sms_body<const R3: bool>(
     cols: &[*const crate::fields::scalar::B128; 16],
     out: &mut SmsBinaryIndex32,
 ) {
@@ -60,11 +83,11 @@ pub(crate) unsafe fn slice_b128_cols16_sms_into(
         _mm512_store_si512(u.add(8 * b) as *mut __m512i, mu);
         _mm512_store_si512(v.add(8 * b) as *mut __m512i, mv);
     }
-    uv_b128_to_sms_rows(u, v, out);
+    uv_b128_to_sms_rows::<R3>(u, v, out);
 }
 
 #[inline(always)]
-unsafe fn uv_sms_step<const T: usize, const BASE: usize>(
+unsafe fn uv_sms_step<const T: usize, const BASE: usize, const R3: bool>(
     u: *const u64,
     v: *const u64,
     out: &mut SmsBinaryIndex32,
@@ -143,12 +166,37 @@ unsafe fn uv_sms_step<const T: usize, const BASE: usize>(
                                     _mm512_gf2p8affine_epi64_epi8::<0>(tagged, matrix),
                                 );
                             } else {
-                                let bytes = if $high {
-                                    _mm512_extracti64x4_epi64::<1>(n)
+                                // r3pair rows hold each six-bit index in both bytes of its word
+                                // (`n * 0x101`, the same single p5 uop as the zero extension):
+                                // the r3pair prefix looks the low and the high byte of a 64-entry
+                                // word table up with one `vpermb` each. The pairing below is
+                                // bytewise, so both bytes stay equal.
+                                let cur = if R3 {
+                                    _mm512_permutexvar_epi8(if $high { dup1 } else { dup0 }, n)
                                 } else {
-                                    _mm512_castsi512_si256(n)
+                                    let bytes = if $high {
+                                        _mm512_extracti64x4_epi64::<1>(n)
+                                    } else {
+                                        _mm512_castsi512_si256(n)
+                                    };
+                                    _mm512_cvtepu8_epi16(bytes)
                                 };
-                                _mm512_store_si512(out.rows[row].as_mut_ptr().cast(), _mm512_cvtepu8_epi16(bytes));
+                                let partner = if row < 54 { row + 27 } else { row - 27 };
+                                if R3 && EMIT_ORDER[partner] < EMIT_ORDER[row] {
+                                    // The partner was stored earlier by its own emitter: pair the
+                                    // two rows now. `a` is row 27 + i, `b` is row 54 + i.
+                                    let other = _mm512_load_si512(out.rows[partner].as_ptr().cast());
+                                    let (lo, a, b) = if row < 54 { (row, cur, other) } else { (partner, other, cur) };
+                                    let mask = _mm512_set1_epi16(0x1515);
+                                    let swap = _mm512_set1_epi64(0x0201080420108040);
+                                    let q = _mm512_ternarylogic_epi64::<0xe4>(a, b, mask);
+                                    let w = _mm512_ternarylogic_epi64::<0xe4>(b, a, mask);
+                                    let p = _mm512_gf2p8affine_epi64_epi8::<0>(w, swap);
+                                    _mm512_store_si512(out.rows[lo].as_mut_ptr().cast(), p);
+                                    _mm512_store_si512(out.rows[lo + 27].as_mut_ptr().cast(), q);
+                                } else {
+                                    _mm512_store_si512(out.rows[row].as_mut_ptr().cast(), cur);
+                                }
                             }
                         }
                     }};
@@ -165,7 +213,50 @@ unsafe fn uv_sms_step<const T: usize, const BASE: usize>(
 }
 
 #[inline(always)]
-unsafe fn uv_b128_to_sms_rows(u: *const u64, v: *const u64, out: &mut SmsBinaryIndex32) {
+/// Position of row `row` in [`uv_b128_to_sms_rows`]'s emission sequence: steps `(T, BASE)` in
+/// call order, then `h = 0, 2, 4, 6`, then the rows `i` and `i + 4` of each `h`.
+const fn emit_order(row: usize) -> usize {
+    let mut n = 0;
+    let mut t = 0;
+    while t < 4 {
+        let mut base = 0;
+        while base < 24 {
+            let mut h = 0;
+            while h < 8 {
+                let i = 4 * (base + h) + t;
+                if i < 81 {
+                    if i == row {
+                        return n;
+                    }
+                    n += 1;
+                    if i + 4 < 81 {
+                        if i + 4 == row {
+                            return n;
+                        }
+                        n += 1;
+                    }
+                }
+                h += 2;
+            }
+            base += 8;
+        }
+        t += 1;
+    }
+    panic!("row is not emitted")
+}
+
+/// [`emit_order`] of every row; constant indices fold the pairing decision at compile time.
+const EMIT_ORDER: [usize; 81] = {
+    let mut t = [0usize; 81];
+    let mut r = 0;
+    while r < 81 {
+        t[r] = emit_order(r);
+        r += 1;
+    }
+    t
+};
+
+unsafe fn uv_b128_to_sms_rows<const R3: bool>(u: *const u64, v: *const u64, out: &mut SmsBinaryIndex32) {
     let zero = _mm512_setzero_si512();
     let ident = _mm512_set1_epi64(GF_IDENT);
     let perm_even = _mm512_load_si512(SMS_JOINT_PERM_EVEN.0.as_ptr().cast());
@@ -174,18 +265,18 @@ unsafe fn uv_b128_to_sms_rows(u: *const u64, v: *const u64, out: &mut SmsBinaryI
     let dup1 = _mm512_load_si512(SMS_JOINT_DUP1.0.as_ptr().cast());
     let tag_or = _mm512_set1_epi16(0x8000u16 as i16);
     let matrix = _mm512_set1_epi64(0x0104104080020820u64 as i64);
-    uv_sms_step::<0, 0>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<0, 8>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<0, 16>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<1, 0>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<1, 8>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<1, 16>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<2, 0>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<2, 8>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<2, 16>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<3, 0>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<3, 8>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
-    uv_sms_step::<3, 16>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<0, 0, R3>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<0, 8, R3>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<0, 16, R3>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<1, 0, R3>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<1, 8, R3>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<1, 16, R3>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<2, 0, R3>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<2, 8, R3>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<2, 16, R3>(u, v, out, zero, ident, perm_even, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<3, 0, R3>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<3, 8, R3>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
+    uv_sms_step::<3, 16, R3>(u, v, out, zero, ident, perm_odd, dup0, dup1, tag_or, matrix);
 }
 #[cfg(test)]mod sms_joint_constructor_guards{use super::*;
  #[repr(C,align(64))]struct Guard{pre:[u64;8],value:SmsBinaryIndex32,post:[u64;8]}

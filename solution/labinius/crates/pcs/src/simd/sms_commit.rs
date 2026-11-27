@@ -437,6 +437,8 @@ const _: () = assert!(STREAMS == 7 && LOCK == 8);
 const INPUT_PREFETCH: bool = false;
 
 const PREFETCH_SLOTS: usize = 347;
+// [`WideSink`]'s look-ahead wraps into the next step's tiles at most once.
+const _: () = assert!(PREFETCH_SLOTS < N);
 
 // Quarter-scaled witnesses and reciprocal public keys preserve every product.
 // The64-pair window retains the baseline's statistical accumulation strategy;
@@ -542,13 +544,39 @@ struct WideSink<const RED: bool, const FIRST: bool = false> {
     k: *const u32,
     acc: *mut i32,
     b: *const i32,
+    /// Key look-ahead variant of this step ([`PF_VARIANTS`]), for the same-run comparison.
+    pf: u8,
 }
+
+/// Key look-ahead variants compared side by side within each run, chosen per pair claim of
+/// commitment units ([`pf_of_unit`]): 0 the record's single stream into L1 (`prefetcht0` at `k`
+/// only), 1 both tiles' streams into L1, 2 both tiles' streams into L2 only (`prefetcht1`),
+/// 3 none.
+pub const PF_VARIANTS: usize = 4;
+/// The variant of unit `u`: by pair claim (units `2c` and `2c + 1` go to one core's two
+/// siblings, which share their key lines in L2), cycling through the variants.
+#[inline(always)]
+fn pf_of_unit(u: usize) -> u8 {
+    ((u / 2) % PF_VARIANTS) as u8
+}
+std::thread_local! {
+    /// The look-ahead variant of the unit this thread runs (2, this tree's own, outside units).
+    static PF: core::cell::Cell<u8> = const { core::cell::Cell::new(2) };
+}
+#[inline(always)]
+fn pf_now() -> u8 {
+    PF.with(|c| c.get())
+}
+/// Per variant: nanoseconds of unit runs (main claim loop only, sibling waits included) and
+/// the pair batches they advanced.
+pub static PF_NS: [std::sync::atomic::AtomicU64; PF_VARIANTS] = [const { std::sync::atomic::AtomicU64::new(0) }; PF_VARIANTS];
+pub static PF_BATCHES: [std::sync::atomic::AtomicU64; PF_VARIANTS] = [const { std::sync::atomic::AtomicU64::new(0) }; PF_VARIANTS];
 impl<const RED: bool, const FIRST: bool> vb::SliceSink<16> for WideSink<RED, FIRST> {
     #[inline(always)]
     unsafe fn rows(&mut self, blk: usize, w: [*const i16; 16], r0: usize, r1: usize) {
         // Every producer uses H contiguous 27-vector blocks in wbuf.
         debug_assert!(w.iter().enumerate().all(|(h, &p)| p == w[0].wrapping_add(32 * 27 * h)));
-        wide_sink_rows::<RED, FIRST>(self.k, self.acc, self.b, blk, w[0], r0, r1);
+        wide_sink_rows::<RED, FIRST>(self.k, self.acc, self.b, blk, w[0], r0, r1, self.pf);
     }
 }
 
@@ -556,8 +584,8 @@ impl<const RED: bool, const FIRST: bool> vb::SliceSink<16> for WideSink<RED, FIR
 /// then fit the half of the decoded-uop cache a hyperthread gets.
 #[inline(never)]
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
-unsafe fn wide_sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *mut i32, bias: *const i32, blk: usize, w0: *const i16, r0: usize, r1: usize) {
-    let s = WideSink::<RED, FIRST> { k: kp, acc: accp, b: bias };
+unsafe fn wide_sink_rows<const RED: bool, const FIRST: bool>(kp: *const u32, accp: *mut i32, bias: *const i32, blk: usize, w0: *const i16, r0: usize, r1: usize, pf: u8) {
+    let s = WideSink::<RED, FIRST> { k: kp, acc: accp, b: bias, pf };
     s.rows_inline(blk, w0, r0, r1);
 }
 
@@ -570,12 +598,39 @@ impl<const RED: bool, const FIRST: bool> WideSink<RED, FIRST> {
             let k = self.k.add(j * STREAMS * LOCK);
             let a = self.acc.add(j * STREAMS * 16);
             if PREFETCH_SLOTS > 0 {
-                let lo = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize;
-                let hi = lo + STREAMS * LOCK * 4;
-                let mut p = (lo + 63) & !63;
-                while p < hi {
-                    _mm_prefetch::<_MM_HINT_T0>(p as *const i8);
-                    p += 64;
+                // A sixteen-batch step reads two key tiles, `k` and `k + LOCK_WORDS` (the slot's
+                // second eight pair batches, 145 KB on): two sequential streams. Variants 1 and 2
+                // look ahead `PREFETCH_SLOTS` slots in both; past the tiles' last slot the
+                // look-ahead goes on in the next step's two tiles, `2 LOCK_WORDS` on, so
+                // `k + PREFETCH_SLOTS` slots then lands one `LOCK_WORDS` further than in this
+                // step's tiles. Variant 0 is the eight-batch sink's single stream at `k`, which
+                // only reaches the first tile's tail and, past it, second-tile lines this step has
+                // already read. Variant 2 requests into L2 only: the look-ahead is 2 x 347 x 224 =
+                // 155 KB per thread, three times the 48 KB L1D the two hyperthreads share.
+                macro_rules! stream {
+                    ($lo:expr, $hint:ident) => {{
+                        let lo: usize = $lo;
+                        let hi = lo + STREAMS * LOCK * 4;
+                        let mut p = (lo + 63) & !63;
+                        while p < hi {
+                            _mm_prefetch::<$hint>(p as *const i8);
+                            p += 64;
+                        }
+                    }};
+                }
+                let wrap = if j + PREFETCH_SLOTS >= N { LOCK_WORDS } else { 0 };
+                let first = k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK + wrap) as usize;
+                match self.pf {
+                    0 => stream!(k.wrapping_add(PREFETCH_SLOTS * STREAMS * LOCK) as usize, _MM_HINT_T0),
+                    1 => {
+                        stream!(first, _MM_HINT_T0);
+                        stream!(first + LOCK_WORDS * 4, _MM_HINT_T0);
+                    }
+                    2 => {
+                        stream!(first, _MM_HINT_T1);
+                        stream!(first + LOCK_WORDS * 4, _MM_HINT_T1);
+                    }
+                    _ => {}
                 }
             }
             macro_rules! call {
@@ -950,6 +1005,8 @@ enum RowsOut<'a> {
 /// end reached.
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,gfni")]
 unsafe fn group<F: FnMut(usize), C: FnMut(usize) -> bool>(cols: &[&[B128]], keys: &SmsKeys, np: usize, range: core::ops::Range<usize>, out: RowsOut, ws: &mut SmsWorker, dst: *mut [u32; N], mut sync: F, mut claim: C) -> usize {
+    // The key look-ahead variant of the unit this group runs for (same-run comparison).
+    let pf = pf_now();
     let g = cols.len();
     let mut repair_flags=Vec::<RepairFlag>::new();
     assert!(g >= 1 && g <= 16 && (np / 2) % LOCK == 0 && ((np / 2) % CHUNK_PAIRS) % LOCK == 0 && 2 * np == keys.elements);
@@ -1027,16 +1084,16 @@ unsafe fn group<F: FnMut(usize), C: FnMut(usize) -> bool>(cols: &[&[B128]], keys
             for kk in 0..24 { vb::SliceSink::<LOCK>::rows(&mut sk, kk, core::array::from_fn(|h| w.add(32 * 27 * h) as *const i16), 0, 27); }
         } else if step==16 {
             if first && fold_now {
-                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,true>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,true>{k,acc,b:bias,pf},&mut source);
             }
             else if first {
-                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,true>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,true>{k,acc,b:bias,pf},&mut source);
             }
             else if fold_now {
-                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,false>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<true,false>{k,acc,b:bias,pf},&mut source);
             }
             else if true {
-                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,false>{k,acc,b:bias},&mut source);
+                vb::ntt_bin_batch32_r3pair_source::<P, 16, true, true, _, _>(idx,w,&mut WideSink::<false,false>{k,acc,b:bias,pf},&mut source);
             }
         } else if first && fold_now {
             vb::ntt_bin_batch32_r3pair_source::<P, LOCK, true, true, _, _>(idx, w,&mut Sink::<true, true> { k, acc, b: bias }, &mut source);
@@ -1132,7 +1189,11 @@ pub fn worker_report(workers: usize) -> String {
     let faults: Vec<String> = (0..w).map(|i| WORKER_FAULTS[i].load(Relaxed).to_string()).collect();
     let wait: Vec<String> = (0..w).map(|i| WORKER_WAIT_US[i].load(Relaxed).to_string()).collect();
     let vcsw: Vec<String> = (0..w).map(|i| WORKER_VCSW[i].load(Relaxed).to_string()).collect();
-    format!(" sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={} sms_start_us={} sms_cpu_us={} sms_ivcsw={} sms_faults={} sms_wait_us={} sms_vcsw={} sms_stolen={} sms_rescued={}{}", ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"), starts.join("/"), cpu.join("/"), ivcsw.join("/"), faults.join("/"), wait.join("/"), vcsw.join("/"), STOLEN.load(Relaxed), RESCUED.load(Relaxed), SYS_DELTA.lock().map(|s| s.clone()).unwrap_or_default())
+    {
+        let pf_ns: Vec<String> = (0..PF_VARIANTS).map(|v| PF_NS[v].load(Relaxed).to_string()).collect();
+        let pf_b: Vec<String> = (0..PF_VARIANTS).map(|v| PF_BATCHES[v].load(Relaxed).to_string()).collect();
+        format!(" sms_end_us={} sms_groups={} sms_decoupled={} sms_decoupled_at={} sms_start_us={} sms_cpu_us={} sms_ivcsw={} sms_faults={} sms_wait_us={} sms_vcsw={} sms_stolen={} sms_rescued={} pf_ns={} pf_batches={}{}", ends.join("/"), groups.join("/"), DECOUPLED_PAIRS.load(Relaxed), at.join("/"), starts.join("/"), cpu.join("/"), ivcsw.join("/"), faults.join("/"), wait.join("/"), vcsw.join("/"), STOLEN.load(Relaxed), RESCUED.load(Relaxed), pf_ns.join("/"), pf_b.join("/"), SYS_DELTA.lock().map(|s| s.clone()).unwrap_or_default())
+    }
 }
 
 /// Per runner of the last [`commit_paired`]: CPU time it got and involuntary context switches
@@ -1251,6 +1312,10 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
     let rescue = steal && std::env::var_os("LABINIUS_NO_RESCUE").is_none();
     STOLEN.store(0, Ordering::Relaxed);
     RESCUED.store(0, Ordering::Relaxed);
+    for v in 0..PF_VARIANTS {
+        PF_NS[v].store(0, Ordering::Relaxed);
+        PF_BATCHES[v].store(0, Ordering::Relaxed);
+    }
     let next = AtomicUsize::new(0);
     // Per pair: the unit its last pair claim left for the other sibling.
     let pending: Vec<std::sync::Mutex<Option<usize>>> = (0..pairs).map(|_| std::sync::Mutex::new(None)).collect();
@@ -1348,6 +1413,9 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
             let ws = ws.get_or_insert_with(SmsWorker::new);
             ran += 1;
             let (from, base) = (range.start, progressed);
+            let variant = pf_of_unit(u);
+            PF.with(|c| c.set(variant));
+            let unit_clock = std::time::Instant::now();
             let end = run(gi, range.clone(), ws, &mut |b_done| {
                 #[cfg(test)]
                 if TEST_STALL_WORKER.load(Ordering::Relaxed) == worker + 1 && ran == 1 && b_done - from <= 16 {
@@ -1376,6 +1444,9 @@ fn commit_paired(keys: &SmsKeys, columns: &[&[B128]], np: usize, workers: usize,
                     }
                 }
             });
+            PF_NS[variant as usize].fetch_add(unit_clock.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            PF_BATCHES[variant as usize].fetch_add((end - from) as u64, Ordering::Relaxed);
+            PF.with(|c| c.set(2));
             progressed += end - from;
             mine.store(progressed, Ordering::Release);
         }
@@ -1934,7 +2005,7 @@ pub(crate) fn certify_relocated_pairs(pairs:&[u32]){assert_eq!(pairs.len()%LOCK,
    let keys:Vec<u32>=(0..2*N*STREAMS*LOCK).map(|_|match case{0=>0,1=>4860u32|((-4860i16 as u16 as u32)<<16),2=>(-4860i16 as u16 as u32)|(4860u32<<16),3=>0x7fff7fff,4=>0x80008000,5=>0x80007fff,6=>0xffff0001,_=>rng(&mut state)as u32}).collect();let bias:Vec<i32>=(0..N*DIGITS).map(|_|match case{3=>i32::MAX,4=>i32::MIN,_=>rng(&mut state)as i32}).collect();
    for blk in[0usize,7,23]{for(r0,r1)in[(0usize,27usize),(1,27),(0,26),(3,25),(13,14),(4,4),(26,27)]{
     let init:Vec<Z>=(0..N*STREAMS+2).map(|_|Z(core::array::from_fn(|_|match case{3=>i32::MAX,4=>i32::MIN,_=>rng(&mut state)as i32}))).collect();let mut changed=init.clone();let mut scalar=init.clone();
-    super::wide_sink_rows::<RED,FIRST>(keys.as_ptr(),changed.as_mut_ptr().add(1).cast(),bias.as_ptr(),blk,w.as_ptr().add(1).cast(),r0,r1);
+    super::wide_sink_rows::<RED,FIRST>(keys.as_ptr(),changed.as_mut_ptr().add(1).cast(),bias.as_ptr(),blk,w.as_ptr().add(1).cast(),r0,r1,2);
     for i in r0..r1{let j=27*blk+i;for s in 0..7{for lane in 0..16{let initial=if FIRST&&s>0{bias[j*6+s-1]}else{init[1+j*7+s].0[lane]};let mut sum=initial as i64;for h in 0..16{let a=w[1+h*27+i].0[lane]as u32;let k=keys[(h/8)*LOCK_WORDS+j*7*8+s*8+h%8];let x0=a as u16 as i16 as i64;let x1=(a>>16)as u16 as i16 as i64;let k0=k as u16 as i16 as i64;let k1=(k>>16)as u16 as i16 as i64;sum+=x0*k0+x1*k1;}let value=sum as i32;scalar[1+j*7+s].0[lane]=if RED{let z=(value as u32)^0x8000;let lo=z as u16 as i16 as i64;let hi=(z>>16)as u16 as i16 as i64;(lo+r*hi)as i32}else{value};}}}
     let bad_new=changed.iter().zip(&scalar).position(|(a,b)|a.0!=b.0);assert!(bad_new.is_none(),"new/scalar red={RED} first={FIRST} case={case} blk={blk} rows={r0}..{r1} at={bad_new:?}");
    }}

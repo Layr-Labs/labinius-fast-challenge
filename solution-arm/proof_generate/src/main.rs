@@ -1063,7 +1063,7 @@ mod tests {
                 sms::commit_v::<$v>(&values, &a, 3, q, &mut got, false);
                 assert!(got == want, "variant {} at {elements} elements", $v);
             )* } }
-            check!(1, 2, 3);
+            check!(1, 2, 3, 4);
         }
     }
 

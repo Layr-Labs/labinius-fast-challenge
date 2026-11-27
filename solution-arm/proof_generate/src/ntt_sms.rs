@@ -969,8 +969,8 @@ unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Ker
 /// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients.
 /// Levels 4 to 6 of one transform, from the scratch `sc` into the sweep buffer slot `x`:
 /// `V = 0` the two passes [`pass_c_asm`] and [`pass_d_out`]; otherwise the fused per-node kernel
-/// ([`pass_tail`] straight-line for `V = 1`, [`pass_tail_calls`] for `V = 2`, its other schedule
-/// [`pass_tail_calls_b`] for `V = 3`). The same values.
+/// ([`pass_tail`] straight-line for `V = 1`, [`pass_tail_calls`] for `V = 2`, its other schedules
+/// [`pass_tail_calls_b`] for `V = 3` and [`pass_tail_calls_c`] for `V = 4`). The same values.
 #[inline(always)]
 unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], kern: &Kernel) {
     match V {
@@ -980,7 +980,8 @@ unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], ker
         }
         1 => pass_tail(sc, x, kern),
         2 => pass_tail_calls(sc, x, kern),
-        _ => pass_tail_calls_b(sc, x, kern),
+        3 => pass_tail_calls_b(sc, x, kern),
+        _ => pass_tail_calls_c(sc, x, kern),
     }
 }
 
@@ -1225,11 +1226,13 @@ fn pin_worker(w: usize) {
     let _ = w;
 }
 
-/// Levels 4 to 6 run as [`pass_tail_calls_b`] (`V = 3`): in this lane's in-process A/B on the
-/// official runner (diagnostic `7074ae15`) it measured about 3.9 ms per commitment under the two
-/// passes (`V = 0`), with byte-identical output.
+/// Levels 4 to 6 run as [`pass_tail_calls_c`] (`V = 4`). In this lane's in-process A/B on the
+/// official runner, the fused kernel measured about 3.9 ms per commitment under the two passes
+/// (`V = 0`, diagnostic `7074ae15`). This schedule (skew 24, live budget 29, register reserve 0)
+/// measured another 1.0-2.8 ms under `pass_tail_calls_b` (`V = 3`, diagnostic `5ea44bbf`), with
+/// byte-identical output.
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
-    commit_v::<3>(values, a, workers, q, out, true)
+    commit_v::<4>(values, a, workers, q, out, true)
 }
 
 /// [`commit`] with levels 4 to 6 by [`tail`]`::<V>` (the same output for every `V`); `hook`
@@ -1741,7 +1744,7 @@ mod leap_bench {
             let x0 = a.clone();
             let mut want: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             unsafe { pass_c_asm(&mut a, kern); pass_d_out(&a, &mut want, kern); }
-            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b] {
+            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c] {
                 let mut got: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
                 unsafe { f(&x0, &mut got, kern); }
                 let w: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(want.as_ptr() as *const [i16; 8], N) };

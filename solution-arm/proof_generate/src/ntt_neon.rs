@@ -2321,3 +2321,6 @@ mod indices_asm_tests {
 #[cfg(any(test, target_feature = "sve"))]
 #[path = "ntt_neon_weighted.rs"]
 mod weighted;
+
+#[path = "r8_inverse.rs"]
+mod r8_inverse;

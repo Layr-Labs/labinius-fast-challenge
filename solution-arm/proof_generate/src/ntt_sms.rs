@@ -579,6 +579,77 @@ unsafe fn slot_sink_fresh(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_
     slot_sink_body!(acc, z, k, groups, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
 }
 
+macro_rules! sink_it1 { () => { "ldp q0, q1, [{kp}]\nldp q2, q3, [{kp}, #32]\nldr q4, [{zp}]\nldr q5, [{zp}, #{xs1}]\nldr q6, [{zp}, #{xs2}]\nldr q7, [{zp}, #{xs3}]\nadd {zp}, {zp}, {xs4}\nsdot z16.d, z4.h, z0.h[0]\nsdot z17.d, z5.h, z0.h[0]\nsdot z18.d, z6.h, z0.h[0]\nsdot z19.d, z7.h, z0.h[0]\nsdot z20.d, z4.h, z1.h[0]\nsdot z21.d, z5.h, z1.h[0]\nsdot z22.d, z6.h, z1.h[0]\nsdot z23.d, z7.h, z1.h[0]\nsdot z24.d, z4.h, z2.h[0]\nsdot z25.d, z5.h, z2.h[0]\nsdot z26.d, z6.h, z2.h[0]\nsdot z27.d, z7.h, z2.h[0]\nsdot z28.d, z4.h, z3.h[0]\nsdot z29.d, z5.h, z3.h[0]\nsdot z30.d, z6.h, z3.h[0]\nsdot z31.d, z7.h, z3.h[0]\nldr q4, [{zp}]\nldr q5, [{zp}, #{xs1}]\nldr q6, [{zp}, #{xs2}]\nldr q7, [{zp}, #{xs3}]\nadd {zp}, {zp}, {xs4}\nadd {kp}, {kp}, {ks}\nsdot z16.d, z4.h, z0.h[1]\nsdot z17.d, z5.h, z0.h[1]\nsdot z18.d, z6.h, z0.h[1]\nsdot z19.d, z7.h, z0.h[1]\nsdot z20.d, z4.h, z1.h[1]\nsdot z21.d, z5.h, z1.h[1]\nsdot z22.d, z6.h, z1.h[1]\nsdot z23.d, z7.h, z1.h[1]\nsdot z24.d, z4.h, z2.h[1]\nsdot z25.d, z5.h, z2.h[1]\nsdot z26.d, z6.h, z2.h[1]\nsdot z27.d, z7.h, z2.h[1]\nsdot z28.d, z4.h, z3.h[1]\nsdot z29.d, z5.h, z3.h[1]\nsdot z30.d, z6.h, z3.h[1]\nsdot z31.d, z7.h, z3.h[1]\n" }; }
+macro_rules! sink_it2 { () => { "ldp q0, q1, [{kp}, #64]\nldr q2, [{kp}, #96]\nldr q4, [{zp}]\nldr q5, [{zp}, #{xs1}]\nldr q6, [{zp}, #{xs2}]\nldr q7, [{zp}, #{xs3}]\nadd {zp}, {zp}, {xs4}\nsdot z16.d, z4.h, z0.h[0]\nsdot z17.d, z5.h, z0.h[0]\nsdot z18.d, z6.h, z0.h[0]\nsdot z19.d, z7.h, z0.h[0]\nsdot z20.d, z4.h, z1.h[0]\nsdot z21.d, z5.h, z1.h[0]\nsdot z22.d, z6.h, z1.h[0]\nsdot z23.d, z7.h, z1.h[0]\nsdot z24.d, z4.h, z2.h[0]\nsdot z25.d, z5.h, z2.h[0]\nsdot z26.d, z6.h, z2.h[0]\nsdot z27.d, z7.h, z2.h[0]\nldr q4, [{zp}]\nldr q5, [{zp}, #{xs1}]\nldr q6, [{zp}, #{xs2}]\nldr q7, [{zp}, #{xs3}]\nadd {zp}, {zp}, {xs4}\nadd {kp}, {kp}, {ks}\nsdot z16.d, z4.h, z0.h[1]\nsdot z17.d, z5.h, z0.h[1]\nsdot z18.d, z6.h, z0.h[1]\nsdot z19.d, z7.h, z0.h[1]\nsdot z20.d, z4.h, z1.h[1]\nsdot z21.d, z5.h, z1.h[1]\nsdot z22.d, z6.h, z1.h[1]\nsdot z23.d, z7.h, z1.h[1]\nsdot z24.d, z4.h, z2.h[1]\nsdot z25.d, z5.h, z2.h[1]\nsdot z26.d, z6.h, z2.h[1]\nsdot z27.d, z7.h, z2.h[1]\n" }; }
+
+/// Diagnostic: the sink body for exactly eight tiles with both loops fully unrolled.
+#[cfg(target_feature = "sve")]
+macro_rules! slot_sink8_body {
+    ($acc:expr, $z:expr, $k:expr, [$($rows13:literal),*], [$($rows46:literal),*]) => {
+        core::arch::asm!(
+        "ldp q16, q17, [{a}, #0]",
+        "ldp q18, q19, [{a}, #32]",
+        $($rows13,)*
+        "mov {zp}, {z}",
+        "mov {kp}, {k}",
+        concat!(sink_it1!(), sink_it1!(), sink_it1!(), sink_it1!(), sink_it1!(), sink_it1!(), sink_it1!(), sink_it1!()),
+        "stp q16, q17, [{a}, #0]",
+        "stp q18, q19, [{a}, #32]",
+        "stp q20, q21, [{a}, #64]",
+        "stp q22, q23, [{a}, #96]",
+        "stp q24, q25, [{a}, #128]",
+        "stp q26, q27, [{a}, #160]",
+        "stp q28, q29, [{a}, #192]",
+        "stp q30, q31, [{a}, #224]",
+        $($rows46,)*
+        "mov {zp}, {z}",
+        "mov {kp}, {k}",
+        concat!(sink_it2!(), sink_it2!(), sink_it2!(), sink_it2!(), sink_it2!(), sink_it2!(), sink_it2!(), sink_it2!()),
+        "stp q16, q17, [{a}, #256]",
+        "stp q18, q19, [{a}, #288]",
+        "stp q20, q21, [{a}, #320]",
+        "stp q22, q23, [{a}, #352]",
+        "stp q24, q25, [{a}, #384]",
+        "stp q26, q27, [{a}, #416]",
+            a = in(reg) $acc,
+            z = in(reg) $z,
+            k = in(reg) $k,
+            xs4 = in(reg) 4 * XS,
+            ks = in(reg) KS,
+            xs1 = const XS,
+            xs2 = const 2 * XS,
+            xs3 = const 3 * XS,
+            zp = out(reg) _,
+            kp = out(reg) _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            options(nostack)
+        )
+    };
+}
+
+pub static SINK_UNROLL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_feature = "sve")]
+#[inline(never)]
+unsafe fn slot_sink8(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t) {
+    const XS: usize = N * 16;
+    const KS: usize = N * ROWS * LOCK * 2;
+    slot_sink8_body!(acc, z, k, ["ldp q20, q21, [{a}, #64]", "ldp q22, q23, [{a}, #96]", "ldp q24, q25, [{a}, #128]", "ldp q26, q27, [{a}, #160]", "ldp q28, q29, [{a}, #192]", "ldp q30, q31, [{a}, #224]"], ["ldp q16, q17, [{a}, #256]", "ldp q18, q19, [{a}, #288]", "ldp q20, q21, [{a}, #320]", "ldp q22, q23, [{a}, #352]", "ldp q24, q25, [{a}, #384]", "ldp q26, q27, [{a}, #416]"]);
+}
+
+#[cfg(target_feature = "sve")]
+#[inline(never)]
+unsafe fn slot_sink8_fresh(z: *const int16x8_t, k: *const i16, acc: *mut int64x2_t) {
+    const XS: usize = N * 16;
+    const KS: usize = N * ROWS * LOCK * 2;
+    slot_sink8_body!(acc, z, k, ["movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0", "movi v28.16b, #0", "movi v29.16b, #0", "movi v30.16b, #0", "movi v31.16b, #0"], ["movi v16.16b, #0", "movi v17.16b, #0", "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0", "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0", "movi v24.16b, #0", "movi v25.16b, #0", "movi v26.16b, #0", "movi v27.16b, #0"]);
+}
+
 /// `acc +=` the products of the first `groups` tiles of `xs` (transforms `8 g..8 g + 8` of tile
 /// `g`) with the key tiles at `keys` (`N ROWS LOCK` entries apart), every slot and row; the sums of
 /// [`dot`] per tile, in another order. A tile past the column's end has zero keys. With `FRESH` (a
@@ -591,8 +662,15 @@ unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16
     #[cfg(target_feature = "sve")]
     {
         let z = xs.as_ptr() as *const int16x8_t;
+        let unroll = groups == SINK && SINK_UNROLL.load(core::sync::atomic::Ordering::Relaxed);
         for s in 0..N {
-            if FRESH {
+            if unroll {
+                if FRESH {
+                    slot_sink8_fresh(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)));
+                } else {
+                    slot_sink8(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)));
+                }
+            } else if FRESH {
                 slot_sink_fresh(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
             } else {
                 slot_sink(z.add(s), keys.add(s * ROWS * LOCK), accp.add(idx(s, 0)), groups);
@@ -636,6 +714,9 @@ unsafe fn pass_words(words: &[(*const u8, usize); LANES], elements: usize, e: us
 /// element group, so this is `PF_T / 4` element groups (of four elements, eight columns) ahead,
 /// running into the next sweep's first elements at a sweep's end.
 const PF_T: usize = 16;
+pub static PFT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(16);
+pub static PFL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
 
 /// Prefetches the input words of transform `t` of a pass starting at element `e` (the lines
 /// [`pass_words`] would address: four consecutive 64-byte elements of two columns). The table
@@ -657,10 +738,6 @@ unsafe fn prefetch_words_l1(words: &[(*const u8, usize); LANES], e: usize, t: us
         );
     }
 }
-
-/// Transforms ahead whose input words are also requested into L1, in addition to the L2 request
-/// [`PF_T`] ahead (in-process A/B on the grader, diagnostic 422a97c9: about 0.5 ms per commitment).
-const PF_L1: usize = 4;
 
 #[inline(always)]
 unsafe fn prefetch_words(words: &[(*const u8, usize); LANES], e: usize, t: usize) {
@@ -954,6 +1031,26 @@ unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Ker
     super::pass_lut_loop(nib, x, kern);
 }
 
+/// Diagnostic: the table front schedule by variant (9..=12 other schedules, else the record's).
+#[cfg(target_feature = "sve")]
+#[inline(always)]
+unsafe fn lut_pass_v<const V: u8>(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
+    match V {
+        9 => super::pass_lut_loop_a(nib, x, kern),
+        10 => super::pass_lut_loop_b(nib, x, kern),
+        11 => super::pass_lut_loop_c(nib, x, kern),
+        12 => super::pass_lut_loop_d(nib, x, kern),
+        13 => super::pass_lut_loop_e(nib, x, kern),
+        _ => super::pass_lut_loop(nib, x, kern),
+    }
+}
+
+#[cfg(not(target_feature = "sve"))]
+#[inline(always)]
+unsafe fn lut_pass_v<const V: u8>(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
+    lut_pass(nib, x, kern)
+}
+
 /// Diagnostic only: side 1 of the paired test runs the table front as a 4-iteration loop.
 #[cfg(target_feature = "sve")]
 #[inline(always)]
@@ -999,7 +1096,11 @@ unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], ker
         1 => pass_tail(sc, x, kern),
         2 => pass_tail_calls(sc, x, kern),
         3 => pass_tail_calls_b(sc, x, kern),
-        _ => pass_tail_calls_c(sc, x, kern),
+        4 => pass_tail_calls_c(sc, x, kern),
+        5 => pass_tail_calls_e(sc, x, kern),
+        6 => pass_tail_calls_f(sc, x, kern),
+        7 | 9..=13 => pass_tail_calls_g(sc, x, kern),
+        _ => pass_tail_calls_h(sc, x, kern),
     }
 }
 
@@ -1104,11 +1205,15 @@ unsafe fn sums2<const V: u8>(
                     // the first batch and over the next ones for the second). A counter profile
                     // on Neoverse-V2 had 30% of the table's lines arriving late (L2 refills in
                     // the index packing, 41% of its cycles stalled).
-                    if i + PF_L1 < count {
-                        prefetch_words_l1(words[t], e, i + PF_L1);
+                    let pft = PFT.load(core::sync::atomic::Ordering::Relaxed);
+                    let pfl = PFL.load(core::sync::atomic::Ordering::Relaxed);
+                    if pfl != usize::MAX {
+                        let a1 = i + pfl;
+                        if a1 < count { prefetch_words_l1(words[t], e, a1); }
                     }
-                    let ahead = i + PF_T;
-                    if ahead < count {
+                    let ahead = i + pft;
+                    if pft == usize::MAX {
+                    } else if ahead < count {
                         prefetch_words(words[t], e, ahead);
                     } else if t == 0 {
                         prefetch_words(words[1], e, ahead - count);
@@ -1118,7 +1223,7 @@ unsafe fn sums2<const V: u8>(
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
-                    lut_pass2(nib, sc, kern);
+                    lut_pass_v::<V>(nib, sc, kern);
                     tail::<V>(sc, x, kern);
                 }
                 if e % CHUNK == 0 {
@@ -1249,7 +1354,7 @@ fn pin_worker(w: usize) {
 
 /// Levels 4 to 6 run as [`pass_tail_calls_c`] (`V = 4`). In this lane's in-process A/B on the
 /// official runner, the fused kernel measured about 3.9 ms per commitment under the two passes
-/// (`V = 0`, diagnostic `7074ae15`). This schedule (skew 20, live budget 29, register reserve 0, width 5, one load-store per cycle)
+/// (`V = 0`, diagnostic `7074ae15`). This schedule (skew 24, live budget 29, register reserve 0)
 /// measured another 1.0-2.8 ms under `pass_tail_calls_b` (`V = 3`, diagnostic `5ea44bbf`), with
 /// byte-identical output.
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
@@ -1765,7 +1870,7 @@ mod leap_bench {
             let x0 = a.clone();
             let mut want: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             unsafe { pass_c_asm(&mut a, kern); pass_d_out(&a, &mut want, kern); }
-            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c] {
+            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c, pass_tail_calls_e, pass_tail_calls_f, pass_tail_calls_g, pass_tail_calls_h] {
                 let mut got: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
                 unsafe { f(&x0, &mut got, kern); }
                 let w: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(want.as_ptr() as *const [i16; 8], N) };

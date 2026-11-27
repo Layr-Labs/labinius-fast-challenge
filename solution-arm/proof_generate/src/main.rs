@@ -1045,6 +1045,28 @@ mod tests {
     }
 
     /// The direct encoding is byte for byte bincode's under the proof codec.
+    /// Every levels 4-6 kernel and index-order variant of the SMS commitment writes the record
+    /// variant's bytes, on the edge shapes of [`sms_commit_matches_reference`].
+    #[test]
+    fn sms_commit_variants_match() {
+        use ntt::neon::sms;
+        let q = sms::MODULUS;
+        for (elements, cols) in [(301usize, 11usize), (5, 3), (229, 9), (241, 9), (256, 9), (385, 9), (800, 9)] {
+            let values: Vec<B128> = (0..cols).flat_map(|s| column(300 + s as u64)).take(cols * 4 * elements).collect();
+            let a = sms::matrix(elements, 3);
+            let len = cols * ntt::N * 5;
+            let mut want = vec![0u8; len];
+            sms::commit_v::<0>(&values, &a, 3, q, &mut want, false);
+            let mut got = vec![0u8; len];
+            macro_rules! check { ($($v:literal),*) => { $(
+                got.fill(0);
+                sms::commit_v::<$v>(&values, &a, 3, q, &mut got, false);
+                assert!(got == want, "variant {} at {elements} elements", $v);
+            )* } }
+            check!(1, 2, 3);
+        }
+    }
+
     /// The SMS commitment agrees with the schoolbook commitment at full size on random columns
     /// (its digit recombination is statistical: random witnesses), one and three workers.
     #[test]

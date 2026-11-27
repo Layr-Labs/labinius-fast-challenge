@@ -950,15 +950,14 @@ unsafe fn canonical(x: int16x8_t, p: i16) -> int16x8_t {
 /// so that the portable path builds and runs on AArch64 hosts without SVE.
 #[cfg(target_feature = "sve")]
 #[inline(always)]
-unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    super::pass_lut_loop(nib, x, kern);
+unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], _kern: &Kernel) {
+    super::weighted::pass_lut_weighted(nib, x);
 }
 
-/// Diagnostic only: side 1 of the paired test runs the table front as a 4-iteration loop.
 #[cfg(target_feature = "sve")]
 #[inline(always)]
-unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
-    super::pass_lut_loop(nib, x, kern)
+unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], _kern: &Kernel) {
+    super::weighted::pass_lut_weighted(nib, x)
 }
 
 #[cfg(not(target_feature = "sve"))]

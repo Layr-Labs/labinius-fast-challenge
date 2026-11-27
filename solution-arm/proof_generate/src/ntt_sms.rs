@@ -2039,3 +2039,20 @@ mod leap_bench {
         }
     }
 }
+
+#[path = "sweep_driver.rs"]
+mod sweep_driver;
+#[path = "sweep_whole.rs"]
+mod sweep_whole;
+#[path = "sweep_half.rs"]
+mod sweep_half;
+
+pub fn sweep_compare(v: u8, values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
+    match v {
+        4 => commit_v::<17>(values, a, workers, q, out, false),
+        0 => sweep_driver::commit_v::<17>(values, a, workers, q, out, false),
+        128 => sweep_whole::commit_v::<17>(values, a, workers, q, out, false),
+        32 => sweep_half::commit_v::<17>(values, a, workers, q, out, false),
+        _ => unreachable!("unregistered sweep variant"),
+    }
+}

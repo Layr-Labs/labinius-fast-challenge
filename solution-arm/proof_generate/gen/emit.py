@@ -94,12 +94,12 @@ pub unsafe fn pass_d_out(x: &[int16x8_t; N], y: &mut [int16x8_t; N], kern: &Kern
     );
 }}
 """
-def pass_lut_loop(per=27, K=8, B=23, width=6, ls=1):
-    body = gen_lut.emit_loop(per, K, B, width, ls, cap=23)
+def pass_lut_loop(per=27, K=6, B=23, width=6, ls=1, cap=20):
+    body = gen_lut.emit_loop(per, K, B, width, ls, cap=cap)
     bases = '\n'.join(f'        i{m} = in(reg) (idx.as_ptr() as *const u8).add({64 + 128 * m}),' for m in sorted(gen_lut.BASES))
     return f"""/// [`pass_lut_asm`] as a 4-iteration loop over the level-3 nodes (the same per-node operations;
 /// nodes differ only in the table and output bases), ~5 KB of code instead of ~19 KB. Rescheduled
-/// with the five table registers the one-register lookups free (live budget 23, skew 8).
+/// with the five table registers the one-register lookups free (live budget 23, register cap 20, skew 6).
 #[inline(never)]
 pub unsafe fn pass_lut_loop(idx: &[uint8x16_t; GROUPS], x: &mut [int16x8_t; N], kern: &Kernel) {{
     core::arch::asm!(

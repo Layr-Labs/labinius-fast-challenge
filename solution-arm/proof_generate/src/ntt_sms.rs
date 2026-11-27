@@ -645,6 +645,24 @@ const PF_T: usize = 16;
 /// commit lap with and without it (234-235 ms against 233-234): the table stream does not stall
 /// there, so this is neutral, kept as the measured variant.
 #[inline(always)]
+unsafe fn prefetch_words_l1(words: &[(*const u8, usize); LANES], e: usize, t: usize) {
+    let (h, q) = (t / 4, t % 4);
+    for l in 0..2 {
+        let (w, stride) = words[2 * q + l];
+        let p = w.wrapping_add((e + 4 * h) * stride);
+        core::arch::asm!(
+            "prfm pldl1keep, [{p}]", "prfm pldl1keep, [{p}, #64]",
+            "prfm pldl1keep, [{p}, #128]", "prfm pldl1keep, [{p}, #192]",
+            p = in(reg) p, options(nostack, preserves_flags, readonly)
+        );
+    }
+}
+
+/// Transforms ahead whose input words are also requested into L1, in addition to the L2 request
+/// [`PF_T`] ahead (in-process A/B on the grader, diagnostic 422a97c9: about 0.5 ms per commitment).
+const PF_L1: usize = 4;
+
+#[inline(always)]
 unsafe fn prefetch_words(words: &[(*const u8, usize); LANES], e: usize, t: usize) {
     let (h, q) = (t / 4, t % 4);
     for l in 0..2 {
@@ -1086,6 +1104,9 @@ unsafe fn sums2<const V: u8>(
                     // the first batch and over the next ones for the second). A counter profile
                     // on Neoverse-V2 had 30% of the table's lines arriving late (L2 refills in
                     // the index packing, 41% of its cycles stalled).
+                    if i + PF_L1 < count {
+                        prefetch_words_l1(words[t], e, i + PF_L1);
+                    }
                     let ahead = i + PF_T;
                     if ahead < count {
                         prefetch_words(words[t], e, ahead);

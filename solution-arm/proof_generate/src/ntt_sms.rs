@@ -660,7 +660,7 @@ unsafe fn prefetch_words_l1(words: &[(*const u8, usize); LANES], e: usize, t: us
 
 /// Transforms ahead whose input words are also requested into L1, in addition to the L2 request
 /// [`PF_T`] ahead (in-process A/B on the grader, diagnostic 422a97c9: about 0.5 ms per commitment).
-const PF_L1: usize = 4;
+const PF_L1: usize = 5;
 
 #[inline(always)]
 unsafe fn prefetch_words(words: &[(*const u8, usize); LANES], e: usize, t: usize) {

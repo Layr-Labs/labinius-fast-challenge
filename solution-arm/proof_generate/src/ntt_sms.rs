@@ -379,11 +379,8 @@ pub fn matrix(elements: usize, workers: usize) -> SmsMatrix {
                 }
                 super::transform_general(PB, lanes);
                 for (j, l) in lanes.iter().enumerate() {
-                    // The weighted witness front multiplies this quarter by its
-                    // public scale. Cancel it on all transformed key rows.
-                    let scale = KEY_SCALE * super::weighted::QUARTER_INVERSE[j / (N / 4)];
                     for e in 0..here {
-                        batch[(j * ROWS + r) * LOCK + e] = -centered(l[e] as i64 * scale, p);
+                        batch[(j * ROWS + r) * LOCK + e] = -centered(l[e] as i64 * KEY_SCALE, p);
                     }
                 }
             }
@@ -1063,8 +1060,18 @@ unsafe fn lut_pass2(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Ke
 
 #[cfg(not(target_feature = "sve"))]
 #[inline(always)]
-unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], _kern: &Kernel) {
-    super::weighted::pass_lut_weighted_neon(nib, x);
+unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
+    // `indices` writes the packed byte layout the SVE `ld1b` consumer reads; expand each
+    // slot's eight bytes to the `(2 v, 2 v + 1)` byte pairs `pass_lut`'s `vqtbl2q_u8` indexes.
+    let bytes = core::slice::from_raw_parts(nib.as_ptr() as *const u8, 16 * (N / 4));
+    let mut idx = [vdupq_n_u8(0); N / 4];
+    for (s, slot) in idx.iter_mut().enumerate() {
+        let v = vld1_u8(bytes.as_ptr().add(super::packed_slot(s)));
+        let lo = vshl_n_u8::<1>(v);
+        let hi = vorr_u8(lo, vdup_n_u8(1));
+        *slot = vzip1q_u8(vcombine_u8(lo, lo), vcombine_u8(hi, hi));
+    }
+    super::pass_lut::<PB>(&idx, x, kern);
 }
 
 /// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
@@ -1942,8 +1949,8 @@ mod leap_bench {
         }
     }
 
-    /// The unscaled fused tails match the standalone passes on arbitrary halfwords.
-    /// The scaled tail is tested on its legal front outputs in `weighted_lut_matches_scalar`.
+    /// The fused levels 4-6 (both forms) write what `pass_c_asm` then `pass_d_out` write, on
+    /// arbitrary `i16` inputs (every instruction wraps or saturates the same way in both).
     #[test]
     fn pass_tail_matches() {
         let kern = &kernels()[PB];
@@ -1959,7 +1966,7 @@ mod leap_bench {
             let x0 = a.clone();
             let mut want: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             unsafe { pass_c_asm(&mut a, kern); pass_d_out(&a, &mut want, kern); }
-            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b] {
+            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c] {
                 let mut got: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
                 unsafe { f(&x0, &mut got, kern); }
                 let w: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(want.as_ptr() as *const [i16; 8], N) };

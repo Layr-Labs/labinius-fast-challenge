@@ -259,7 +259,7 @@ impl Output {
 }
 impl Drop for Output { fn drop(&mut self) { self.quiesce(); } }
 
-fn encode_vec(p: &ProofParts) -> Vec<u8> {
+pub(super) fn encode_vec(p: &ProofParts) -> Vec<u8> {
     let layout = Layout::parts(p);
     let mut bytes = vec![0; layout.len()];
     unsafe { encode_into(p, layout, bytes.as_mut_ptr()); }

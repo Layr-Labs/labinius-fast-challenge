@@ -2397,3 +2397,8 @@ mod indices_asm_tests {
 
 #[path = "ntt_neon_weighted.rs"]
 mod weighted;
+
+#[cfg(not(test))]
+#[allow(dead_code, unused_imports)]
+#[path = "sms_sat84.rs"]
+pub(crate) mod sms_sat84;

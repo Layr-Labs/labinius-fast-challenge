@@ -826,3 +826,28 @@ pub mod tests {
         }
     }
 }
+
+#[cfg(all(target_arch = "aarch64", not(test)))]
+#[allow(dead_code, unused_imports)]
+#[path = "forward_keep10_neon.rs"]
+pub(crate) mod forward_keep10;
+
+#[cfg(all(target_arch = "aarch64", not(test)))]
+#[allow(dead_code, unused_imports)]
+#[path = "forward_all6_neon.rs"]
+pub(crate) mod forward_all6;
+
+#[cfg(all(target_arch = "aarch64", not(test)))]
+#[allow(dead_code, unused_imports)]
+#[path = "forward_exact_even_neon.rs"]
+pub(crate) mod forward_exact_even;
+
+#[cfg(all(target_arch = "aarch64", not(test)))]
+#[allow(dead_code, unused_imports)]
+#[path = "forward_local_sticky_neon.rs"]
+pub(crate) mod forward_local_sticky;
+
+#[cfg(all(target_arch = "aarch64", not(test)))]
+#[allow(dead_code, unused_imports)]
+#[path = "forward_local_strict_neon.rs"]
+pub(crate) mod forward_local_strict;

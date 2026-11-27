@@ -1562,13 +1562,19 @@ mod tests {
         pass_lut::<1>(idx, x, kern);
     }
 
-    /// `u16` slot indices ([`nibbles`]' format; high bytes must be zero) in the packed byte
+    /// [`nibbles`] indices (SVE halfwords or validated NEON byte pairs) in the packed byte
     /// layout of [`packed_slot`].
     pub(crate) fn pack(idx: &[uint8x16_t; GROUPS]) -> Box<[uint8x16_t; GROUPS]> {
         let src: &[[u16; 8]; GROUPS] = unsafe { &*(idx as *const _ as *const [[u16; 8]; GROUPS]) };
         let mut out = [0u8; 16 * GROUPS];
         for (s, v) in src.iter().enumerate() {
             for (c, &x) in v.iter().enumerate() {
+                #[cfg(not(target_feature = "sve"))]
+                let x = {
+                    let (lo, hi) = (x as u8, (x >> 8) as u8);
+                    assert!(lo <= 30 && lo % 2 == 0 && hi == lo + 1, "slot {s} lane {c}: {x} is not a nibble byte pair");
+                    (lo / 2) as u16
+                };
                 assert!(x < 256, "slot {s} lane {c}: {x} does not fit a byte");
                 out[packed_slot(s) + c] = x as u8;
             }

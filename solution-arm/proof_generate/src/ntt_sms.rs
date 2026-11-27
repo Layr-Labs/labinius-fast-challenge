@@ -632,6 +632,20 @@ unsafe fn pass_words(words: &[(*const u8, usize); LANES], elements: usize, e: us
     })
 }
 
+/// The full sweep uses two input bases. Partial columns and short sweeps retain the
+/// independent-lane kernel, including its zero words for missing elements.
+#[inline(always)]
+unsafe fn pass_indices(words: &[(*const u8, usize); LANES], elements: usize, e: usize, t: usize, full: bool, nib: &mut [uint8x16_t; N / 4]) {
+    if full {
+        let element = e + 4 * (t / 4);
+        let q = 2 * (t % 4);
+        super::idx::indices_contiguous(words[q].0.add(element * 64), words[q + 1].0.add(element * 64), nib);
+    } else {
+        let at = pass_words(words, elements, e, t);
+        indices_asm(&at, nib);
+    }
+}
+
 /// Transforms ahead whose input words [`prefetch_words`] requests (into L2): four transforms span one
 /// element group, so this is `PF_T / 4` element groups (of four elements, eight columns) ahead,
 /// running into the next sweep's first elements at a sweep's end.
@@ -1073,6 +1087,7 @@ unsafe fn sums2<const V: u8>(
     dev16: [&mut [int16x8_t]; 2],
 ) {
     let kern = &kernels()[PB];
+    let contiguous = words.map(|w| w.iter().all(|&(_, stride)| stride == 64));
     let mut dev16 = dev16;
     for sums in dev16.iter_mut() {
         sums.fill(vdupq_n_s16(0));
@@ -1098,6 +1113,7 @@ unsafe fn sums2<const V: u8>(
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             for t in 0..2 {
                 let count = groups * LOCK;
+                let full = contiguous[t] && e + count <= a.elements;
                 for i in 0..count {
                     // The input words [`PF_T`] transforms on: later in this sweep, or the start of
                     // the sweep that follows it (the other batch's, over the same elements for
@@ -1115,8 +1131,7 @@ unsafe fn sums2<const V: u8>(
                     } else {
                         prefetch_words(words[0], e + l, ahead - count);
                     }
-                    let at = pass_words(words[t], a.elements, e, i);
-                    indices_asm(&at, nib);
+                    pass_indices(words[t], a.elements, e, i, full, nib);
                     let x = &mut xs[i];
                     lut_pass2(nib, sc, kern);
                     tail::<V>(sc, x, kern);
@@ -1432,6 +1447,37 @@ mod chunk_bench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both index paths match the independent Rust builder. Exact-sized columns expose
+    /// short tails; padded lanes and transforms on each side of a four-element group are checked.
+    #[test]
+    fn contiguous_indices_match_independent_lanes() {
+        let mut state = 71u64;
+        let mut got = Box::new([unsafe { vdupq_n_u8(0) }; N / 4]);
+        let mut want = got.clone();
+        for elements in [1usize, 2, 3, 4, 5, 7, 8, 9, 63, 64, 65, 383, 384, 385, 4096] {
+            let raw: Vec<u64> = (0..LANES * elements * 8).map(|_| crate::ntt::tests::xorshift(&mut state)).collect();
+            for here in [0usize, 1, 3, 7, 8] {
+                let words: [(*const u8, usize); LANES] = core::array::from_fn(|c| {
+                    if c < here { (raw[c * elements * 8..].as_ptr() as *const u8, 64) }
+                    else { (ZERO_WORDS.as_ptr() as *const u8, 0) }
+                });
+                for e in (0..elements).step_by(SWEEP) {
+                    let count = SWEEP.min(elements - e).div_ceil(LOCK) * LOCK;
+                    let full = here == LANES && e + count <= elements;
+                    for t in 0..count {
+                        unsafe {
+                            let ptrs = pass_words(&words, elements, e, t);
+                            indices(&ptrs, &mut want);
+                            pass_indices(&words, elements, e, t, full, &mut got);
+                            let bytes = |v: &[uint8x16_t; N / 4]| core::slice::from_raw_parts(v.as_ptr() as *const u8, N * 4);
+                            assert_eq!(bytes(&got), bytes(&want), "elements={elements} columns={here} e={e} t={t}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// [`narrow_digits`] is congruent to the sum and within `p`, on the extremes of a chunk's sums
     /// (`+-CHUNK PRODUCT`), small and boundary values, and random values in range.

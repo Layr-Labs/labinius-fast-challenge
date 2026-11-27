@@ -590,13 +590,16 @@ pub(super) fn partial_evals_sets_tiled(
             for x in 0..count {
                 combinations(tile.as_ptr().add(GROUP * x), &mut tabs[x]);
             }
-            let next = base + GROUP * PASS < end;
             for (q, sum) in sums.iter_mut().enumerate() {
-                // This block's next tile into L2: 64 blocks 4 MiB apart, 1 KiB each per tile, are more
-                // streams than the hardware prefetchers follow.
-                let row = words.as_ptr().add(q * stride + base) as *const u8;
-                if next {
-                    prefetch_l2(row.add(16 * GROUP * PASS), 16 * GROUP * PASS);
+                // Block `q + 2`'s current tile into L2 (past the last block, the next tile of block
+                // `q + 2 - blocks`). The blocks sit a power of two apart, and on 2 MiB pages each
+                // tile offset of every block maps to the same L2 sets: a whole next tile of every
+                // block cannot stay in their eight ways until it is used, two blocks ahead can.
+                // Measured on the grader in one process (diagnostic 99d228aa): 13.7-13.9 ms per
+                // pass against 14.1-15.2 for the next-tile prefetch and 15.6 for none.
+                let (ahead, at) = if q + 2 < blocks { (q + 2, base) } else { (q + 2 - blocks, base + GROUP * PASS) };
+                if ahead < blocks && ahead != q && at + GROUP * PASS <= end {
+                    prefetch_l2(words.as_ptr().wrapping_add(ahead * stride + at) as *const u8, 16 * GROUP * PASS);
                 }
                 for x in 0..count {
                     patterns(words.as_ptr().add(q * stride + base + GROUP * x), &mut pats[x]);
@@ -662,14 +665,14 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
     let mut scratch = vec![[[z; 6]; 2]; PAIRS];
     for first in (0..len).step_by(2 * PAIRS) {
         let pairs = ((len - first) / 2).min(PAIRS);
-        let next = first + 2 * PAIRS < len;
         for (group, ws) in wk.chunks(8).enumerate() {
-            // This group's rows of the next chunk into L2.
+            // The first eight lines of this group's rows; the step loop then keeps eight lines
+            // ahead within the same rows. Prefetching each group's rows of the next chunk instead
+            // (the eight rows of every group share their L2 sets on 2 MiB pages) measured 4.9-5.3 ms
+            // per pass on the grader against 4.47-4.49 for this (diagnostic 99d228aa).
             for g in 0..ws.len() {
                 let row = words.as_ptr().add((8 * group + g) * stride + start + first) as *const u8;
-                if next {
-                    prefetch_l2(row.wrapping_add(64 * PAIRS), 64 * PAIRS);
-                }
+                prefetch_l2(row, 64 * 8.min(pairs.div_ceil(2)));
             }
             // Two pairs (one 64-byte line of each row) per step: the eight rows of a group sit 4 MiB
             // apart, so their lines share one L1 set; reading a line once instead of once per pair
@@ -681,6 +684,9 @@ pub(super) unsafe fn materialize_prefix(words: &[B128], weights: &[F162], start:
                 for (g, w) in ws.iter().enumerate() {
                     let q = 8 * group + g;
                     let row = words.as_ptr().add(q * stride + start + first + 2 * i) as *const u64;
+                    if i + 2 * 8 + 2 <= pairs {
+                        core::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) (row as *const u8).wrapping_add(64 * 8), options(nostack, preserves_flags, readonly));
+                    }
                     mat_step(&mut a, w, vld2q_u64(row));
                     mat_step(&mut b, w, vld2q_u64(row.add(4)));
                 }

@@ -894,9 +894,53 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
     (partials, rounds, coords, opened)
 }
 
+/// Diagnostic: the commit variants of `sms::commit_v` timed back to back in this process, each
+/// into its own pre-faulted buffer, every output asserted equal to the first; one stderr line.
+#[cfg(target_arch = "aarch64")]
+fn diag_commit(values: &[B128], modulus: u128, len: usize) {
+    use ntt::neon::sms;
+    if modulus != sms::MODULUS {
+        return;
+    }
+    let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
+        .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+    const ORDER: [u32; 21] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
+    let mut reference: Option<Vec<u8>> = None;
+    let mut line = String::from("diag commit_v");
+    // `LABINIUS_DIAG_ONCE` (development only; the sandbox clears the environment): each variant once
+    let once = std::env::var_os("LABINIUS_DIAG_ONCE").is_some();
+    for &v in ORDER.iter().take(if once { 10 } else { ORDER.len() }) {
+        let mut out = vec![1u8; len];
+        let t = std::time::Instant::now();
+        let w = threads();
+        match v {
+            0 => sms::commit_v::<0>(values, &matrix, w, modulus, &mut out, false),
+            1 => sms::commit_v::<1>(values, &matrix, w, modulus, &mut out, false),
+            2 => sms::commit_v::<2>(values, &matrix, w, modulus, &mut out, false),
+            3 => sms::commit_v::<3>(values, &matrix, w, modulus, &mut out, false),
+            4 => sms::commit_v::<4>(values, &matrix, w, modulus, &mut out, false),
+            5 => sms::commit_v::<5>(values, &matrix, w, modulus, &mut out, false),
+            6 => sms::commit_v::<6>(values, &matrix, w, modulus, &mut out, false),
+            7 => sms::commit_v::<7>(values, &matrix, w, modulus, &mut out, false),
+            8 => sms::commit_v::<8>(values, &matrix, w, modulus, &mut out, false),
+            9 => sms::commit_v::<9>(values, &matrix, w, modulus, &mut out, false),
+            _ => unreachable!(),
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let same = reference.as_ref().map_or(true, |r| r == &out);
+        line += &format!(" v{v}={ms:.3}{}", if same { "" } else { "!MISMATCH" });
+        if reference.is_none() {
+            reference = Some(out);
+        }
+    }
+    eprintln!("{line}");
+}
+
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
     let mut commitment = output.commitment_buffer();
+    #[cfg(target_arch = "aarch64")]
+    diag_commit(values, modulus, commitment.len());
     commit(values, modulus, &mut commitment);
     labinius::par::pool();
     timer.lap("commit");

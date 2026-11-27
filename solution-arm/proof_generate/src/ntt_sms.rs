@@ -967,8 +967,25 @@ unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Ker
 
 /// The batch's pass: each chunk's digit sums inverted to canonical coefficients, handed to
 /// `chunk(c, d, coefficients)`; on return `y` holds the base row's coefficients.
+/// Levels 4 to 6 of one transform, from the scratch `sc` into the sweep buffer slot `x`:
+/// `V = 0` the two passes [`pass_c_asm`] and [`pass_d_out`]; otherwise the fused per-node kernel
+/// ([`pass_tail`] straight-line for `V = 1`, [`pass_tail_calls`] for `V = 2`, its other schedule
+/// [`pass_tail_calls_b`] for `V = 3`). The same values.
+#[inline(always)]
+unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], kern: &Kernel) {
+    match V {
+        0 => {
+            pass_c_asm(sc, kern);
+            pass_d_out(sc, x, kern);
+        }
+        1 => pass_tail(sc, x, kern),
+        2 => pass_tail_calls(sc, x, kern),
+        _ => pass_tail_calls_b(sc, x, kern),
+    }
+}
+
 #[inline(never)]
-unsafe fn sums(
+unsafe fn sums<const V: u8>(
     words: &[(*const u8, usize); LANES],
     a: &SmsMatrix,
     m: &mut [int16x8_t; BITS],
@@ -997,8 +1014,7 @@ unsafe fn sums(
                 indices_asm(&at, nib);
                 let x = &mut xs[i];
                 lut_pass(nib, sc, kern);
-                pass_c_asm(sc, kern);
-                pass_d_out(sc, x, kern);
+                tail::<V>(sc, x, kern);
             }
             let keys = a.data.as_ptr().add(e / LOCK * N * ROWS * LOCK);
             // the chunk's first sweep starts the digit rows' sums afresh
@@ -1026,7 +1042,7 @@ unsafe fn sums(
 /// ce686fcc): per sweep, batch A's transforms into `xs` and their sink, then batch B's into the
 /// same `xs` and their sink against the same key lines, which are then still cached.
 #[inline(never)]
-unsafe fn sums2(
+unsafe fn sums2<const V: u8>(
     words: [&[(*const u8, usize); LANES]; 2],
     a: &SmsMatrix,
     nib: &mut [uint8x16_t; N / 4],
@@ -1081,8 +1097,7 @@ unsafe fn sums2(
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
                     lut_pass2(nib, sc, kern);
-                    pass_c_asm(sc, kern);
-                    pass_d_out(sc, x, kern);
+                    tail::<V>(sc, x, kern);
                 }
                 if e % CHUNK == 0 {
                     sink::<true>(xs, keys, accs[t], groups);
@@ -1211,6 +1226,12 @@ fn pin_worker(w: usize) {
 }
 
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
+    commit_v::<0>(values, a, workers, q, out, true)
+}
+
+/// [`commit`] with levels 4 to 6 by [`tail`]`::<V>` (the same output for every `V`); `hook`
+/// runs [`BETWEEN`] between batch pairs.
+pub fn commit_v<const V: u8>(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8], hook: bool) {
     let len = 4 * a.elements;
     assert_eq!(values.len() % len, 0);
     let columns = values.len() / len;
@@ -1247,9 +1268,9 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     dev2.fill(vdupq_n_s32(0));
                     let (w0, w1) = (batch_words(b), batch_words(b + 1));
                     let [d16a, d16b] = dev16;
-                    sums2([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
+                    sums2::<V>([&w0, &w1], a, nib, xs, sc, [&mut acc[..], &mut acc2[..]], [&mut *y, &mut *y2], [&mut dev[..], &mut dev2[..]], [&mut d16a[..], &mut d16b[..]]);
                 } else {
-                    sums(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
+                    sums::<V>(&batch_words(b), a, m, nib, xs, sc, acc, y, dev);
                 }
             } else {
                 core::mem::swap(dev, dev2);
@@ -1303,7 +1324,7 @@ pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut
                     slot[4] = (v >> 32) as u8;
                 }
             }
-            if b % 2 == 1 {
+            if b % 2 == 1 && hook {
                 if let Some(between) = BETWEEN.get() {
                     between(first * workers / columns, (b + 1) / 2);
                 }
@@ -1697,6 +1718,33 @@ mod leap_bench {
             let x: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(a.as_ptr() as *const [i16; 8], N) };
             let y: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(b.as_ptr() as *const [i16; 8], N) };
             assert_eq!(x, y);
+        }
+    }
+
+    /// The fused levels 4-6 (both forms) write what `pass_c_asm` then `pass_d_out` write, on
+    /// arbitrary `i16` inputs (every instruction wraps or saturates the same way in both).
+    #[test]
+    fn pass_tail_matches() {
+        let kern = &kernels()[PB];
+        let mut st = 19u64;
+        for case in 0..60 {
+            let raw: Vec<i16> = (0..N * 8).map(|_| crate::ntt::tests::xorshift(&mut st) as i16).collect();
+            let mut a: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            for (i, v) in a.iter_mut().enumerate() {
+                // half the cases within the table front's output bound, half arbitrary
+                let w = unsafe { vld1q_s16(raw.as_ptr().add(8 * i)) };
+                *v = if case % 2 == 0 { unsafe { vshrq_n_s16::<1>(w) } } else { w };
+            }
+            let x0 = a.clone();
+            let mut want: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+            unsafe { pass_c_asm(&mut a, kern); pass_d_out(&a, &mut want, kern); }
+            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b] {
+                let mut got: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
+                unsafe { f(&x0, &mut got, kern); }
+                let w: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(want.as_ptr() as *const [i16; 8], N) };
+                let g: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(got.as_ptr() as *const [i16; 8], N) };
+                assert_eq!(w, g, "case {case}");
+            }
         }
     }
 

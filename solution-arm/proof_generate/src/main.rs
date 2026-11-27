@@ -894,9 +894,53 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
     (partials, rounds, coords, opened)
 }
 
+/// DIAGNOSTIC: the whole SMS commitment with each levels 4-6 kernel ([`ntt::neon::sms::commit_v`]),
+/// into private pre-faulted buffers, in rounds `0 1 2 3` (then a closing `0`), wall ms per
+/// commitment on stderr; every output is compared with variant 0's. The proof is made afterwards
+/// by the record path, so it is the record's.
+#[cfg(target_arch = "aarch64")]
+fn diag_commit(values: &[B128], modulus: u128, len: usize) {
+    use ntt::neon::sms;
+    const V: usize = 4;
+    let matrix = sms::SmsMatrix::from_images(&SMS_DATA.0, &SMS_MEANS.0, &SMS_MU.0, &SMS_META.0, &SMS_DIGITS.0, &SMS_MEAN_INT.0, &SMS_THRESHOLD.0, RING_ELEMENTS)
+        .unwrap_or_else(|| sms::matrix(RING_ELEMENTS, threads()));
+    let mut bufs: Vec<Vec<u8>> = (0..V).map(|_| vec![1u8; len]).collect();
+    let rounds = if std::env::var_os("LABINIUS_DIAG_ONCE").is_some() { 1 } else { 5 };
+    let mut order: Vec<usize> = (0..rounds).flat_map(|_| 0..V).collect();
+    order.push(0);
+    let mut ms: Vec<Vec<f64>> = vec![Vec::new(); V];
+    for &v in &order {
+        let buf = &mut bufs[v];
+        let start = std::time::Instant::now();
+        match v {
+            0 => sms::commit_v::<0>(values, &matrix, threads(), modulus, buf, false),
+            1 => sms::commit_v::<1>(values, &matrix, threads(), modulus, buf, false),
+            2 => sms::commit_v::<2>(values, &matrix, threads(), modulus, buf, false),
+            _ => sms::commit_v::<3>(values, &matrix, threads(), modulus, buf, false),
+        }
+        ms[v].push(start.elapsed().as_secs_f64() * 1e3);
+    }
+    let mut line = String::from("diag commit_v");
+    for (v, t) in ms.iter().enumerate() {
+        let list: Vec<String> = t.iter().map(|x| format!("{x:.2}")).collect();
+        let mut sorted = t.clone();
+        sorted.sort_by(f64::total_cmp);
+        line += &format!(" v{v}=[{}] med{v}={:.2}", list.join(","), sorted[sorted.len() / 2]);
+        if bufs[v] != bufs[0] {
+            line += &format!(" !MISMATCH{v}");
+        }
+    }
+    eprintln!("{line}");
+}
+
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
     let mut commitment = output.commitment_buffer();
+    #[cfg(target_arch = "aarch64")]
+    if modulus == ntt::neon::sms::MODULUS {
+        diag_commit(values, modulus, commitment.len());
+        timer.lap("diag");
+    }
     commit(values, modulus, &mut commitment);
     labinius::par::pool();
     timer.lap("commit");

@@ -45,6 +45,12 @@ pub struct Kernel {
     c: [[i16; 16]; 24],
     /// Level 6, per two level-5 nodes: their radix-3 pairs.
     d: [[i16; 8]; 108],
+    /// [`pass_tail`]'s per-node constant vector: `k` with node `n`'s level-4 pair (`c[n][..4]`)
+    /// in lanes 4..8.
+    kc: [[i16; 8]; 24],
+    /// [`pass_tail`]'s level-6 pairs per level-3 node: those of its nine level-5 children
+    /// `9 n + m` at `t6[n][m / 2]`, lanes `4 (m % 2)..`, the pairs of `d` laid out per node.
+    t6: [[[i16; 8]; 5]; 24],
     /// `round(2^31 / p)` for the reduction of the `i32` sums.
     v32: i32,
     /// Levels 0 to 2 and the level-3 twiddles of the binary transform as nibble tables
@@ -102,6 +108,16 @@ impl Kernel {
             slot[..4].copy_from_slice(&r3(plan.exps[5][2 * q]));
             slot[4..].copy_from_slice(&r3(plan.exps[5][2 * q + 1]));
         }
+        let mut kc = [[0i16; 8]; 24];
+        let mut t6 = [[[0i16; 8]; 5]; 24];
+        for n in 0..24 {
+            kc[n][..4].copy_from_slice(&k[..4]);
+            kc[n][4..].copy_from_slice(&cc[n][..4]);
+            for m in 0..9 {
+                let q = 9 * n + m;
+                t6[n][m / 2][4 * (m % 2)..4 * (m % 2) + 4].copy_from_slice(&d[q / 2][4 * (q % 2)..4 * (q % 2) + 4]);
+            }
+        }
         let mut lut = [[[0i16; 16]; 6]; 4];
         for (n, tables) in lut.iter_mut().enumerate() {
             let tau = plan.root(plan.exps[1][n] as usize / 2);
@@ -135,6 +151,8 @@ impl Kernel {
             b,
             c: cc,
             d,
+            kc,
+            t6,
             v32: ((1u64 << 32) / p as u64).div_ceil(2) as i32,
             lut,
         }
@@ -810,7 +828,7 @@ mod asm;
 #[path = "ntt_neon_idx.rs"]
 mod idx;
 pub use idx::indices_asm;
-pub use asm::{pass_c_asm, pass_d_asm, pass_d_out, pass_lut_asm, pass_lut_loop};
+pub use asm::{pass_c_asm, pass_d_asm, pass_d_out, pass_lut_asm, pass_lut_loop, pass_tail, pass_tail_calls, pass_tail_calls_b};
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].

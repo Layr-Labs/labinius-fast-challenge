@@ -375,7 +375,7 @@ mod tests {
         let map = OnceLock::new();
         if force_write { assert!(map.set(None).is_ok()); }
         Output {
-            state: Arc::new(State { path: path.to_owned(), layout, map }),
+            state: Arc::new(State { path: path.to_owned(), claimed: (0..layout.len().div_ceil(CHUNK)).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(), layout, map }),
             setup: Mutex::new(None),
             populate: OnceLock::new(),
             commitment: Mutex::new(None),

@@ -1856,9 +1856,16 @@ mod bitsliced {
     /// counter of the trees' weight-64 carries; every seventh chunk that counter is added into
     /// the nine upper counter bits in memory. The `pos` entries add their planes, the `neg`
     /// entries their complements (leaf full adders by [`csa_neg`]).
+    ///
+    /// `top` bounds the counters: no lane's count, before or after this call, exceeds
+    /// `2^(top + 1) - 1` (every entry adds at most one per lane, so the number of entries the
+    /// counters have taken since they were zeroed, this call's included, gives it). Counter bits
+    /// above `top` are then zero throughout and the carry out of bit `top` is zero, so a flush
+    /// ripples through bits `9..=top` only (all of them for `top >= BITS - 1`).
     #[target_feature(enable = "avx512f")]
     #[inline(never)]
-    unsafe fn accumulate_pair(planes: *const __m512i, pos: &[u16], neg: &[u16], acc: *mut __m512i) {
+    unsafe fn accumulate_pair(planes: *const __m512i, pos: &[u16], neg: &[u16], acc: *mut __m512i, top: usize) {
+        let top = top.min(BITS - 1);
         let planes = planes as *const u64;
         let (even, odd) = (acc, acc.add(BITS));
         let mut s0: [__m512i; 6] = core::array::from_fn(|b| _mm512_load_si512(even.add(b)));
@@ -1884,14 +1891,18 @@ mod bitsliced {
                 let x = _mm512_ternarylogic_epi64::<0x96>(m8, $h[2], carry);
                 _mm512_store_si512(p, x);
                 carry = _mm512_ternarylogic_epi64::<0xb2>($h[2], x, carry);
-                for b in 9..BITS - 1 {
-                    let p = $slot.add(b);
-                    let old = _mm512_load_si512(p);
-                    _mm512_store_si512(p, _mm512_xor_si512(old, carry));
-                    carry = _mm512_and_si512(old, carry);
+                // Bits above `top` stay zero (see `top`): the ripple ends at bit `top`, whose
+                // carry out is zero, and for `top <= 8` the carry out of bit 8 is.
+                if top > 8 {
+                    for b in 9..top {
+                        let p = $slot.add(b);
+                        let old = _mm512_load_si512(p);
+                        _mm512_store_si512(p, _mm512_xor_si512(old, carry));
+                        carry = _mm512_and_si512(old, carry);
+                    }
+                    let p = $slot.add(top);
+                    _mm512_store_si512(p, _mm512_xor_si512(_mm512_load_si512(p), carry));
                 }
-                let p = $slot.add(BITS - 1);
-                _mm512_store_si512(p, _mm512_xor_si512(_mm512_load_si512(p), carry));
             }};
         }
         let mut t: *const u16;
@@ -2024,6 +2035,12 @@ mod bitsliced {
             _mm512_store_si512(even.add(b), s0[b]);
             _mm512_store_si512(odd.add(b), s1[b]);
         }
+    }
+
+    /// The highest bit of a count of at most `n` (0 for `n <= 1`): [`accumulate_pair`]'s `top`.
+    #[inline(always)]
+    fn top_bit(n: usize) -> usize {
+        (usize::BITS - 1 - n.max(1).leading_zeros()) as usize
     }
 
     /// Inverse bit transpose to 512 ordinary 16-bit lane counts.
@@ -2344,6 +2361,7 @@ mod bitsliced {
             for p in 0..2 * PAIRS * BITS {
                 _mm512_store_si512(acc.as_mut_ptr().add(p), zero);
             }
+            let mut taken = [0usize; PAIRS];
             let range = cuts[part]..cuts[part + 1];
             for gi in range.clone() {
                 let group = &groups[gi];
@@ -2367,11 +2385,15 @@ mod bitsliced {
                 #[cfg(test)]
                 let start = profile.then(std::time::Instant::now);
                 for q in 0..PAIRS {
+                    // Entries pair `q`'s counters have taken this task, this group's included:
+                    // a bound on every count (one per lane per entry at most).
+                    taken[q] += group.offsets[q + 1] - group.offsets[q];
                     accumulate_pair(
                         planes.as_ptr(),
                         &group.terms[group.offsets[q]..group.mid[q]],
                         &group.terms[group.mid[q]..group.offsets[q + 1]],
                         acc.as_mut_ptr().add(2 * q * BITS),
+                        top_bit(taken[q]),
                     );
                 }
                 #[cfg(test)]
@@ -2624,6 +2646,8 @@ mod bitsliced {
                 ] {
                     let mut acc = vec![zero; 2 * BITS];
                     let mut want = [[0usize; LANES]; 2];
+                    // Entries taken so far: the counters' bound, as the fold passes it.
+                    let mut taken = 0usize;
                     for (i, &n) in lens.iter().enumerate() {
                         let m = lens[(i + 1) % lens.len()];
                         let mut terms = |n: usize| -> Vec<u16> {
@@ -2642,7 +2666,8 @@ mod bitsliced {
                                 }
                             }
                         }
-                        accumulate_pair(planes.as_ptr(), &pos, &neg, acc.as_mut_ptr());
+                        taken += pos.len() + neg.len();
+                        accumulate_pair(planes.as_ptr(), &pos, &neg, acc.as_mut_ptr(), top_bit(taken));
                     }
                     for slot in 0..2 {
                         let mut got = [0i16; LANES];

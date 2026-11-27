@@ -66,7 +66,53 @@ const fn sms_r3pair_lut() -> SmsJointPairLut {
     }
     SmsJointPairLut(out)
 }
+/// The word tables (the kernel reads them as [`SMS_R3PAIR_BYTES`]); the guards check these.
+#[cfg(test)]
 static SMS_R3PAIR_LUT: SmsJointPairLut = sms_r3pair_lut();
+/// [`sms_r3pair_lut`] split into bytes: `[band][k][rr][s][0]` holds the low bytes of the 64
+/// entries, `[..][1]` the high bytes. The prefix reads a word entry as one `vpermb` of the low
+/// bytes and one of the high bytes merged into the odd bytes (two p5 uops); `vpermt2w` on the
+/// two 32-word halves is three (two p5, one p0/p5).
+#[repr(C, align(64))]
+struct SmsR3PairBytes([[[[[[u8; 64]; 2]; 2]; 2]; 4]; 3]);
+const fn sms_r3pair_bytes() -> SmsR3PairBytes {
+    let lut = sms_r3pair_lut();
+    let mut out = [[[[[[0u8; 64]; 2]; 2]; 2]; 4]; 3];
+    let mut band = 0;
+    while band < 3 {
+        let mut k = 0;
+        while k < 4 {
+            let mut rr = 0;
+            while rr < 2 {
+                let mut s = 0;
+                while s < 2 {
+                    let mut n = 0;
+                    while n < 64 {
+                        let v = lut.0[band][k][rr][s][n] as u16;
+                        out[band][k][rr][s][0][n] = v as u8;
+                        out[band][k][rr][s][1][n] = (v >> 8) as u8;
+                        n += 1;
+                    }
+                    s += 1;
+                }
+                rr += 1;
+            }
+            k += 1;
+        }
+        band += 1;
+    }
+    SmsR3PairBytes(out)
+}
+static SMS_R3PAIR_BYTES: SmsR3PairBytes = sms_r3pair_bytes();
+/// The odd bytes of a vector: the high byte of every word.
+const HIGH_BYTES: __mmask64 = 0xaaaa_aaaa_aaaa_aaaa;
+/// Word entry `table[n]` for every word lane, from an index word holding `n` (six bits) in both
+/// bytes: the low byte from `lo[n]`, the high byte from `hi[n]` (`vpermb` reads the low six bits
+/// of each index byte).
+#[inline(always)]
+unsafe fn r3pair_lookup(n: __m512i, lo: __m512i, hi: __m512i) -> __m512i {
+    _mm512_mask_permutexvar_epi8(_mm512_permutexvar_epi8(n, lo), HIGH_BYTES, n, hi)
+}
 /// Per quarter, the band-0 rows whose `v2` (tail block 3) the prefix reduces.
 const V2_BARRETT: [u32; 4] = [1 << 3, 0, 0, 0];
 /// Whether the prefix Barrett-reduces tail block `block`'s row `row` of band `band` in quarter
@@ -134,9 +180,9 @@ pub(crate) unsafe fn ntt_bin_batch32_r3pair_source<
                 _mm512_load_si512(lut.add(64 * (r * 2 + ab)) as *const __m512i)
             };
             let (l000, l001) = (l(0, 0), l(0, 1));
-            let pair_band = SMS_R3PAIR_LUT.0.get_unchecked(band).get_unchecked(k);
-            let pair = |r: usize, s: usize, h: usize| {
-                _mm512_load_si512(pair_band[r][s].as_ptr().add(32 * h).cast())
+            let pair_band = SMS_R3PAIR_BYTES.0.get_unchecked(band).get_unchecked(k);
+            let pair = |r: usize, s: usize, byte: usize| {
+                _mm512_load_si512(pair_band[r][s][byte].as_ptr().cast())
             };
             let (a10, a11, b10, b11) = (pair(0, 0, 0), pair(0, 0, 1), pair(0, 1, 0), pair(0, 1, 1));
             let (a20, a21, b20, b21) = (pair(1, 0, 0), pair(1, 0, 1), pair(1, 1, 0), pair(1, 1, 1));
@@ -154,10 +200,12 @@ pub(crate) unsafe fn ntt_bin_batch32_r3pair_source<
                     let y = _mm512_permutexvar_epi8(ny, l001);
                     let a0 = _mm512_add_epi16(x, y);
                     let b0 = _mm512_sub_epi16(x, y);
-                    let a1 = _mm512_permutex2var_epi16(a10, n1, a11);
-                    let b1 = _mm512_permutex2var_epi16(b10, n1, b11);
-                    let a2 = _mm512_permutex2var_epi16(a20, n2, a21);
-                    let b2 = _mm512_permutex2var_epi16(b20, n2, b21);
+                    // Rows 27..81 hold each index in both bytes of its word (the slicer's r3pair
+                    // emitter), so each entry is two single-uop byte lookups.
+                    let a1 = r3pair_lookup(n1, a10, a11);
+                    let b1 = r3pair_lookup(n1, b10, b11);
+                    let a2 = r3pair_lookup(n2, a20, a21);
+                    let b2 = r3pair_lookup(n2, b20, b21);
 
                     let t0 = _mm512_add_epi16(a1, a2);
                     let t1 = _mm512_add_epi16(b1, b2);
@@ -426,6 +474,44 @@ mod sms_r3pair_lut_guards {
             }
         }
     }
+    /// The byte tables and the two-`vpermb` lookup return every word entry, for every index
+    /// word the slicer's r3pair emitter writes (`n * 0x101`) in every lane.
+    #[test]
+    fn byte_lookup_matches_word_tables() {
+        unsafe {
+            for band in 0..3 {
+                for k in 0..4 {
+                    for rr in 0..2 {
+                        for s in 0..2 {
+                            let t = &SMS_R3PAIR_BYTES.0[band][k][rr][s];
+                            let lo = _mm512_load_si512(t[0].as_ptr().cast());
+                            let hi = _mm512_load_si512(t[1].as_ptr().cast());
+                            for base in [0usize, 32] {
+                                let idx: [u16; 32] = core::array::from_fn(|l| ((base + l) as u16) * 0x101);
+                                let got: [i16; 32] = core::mem::transmute(r3pair_lookup(
+                                    _mm512_loadu_si512(idx.as_ptr().cast()),
+                                    lo,
+                                    hi,
+                                ));
+                                for l in 0..32 {
+                                    assert_eq!(got[l], SMS_R3PAIR_LUT.0[band][k][rr][s][base + l]);
+                                }
+                                let rev: [u16; 32] = core::array::from_fn(|l| ((63 - base - l) as u16) * 0x101);
+                                let got: [i16; 32] = core::mem::transmute(r3pair_lookup(
+                                    _mm512_loadu_si512(rev.as_ptr().cast()),
+                                    lo,
+                                    hi,
+                                ));
+                                for l in 0..32 {
+                                    assert_eq!(got[l], SMS_R3PAIR_LUT.0[band][k][rr][s][63 - base - l]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Interval proof of the prefix's reductions: the exact range of every prefix output per block,
@@ -464,6 +550,9 @@ mod r3pair_tail_interval_proof {
             unsafe { slice_b128_cols16_r3pair_into(&ptrs, &mut out) };
             for r in 0..81 {
                 for &w in &out.rows[r] {
+                    if r >= 27 {
+                        assert!(w >> 8 == w & 0xff && w & 0xc0 == 0, "pair index word {w:#06x}");
+                    }
                     sets[r / 27].insert(w);
                 }
             }
@@ -481,7 +570,8 @@ mod r3pair_tail_interval_proof {
         let t = tables::<9721>();
         let bv = t.bv as u16 as i16 as i64;
         let r0 = &SMS_JOINT_R0_LUT.0[band][k];
-        // vpermt2w reads the low 6 bits of each index word.
+        // Index words hold n in both bytes (asserted in words_seen); the byte lookups read
+        // table[n] with n = the low six bits.
         let pl = &SMS_R3PAIR_LUT.0[band][k];
         let word = |lo: &[u8; 64], hi: &[u8; 64], w: u16| -> i64 {
             (lo[(w & 63) as usize] as u16 | ((hi[((w >> 8) & 63) as usize] as u16) << 8)) as i16 as i64

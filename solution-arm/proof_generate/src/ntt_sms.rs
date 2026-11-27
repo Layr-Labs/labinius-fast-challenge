@@ -2023,3 +2023,26 @@ mod leap_bench {
         }
     }
 }
+
+#[path = "compare_v0.rs"]
+mod compare_v0;
+#[path = "compare_v91.rs"]
+mod compare_v91;
+#[path = "compare_v92.rs"]
+mod compare_v92;
+#[path = "compare_v93.rs"]
+mod compare_v93;
+#[path = "compare_v94.rs"]
+mod compare_v94;
+
+pub fn compare_inverse(v: u8, values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
+    match v {
+        4 => commit_v::<17>(values, a, workers, q, out, false),
+        0 => compare_v0::commit_v::<17>(values, a, workers, q, out, false),
+        91 => compare_v91::commit_v::<17>(values, a, workers, q, out, false),
+        92 => compare_v92::commit_v::<17>(values, a, workers, q, out, false),
+        93 => compare_v93::commit_v::<17>(values, a, workers, q, out, false),
+        94 => compare_v94::commit_v::<17>(values, a, workers, q, out, false),
+        _ => unreachable!("unknown inverse route"),
+    }
+}

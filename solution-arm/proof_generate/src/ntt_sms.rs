@@ -936,6 +936,26 @@ unsafe fn lut_pass(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Ker
     super::pass_lut_loop(nib, x, kern);
 }
 
+/// Diagnostic: the table front schedule by variant (9..=12 other schedules, else the record's).
+#[cfg(target_feature = "sve")]
+#[inline(always)]
+unsafe fn lut_pass_v<const V: u8>(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
+    match V {
+        9 => super::pass_lut_loop_a(nib, x, kern),
+        10 => super::pass_lut_loop_b(nib, x, kern),
+        11 => super::pass_lut_loop_c(nib, x, kern),
+        12 => super::pass_lut_loop_d(nib, x, kern),
+        13 => super::pass_lut_loop_e(nib, x, kern),
+        _ => super::pass_lut_loop(nib, x, kern),
+    }
+}
+
+#[cfg(not(target_feature = "sve"))]
+#[inline(always)]
+unsafe fn lut_pass_v<const V: u8>(nib: &[uint8x16_t; N / 4], x: &mut [int16x8_t; N], kern: &Kernel) {
+    lut_pass(nib, x, kern)
+}
+
 /// Diagnostic only: side 1 of the paired test runs the table front as a 4-iteration loop.
 #[cfg(target_feature = "sve")]
 #[inline(always)]
@@ -981,7 +1001,11 @@ unsafe fn tail<const V: u8>(sc: &mut [int16x8_t; N], x: &mut [int16x8_t; N], ker
         1 => pass_tail(sc, x, kern),
         2 => pass_tail_calls(sc, x, kern),
         3 => pass_tail_calls_b(sc, x, kern),
-        _ => pass_tail_calls_c(sc, x, kern),
+        4 => pass_tail_calls_c(sc, x, kern),
+        5 => pass_tail_calls_e(sc, x, kern),
+        6 => pass_tail_calls_f(sc, x, kern),
+        7 | 9..=13 => pass_tail_calls_g(sc, x, kern),
+        _ => pass_tail_calls_h(sc, x, kern),
     }
 }
 
@@ -1097,7 +1121,7 @@ unsafe fn sums2<const V: u8>(
                     let at = pass_words(words[t], a.elements, e, i);
                     indices_asm(&at, nib);
                     let x = &mut xs[i];
-                    lut_pass2(nib, sc, kern);
+                    lut_pass_v::<V>(nib, sc, kern);
                     tail::<V>(sc, x, kern);
                 }
                 if e % CHUNK == 0 {
@@ -1228,7 +1252,7 @@ fn pin_worker(w: usize) {
 
 /// Levels 4 to 6 run as [`pass_tail_calls_c`] (`V = 4`). In this lane's in-process A/B on the
 /// official runner, the fused kernel measured about 3.9 ms per commitment under the two passes
-/// (`V = 0`, diagnostic `7074ae15`). This schedule (skew 20, live budget 29, register reserve 0, width 5, one load-store per cycle)
+/// (`V = 0`, diagnostic `7074ae15`). This schedule (skew 24, live budget 29, register reserve 0)
 /// measured another 1.0-2.8 ms under `pass_tail_calls_b` (`V = 3`, diagnostic `5ea44bbf`), with
 /// byte-identical output.
 pub fn commit(values: &[B128], a: &SmsMatrix, workers: usize, q: u128, out: &mut [u8]) {
@@ -1744,7 +1768,7 @@ mod leap_bench {
             let x0 = a.clone();
             let mut want: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
             unsafe { pass_c_asm(&mut a, kern); pass_d_out(&a, &mut want, kern); }
-            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c] {
+            for f in [pass_tail as unsafe fn(&[int16x8_t; N], &mut [int16x8_t; N], &Kernel), pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c, pass_tail_calls_e, pass_tail_calls_f, pass_tail_calls_g, pass_tail_calls_h] {
                 let mut got: Box<[int16x8_t; N]> = unsafe { Box::new(core::mem::zeroed()) };
                 unsafe { f(&x0, &mut got, kern); }
                 let w: &[[i16; 8]] = unsafe { core::slice::from_raw_parts(want.as_ptr() as *const [i16; 8], N) };

@@ -828,7 +828,7 @@ mod asm;
 #[path = "ntt_neon_idx.rs"]
 mod idx;
 pub use idx::indices_asm;
-pub use asm::{pass_c_asm, pass_d_asm, pass_d_out, pass_lut_asm, pass_lut_loop, pass_tail, pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c};
+pub use asm::{pass_c_asm, pass_d_asm, pass_d_out, pass_lut_asm, pass_lut_loop, pass_lut_loop_a, pass_lut_loop_b, pass_lut_loop_c, pass_lut_loop_d, pass_tail, pass_tail_calls, pass_tail_calls_b, pass_tail_calls_c, pass_tail_calls_e, pass_tail_calls_f, pass_tail_calls_g, pass_tail_calls_h};
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].

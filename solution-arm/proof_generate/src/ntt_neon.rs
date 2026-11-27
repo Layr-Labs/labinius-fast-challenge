@@ -14,8 +14,7 @@
 //!
 //! The SMS commitment ([`sms`]) runs levels 0 to 2 and the level-3 twiddles as lookups instead
 //! ([`nibbles`], [`pass_lut`]): per level-1 node, 16-entry `i16` tables indexed by the nibble of
-//! the coefficients `j + 162 g`, one SVE halfword `tbl` per lookup (one table register where the
-//! nibble's bit 3, coefficient `j + 486`, is always clear: `j >= 26`) and two lookups per level-3 input,
+//! the coefficients `j + 162 g`, one SVE2 halfword `tbl` per lookup and two lookups per level-3 input,
 //! within [`super::lut_transform_bound`] (the library's x86 `bin_asm` does the same).
 use super::{for_blocks, primes, schedule, Matrix, Schedule, ALL, FIRST, FIRST13, N, PRIMES, ROW, SCHEDULES};
 use core::arch::aarch64::*;
@@ -810,7 +809,7 @@ mod asm;
 #[path = "ntt_neon_idx.rs"]
 mod idx;
 pub use idx::indices_asm;
-pub use asm::{pass_c_asm, pass_d_asm, pass_d_out, pass_lut_asm, pass_lut_loop};
+pub use asm::{pass_c_asm, pass_d_asm, pass_d_out, pass_d_out_nt, pass_lut_asm, pass_lut_loop, pass_lut_loop1, pass_lut_loop_r21, pass_lut_loop_r23, pass_lut_loop_w4, pass_lut_loop_w5};
 
 /// The transform of `-s` for the eight columns' element whose masks are `m`, in `x`, within
 /// [`super::transform_bound`].

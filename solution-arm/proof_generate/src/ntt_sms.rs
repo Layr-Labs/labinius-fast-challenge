@@ -485,26 +485,49 @@ macro_rules! narrow_terminal_row {
     };
 }
 
+/// Four signed 32-bit lanes at a time. Saturation is checked once per sweep.
+#[cfg(target_feature = "sve")]
+macro_rules! narrow_saturated_row {
+    ($a:literal, $b:literal, $c:literal, $d:literal, $offset:literal) => {
+        concat!(
+            "sqxtn v2.2s, v", $a, ".2d\n",
+            "sqxtn2 v2.4s, v", $b, ".2d\n",
+            "sqrdmulh v4.4s, v2.4s, v0.s[1]\n",
+            "mls v2.4s, v4.4s, v0.s[2]\n",
+            "sqxtn v3.2s, v", $c, ".2d\n",
+            "sqxtn2 v3.4s, v", $d, ".2d\n",
+            "sqrdmulh v4.4s, v3.4s, v0.s[1]\n",
+            "mls v3.4s, v4.4s, v0.s[2]\n",
+            "uzp1 v3.8h, v2.8h, v3.8h\n",
+            "str q3, [{compact}, #", $offset, "]"
+        )
+    };
+}
+
 /// Accumulate all six rows of each slot together. Registers z8-z31 hold the
 /// four column pairs of each row. z0-z5 hold the six indexed key operands.
 /// Load each witness once and use it for all six rows before loading the next.
 /// Keep the slot loop inside the assembler so the callee saves occur once per sweep.
 #[cfg(target_feature = "sve")]
 #[inline(never)]
-unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
+unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool, const REPLAY: bool>(
     xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
     compact: *mut int16x8_t,
-) {
+) -> bool {
+    const { assert!(!REPLAY || (FRESH && TERMINAL)) };
     const XS: usize = N * 16;
     const KS: usize = N * ROWS * LOCK * 2;
     const _: () = assert!(ROWS == 6 && LOCK == 8);
     debug_assert!(acc.len() == ROWS * 4 * N && (1..=SINK).contains(&groups));
     macro_rules! run {
-        ([$($init:literal),* $(,)?], [$($post:expr),* $(,)?], $($extra:tt)*) => {
+        ([$($init:literal),* $(,)?], [$($post:expr),* $(,)?], [$($before:literal),*], [$($after:literal),*], $($extra:tt)*) => {
             core::arch::asm!(
+                $($before,)*
                 "2:",
+                ".if {keep_base}",
                 "ldp q8, q9, [{a}, #0]",
                 "ldp q10, q11, [{a}, #32]",
+                ".endif",
                 $( $init, )*
                 "mov {zp}, {z}",
                 "mov {kp}, {k}",
@@ -515,8 +538,10 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "ldp q4, q5, [{kp}, #64]",
                 "ldr q6, [{zp}]",
                 "ldr q7, [{zp}, #{xs1}]",
+                ".if {keep_base}",
                 "sdot z8.d, z6.h, z0.h[0]",
                 "sdot z9.d, z7.h, z0.h[0]",
+                ".endif",
                 "sdot z12.d, z6.h, z1.h[0]",
                 "sdot z13.d, z7.h, z1.h[0]",
                 "sdot z16.d, z6.h, z2.h[0]",
@@ -530,8 +555,10 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "ldr q6, [{zp}, #{xs2}]",
                 "ldr q7, [{zp}, #{xs3}]",
                 "add {zp}, {zp}, {xs4}",
+                ".if {keep_base}",
                 "sdot z10.d, z6.h, z0.h[0]",
                 "sdot z11.d, z7.h, z0.h[0]",
+                ".endif",
                 "sdot z14.d, z6.h, z1.h[0]",
                 "sdot z15.d, z7.h, z1.h[0]",
                 "sdot z18.d, z6.h, z2.h[0]",
@@ -544,8 +571,10 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "sdot z31.d, z7.h, z5.h[0]",
                 "ldr q6, [{zp}]",
                 "ldr q7, [{zp}, #{xs1}]",
+                ".if {keep_base}",
                 "sdot z8.d, z6.h, z0.h[1]",
                 "sdot z9.d, z7.h, z0.h[1]",
+                ".endif",
                 "sdot z12.d, z6.h, z1.h[1]",
                 "sdot z13.d, z7.h, z1.h[1]",
                 "sdot z16.d, z6.h, z2.h[1]",
@@ -560,8 +589,10 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "ldr q7, [{zp}, #{xs3}]",
                 "add {zp}, {zp}, {xs4}",
                 "add {kp}, {kp}, {ks}",
+                ".if {keep_base}",
                 "sdot z10.d, z6.h, z0.h[1]",
                 "sdot z11.d, z7.h, z0.h[1]",
+                ".endif",
                 "sdot z14.d, z6.h, z1.h[1]",
                 "sdot z15.d, z7.h, z1.h[1]",
                 "sdot z18.d, z6.h, z2.h[1]",
@@ -574,14 +605,18 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                 "sdot z31.d, z7.h, z5.h[1]",
                 "subs {n}, {n}, #1",
                 "b.ne 3b",
+                ".if {keep_base}",
                 "stp q8, q9, [{a}, #0]",
                 "stp q10, q11, [{a}, #32]",
+                ".endif",
                 $($post,)*
                 "add {a}, {a}, #384",
                 "add {z}, {z}, #16",
                 "add {k}, {k}, #96",
                 "subs {slots}, {slots}, #1",
                 "b.ne 2b",
+                $($after,)*
+                keep_base = const !REPLAY as usize,
                 a = inout(reg) acc.as_mut_ptr() => _,
                 z = inout(reg) xs.as_ptr() => _,
                 k = inout(reg) keys => _,
@@ -609,7 +644,7 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
         };
     }
     macro_rules! run_with_init {
-        ([$($post:expr),* $(,)?], $($extra:tt)*) => {{
+        ([$($post:expr),* $(,)?], [$($before:literal),*], [$($after:literal),*], $($extra:tt)*) => {{
             if FRESH {
                 run!([
                     "movi v12.16b, #0", "movi v13.16b, #0",
@@ -622,7 +657,7 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                     "movi v26.16b, #0", "movi v27.16b, #0",
                     "movi v28.16b, #0", "movi v29.16b, #0",
                     "movi v30.16b, #0", "movi v31.16b, #0",
-                ], [$($post),*], $($extra)*);
+                ], [$($post),*], [$($before),*], [$($after),*], $($extra)*);
             } else {
                 run!([
                     "ldp q12, q13, [{a}, #64]", "ldp q14, q15, [{a}, #96]",
@@ -630,11 +665,32 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
                     "ldp q20, q21, [{a}, #192]", "ldp q22, q23, [{a}, #224]",
                     "ldp q24, q25, [{a}, #256]", "ldp q26, q27, [{a}, #288]",
                     "ldp q28, q29, [{a}, #320]", "ldp q30, q31, [{a}, #352]",
-                ], [$($post),*], $($extra)*);
+                ], [$($post),*], [$($before),*], [$($after),*], $($extra)*);
             }
         }};
     }
-    if TERMINAL {
+    if TERMINAL && FRESH && !REPLAY {
+        // V31 * P1 - 2^31 bounds the reciprocal error after multiplying by any i32.
+        // The inverse accepts |x| <= P1, and the remainder below has |x| <= 6764.
+        const { assert!((P1 as i64 / 2) + (V31 as i64 * P1 as i64 - (1i64 << 31)).abs() <= P1 as i64) };
+        let status: u64;
+        run_with_init!([
+            "ldr q0, [{coefficients}]",
+            narrow_saturated_row!(12, 13, 14, 15, "0"),
+            narrow_saturated_row!(16, 17, 18, 19, "{row1}"),
+            narrow_saturated_row!(20, 21, 22, 23, "{row2}"),
+            narrow_saturated_row!(24, 25, 26, 27, "{row3}"),
+            narrow_saturated_row!(28, 29, 30, 31, "{row4}"),
+            "add {compact}, {compact}, #16",
+        ], ["mrs {saved}, fpsr", "msr fpsr, xzr"], ["mrs {status}, fpsr", "msr fpsr, {saved}"],
+            saved = out(reg) _,
+            status = lateout(reg) status,
+            coefficients = in(reg) NARROW_COEFFICIENTS.as_ptr(),
+            compact = inout(reg) compact => _,
+            row1 = const 16 * N, row2 = const 32 * N, row3 = const 48 * N, row4 = const 64 * N,
+        );
+        return status & (1 << 27) != 0;
+    } else if TERMINAL {
         run_with_init!([
             "ldr q0, [{coefficients}]",
             narrow_terminal_row!(12, 13, 14, 15, "0"),
@@ -643,7 +699,7 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
             narrow_terminal_row!(24, 25, 26, 27, "{row3}"),
             narrow_terminal_row!(28, 29, 30, 31, "{row4}"),
             "add {compact}, {compact}, #16",
-        ],
+        ], [], [],
             coefficients = in(reg) NARROW_COEFFICIENTS.as_ptr(),
             compact = inout(reg) compact => _,
             row1 = const 16 * N, row2 = const 32 * N, row3 = const 48 * N, row4 = const 64 * N,
@@ -660,14 +716,15 @@ unsafe fn sink_sve<const FRESH: bool, const TERMINAL: bool>(
             "stp q26, q27, [{a}, #288]",
             "stp q28, q29, [{a}, #320]",
             "stp q30, q31, [{a}, #352]",
-        ],);
+        ], [], [],);
     }
+    false
 }
 
 #[cfg(target_feature = "sve")]
 #[inline(always)]
 unsafe fn sink<const FRESH: bool>(xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize) {
-    sink_sve::<FRESH, false>(xs, keys, acc, groups, core::ptr::null_mut());
+    sink_sve::<FRESH, false, false>(xs, keys, acc, groups, core::ptr::null_mut());
 }
 
 #[cfg(target_feature = "sve")]
@@ -676,7 +733,21 @@ unsafe fn sink_terminal<const FRESH: bool>(
     xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
     narrowed: &mut NarrowedDigits,
 ) {
-    sink_sve::<FRESH, true>(xs, keys, acc, groups, narrowed.as_mut_ptr().cast());
+    let compact = narrowed.as_mut_ptr().cast();
+    if sink_sve::<FRESH, true, false>(xs, keys, acc, groups, compact) {
+        replay_terminal(xs, keys, acc, groups, compact);
+    }
+}
+
+#[cfg(target_feature = "sve")]
+#[cold]
+#[inline(never)]
+unsafe fn replay_terminal(
+    xs: &[[int16x8_t; N]; SWEEP], keys: *const i16, acc: &mut [int64x2_t], groups: usize,
+    compact: *mut int16x8_t,
+) {
+    // The first pass has committed the base row. Replace only the five digit outputs.
+    sink_sve::<true, true, true>(xs, keys, acc, groups, compact);
 }
 
 #[cfg(not(target_feature = "sve"))]
@@ -1631,8 +1702,12 @@ mod tests {
                                core::mem::transmute::<_, [i64; 2]>(want[at + q]));
                 }
                 for (d, row) in compact.iter().enumerate() {
-                    assert_eq!(core::mem::transmute::<_, [i16; 8]>(row[s]),
-                               core::mem::transmute::<_, [i16; 8]>(narrow_digit(&want, s, d + 1)));
+                    let actual: [i16; 8] = core::mem::transmute(row[s]);
+                    let expected: [i16; 8] = core::mem::transmute(narrow_digit(&want, s, d + 1));
+                    for (a, b) in actual.into_iter().zip(expected) {
+                        assert!((a as i32).abs() <= P1 as i32);
+                        assert_eq!((a as i32 - b as i32).rem_euclid(P1 as i32), 0);
+                    }
                 }
             }
         }

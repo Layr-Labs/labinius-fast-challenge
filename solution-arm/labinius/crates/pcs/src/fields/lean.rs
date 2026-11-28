@@ -6,6 +6,8 @@ use crate::par;
 const PACK: usize = 128;
 const PREFIX: usize = 7;
 const PLANE_RESERVE: usize = 4 << 20;
+/// The live length at which the tail turns dense (see [`Switch::fold`]).
+const DENSE_HALF: usize = 1 << 12;
 
 fn inverse(x: B128) -> B128 {
     assert_ne!(x, B128::ZERO);
@@ -137,6 +139,14 @@ pub struct Switch<'a> {
     lt: ByteTables,
     prefix_r: Vec<F162>,
     planes: [Vec<u64>; 3],
+    /// Dense tail: once the live length is at most `dense_half`, the equality polynomial is kept as
+    /// explicit F162 limbs, and each round folds both it and the witness. Each plane then holds the
+    /// witness limbs from 0 and the equality limbs from `eoff` (the materialized length), in the part
+    /// of the plane's huge page that the witness limbs leave unused.
+    dense: bool,
+    dense_half: usize,
+    tail: bool,
+    eoff: usize,
     half: usize,
     round: usize,
     pending: Option<[F162; 2]>,
@@ -155,6 +165,10 @@ impl<'a> Switch<'a> {
             lt,
             prefix_r,
             planes: core::array::from_fn(|_| Vec::new()),
+            dense: std::env::var_os("LABINIUS_SWITCH_LINEAR").is_none(),
+            dense_half: std::env::var("LABINIUS_DENSE_HALF").ok().and_then(|v| v.parse().ok()).unwrap_or(DENSE_HALF),
+            tail: false,
+            eoff: 0,
             half: words.len(),
             round: 0,
             pending: None,
@@ -211,6 +225,9 @@ impl<'a> Switch<'a> {
         if self.round < self.prepared.prefix {
             return self.prefix_message();
         }
+        if self.tail {
+            return self.dense_message(self.half);
+        }
         self.message(self.half)
     }
 
@@ -240,7 +257,7 @@ impl<'a> Switch<'a> {
     }
 
     pub fn fold(&mut self, r: F162) {
-        if self.round + 1 < self.prepared.inverses.len() {
+        if self.round + 1 < self.prepared.inverses.len() && !self.tail {
             for (l, &lp) in self.l.iter_mut().zip(&self.lp) {
                 *l += r * lp;
             }
@@ -258,6 +275,19 @@ impl<'a> Switch<'a> {
             let (l1, h1) = p1.split_at_mut(1);
             let (l2, h2) = p2.split_at_mut(1);
             unsafe { neon::fold_share([l0, l1, l2], [&h0[..1], &h1[..1], &h2[..1]], r); }
+        } else if self.tail {
+            self.pending = Some(self.fold_dense(r));
+        } else if self.dense && self.half <= self.dense_half {
+            // The last linear round: fold the witness, then make the equality side explicit through
+            // the maps just updated for the next round.
+            let h = self.half;
+            let [p0, p1, p2] = &mut self.planes;
+            let (l0, h0) = p0.split_at_mut(h);
+            let (l1, h1) = p1.split_at_mut(h);
+            let (l2, h2) = p2.split_at_mut(h);
+            unsafe { neon::fold_share([l0, l1, l2], [&h0[..h], &h1[..h], &h2[..h]], r); }
+            self.build_dense_eq(h);
+            self.tail = true;
         } else {
             self.pending = Some(self.fold_message(r));
         }
@@ -314,12 +344,108 @@ impl<'a> Switch<'a> {
         sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])
     }
 
+    /// The dense round message over the explicit equality limbs.
+    fn dense_message(&self, half: usize) -> [F162; 2] {
+        let p = &self.planes;
+        let n = self.eoff;
+        let e: [&[u64]; 3] = core::array::from_fn(|k| &p[k][n..]);
+        let parts = par::workers(half, 1 << 10);
+        let sums = par::map_blocks(half, parts, 2.min(half), |_, s, t| unsafe {
+            neon::msg_range(
+                core::array::from_fn(|k| &e[k][s..t]),
+                core::array::from_fn(|k| &e[k][half + s..half + t]),
+                core::array::from_fn(|k| &p[k][s..t]),
+                core::array::from_fn(|k| &p[k][half + s..half + t]),
+            )
+        });
+        sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])
+    }
+
+    /// The dense fold at `r` of both the equality and the witness limbs, fused with the next message.
+    fn fold_dense(&mut self, r: F162) -> [F162; 2] {
+        let hh = self.half / 2;
+        let parts = par::workers(hh, 1 << 10);
+        let edges: Vec<_> = (0..parts).map(|t| par::block(hh, parts, t, 2.min(hh))).collect();
+        fn split(p: &mut [u64], hh: usize) -> (&mut [u64], &mut [u64], &[u64], &[u64]) {
+            let (lo, hi) = p[..4 * hh].split_at_mut(2 * hh);
+            let (q0, q1) = lo.split_at_mut(hh);
+            let (h0, h1) = hi.split_at(hh);
+            (q0, q1, h0, h1)
+        }
+        let n = self.eoff;
+        let [p0, p1, p2] = &mut self.planes;
+        let (p0, e0) = p0.split_at_mut(n);
+        let (p1, e1) = p1.split_at_mut(n);
+        let (p2, e2) = p2.split_at_mut(n);
+        let (ea0, ea1, eah0, eah1) = split(e0, hh);
+        let (eb0, eb1, ebh0, ebh1) = split(e1, hh);
+        let (ec0, ec1, ech0, ech1) = split(e2, hh);
+        let (a0, a1, ah0, ah1) = split(p0, hh);
+        let (b0, b1, bh0, bh1) = split(p1, hh);
+        let (c0, c1, ch0, ch1) = split(p2, hh);
+        if parts == 1 {
+            return unsafe {
+                neon::fold_dense_message(
+                    [ea0, eb0, ec0], [ea1, eb1, ec1], [eah0, ebh0, ech0], [eah1, ebh1, ech1],
+                    [a0, b0, c0], [a1, b1, c1], [ah0, bh0, ch0], [ah1, bh1, ch1], r,
+                )
+            };
+        }
+        fn sp<'x>(x: &'x mut [u64], edges: &[(usize, usize)]) -> Vec<&'x mut [u64]> { par::split_mut(x, edges) }
+        let mut eq0: Vec<[&mut [u64]; 3]> = sp(ea0, &edges).into_iter().zip(sp(eb0, &edges)).zip(sp(ec0, &edges)).map(|((a, b), c)| [a, b, c]).collect();
+        let mut eq1: Vec<[&mut [u64]; 3]> = sp(ea1, &edges).into_iter().zip(sp(eb1, &edges)).zip(sp(ec1, &edges)).map(|((a, b), c)| [a, b, c]).collect();
+        let mut q0: Vec<[&mut [u64]; 3]> = sp(a0, &edges).into_iter().zip(sp(b0, &edges)).zip(sp(c0, &edges)).map(|((a, b), c)| [a, b, c]).collect();
+        let mut q1: Vec<[&mut [u64]; 3]> = sp(a1, &edges).into_iter().zip(sp(b1, &edges)).zip(sp(c1, &edges)).map(|((a, b), c)| [a, b, c]).collect();
+        let tasks: Vec<_> = (0..parts).rev().map(|t| (eq0.pop().unwrap(), eq1.pop().unwrap(), q0.pop().unwrap(), q1.pop().unwrap(), edges[t])).collect();
+        let (eh0, eh1, ph0, ph1) = ([&*eah0, &*ebh0, &*ech0], [&*eah1, &*ebh1, &*ech1], [&*ah0, &*bh0, &*ch0], [&*ah1, &*bh1, &*ch1]);
+        let sums = par::map_each(tasks, |(e0, e1, q0, q1, (s, t))| unsafe {
+            fn cut<'x>(h: [&'x [u64]; 3], s: usize, t: usize) -> [&'x [u64]; 3] { core::array::from_fn(|k| &h[k][s..t]) }
+            neon::fold_dense_message(e0, e1, cut(eh0, s, t), cut(eh1, s, t), q0, q1, cut(ph0, s, t), cut(ph1, s, t), r)
+        });
+        sums.into_iter().fold([F162::ZERO; 2], |a, b| [a[0] + b[0], a[1] + b[1]])
+    }
+
+    /// The explicit equality limbs of the first dense round: both halves of the live equality
+    /// polynomial, from the original weights through the current maps.
+    fn build_dense_eq(&mut self, live: usize) {
+        let n = self.eoff;
+        let half = live / 2;
+        if half == 0 {
+            return;
+        }
+        let (l, lp) = (&self.lt, &ByteTables::new(&self.lp));
+        let eq = &self.prepared.eq;
+        let parts = par::workers(half, 1 << 12);
+        let edges: Vec<_> = (0..parts).map(|t| par::block(half, parts, t, 64.min(half))).collect();
+        let [p0, p1, p2] = &mut self.planes;
+        let (e0, e1, e2) = (&mut p0[n..], &mut p1[n..], &mut p2[n..]);
+        let (a0, b0) = e0.split_at_mut(half);
+        let (a1, b1) = e1.split_at_mut(half);
+        let (a2, b2) = e2.split_at_mut(half);
+        let chunks = par::split_mut(a0, &edges).into_iter().zip(par::split_mut(a1, &edges)).zip(par::split_mut(a2, &edges))
+            .zip(par::split_mut(b0, &edges)).zip(par::split_mut(b1, &edges)).zip(par::split_mut(b2, &edges));
+        par::for_each(chunks.zip(&edges), |((((((x0, x1), x2), y0), y1), y2), &(start, end))| {
+            let mut tile = [B128::ZERO; 64];
+            for base in (start..end).step_by(64) {
+                let count = (end - base).min(64);
+                eq.fill(base, &mut tile[..count]);
+                let o = base - start;
+                neon::dense_eq(
+                    &tile[..count], l, lp,
+                    [&mut x0[o..o + count], &mut x1[o..o + count], &mut x2[o..o + count]],
+                    [&mut y0[o..o + count], &mut y1[o..o + count], &mut y2[o..o + count]],
+                );
+            }
+        });
+    }
+
     fn materialize(&mut self) {
         let n = self.words.len() >> self.prepared.prefix;
-        let reserve = n.max(PLANE_RESERVE / core::mem::size_of::<u64>());
+        let len = if self.dense { n + n.min(self.dense_half) } else { n };
+        let reserve = len.max(PLANE_RESERVE / core::mem::size_of::<u64>());
         self.planes = core::array::from_fn(|_| {
             let mut v = Vec::<u64>::with_capacity(reserve);
-            unsafe { v.set_len(n) };
+            unsafe { v.set_len(len) };
             v
         });
         let weights = eq_expand_f162(&self.prefix_r);
@@ -333,6 +459,7 @@ impl<'a> Switch<'a> {
         par::for_each(chunks.zip(&edges), |(((a, b), c), &(start, _))| unsafe {
             neon::materialize_prefix(words, weights, start, [a, b, c])
         });
+        self.eoff = n;
     }
 
     pub fn final_eval(&self) -> F162 {
@@ -372,6 +499,42 @@ mod tests {
                 full.fold(challenge);
             }
             assert_eq!(lean.final_eval(), full.final_eval());
+        }
+    }
+
+    #[test]
+    fn dense_tail_matches_at_every_threshold() {
+        let mut state = 0x2545f4914f6cdd1du128;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (log, prefix) in [(3, 0), (7, 1), (10, 4), (14, 6), (15, 7)] {
+            for dense_half in [0usize, 1, 2, 8, 256, 1 << 20] {
+                for dense in [false, true] {
+                    let words: Vec<_> = (0..1 << log).map(|_| B128(next())).collect();
+                    let r: Vec<_> = (0..log).map(|_| B128(next())).collect();
+                    let batch = eq_expand_f162(&(0..7).map(|_| F162::from_b128(B128(next()))).collect::<Vec<_>>());
+                    let prepared = Prepared::with_prefix(&words, &r, prefix).unwrap();
+                    let (_, eq) = SwitchProver::partial_evals_and_eq(&words, &r);
+                    let mut lean = Switch::new(&words, prepared, &batch);
+                    // `new` may have materialized already (prefix 0) with the default settings: rebuild it.
+                    lean.dense = dense;
+                    lean.dense_half = dense_half;
+                    if lean.prepared.prefix == 0 { lean.materialize(); }
+                    let mut full = SwitchProver::new(&words, &eq, &batch);
+                    for round in 0..log {
+                        assert_eq!(lean.msg(), full.msg(), "log={log} prefix={prefix} dense={dense} at={dense_half} round={round}");
+                        let x = next();
+                        let challenge = F162([x as u64, (x >> 64) as u64, next() as u64 & ((1 << 34) - 1)]);
+                        lean.fold(challenge);
+                        full.fold(challenge);
+                    }
+                    assert_eq!(lean.final_eval(), full.final_eval());
+                }
+            }
         }
     }
 

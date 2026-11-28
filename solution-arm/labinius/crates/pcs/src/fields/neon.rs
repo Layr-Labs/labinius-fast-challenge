@@ -779,6 +779,72 @@ pub(super) unsafe fn fold_linear_message(
     out
 }
 
+/// The dense tail round: both the explicit equality limbs `e` and the witness limbs `p` are folded
+/// at `r` over one quarter split (`q0 <- q0 + r (q0 + h0)`, `q1 <- q1 + r (q1 + h1)`), and the next
+/// message `[sum e0 p0, sum (e0 + e1)(p0 + p1)]` of the folded halves is accumulated.
+///
+/// # Safety
+/// The CPU must have PMULL ([`pmull`]).
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn fold_dense_message(
+    eq0: [&mut [u64]; 3], eq1: [&mut [u64]; 3], eh0: [&[u64]; 3], eh1: [&[u64]; 3],
+    q0: [&mut [u64]; 3], q1: [&mut [u64]; 3], h0: [&[u64]; 3], h1: [&[u64]; 3], r: F162,
+) -> [F162; 2] {
+    let n = q0[0].len();
+    for w in [&eq0, &eq1, &q0, &q1] {
+        assert!(w.iter().all(|s| s.len() == n));
+    }
+    for w in [eh0, eh1, h0, h1] {
+        assert!(w.iter().all(|s| s.len() == n));
+    }
+    let rk = kara(r.0.map(|x| vdupq_n_u64(x)));
+    let mut acc0 = [vdupq_n_u64(0); 6];
+    let mut acci = acc0;
+    #[inline(always)]
+    unsafe fn get(q: &[&mut [u64]; 3], j: usize) -> [uint64x2_t; 3] { core::array::from_fn(|k| vld1q_u64(q[k].as_ptr().add(j))) }
+    for j in (0..n / 2 * 2).step_by(2) {
+        let a0 = fold2(get(&eq0, j), load2(eh0, j), rk);
+        let a1 = fold2(get(&eq1, j), load2(eh1, j), rk);
+        let p0 = fold2(get(&q0, j), load2(h0, j), rk);
+        let p1 = fold2(get(&q1, j), load2(h1, j), rk);
+        mac2(&mut acc0, a0, p0);
+        mac2(&mut acci, core::array::from_fn(|k| x2(a0[k], a1[k])), core::array::from_fn(|k| x2(p0[k], p1[k])));
+        for k in 0..3 {
+            vst1q_u64(eq0[k].as_mut_ptr().add(j), a0[k]);
+            vst1q_u64(eq1[k].as_mut_ptr().add(j), a1[k]);
+            vst1q_u64(q0[k].as_mut_ptr().add(j), p0[k]);
+            vst1q_u64(q1[k].as_mut_ptr().add(j), p1[k]);
+        }
+    }
+    let mut out = [reduce(assemble(acc0.map(|v| to_u128(v)))), reduce(assemble(acci.map(|v| to_u128(v))))];
+    if n % 2 != 0 {
+        let j = n - 1;
+        let f = |x: &[&mut [u64]; 3], h: [&[u64]; 3]| {
+            let a = F162(core::array::from_fn(|k| x[k][j]));
+            a + r * (a + F162(core::array::from_fn(|k| h[k][j])))
+        };
+        let (a0, a1, p0, p1) = (f(&eq0, eh0), f(&eq1, eh1), f(&q0, h0), f(&q1, h1));
+        out[0] += a0 * p0;
+        out[1] += (a0 + a1) * (p0 + p1);
+        for k in 0..3 {
+            eq0[k][j] = a0.0[k]; eq1[k][j] = a1.0[k]; q0[k][j] = p0.0[k]; q1[k][j] = p1.0[k];
+        }
+    }
+    out
+}
+
+/// The explicit equality limbs of the current round: `lo[j] = l(eq[j])`, `hi[j] = l(eq[j]) + lp(eq[j])`.
+pub(super) fn dense_eq(eq: &[B128], l: &ByteTables, lp: &ByteTables, lo: [&mut [u64]; 3], hi: [&mut [u64]; 3]) {
+    let [l0, l1, l2] = lo;
+    let [h0, h1, h2] = hi;
+    for (j, &x) in eq.iter().enumerate() {
+        let a = l.apply(x);
+        let b = a + lp.apply(x);
+        l0[j] = a.0[0]; l1[j] = a.0[1]; l2[j] = a.0[2];
+        h0[j] = b.0[0]; h1[j] = b.0[1]; h2[j] = b.0[2];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

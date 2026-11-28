@@ -896,6 +896,8 @@ fn switch_proof(values: &[B128], lo: &[B128], hi: &[B128], t: &mut Transcript) -
 
 fn prove(seed: &[u8; 32], modulus: u128, values: &[B128], timer: &mut Timer, output: &Output) -> ProofParts {
     output.wait_setup();
+    #[cfg(target_arch = "aarch64")]
+    stride_diagnostic(values, modulus);
     let mut commitment = output.commitment_buffer();
     commit(values, modulus, &mut commitment);
     labinius::par::pool();
@@ -1288,4 +1290,34 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(target_arch="aarch64")]
+fn stride_diagnostic(values:&[B128], modulus:u128) {
+    use ntt::neon::sms;
+    assert_eq!(modulus,sms::MODULUS);
+    let key=sms::SmsMatrix::from_images(&SMS_DATA.0,&SMS_MEANS.0,&SMS_MU.0,&SMS_META.0,
+        &SMS_DIGITS.0,&SMS_MEAN_INT.0,&SMS_THRESHOLD.0,RING_ELEMENTS).expect("embedded key");
+    let mut reference=vec![0;COLUMNS*ntt::N*5];
+    let mut out=vec![0;reference.len()];
+    let measure=|route, dst:&mut [u8]| {
+        let start=std::time::Instant::now();
+        if route==0 { sms::commit_layout::<17,0>(values,&key,threads(),modulus,dst,false); }
+        else { sms::commit_layout::<17,192>(values,&key,threads(),modulus,dst,false); }
+        start.elapsed().as_nanos()
+    };
+    eprintln!("STRIDE17 reference {}",measure(0,&mut reference));
+    eprintln!("STRIDE17 warm {}",measure(1,&mut out));
+    assert_eq!(reference,out);
+    for r in 0..4 {
+        for p in 0..2 {
+            let route=(r+p)%2;
+            let n=measure(route,&mut out);
+            assert_eq!(reference,out);
+            eprintln!("STRIDE17 {r} {p} {route} {n} bytes={} equal=true",out.len());
+        }
+    }
+    let n=measure(0,&mut out);
+    assert_eq!(reference,out);
+    eprintln!("STRIDE17 closing {n} bytes={} equal=true",out.len());
 }

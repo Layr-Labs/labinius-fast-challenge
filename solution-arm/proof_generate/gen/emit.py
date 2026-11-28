@@ -134,11 +134,11 @@ pub unsafe fn pass_tail(x: &[int16x8_t; N], y: &mut [int16x8_t; N], kern: &Kerne
     );
 }}
 """
-def pass_tail_calls(K=8, B=26, name="pass_tail_calls", reserve=1, width=6, ls=2, mfirst=True, omit6=None, omit5=None, memory_pairs=None):
+def pass_tail_calls(K=8, B=26, name="pass_tail_calls", reserve=1, width=6, ls=2, mfirst=True, omit6=None, omit5=None):
     # the scheduler reads MFIRST per call: off selects its load-first priority order
     saved = os.environ.pop('MFIRST', None)
     if mfirst: os.environ['MFIRST'] = saved or '1'
-    body = ',\n        '.join(gen_tail.emit_calls(K, B, reserve, width, ls, omit6, omit5, memory_pairs=memory_pairs))
+    body = ',\n        '.join(gen_tail.emit_calls(K, B, reserve, width, ls, omit6, omit5))
     if saved is not None: os.environ['MFIRST'] = saved
     return f"""/// [`pass_tail`] with one body per node reduction kind ({len(gen_tail.kinds())} kinds), called per node
 /// with the node's base pointers: about a third of the straight-line code (schedule skew {K},
@@ -158,14 +158,14 @@ pub unsafe fn {name}(x: &[int16x8_t; N], y: &mut [int16x8_t; N], kern: &Kernel) 
     );
 }}
 """
-def pass_quarter_tail(name="pass_tail_calls_c", omit6=None, omit5=None, preset=(20,30,6,1), memory_pairs=None):
+def pass_quarter_tail(name="pass_tail_calls_c", omit6=None, omit5=None, preset=(20,30,6,1)):
     # Each node omits nine first-input reductions. Node 10 omits them at
     # level 5, while the other nodes omit them at level 4.
     previous = gen_pc.kind
     gen_pc.kind = lambda n: (n == 10, 7 if n == 10 else 0)
     try:
         k, b, w, ls = preset
-        return pass_tail_calls(k, b, name, 0, w, ls, True, omit6, omit5, memory_pairs=memory_pairs)
+        return pass_tail_calls(k, b, name, 0, w, ls, True, omit6, omit5)
     finally:
         gen_pc.kind = previous
 
@@ -184,5 +184,5 @@ def guard_status(body):
 # Keep j=0 and guard the two other level-5 first inputs in each 9-slot group.
 # Node 10 already omits all nine level-5 reductions.
 l5_mask = lambda n: 0 if n == 10 else 0b110110110
-out += "\n" + guard_status(pass_quarter_tail("pass_tail_guarded", lambda n: True, l5_mask, memory_pairs="both"))
+out += "\n" + guard_status(pass_quarter_tail("pass_tail_guarded", lambda n: True, l5_mask))
 open(os.path.join(os.path.dirname(__file__), '..', 'src', 'ntt_neon_asm.rs'), 'w', newline='').write(out.replace('\n', '\r\n'))

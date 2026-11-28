@@ -826,3 +826,8 @@ pub mod tests {
         }
     }
 }
+
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code, unused_imports)]
+#[path = "r17_ntt_neon.rs"]
+pub(crate) mod r17_mixed;

@@ -30,7 +30,13 @@ fn main() {
     // The hybrid matrix is no longer the default's: its image stays empty and `--modulus` with
     // the hybrid modulus builds it at run time.
     std::fs::write(dir.join("hybrid-matrix.bin"), Vec::<u8>::new()).expect("write the matrix image");
+    println!("cargo:rerun-if-changed=src/r17_ntt_neon.rs");
+    println!("cargo:rerun-if-changed=src/r17_ntt_neon_asm.rs");
+    println!("cargo:rerun-if-changed=src/r17_ntt_neon_weighted.rs");
+    println!("cargo:rerun-if-changed=src/r17_ntt_neon_weighted_tables.rs");
+    println!("cargo:rerun-if-changed=src/r17_ntt_sms.rs");
     let [data, means, mu, meta, digits, mean_int, threshold] = sms_images();
+    write_mixed_image(&dir, [&means, &mu, &meta, &digits, &mean_int, &threshold]);
     for (name, bytes) in [
         ("sms-data.bin", data),
         ("sms-means.bin", means),
@@ -80,3 +86,21 @@ fn image() -> Vec<u8> {
 fn image() -> Vec<u8> {
     Vec::new()
 }
+
+#[cfg(target_arch = "aarch64")]
+fn write_mixed_image(dir: &std::path::Path, selective_metadata: [&[u8]; 6]) {
+    let image = if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let [mixed, means, mu, meta, digits, mean_int, threshold] =
+            ntt::r17_mixed::sms::matrix(RING_ELEMENTS, workers).images();
+        for (generated, selective) in [means, mu, meta, digits, mean_int, threshold]
+                .into_iter().zip(selective_metadata) {
+            assert_eq!(generated.as_slice(), selective, "mixed non-spectral key metadata");
+        }
+        mixed
+    } else { Vec::new() };
+    std::fs::write(dir.join("r17-mixed-data.bin"), image).expect("write mixed balanced key");
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn write_mixed_image(_: &std::path::Path, _: [&[u8]; 6]) {}
